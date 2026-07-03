@@ -1,0 +1,33 @@
+# Core deep learning
+# transformers >=4.60 references torch.float8_e8m0fnu (added in torch 2.7).
+# NOTE: on hosts with NVIDIA driver < 580 (i.e. CUDA <= 12.x), do NOT take the
+# default pip wheel for torch -- it pulls a cu13 build that can't see the GPU.
+# Install explicitly from the CUDA 12 index, e.g.:
+#   pip install -U "torch>=2.7" torchvision torchaudio \
+#       --index-url https://download.pytorch.org/whl/cu124
+torch>=2.7.0
+torchvision>=0.22.0
+einops>=0.7.0
+
+# Hugging Face ecosystem
+# Gemma 4 requires a recent transformers (AutoModelForMultimodalLM, gemma4 arch).
+# transformers 4.57.1 does NOT have AutoModelForMultimodalLM; bump or pip install -U.
+transformers>=4.60.0
+datasets>=2.18.0
+huggingface_hub>=0.30.0
+tokenizers>=0.15.0
+safetensors>=0.4.0
+accelerate>=1.0.0
+
+# Parameter-efficient fine-tuning
+peft>=0.10.0
+
+# Game engine and graphics
+pygame>=2.5.0
+Pillow>=10.0.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+
+# Environment and utilities
+python-dotenv>=1.0.0
+
