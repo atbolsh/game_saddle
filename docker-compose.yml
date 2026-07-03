@@ -1,0 +1,29 @@
+# Local Neo4j for the NAMS-backed game agent.
+#
+#   NEO4J_PASSWORD=changeme docker compose up -d neo4j
+#
+# Bolt:        bolt://localhost:7687
+# Browser UI:  http://localhost:7474
+#
+# Point the agent at it by setting NEO4J_URI / NEO4J_PASSWORD in .env (see
+# .env.example). To use an existing Neo4j instance instead, simply do not
+# start this service and set NEO4J_URI to your bolt URI.
+
+services:
+  neo4j:
+    image: neo4j:5.20-community
+    container_name: game_saddle_neo4j
+    restart: unless-stopped
+    ports:
+      - "7474:7474"   # HTTP browser UI
+      - "7687:7687"   # Bolt
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-changeme}
+      # APOC is handy for ad-hoc queries / image decoding in the browser.
+      NEO4J_PLUGINS: '["apoc"]'
+      # Allow longer property strings (e.g. settings_json, base64 thumbnails).
+      NEO4J_dbms_memory_heap_max__size: 1G
+      NEO4J_server_memory_heap_max__size: 1G
+    volumes:
+      - ./neo4j_data:/data
+      - ./neo4j_logs:/logs

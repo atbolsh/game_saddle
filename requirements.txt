@@ -31,3 +31,21 @@ matplotlib>=3.7.0
 # Environment and utilities
 python-dotenv>=1.0.0
 
+# Agent memory: Neo4j Agent Memory (NAMS) -- self-hosted bolt backend.
+# The [sentence-transformers] extra gives local embeddings (no API key).
+# No [nams]/[openai]/[anthropic] extras: we deliberately do not pass an llm=
+# to NAMS, so no external provider key is required.
+neo4j-agent-memory[sentence-transformers]>=0.5.0
+
+# Direct Neo4j driver (used for GameSnapshot image-node writes via
+# client.graph.execute_write on the bolt backend; pinned to match the
+# Neo4j 5.20 server we ship in docker-compose.yml).
+neo4j>=5.20.0
+
+# Sentence-transformers local embedding model (pinned explicitly so the
+# NAMS extra does not silently fall back to a different version).
+sentence-transformers>=2.7.0
+
+# Pydantic v2 (NAMS SecretStr / settings models).
+pydantic>=2.7.0
+

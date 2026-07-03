@@ -6,3 +6,9 @@ brain_checkpoints
 .ipynb_checkpoints
 demo_images/
 demo_images.tar.gz
+
+# Agent runtime artifacts
+memory_images/
+neo4j_data/
+neo4j_logs/
+brain_checkpoints/
