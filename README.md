@@ -130,6 +130,32 @@ sees Settings.
    `docker compose up`. Bolt runs on `bolt://localhost:7687`; the browser
    UI is at `http://localhost:7474`.
 
+   **Bare-metal Neo4j (no Docker, e.g. Vast.ai).** Rented GPU boxes often
+   don't run a Docker daemon inside the container. Use the helper scripts in
+   `scripts/` to run Neo4j directly instead:
+
+   ```bash
+   # Idempotent: installs Neo4j + OpenJDK 17 (if missing), configures bolt +
+   # APOC, sets the password, starts the server, and writes the connection
+   # vars into .env. Re-runnable.
+   bash scripts/vast_neo4j_launch.sh
+
+   # Sanity-check connectivity (direct bolt + a NAMS get_context round-trip):
+   python scripts/neo4j_connect_diagnostic.py
+   ```
+
+   The password defaults to `changeme` (matching `.env.example`); override
+   with `NEO4J_PASSWORD=… bash scripts/vast_neo4j_launch.sh`.
+
+   Manage the bare-metal database with `scripts/neo4j_db.sh`:
+
+   ```bash
+   bash scripts/neo4j_db.sh status              # running state + bolt + node counts by label
+   bash scripts/neo4j_db.sh save logs/mem.dump  # snapshot the graph (non-destructive)
+   bash scripts/neo4j_db.sh wipe                # delete the graph, keep the password
+   bash scripts/neo4j_db.sh load logs/mem.dump  # restore a saved graph
+   ```
+
 3. **Env file.**
 
    ```bash
@@ -172,6 +198,40 @@ python -m agent.runner eval --session <session_id_printed_by_game>
 `--session` is optional for `game` / `discuss` (a fresh UUID-based id is
 generated and printed in the JSON output). `--session` is required for
 `eval`.
+
+## Interactive notebooks
+
+Two Jupyter notebooks live in `notebooks/`. Install the extra deps
+(`pip install -r requirements.txt` pulls in `ipywidgets` and the yfiles
+widget) and launch Jupyter from the repo root:
+
+```bash
+jupyter notebook   # or: jupyter lab
+```
+
+* **`notebooks/play.ipynb`** — interactive mode-1 play. It holds **one
+  persistent game** and **one conversation thread**: each turn the agent
+  sees the *current* live frame plus its (settings-stripped) memory context
+  and either answers your question or emits a move that updates the game.
+  You see the exact frame the agent saw and, after a move, the resulting
+  frame. A **"Restart conversation"** button re-initializes the env (a fresh
+  bare level) and starts a new `session_id`. The heavy lifting lives in
+  [`agent/interactive.py`](agent/interactive.py) (`InteractiveSession`),
+  which runs the async NAMS client on a background event loop so the
+  synchronous ipywidgets buttons can drive it. The mode-1 privacy invariant
+  holds: the Settings dict is never fed to the model here.
+
+* **`notebooks/visualize_memory.ipynb`** — an interactive, Neo4j-Browser-like
+  view of the memory graph via
+  [`yfiles-jupyter-graphs-for-neo4j`](https://github.com/yWorks/yfiles-jupyter-graphs-for-neo4j).
+  Pan/zoom/click through all `Message`, `GameSnapshot`, `Trace`/`Step`/
+  `ToolCall`, `Entity`, and `Preference` nodes and their relationships, with
+  per-label captions and colors. Set `SESSION_ID` in the last cell to scope
+  the view to a single conversation.
+
+If widgets don't render, ensure `ipywidgets` is installed in the same
+environment as the Jupyter server (classic Notebook 7+ / JupyterLab 4+ ship
+the widget manager by default).
 
 ## Storing images in Neo4j: the approach used here
 
@@ -236,7 +296,15 @@ agent/
   image_store.py     # disk PNG + 64x64 thumbnail b64 + GameSnapshot node + linking
   memory.py          # NAMS MemoryClient factory; context stripping; semantic-model seed
   modes.py           # mode_game / mode_discuss / mode_self_eval
+  interactive.py     # InteractiveSession: persistent-game mode-1 for notebooks
   runner.py          # CLI
+notebooks/
+  play.ipynb            # interactive mode-1 play (Ask + Restart conversation)
+  visualize_memory.ipynb# yfiles Neo4j graph browser for the memory graph
+scripts/
+  vast_neo4j_launch.sh       # bare-metal Neo4j setup (no Docker; Vast.ai)
+  neo4j_db.sh                # save / wipe / load / status for the bare-metal DB
+  neo4j_connect_diagnostic.py# bolt + NAMS connectivity probe
 docker-compose.yml   # local Neo4j 5.20 community (bolt + APOC)
 requirements.txt
 README.md
