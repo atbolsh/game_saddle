@@ -47,7 +47,7 @@ _SETTINGS_FIELDS = [
 ]
 
 
-def new_bare_game(gameSize: int = 64) -> discreteGame:
+def new_bare_game(gameSize: int = 224) -> discreteGame:
     """Create a fresh bare discrete game (env mode, no GUI window)."""
     game = discreteGame(envMode=True)
     # ``random_bare_settings`` lives on the engine instance.
