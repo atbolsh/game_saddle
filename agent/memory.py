@@ -199,6 +199,50 @@ _SEMANTIC_MODEL_PREFERENCES = [
     ("tip_overshoot", "Tip: one FORWARD step is up to 1/16 of the board, which can overshoot the gold. When close, prefer small CLOCK/ANTICLOCK nudges before FORWARD."),
 ]
 
+# Hardwired relationships between the seeded entities, added as NAMS long-term
+# Facts (subject-predicate-object). These give the semantic model actual edges
+# without any LLM extractor: each fact links two Entity nodes by name.
+_SEMANTIC_MODEL_FACTS = [
+    ("Agent", "collects", "Gold"),
+    ("Agent", "has", "Direction"),
+    ("Agent", "bounded_by", "BoundaryWall"),
+    ("DiscreteGame", "contains", "Agent"),
+    ("DiscreteGame", "contains", "Gold"),
+    ("DiscreteGame", "contains", "BoundaryWall"),
+]
+
+
+async def add_semantic_relationships(client: Any) -> dict[str, int]:
+    """Add the hardwired entity-to-entity relationships (see
+    ``_SEMANTIC_MODEL_FACTS``) as NAMS long-term Facts.
+
+    Safe to run against an already-seeded graph without wiping: it only adds
+    Fact edges between existing entities (referenced by name), so it does not
+    touch or duplicate the Entity / Preference nodes. Best-effort per fact.
+    """
+    n_fact = 0
+    for subject, predicate, obj in _SEMANTIC_MODEL_FACTS:
+        try:
+            await client.long_term.add_fact(
+                subject=subject, predicate=predicate, obj=obj
+            )
+            n_fact += 1
+        except TypeError:
+            # Positional-only signature variant on some NAMS versions.
+            try:
+                await client.long_term.add_fact(subject, predicate, obj)
+                n_fact += 1
+            except Exception as exc:  # pragma: no cover - best-effort seed
+                logger.warning(
+                    "add_fact(%s-%s-%s) failed: %s", subject, predicate, obj, exc
+                )
+        except Exception as exc:  # pragma: no cover - best-effort seed
+            logger.warning(
+                "add_fact(%s-%s-%s) failed: %s", subject, predicate, obj, exc
+            )
+    logger.info("Added %d semantic relationships.", n_fact)
+    return {"facts": n_fact}
+
 
 async def build_semantic_model(client: Any) -> dict[str, int]:
     """Seed the long-term memory graph with a small description of the game
@@ -229,5 +273,11 @@ async def build_semantic_model(client: Any) -> dict[str, int]:
         except Exception as exc:  # pragma: no cover - best-effort seed
             logger.warning("add_preference(%s) failed: %s", category, exc)
 
-    logger.info("Seeded semantic model: %d entities, %d preferences.", n_ent, n_pref)
-    return {"entities": n_ent, "preferences": n_pref}
+    rel_counts = await add_semantic_relationships(client)
+    n_fact = rel_counts.get("facts", 0)
+
+    logger.info(
+        "Seeded semantic model: %d entities, %d preferences, %d facts.",
+        n_ent, n_pref, n_fact,
+    )
+    return {"entities": n_ent, "preferences": n_pref, "facts": n_fact}

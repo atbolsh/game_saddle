@@ -3,6 +3,7 @@
 Usage::
 
     python -m agent.runner seed
+    python -m agent.runner link
     python -m agent.runner game     --session <id> --question "..." [--solve]
     python -m agent.runner discuss  --session <id> --text "..."
     python -m agent.runner eval     --session <id>
@@ -41,6 +42,16 @@ async def _cmd_seed(args: argparse.Namespace) -> int:
     finally:
         await client.close()
     print(json.dumps({"seeded": counts}, indent=2))
+    return 0
+
+
+async def _cmd_link(args: argparse.Namespace) -> int:
+    client = await mem.connect()
+    try:
+        counts = await mem.add_semantic_relationships(client)
+    finally:
+        await client.close()
+    print(json.dumps({"linked": counts}, indent=2))
     return 0
 
 
@@ -89,6 +100,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_seed = sub.add_parser("seed", help="Seed the NAMS long-term semantic model (run once).")
     p_seed.set_defaults(func=_cmd_seed)
+
+    p_link = sub.add_parser(
+        "link",
+        help="Add the hardwired entity relationships to an already-seeded graph "
+             "(no wipe; does not duplicate entities/preferences).",
+    )
+    p_link.set_defaults(func=_cmd_link)
 
     p_game = sub.add_parser("game", help="Mode 1: play / answer a question about a game screen.")
     p_game.add_argument("--session", default=None)
