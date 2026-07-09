@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 SYSTEM_PROMPT_GAME = (
-    "You are an agent playing a 2D discrete game on a 64x64 board. You see "
+    "You are an agent playing a 2D discrete game on a 224x224 board. You see "
     "the current game screen as an image. The board is the unit square "
     "framed by four boundary walls; there is exactly one gold piece (small "
     "yellow circle). You are the green circle with a red eye showing the "

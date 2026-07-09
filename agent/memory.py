@@ -186,7 +186,7 @@ _SEMANTIC_MODEL_ENTITIES = [
     ("Agent", "PERSON", "The green circle controlled by the player; has a red eye showing its facing direction."),
     ("Gold", "OBJECT", "Small yellow circle the agent must collect. Bare levels have exactly one."),
     ("BoundaryWall", "OBJECT", "The four fixed walls framing the play area. Always present."),
-    ("DiscreteGame", "SYSTEM", "The 2D discrete game engine: 64x64 board, agent + gold + walls."),
+    ("DiscreteGame", "SYSTEM", "The 2D discrete game engine: 224x224 board, agent + gold + walls."),
     ("Direction", "ATTRIBUTE", "The agent's facing angle in radians, 0..2pi, measured CCW from +x."),
 ]
 

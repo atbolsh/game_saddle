@@ -62,7 +62,7 @@ class AgentConfig:
     )
 
     # Game defaults
-    game_size: int = field(default_factory=lambda: _env_int("GAME_SIZE", 64))
+    game_size: int = field(default_factory=lambda: _env_int("GAME_SIZE", 224))
     max_solve_steps: int = field(default_factory=lambda: _env_int("MAX_SOLVE_STEPS", 200))
 
     # HuggingFace token (optional; some Gemma weights are gated)
