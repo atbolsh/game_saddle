@@ -202,8 +202,8 @@ generated and printed in the JSON output). `--session` is required for
 ## Interactive notebooks
 
 Two Jupyter notebooks live in `notebooks/`. Install the extra deps
-(`pip install -r requirements.txt` pulls in `ipywidgets` and the yfiles
-widget) and launch Jupyter from the repo root:
+(`pip install -r requirements.txt` pulls in `ipywidgets` and `pyvis`) and
+launch Jupyter from the repo root:
 
 ```bash
 jupyter notebook   # or: jupyter lab
@@ -221,17 +221,19 @@ jupyter notebook   # or: jupyter lab
   synchronous ipywidgets buttons can drive it. The mode-1 privacy invariant
   holds: the Settings dict is never fed to the model here.
 
-* **`notebooks/visualize_memory.ipynb`** — an interactive, Neo4j-Browser-like
-  view of the memory graph via
-  [`yfiles-jupyter-graphs-for-neo4j`](https://github.com/yWorks/yfiles-jupyter-graphs-for-neo4j).
-  Pan/zoom/click through all `Message`, `GameSnapshot`, `Trace`/`Step`/
-  `ToolCall`, `Entity`, and `Preference` nodes and their relationships, with
-  per-label captions and colors. Set `SESSION_ID` in the last cell to scope
-  the view to a single conversation.
+* **`notebooks/visualize_memory.ipynb`** — an interactive view of the memory
+  graph via [`pyvis`](https://pyvis.readthedocs.io/). Pan/zoom/drag through all
+  `Message`, `GameSnapshot`, `Trace`/`Step`/`ToolCall`, `Entity`, and
+  `Preference` nodes and their relationships, with per-label captions and
+  colors; hover a node to see its full property set. Set `SESSION_ID` in the
+  per-session cell to scope the view to a single conversation. The graph is
+  rendered as a self-contained `<iframe srcdoc>` with vis.js inlined, so it
+  needs **no** Jupyter widget frontend extension (works in JupyterLab and
+  Notebook 7, online or offline).
 
-If widgets don't render, ensure `ipywidgets` is installed in the same
-environment as the Jupyter server (classic Notebook 7+ / JupyterLab 4+ ship
-the widget manager by default).
+The play notebook's buttons do use `ipywidgets`; if they don't render, ensure
+`ipywidgets` is installed in the same environment as the Jupyter server
+(Notebook 7+ / JupyterLab 4+ ship the widget manager by default).
 
 ## Storing images in Neo4j: the approach used here
 
@@ -300,7 +302,7 @@ agent/
   runner.py          # CLI
 notebooks/
   play.ipynb            # interactive mode-1 play (Ask + Restart conversation)
-  visualize_memory.ipynb# yfiles Neo4j graph browser for the memory graph
+  visualize_memory.ipynb# pyvis interactive graph of the memory graph
 scripts/
   vast_neo4j_launch.sh       # bare-metal Neo4j setup (no Docker; Vast.ai)
   neo4j_db.sh                # save / wipe / load / status for the bare-metal DB

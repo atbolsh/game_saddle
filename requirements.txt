@@ -50,9 +50,12 @@ sentence-transformers>=2.7.0
 pydantic>=2.7.0
 
 # Interactive notebooks: play.ipynb (ipywidgets UI over a live game) and
-# visualize_memory.ipynb (interactive Neo4j graph browser in Jupyter).
+# visualize_memory.ipynb (interactive Neo4j graph via pyvis).
 jupyter>=1.0.0
 notebook>=7.0.0
 ipywidgets>=8.0.0
-yfiles-jupyter-graphs-for-neo4j>=1.7.0
+# pyvis renders the memory graph as a self-contained <iframe srcdoc> with
+# vis.js inlined, so the graph needs no Jupyter widget frontend extension
+# (avoids the "Failed to load model class 'GraphModel'" labextension issue).
+pyvis>=0.3.2
 
