@@ -107,7 +107,9 @@ async def add_assistant_message(
 async def start_move_trace(client: Any, session_id: str, task: str, triggered_by_message_id: str | None = None) -> Any:
     kwargs: dict[str, Any] = {"session_id": session_id, "task": task}
     if triggered_by_message_id:
-        kwargs["triggered_by_message_id"] = triggered_by_message_id
+        # NAMS hands back UUID objects; normalise to the stored string form so
+        # any downstream bolt parameter binding works.
+        kwargs["triggered_by_message_id"] = str(triggered_by_message_id)
     return await client.reasoning.start_trace(**kwargs)
 
 

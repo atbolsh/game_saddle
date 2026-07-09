@@ -14,6 +14,7 @@ Moves exposed to the agent:
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -47,12 +48,51 @@ _SETTINGS_FIELDS = [
 ]
 
 
-def new_bare_game(gameSize: int = 224) -> discreteGame:
-    """Create a fresh bare discrete game (env mode, no GUI window)."""
-    game = discreteGame(envMode=True)
-    # ``random_bare_settings`` lives on the engine instance.
-    bare = game.random_bare_settings(gameSize=gameSize)
-    return discreteGame(settings=bare, envMode=True)
+# Minimum agent<->gold separation for a freshly generated bare game, in
+# normalised board units ([0,1] square). The engine's default places the gold
+# within ~0.1 of the agent ("almost on top of it"); we want a real gap so the
+# agent has to navigate.
+MIN_GOLD_DISTANCE = 0.6
+
+
+def new_bare_game(
+    gameSize: int = 224,
+    min_gold_distance: float = MIN_GOLD_DISTANCE,
+) -> discreteGame:
+    """Create a fresh bare discrete game (env mode, no GUI window).
+
+    The engine places the single gold piece within ``max_agent_offset`` of the
+    agent (default ~0.1), which lands it almost on top of the agent. We instead
+    require the gold to be at least ``min_gold_distance`` away (normalised board
+    units). Since the reachable interior is only ~0.9 wide, a central agent
+    leaves little room for a far gold, so we re-roll the whole level (agent +
+    walls + gold) until a valid far placement is found, keeping the best-found
+    layout as a fallback. The engine itself is never modified.
+    """
+    engine = discreteGame(envMode=True)
+
+    best_settings = None
+    best_dist = -1.0
+    # Outer loop re-rolls agent/walls; inner loop searches for a far gold that
+    # is also wall-valid, using the engine's own coordinate sampler.
+    for _ in range(64):
+        # ``max_agent_offset`` large so the engine's initial gold can be anywhere;
+        # we override it below regardless.
+        bare = engine.random_bare_settings(gameSize=gameSize, max_agent_offset=1.0)
+        ax, ay = bare.agent_x, bare.agent_y
+        for _ in range(200):
+            gx, gy = engine.random_valid_coords(bare.walls, engine.typical_gold_r)
+            dist = math.hypot(gx - ax, gy - ay)
+            if dist > best_dist:
+                best_dist = dist
+                bare.gold = [(gx, gy)]
+                best_settings = bare
+            if dist >= min_gold_distance:
+                return discreteGame(settings=bare, envMode=True)
+
+    # Fallback: no layout hit the target after many tries -- use the farthest
+    # gold placement we saw (still a valid, non-overlapping position).
+    return discreteGame(settings=best_settings, envMode=True)
 
 
 def settings_to_dict(s: Settings) -> dict[str, Any]:

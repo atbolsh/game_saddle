@@ -108,12 +108,18 @@ async def link_snapshot_to_message(
 
     The relationship type is ``CAPTURED_STATE``; ``role`` distinguishes
     'before' / 'after' / 'observation' snapshots.
+
+    NAMS returns message ids as ``uuid.UUID`` objects, which the Neo4j bolt
+    driver cannot serialize as query parameters. The ``Message.id`` node
+    property is stored as the (dashed) string form, so we cast to ``str`` --
+    this both fixes the ``ValueError: Values of type <class 'uuid.UUID'> are
+    not supported`` and matches the stored id.
     """
     await client.graph.execute_write(
         "MATCH (m:Message {id: $mid}), (s:GameSnapshot {id: $sid}) "
         "MERGE (m)-[r:CAPTURED_STATE]->(s) "
         "SET r.role = $role",
-        {"mid": message_id, "sid": snapshot_id, "role": role},
+        {"mid": str(message_id), "sid": str(snapshot_id), "role": role},
     )
 
 
@@ -130,9 +136,14 @@ async def fetch_session_snapshots(client: Any, session_id: str) -> list[dict[str
 async def fetch_messages_with_snapshots(client: Any, session_id: str) -> list[dict[str, Any]]:
     """Return messages for a session with their linked snapshots (used by
     mode 3 self-evaluation). Each row: {message, snapshots: [GameSnapshot...]}.
+
+    NAMS does not store ``session_id`` on ``Message`` nodes; it links messages
+    to a ``Conversation`` node (which carries ``session_id``) via
+    ``(:Conversation)-[:HAS_MESSAGE]->(:Message)``. We therefore reach the
+    session's messages through the Conversation.
     """
     rows = await client.query.cypher(
-        "MATCH (m:Message {session_id: $sid}) "
+        "MATCH (c:Conversation {session_id: $sid})-[:HAS_MESSAGE]->(m:Message) "
         "OPTIONAL MATCH (m)-[:CAPTURED_STATE]->(s:GameSnapshot) "
         "RETURN m, collect(s) AS snaps "
         "ORDER BY m.created_at ASC",
