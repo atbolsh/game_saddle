@@ -122,11 +122,13 @@ async def record_move_trace(
 ) -> None:
     """Add a reasoning step + tool call to an in-progress trace."""
     step = await client.reasoning.add_step(trace.id, thought=thought)
+    # NAMS ``record_tool_call`` takes only (step_id, tool_name, arguments) as
+    # positionals; the tool output is the keyword-only ``result=``.
     await client.reasoning.record_tool_call(
         step.id,
         action,  # tool name = the action (CLOCK/ANTICLOCK/FORWARD)
         {"action": action},
-        {"gold_collected": int(gold_collected)},
+        result={"gold_collected": int(gold_collected)},
     )
 
 
