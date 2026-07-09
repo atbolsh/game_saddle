@@ -196,13 +196,16 @@ _SEMANTIC_MODEL_PREFERENCES = [
     ("goal", "Collect the gold piece. In bare levels there is exactly one gold piece; the game ends for the agent once it is eaten (overlap of agent and gold circles)."),
     ("tip_distance", "Tip: the agent does not need to know its exact coordinates. Use the visual angle between the agent's red eye and the gold to decide CLOCK vs ANTICLOCK, then FORWARD."),
     ("tip_facing", "Tip: if the gold is roughly in front of the agent's eye, FORWARD is the best move. If it is to the right, CLOCK until it is centered. If to the left, ANTICLOCK."),
-    ("tip_overshoot", "Tip: one FORWARD step is up to 1/16 of the board, which can overshoot the gold. When close, prefer small CLOCK/ANTICLOCK nudges before FORWARD."),
+    ("tip_overshoot", "Tip: only FORWARD moves the agent (up to 1/16 of the board per step); CLOCK and ANTICLOCK merely rotate it in place and never move it, so they cannot collect gold on their own. FORWARD can overshoot the gold, so aim carefully with CLOCK/ANTICLOCK first, then step FORWARD."),
 ]
 
-# Hardwired relationships between the seeded entities, added as NAMS long-term
-# Facts (subject-predicate-object). These give the semantic model actual edges
-# without any LLM extractor: each fact links two Entity nodes by name.
-_SEMANTIC_MODEL_FACTS = [
+# Hardwired relationships between the seeded entities, as (subject, predicate,
+# object) triples. We write them as *direct* Neo4j edges between the Entity
+# nodes (see :func:`add_semantic_relationships`), not as NAMS ``Fact`` nodes:
+# ``long_term.add_fact`` only creates a standalone Fact node with the endpoints
+# as string properties -- it does NOT link the Entity nodes, so no edge ever
+# shows up in the graph. A direct MERGE gives a real, labeled edge.
+_SEMANTIC_MODEL_RELATIONSHIPS = [
     ("Agent", "collects", "Gold"),
     ("Agent", "has", "Direction"),
     ("Agent", "bounded_by", "BoundaryWall"),
@@ -213,35 +216,48 @@ _SEMANTIC_MODEL_FACTS = [
 
 
 async def add_semantic_relationships(client: Any) -> dict[str, int]:
-    """Add the hardwired entity-to-entity relationships (see
-    ``_SEMANTIC_MODEL_FACTS``) as NAMS long-term Facts.
+    """Create direct edges between the seeded Entity nodes (see
+    ``_SEMANTIC_MODEL_RELATIONSHIPS``) via bolt write-Cypher.
 
-    Safe to run against an already-seeded graph without wiping: it only adds
-    Fact edges between existing entities (referenced by name), so it does not
-    touch or duplicate the Entity / Preference nodes. Best-effort per fact.
+    Each relationship is a real ``(:Entity)-[:PREDICATE]->(:Entity)`` edge
+    (relationship type = the predicate upper-cased), so it is immediately
+    visible in the visualization. ``MERGE`` makes this idempotent -- safe to
+    run repeatedly against an already-seeded graph without wiping, and without
+    touching or duplicating the Entity / Preference nodes.
+
+    Also removes any redundant standalone ``Fact`` nodes left by an earlier
+    ``add_fact``-based version of this seed (matched by the same triple), so
+    the graph doesn't carry duplicate, edge-less clutter.
     """
-    n_fact = 0
-    for subject, predicate, obj in _SEMANTIC_MODEL_FACTS:
+    n_rel = 0
+    for subject, predicate, obj in _SEMANTIC_MODEL_RELATIONSHIPS:
+        # Predicates come from the fixed list above (no injection risk); use the
+        # predicate as the edge TYPE so the viz shows a meaningful label.
+        rel_type = predicate.upper()
         try:
-            await client.long_term.add_fact(
-                subject=subject, predicate=predicate, obj=obj
+            await client.graph.execute_write(
+                f"MATCH (a:Entity {{name: $s}}), (b:Entity {{name: $o}}) "
+                f"MERGE (a)-[r:`{rel_type}`]->(b) "
+                f"SET r.predicate = $p",
+                {"s": subject, "o": obj, "p": predicate},
             )
-            n_fact += 1
-        except TypeError:
-            # Positional-only signature variant on some NAMS versions.
-            try:
-                await client.long_term.add_fact(subject, predicate, obj)
-                n_fact += 1
-            except Exception as exc:  # pragma: no cover - best-effort seed
-                logger.warning(
-                    "add_fact(%s-%s-%s) failed: %s", subject, predicate, obj, exc
-                )
+            n_rel += 1
         except Exception as exc:  # pragma: no cover - best-effort seed
             logger.warning(
-                "add_fact(%s-%s-%s) failed: %s", subject, predicate, obj, exc
+                "relationship %s-[%s]->%s failed: %s", subject, predicate, obj, exc
             )
-    logger.info("Added %d semantic relationships.", n_fact)
-    return {"facts": n_fact}
+        # Clean up the edge-less Fact node from the previous approach, if any.
+        try:
+            await client.graph.execute_write(
+                "MATCH (f:Fact {subject: $s, predicate: $p, object: $o}) "
+                "DETACH DELETE f",
+                {"s": subject, "o": obj, "p": predicate},
+            )
+        except Exception as exc:  # pragma: no cover - best-effort cleanup
+            logger.debug("Fact cleanup for %s-%s-%s failed: %s", subject, predicate, obj, exc)
+
+    logger.info("Added %d semantic relationships (direct edges).", n_rel)
+    return {"relationships": n_rel}
 
 
 async def build_semantic_model(client: Any) -> dict[str, int]:
@@ -274,10 +290,10 @@ async def build_semantic_model(client: Any) -> dict[str, int]:
             logger.warning("add_preference(%s) failed: %s", category, exc)
 
     rel_counts = await add_semantic_relationships(client)
-    n_fact = rel_counts.get("facts", 0)
+    n_rel = rel_counts.get("relationships", 0)
 
     logger.info(
-        "Seeded semantic model: %d entities, %d preferences, %d facts.",
-        n_ent, n_pref, n_fact,
+        "Seeded semantic model: %d entities, %d preferences, %d relationships.",
+        n_ent, n_pref, n_rel,
     )
-    return {"entities": n_ent, "preferences": n_pref, "facts": n_fact}
+    return {"entities": n_ent, "preferences": n_pref, "relationships": n_rel}
