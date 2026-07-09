@@ -29,16 +29,16 @@ Available moves in mode 1: `CLOCK` (turn clockwise by π/30),
 
 ```mermaid
 flowchart TD
-    User[User / CLI] --> Runner[agent.runner]
-    Runner --> Modes[agent.modes]
-    Modes --> Model[agent.model: Gemma 4 E4B multimodal]
-    Modes --> Memory[agent.memory: NAMS MemoryClient]
-    Modes --> GameIO[agent.game_io: bare level gen + render]
-    Modes --> ImgStore[agent.image_store: disk + Neo4j GameSnapshot]
-    Memory --> Neo4j[(Neo4j 5.20 bolt)]
+    User["User / CLI"] --> Runner["agent.runner"]
+    Runner --> Modes["agent.modes"]
+    Modes --> Model["agent.model: Gemma 4 E4B multimodal"]
+    Modes --> Memory["agent.memory: NAMS MemoryClient"]
+    Modes --> GameIO["agent.game_io: bare level gen + render"]
+    Modes --> ImgStore["agent.image_store: disk + Neo4j GameSnapshot"]
+    Memory --> Neo4j[("Neo4j 5.20 bolt")]
     ImgStore --> Neo4j
-    ImgStore --> Disk[(memory_images/ PNGs)]
-    GameIO --> Engine[game.discreteEngine.discreteGame]
+    ImgStore --> Disk[("memory_images/ PNGs")]
+    GameIO --> Engine["game.discreteEngine.discreteGame"]
 ```
 
 ### NAMS memory tiers and how we use them
@@ -46,19 +46,19 @@ flowchart TD
 ```mermaid
 flowchart TD
     subgraph short [Short-term]
-        Msg[Message nodes]
+        Msg["Message nodes"]
     end
     subgraph long [Long-term]
-        Ent[Entity / Preference nodes]
+        Ent["Entity / Preference nodes"]
     end
     subgraph reason [Reasoning]
-        Trace[Trace + Step + ToolCall]
+        Trace["Trace + Step + ToolCall"]
     end
-    subgraph custom [Custom (bolt write-Cypher)]
-        Snap[GameSnapshot: path, thumbnail_b64, settings_json]
+    subgraph custom [Custom bolt write-Cypher]
+        Snap["GameSnapshot: path, thumbnail_b64, settings_json"]
     end
-    Msg -.-|CAPTURED_STATE| Snap
-    Trace -.-|TRIGGERED_BY| Msg
+    Msg -.->|CAPTURED_STATE| Snap
+    Trace -.->|TRIGGERED_BY| Msg
 ```
 
 * **short_term** — the conversation: user questions + assistant

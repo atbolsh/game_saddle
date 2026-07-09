@@ -32,9 +32,18 @@ logger = logging.getLogger(__name__)
 
 def make_memory_settings(cfg: AgentConfig | None = None):
     """Build a NAMS ``MemorySettings`` for the bolt backend."""
-    from neo4j_agent_memory import MemorySettings  # local import for cost
+    from neo4j_agent_memory import ExtractionConfig, MemorySettings  # local import for cost
 
     cfg = cfg or CONFIG
+    # NAMS' default extraction pipeline has an optional "LLM fallback" stage
+    # that defaults to the ``openai`` provider. With ``llm=None`` (our design)
+    # NAMS still *tries* to build it, fails to find an adapter, and logs a
+    # noisy "LLM extractor not available, skipping ... provider 'openai'"
+    # warning on every connect. We never want a cloud LLM here (Gemma 4 E4B is
+    # the only model, and it does generation, not NAMS extraction), so disable
+    # the fallback explicitly: extraction stays fully local (spaCy / GLiNER /
+    # sentence-transformers) and the warning goes away -- no openai/litellm
+    # extra needs installing.
     return MemorySettings(
         backend="bolt",
         neo4j={
@@ -46,6 +55,7 @@ def make_memory_settings(cfg: AgentConfig | None = None):
         embedding=cfg.embedding_model,
         # No llm= -> we skip LLM-driven entity extraction and add entities
         # manually. This keeps the whole system local / API-key-free.
+        extraction=ExtractionConfig(enable_llm_fallback=False),
     )
 
 
