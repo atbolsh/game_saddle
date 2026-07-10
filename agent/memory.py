@@ -109,8 +109,19 @@ async def add_assistant_message(
 
 
 # ---------------------------------------------------------------- reasoning
+#
+# One reasoning trace per *turn* (not per move). The trace's ``task`` is the
+# user's instruction/goal (e.g. the question that started the turn); each move
+# the agent makes becomes a ``ReasoningStep`` within that single trace, with the
+# move recorded as a tool call. This matches NAMS' model -- a trace is one
+# reasoning episode toward a goal -- and makes traces meaningful to both the
+# in-play ``get_similar_traces`` recall and the mode-3 self-evaluation.
 
-async def start_move_trace(client: Any, session_id: str, task: str, triggered_by_message_id: str | None = None) -> Any:
+async def start_turn_trace(
+    client: Any, session_id: str, task: str, triggered_by_message_id: str | None = None
+) -> Any:
+    """Open ONE trace for the whole turn. ``task`` is the goal (the user's
+    instruction/question), NOT a mechanical action -- the moves are the steps."""
     kwargs: dict[str, Any] = {"session_id": session_id, "task": task}
     if triggered_by_message_id:
         # NAMS hands back UUID objects; normalise to the stored string form so
@@ -119,28 +130,36 @@ async def start_move_trace(client: Any, session_id: str, task: str, triggered_by
     return await client.reasoning.start_trace(**kwargs)
 
 
-async def record_move_trace(
+async def add_reasoning_step(
     client: Any,
     trace: Any,
     thought: str,
-    action: str,
-    gold_collected: int,
+    action: str | None = None,
+    gold_collected: int = 0,
 ) -> None:
-    """Add a reasoning step + tool call to an in-progress trace."""
+    """Record one step of the turn's reasoning: the model's ``thought`` (its raw
+    output for this generation) and, if it emitted a move, that move as a tool
+    call. ``action=None`` captures a non-move generation (e.g. the final reply
+    that ends the turn), which is still part of the reasoning episode."""
+    if trace is None:
+        return
     step = await client.reasoning.add_step(trace.id, thought=thought)
-    # NAMS ``record_tool_call`` takes only (step_id, tool_name, arguments) as
-    # positionals; the tool output is the keyword-only ``result=``.
-    await client.reasoning.record_tool_call(
-        step.id,
-        action,  # tool name = the action (CLOCK/ANTICLOCK/FORWARD)
-        {"action": action},
-        result={"gold_collected": int(gold_collected)},
-    )
+    if action:
+        # NAMS ``record_tool_call`` takes only (step_id, tool_name, arguments) as
+        # positionals; the tool output is the keyword-only ``result=``.
+        await client.reasoning.record_tool_call(
+            step.id,
+            action,  # tool name = the action (CLOCK/ANTICLOCK/FORWARD)
+            {"action": action},
+            result={"gold_collected": int(gold_collected)},
+        )
 
 
-async def complete_move_trace(
-    client: Any, trace: Any, outcome: str, success: bool = True
+async def complete_turn_trace(
+    client: Any, trace: Any, outcome: str, success: bool = False
 ) -> None:
+    if trace is None:
+        return
     await client.reasoning.complete_trace(trace.id, outcome=outcome, success=success)
 
 
@@ -174,20 +193,141 @@ def _strip_settings_from_text(text: str) -> str:
     return _SETTINGS_TEXT_RE.sub('"<redacted>"', text)
 
 
-async def get_game_context(client: Any, session_id: str, query: str) -> str:
-    """Wrapper around ``client.get_context`` that scrubs any settings-leaking
-    fields before they reach the model in mode 1."""
+def _message_timestamp(m: Any) -> Any:
+    """Best-effort timestamp accessor -- NAMS' Message dataclass uses
+    ``timestamp``; some code paths expose ``created_at``."""
+    return getattr(m, "timestamp", None) or getattr(m, "created_at", None)
+
+
+def _format_message_line(m: Any) -> str:
+    role = getattr(m, "role", "?")
+    role = role.value if hasattr(role, "value") else str(role)
+    content = _strip_settings_from_text(str(getattr(m, "content", "")))
+    return f"[{role}] {content}"
+
+
+async def get_recent_messages(client: Any, session_id: str, window: int) -> str:
+    """Return the last ``window`` messages of this session by **recency**
+    (chronological, most-recent last), independent of semantic similarity.
+
+    NAMS stores messages ``ORDER BY timestamp ASC`` and its ``get_context`` recall
+    is pure vector similarity, so recent moves are not guaranteed to surface.
+    This fetches the full session chain (no limit) and slices the tail so the
+    agent always sees its latest turns verbatim. Settings are stripped for the
+    mode-1 privacy invariant. Returns "" if there are none / on error.
+    """
+    if window <= 0:
+        return ""
+    msgs: list[Any] = []
+    try:
+        # limit=None -> the whole conversation; we only inject the tail, but we
+        # must fetch past any low LIMIT to actually reach the most-recent ones
+        # (NAMS orders ASC, so a small limit would return the OLDEST messages).
+        convo = await client.short_term.get_conversation(session_id=session_id, limit=None)
+        msgs = list(getattr(convo, "messages", None) or [])
+    except Exception as exc:  # pragma: no cover - fall back to get_messages
+        logger.debug("get_conversation failed (%s); trying get_messages", exc)
+        try:
+            msgs = list(
+                await client.short_term.get_messages(session_id=session_id, limit=100000)
+                or []
+            )
+        except Exception as exc2:
+            logger.warning("recent-message fetch failed: %s", exc2)
+            return ""
+    if not msgs:
+        return ""
+    # Defensive: ensure chronological order before taking the tail.
+    try:
+        if all(_message_timestamp(m) is not None for m in msgs):
+            msgs = sorted(msgs, key=_message_timestamp)
+    except Exception:  # pragma: no cover - heterogeneous timestamps
+        pass
+    recent = msgs[-window:]
+    return "\n".join(_format_message_line(m) for m in recent)
+
+
+async def get_game_context(
+    client: Any, session_id: str, query: str, recent_window: int = 0
+) -> str:
+    """Build the mode-1 memory context: a **recency** window of the last
+    ``recent_window`` session messages (always included, verbatim) followed by
+    the general **semantic** search across all memory tiers (messages, entities,
+    preferences, reasoning traces). Both are scrubbed of any settings-leaking
+    fields before they reach the model.
+
+    Passing ``recent_window=0`` reproduces the old behaviour (semantic only).
+    """
     ctx = await client.get_context(query=query, session_id=session_id)
     if isinstance(ctx, str):
-        return _strip_settings_from_text(ctx)
-    cleaned = _strip_settings(ctx)
-    # NAMS may return a structured object; stringify for the prompt.
-    import json as _json
+        semantic = _strip_settings_from_text(ctx)
+    else:
+        cleaned = _strip_settings(ctx)
+        # NAMS may return a structured object; stringify for the prompt.
+        import json as _json
 
+        try:
+            semantic = _json.dumps(cleaned, default=str, indent=2)
+        except Exception:
+            semantic = str(cleaned)
+
+    recent = await get_recent_messages(client, session_id, recent_window)
+
+    parts: list[str] = []
+    if recent:
+        parts.append(
+            "Recent conversation (most recent last -- your latest questions and "
+            "moves this session, in order):\n" + recent
+        )
+    if semantic and semantic.strip() not in ("", "{}", "[]"):
+        parts.append(
+            "Relevant memories (semantic search across messages, entities, "
+            "preferences, and past reasoning):\n" + semantic
+        )
+    return "\n\n".join(parts)
+
+
+async def get_semantic_model(client: Any) -> str:
+    """Return the full curated long-term semantic model (all ``Entity`` +
+    ``Preference`` nodes) as a formatted string.
+
+    The general ``get_context`` recall is thresholded similarity search, so it
+    only returns a *subset* of long-term memory. The privileged modes (2/3) that
+    should reason/judge against the complete rubric want the whole thing, so we
+    read it directly. Best-effort: returns "" on error."""
+    ent_rows: list[Any] = []
+    pref_rows: list[Any] = []
     try:
-        return _json.dumps(cleaned, default=str, indent=2)
-    except Exception:
-        return str(cleaned)
+        ent_rows = await client.graph.execute_write(
+            "MATCH (e:Entity) RETURN e.name AS name, e.type AS type, "
+            "e.description AS description ORDER BY e.name",
+            {},
+        ) or []
+    except Exception as exc:  # pragma: no cover - best-effort read
+        logger.debug("semantic-model entity fetch failed: %s", exc)
+    try:
+        pref_rows = await client.graph.execute_write(
+            "MATCH (p:Preference) RETURN p.category AS category, "
+            "p.preference AS preference ORDER BY p.category",
+            {},
+        ) or []
+    except Exception as exc:  # pragma: no cover - best-effort read
+        logger.debug("semantic-model preference fetch failed: %s", exc)
+
+    lines: list[str] = []
+    if ent_rows:
+        lines.append("Entities:")
+        for r in ent_rows:
+            d = dict(r)
+            lines.append(
+                f"  - {d.get('name')} ({d.get('type')}): {d.get('description')}"
+            )
+    if pref_rows:
+        lines.append("Preferences / tips:")
+        for r in pref_rows:
+            d = dict(r)
+            lines.append(f"  - [{d.get('category')}] {d.get('preference')}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------- semantic model

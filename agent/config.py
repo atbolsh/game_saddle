@@ -65,6 +65,16 @@ class AgentConfig:
     game_size: int = field(default_factory=lambda: _env_int("GAME_SIZE", 224))
     max_solve_steps: int = field(default_factory=lambda: _env_int("MAX_SOLVE_STEPS", 200))
 
+    # How many of the most-recent session messages to always thread into the
+    # mode-1 prompt verbatim (by recency, independent of the semantic search).
+    # NAMS' get_context is pure similarity search with a threshold, so recent
+    # moves are not guaranteed to be recalled; this recency window guarantees the
+    # agent always sees at least this many of its latest questions/moves so it
+    # has reliable "what did I just do" continuity mid-turn.
+    recent_messages_window: int = field(
+        default_factory=lambda: _env_int("RECENT_MESSAGES_WINDOW", 7)
+    )
+
     # HuggingFace token (optional; some Gemma weights are gated)
     hf_token: str | None = field(
         default_factory=lambda: os.environ.get("HF_TOKEN") or None

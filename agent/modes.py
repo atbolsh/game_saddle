@@ -47,7 +47,22 @@ SYSTEM_PROMPT_GAME = (
     "To END your turn, simply finish your reply WITHOUT emitting a move token "
     "(just stop normally). Do this once you have collected the gold or wish to "
     "stop. If the user asks a question about the screen rather than asking you "
-    "to play, answer in prose with no move token (which likewise ends the turn)."
+    "to play, answer in prose with no move token (which likewise ends the turn).\n\n"
+    "NOTE: the default mode is to try to solve the game (get the gold), which is "
+    "what the user usually asks for. However, you may instead be asked questions "
+    "about the game; in that case answer in prose, and avoid using move tokens "
+    "unless it is very apparent that the user is asking you to play.\n\n"
+    "HOW TO PLAY -- take this reasoning step before every move. First REASON, in "
+    "a sentence or two, about where the gold is relative to your red eye: the eye "
+    "points in the direction you face, and [FORWARD] sends you straight that way. "
+    "Then choose your move from that reasoning:\n"
+    "  - If your eye is pointing roughly at the gold, emit [FORWARD].\n"
+    "  - Otherwise, aim your eye at the gold: emit [CLOCK] or [ANTICLOCK], then "
+    "check the re-rendered screen to see which way your eye swung, and keep "
+    "rotating that way (or reverse if you overshoot) until your eye lines up with "
+    "the gold -- then emit [FORWARD].\n"
+    "Always state this reasoning before the move token; reasoning first, then a "
+    "single move, is how you decide well."
 )
 
 SYSTEM_PROMPT_DISCUSS = (
@@ -71,6 +86,52 @@ SYSTEM_PROMPT_EVAL = (
 
 # --------------------------------------------------------------- mode 1
 
+# How many of the most-recent move tokens to fold into the memory-retrieval
+# query. Move tokens are the agent's own outputs (not privileged Settings), so
+# this keeps the mode-1 "no coordinates" invariant intact.
+_RECENT_ACTIONS_FOR_QUERY = 5
+
+
+def _retrieval_query(
+    question: str,
+    step: int,
+    recent_actions: list[str] | None,
+    gold_remaining: int,
+) -> str:
+    """Build a *situational* memory-retrieval query for the current step.
+
+    NAMS recall is pure vector similarity, so querying with the static user
+    instruction returns roughly the same thing every step and rarely surfaces
+    the reasoning traces / tips relevant to the move at hand. We enrich the query
+    with the current decision context -- recent moves and gold progress -- to
+    bias similarity toward "what should I do *now*". This drives the whole
+    ``get_context`` fan-out (messages, entities, preferences, and the
+    ``get_similar_traces`` reasoning recall). Exact coordinates are deliberately
+    excluded to preserve the mode-1 privacy invariant.
+    """
+    parts: list[str] = []
+    if question and question.strip():
+        parts.append(question.strip())
+    status = "gold collected" if gold_remaining == 0 else "gold not yet collected"
+    if step == 0:
+        # Ambiguous at step 0 (could be a question or the first move); stay close
+        # to the instruction and just note progress.
+        parts.append(status)
+    else:
+        # step > 0 is only reached after a move was made -> definitely gameplay.
+        if recent_actions:
+            parts.append("recent moves: " + ", ".join(recent_actions))
+        parts.append(
+            f"step {step}; {status}; choosing the next move to reach the gold"
+        )
+    return " | ".join(parts) if parts else question
+
+
+def _recent_actions(turns: list[dict], limit: int = _RECENT_ACTIONS_FOR_QUERY) -> list[str]:
+    """The last ``limit`` non-empty actions from a list of step/turn result dicts."""
+    return [t["action"] for t in turns if t.get("action")][-limit:]
+
+
 def _build_game_messages(system: str, image_path: str, context: str, question: str) -> list[dict]:
     user_text = []
     if context:
@@ -88,7 +149,7 @@ def _build_game_messages(system: str, image_path: str, context: str, question: s
     ]
 
 
-async def _record_turn(
+async def _record_step(
     client: Any,
     session_id: str,
     cfg: AgentConfig,
@@ -101,16 +162,15 @@ async def _record_turn(
     snapshot_before_path: str,
     *,
     include_user_message: bool = True,
-    triggered_by_message_id: str | None = None,
 ) -> dict[str, Any]:
-    """Persist one mode-1 step to NAMS: (optional) user message + assistant
-    message + reasoning trace + before/after GameSnapshot nodes.
+    """Persist the *message + snapshot* side of one mode-1 step to NAMS:
+    (optional) user message + assistant message + before/after GameSnapshot
+    nodes. The reasoning trace is NOT handled here -- it spans the whole turn
+    and is managed by the caller (one trace per turn; see
+    :func:`agent.memory.start_turn_trace`).
 
-    In the interactive multi-move loop a single user instruction ("solve the
-    game") drives many agent moves. Only the first step should record the user
-    message; set ``include_user_message=False`` on continuation steps and pass
-    ``triggered_by_message_id`` (the first step's user message id) so the move
-    traces still link back to the instruction that started the turn.
+    In the multi-move loop a single user instruction drives many agent moves, so
+    only the first step records the user message (``include_user_message=True``).
     """
     # 1. User message linked to the 'before' snapshot (first step only).
     user_msg = None
@@ -121,7 +181,6 @@ async def _record_turn(
         await image_store.link_snapshot_to_message(
             client, user_msg.id, snapshot_before_id, role="before"
         )
-        triggered_by_message_id = str(user_msg.id)
 
     # 2. Assistant message (the raw model output; if it was a move, also tag it).
     assistant_content = raw_out if raw_out else (action or "")
@@ -139,21 +198,7 @@ async def _record_turn(
             client, assistant_msg.id, snapshot_before_id, role="before"
         )
 
-    # 3. Reasoning trace for the move (if any).
-    trace = None
-    if action:
-        trace = await mem.start_move_trace(
-            client, session_id, task=f"apply {action}",
-            triggered_by_message_id=triggered_by_message_id,
-        )
-        await mem.record_move_trace(client, trace, thought=raw_out, action=action, gold_collected=gold_collected)
-        await mem.complete_move_trace(
-            client, trace,
-            outcome=f"applied {action}; gold_collected={gold_collected}",
-            success=(gold_collected > 0) or True,
-        )
-
-    # 4. 'After' snapshot (only if a move was actually applied).
+    # 3. 'After' snapshot (only if a move was actually applied).
     snapshot_after_id = None
     snapshot_after_path = None
     if action:
@@ -171,7 +216,6 @@ async def _record_turn(
     return {
         "user_msg_id": str(user_msg.id) if user_msg else None,
         "assistant_msg_id": str(assistant_msg.id),
-        "trace_id": str(trace.id) if trace else None,
         "snapshot_before_id": snapshot_before_id,
         "snapshot_before_path": snapshot_before_path,
         "snapshot_after_id": snapshot_after_id,
@@ -179,6 +223,26 @@ async def _record_turn(
         "action": action,
         "gold_collected": gold_collected,
     }
+
+
+def _turn_trace_outcome(
+    turns: list[dict[str, Any]], gold_remaining: int
+) -> tuple[str, bool]:
+    """Summarise a finished turn into an ``(outcome, success)`` pair for the
+    trace. Success is the turn-level objective: for a turn that made moves it
+    means the gold was collected; a pure Q&A turn (no moves) is a success by
+    virtue of having answered."""
+    made_moves = any(t.get("action") for t in turns)
+    solved = gold_remaining == 0
+    n = len(turns)
+    if made_moves:
+        actions = [t["action"] for t in turns if t.get("action")]
+        outcome = (
+            f"turn ended after {n} step(s); actions={actions}; "
+            f"solved={solved}; gold_remaining={gold_remaining}"
+        )
+        return outcome, solved
+    return f"answered without moving after {n} step(s)", True
 
 
 async def mode_game(
@@ -204,6 +268,10 @@ async def mode_game(
     turns: list[dict[str, Any]] = []
 
     steps = 0
+    # One reasoning trace for the whole turn; opened after the first step's user
+    # message exists (so it can be triggered_by that message) and completed once
+    # the loop ends.
+    trace: Any = None
     # Capture the initial 'before' snapshot for the first turn.
     snapshot_before_id = image_store.snapshot_id()
     settings_before = game_io.game_to_settings_dict(game)
@@ -213,53 +281,82 @@ async def mode_game(
         extra={"step": steps},
     )
 
-    while True:
-        # Recompute context with the current image each step.
-        ctx = await mem.get_game_context(client, session_id, query=question)
-        messages = _build_game_messages(SYSTEM_PROMPT_GAME, snapshot_before_path, ctx, question)
-        raw = model.generate(messages, stop_strings=game_io.MOVE_STOP_STRINGS)
-        action = game_io.parse_action(raw)
+    try:
+        while True:
+            # Recompute context with the current image each step: recency window
+            # of the latest messages + a general semantic search across tiers,
+            # queried with the *situational* state (recent moves + gold progress)
+            # rather than the static instruction, so trace/tip recall is relevant
+            # to the move at hand.
+            query = _retrieval_query(
+                question, steps, _recent_actions(turns), game_io.gold_remaining(game)
+            )
+            ctx = await mem.get_game_context(
+                client, session_id, query=query,
+                recent_window=cfg.recent_messages_window,
+            )
+            messages = _build_game_messages(SYSTEM_PROMPT_GAME, snapshot_before_path, ctx, question)
+            raw = model.generate(messages, stop_strings=game_io.MOVE_STOP_STRINGS)
+            action = game_io.parse_action(raw)
 
-        if action:
-            gold_collected = game_io.apply_action(game, action)
-        else:
-            gold_collected = 0
+            if action:
+                gold_collected = game_io.apply_action(game, action)
+            else:
+                gold_collected = 0
 
-        turn = await _record_turn(
-            client, session_id, cfg, game, question, raw, action,
-            gold_collected, snapshot_before_id, snapshot_before_path,
-        )
-        turns.append(turn)
-        steps += 1
-        logger.info("step %d: action=%s gold=%d remaining=%d",
-                    steps, action, gold_collected, game_io.gold_remaining(game))
+            turn = await _record_step(
+                client, session_id, cfg, game, question, raw, action,
+                gold_collected, snapshot_before_id, snapshot_before_path,
+                include_user_message=(steps == 0),
+            )
+            turns.append(turn)
 
-        # If no move was produced, this is a Q&A turn -- stop here.
-        if not action:
-            break
+            # Open the turn trace once the first user message exists; then record
+            # this generation (and every later one) as a step within it.
+            if steps == 0:
+                trace = await mem.start_turn_trace(
+                    client, session_id, task=question,
+                    triggered_by_message_id=turn["user_msg_id"],
+                )
+            await mem.add_reasoning_step(
+                client, trace, thought=raw, action=action, gold_collected=gold_collected
+            )
 
-        # Set up the 'before' snapshot for the next iteration (the current
-        # 'after' state becomes the next 'before').
-        snapshot_before_id = image_store.snapshot_id()
-        settings_before = game_io.game_to_settings_dict(game)
-        snapshot_before_path, _ = await image_store.store_snapshot(
-            client, session_id, snapshot_before_id, game, settings_before, cfg=cfg,
-            label="before",
-            extra={"step": steps},
-        )
+            steps += 1
+            logger.info("step %d: action=%s gold=%d remaining=%d",
+                        steps, action, gold_collected, game_io.gold_remaining(game))
 
-        # Stop conditions.
-        if not solve:
-            break
-        if game_io.gold_remaining(game) == 0:
-            logger.info("Gold eaten after %d steps.", steps)
-            break
-        if steps >= max_steps:
-            logger.warning("Hit max_steps=%d without eating the gold.", max_steps)
-            break
+            # If no move was produced, this is a Q&A turn -- stop here.
+            if not action:
+                break
+
+            # Set up the 'before' snapshot for the next iteration (the current
+            # 'after' state becomes the next 'before').
+            snapshot_before_id = image_store.snapshot_id()
+            settings_before = game_io.game_to_settings_dict(game)
+            snapshot_before_path, _ = await image_store.store_snapshot(
+                client, session_id, snapshot_before_id, game, settings_before, cfg=cfg,
+                label="before",
+                extra={"step": steps},
+            )
+
+            # Stop conditions.
+            if not solve:
+                break
+            if game_io.gold_remaining(game) == 0:
+                logger.info("Gold eaten after %d steps.", steps)
+                break
+            if steps >= max_steps:
+                logger.warning("Hit max_steps=%d without eating the gold.", max_steps)
+                break
+    finally:
+        gold_remaining = game_io.gold_remaining(game)
+        outcome, success = _turn_trace_outcome(turns, gold_remaining)
+        await mem.complete_turn_trace(client, trace, outcome=outcome, success=success)
 
     return {"session_id": session_id, "turns": turns, "steps": steps,
-            "gold_remaining": game_io.gold_remaining(game)}
+            "gold_remaining": game_io.gold_remaining(game),
+            "trace_id": str(trace.id) if trace else None, "success": success}
 
 
 # --------------------------------------------------------------- mode 2
@@ -272,25 +369,41 @@ async def mode_discuss(
 ) -> dict[str, Any]:
     """Mode 2: open-ended discussion with full memory access.
 
-    Records the user message, retrieves full context (no settings stripping
-    -- this mode is the bootstrap/evaluation channel and is allowed to see
-    everything NAMS returns), generates a response, and records the
-    assistant message.
+    Like mode 1 it combines a **recency** window of the latest messages (so the
+    chat has reliable turn-to-turn continuity, which pure similarity search does
+    not guarantee) with the general **semantic** search across all memory tiers.
+    Unlike mode 1 there is NO settings stripping -- this mode is the
+    bootstrap/evaluation channel and is allowed to see everything NAMS returns.
     """
     cfg = cfg or CONFIG
     model = get_model(cfg)
 
+    # Retrieve BEFORE storing the current message: the recency window should show
+    # the PRIOR turns, and the semantic search should not just echo back the
+    # message we are about to answer.
+    recent = await mem.get_recent_messages(client, session_id, cfg.recent_messages_window)
+    ctx = await client.get_context(query=user_text, session_id=session_id)
+    ctx_text = ctx if isinstance(ctx, str) else json.dumps(ctx, default=str, indent=2)
+
+    context_parts: list[str] = []
+    if recent:
+        context_parts.append("Recent conversation (most recent last):\n" + recent)
+    if ctx_text and ctx_text.strip() not in ("", "{}", "[]"):
+        context_parts.append(
+            "Relevant memories (semantic search across all tiers):\n" + ctx_text
+        )
+    context_block = "\n\n".join(context_parts) if context_parts else "(no prior context)"
+
+    # Now record the user message (after retrieval, so it isn't self-retrieved).
     await client.short_term.add_message(
         session_id=session_id, role="user", content=user_text,
         metadata={"kind": "discussion"},
     )
-    ctx = await client.get_context(query=user_text, session_id=session_id)
-    ctx_text = ctx if isinstance(ctx, str) else json.dumps(ctx, default=str, indent=2)
 
     messages = [
         {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT_DISCUSS}]},
         {"role": "user", "content": [
-            {"type": "text", "text": f"Memory context:\n{ctx_text}"},
+            {"type": "text", "text": f"Memory context:\n{context_block}"},
             {"type": "text", "text": f"User: {user_text}"},
         ]},
     ]
@@ -355,11 +468,22 @@ async def mode_self_eval(
     messages_with_snaps = await image_store.fetch_messages_with_snapshots(client, session_id)
     traces = await _fetch_session_traces(client, session_id)
     dump = _format_session_for_eval(messages_with_snaps, traces)
+    # The full long-term semantic model = the intended rules/strategy. Give it to
+    # the evaluator as the rubric to judge the recorded play against.
+    semantic_model = await mem.get_semantic_model(client)
+
+    sections: list[str] = [f"Session id: {session_id}"]
+    if semantic_model:
+        sections.append(
+            "# Game semantic model (intended rules & strategy -- the standard to "
+            "judge the play against)\n" + semantic_model
+        )
+    sections.append(dump)
 
     messages = [
         {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT_EVAL}]},
         {"role": "user", "content": [
-            {"type": "text", "text": f"Session id: {session_id}\n\n{dump}"},
+            {"type": "text", "text": "\n\n".join(sections)},
         ]},
     ]
     verdict = model.generate(messages, max_new_tokens=cfg.gemma_max_new_tokens)

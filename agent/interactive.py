@@ -108,9 +108,12 @@ class InteractiveSession:
         game_io.render_frame_png(self.game, abs_path)
         return str(abs_path)
 
-    def _step(self, question: str, step: int, triggered_by_id: str | None) -> dict[str, Any]:
+    def _step(
+        self, question: str, step: int, recent_actions: list[str] | None = None
+    ) -> dict[str, Any]:
         """Run one step of a turn: snapshot -> context -> model -> apply move
-        -> persist. Returns a per-step result dict."""
+        -> persist (messages + snapshots). The turn-level reasoning trace is
+        managed by :meth:`ask`, not here. Returns a per-step result dict."""
         # 1. Snapshot the current ('before') frame -> disk + GameSnapshot node.
         snapshot_before_id = image_store.snapshot_id()
         settings_before = game_io.game_to_settings_dict(self.game)
@@ -121,9 +124,19 @@ class InteractiveSession:
             )
         )
 
-        # 2. Memory context (settings stripped -- mode-1 privacy invariant).
+        # 2. Memory context (settings stripped -- mode-1 privacy invariant):
+        #    a guaranteed recency window of the latest messages + the general
+        #    semantic search across all memory tiers. The search is queried with
+        #    the *situational* state (recent moves + gold progress), not the
+        #    static instruction, so trace/tip recall is relevant to this move.
+        query = modes._retrieval_query(
+            question, step, recent_actions, game_io.gold_remaining(self.game)
+        )
         ctx = self._run(
-            mem.get_game_context(self.client, self.session_id, query=question)
+            mem.get_game_context(
+                self.client, self.session_id, query=query,
+                recent_window=self.cfg.recent_messages_window,
+            )
         )
 
         # 3. Build the multimodal prompt and call the model (sync, on this
@@ -154,13 +167,14 @@ class InteractiveSession:
         action = game_io.parse_action(raw)
         gold_collected = game_io.apply_action(self.game, action) if action else 0
 
-        # 5. Persist the step (user message on the first step only).
+        # 5. Persist the step's messages + snapshots (user message on step 0
+        #    only). The reasoning trace spans the whole turn and is handled in
+        #    :meth:`ask`.
         turn = self._run(
-            modes._record_turn(
+            modes._record_step(
                 self.client, self.session_id, self.cfg, self.game, question, raw,
                 action, gold_collected, snapshot_before_id, before_path,
                 include_user_message=(step == 0),
-                triggered_by_message_id=triggered_by_id,
             )
         )
 
@@ -200,22 +214,49 @@ class InteractiveSession:
         """
         max_steps = max_steps or self.cfg.max_solve_steps
         steps: list[dict[str, Any]] = []
-        triggered_by_id: str | None = None
+        # One reasoning trace for the whole turn (task = the user's question);
+        # each step becomes a reasoning step within it. Opened after step 0's
+        # user message exists and completed once the turn ends.
+        trace: Any = None
 
-        for i in range(max_steps):
-            step_result = self._step(question, i, triggered_by_id)
-            if i == 0:
-                triggered_by_id = step_result["user_msg_id"]
-            steps.append(step_result)
-            if on_step is not None:
-                on_step(step_result)
+        try:
+            for i in range(max_steps):
+                step_result = self._step(question, i, modes._recent_actions(steps))
+                steps.append(step_result)
 
-            # Stop conditions: the model emitted no move token (it ended its
-            # turn / answered), or the gold has been collected.
-            if step_result["action"] is None:
-                break
-            if step_result["gold_remaining"] == 0:
-                break
+                # Open the turn trace once the first user message exists, then
+                # record this generation (and every later one) as a step.
+                if i == 0:
+                    trace = self._run(
+                        mem.start_turn_trace(
+                            self.client, self.session_id, task=question,
+                            triggered_by_message_id=step_result["user_msg_id"],
+                        )
+                    )
+                self._run(
+                    mem.add_reasoning_step(
+                        self.client, trace, thought=step_result["raw"],
+                        action=step_result["action"],
+                        gold_collected=step_result["gold_collected"],
+                    )
+                )
+
+                if on_step is not None:
+                    on_step(step_result)
+
+                # Stop conditions: the model emitted no move token (it ended its
+                # turn / answered), or the gold has been collected.
+                if step_result["action"] is None:
+                    break
+                if step_result["gold_remaining"] == 0:
+                    break
+        finally:
+            outcome, success = modes._turn_trace_outcome(
+                steps, game_io.gold_remaining(self.game)
+            )
+            self._run(
+                mem.complete_turn_trace(self.client, trace, outcome=outcome, success=success)
+            )
 
         return {
             "session_id": self.session_id,
@@ -224,6 +265,8 @@ class InteractiveSession:
             "num_steps": len(steps),
             "gold_remaining": game_io.gold_remaining(self.game),
             "solved": game_io.gold_remaining(self.game) == 0,
+            "trace_id": str(trace.id) if trace else None,
+            "success": success,
         }
 
     def reset_memory_to_seed(self) -> dict[str, int]:
