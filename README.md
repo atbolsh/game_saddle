@@ -210,12 +210,21 @@ jupyter notebook   # or: jupyter lab
 ```
 
 * **`notebooks/play.ipynb`** — interactive mode-1 play. It holds **one
-  persistent game** and **one conversation thread**: each turn the agent
-  sees the *current* live frame plus its (settings-stripped) memory context
-  and either answers your question or emits a move that updates the game.
-  You see the exact frame the agent saw and, after a move, the resulting
-  frame. A **"Restart conversation"** button re-initializes the env (a fresh
-  bare level) and starts a new `session_id`. The heavy lifting lives in
+  persistent game** and **one conversation thread**. Asking the agent to play
+  starts a **multi-move turn**: it sees the *current* live frame plus its
+  (settings-stripped) memory context and emits a move token (`[CLOCK]`,
+  `[ANTICLOCK]`, `[FORWARD]`). Generation is stopped early the instant that token
+  appears (HF `stop_strings`), the move is applied, and — because a move does
+  *not* end the turn — the board is re-rendered and fed back so it keeps moving
+  (`[CLOCK] [CLOCK] [FORWARD] ...`). The turn ends when the agent finishes a
+  reply without a move token (Gemma's native `<end_of_turn>`), collects the gold,
+  or hits the step cap (`MAX_SOLVE_STEPS`). You watch every intermediate frame
+  and move live. A
+  **"Restart conversation"** button re-initializes the env (a fresh bare level)
+  and starts a new `session_id`. To discard an unwanted conversation and get
+  back to the "semantic seeding only" state, either run the notebook's gated
+  reset cell (`session.reset_memory_to_seed()`) or, from a shell,
+  `bash scripts/reset_semantics.sh` (wipe + reseed). The heavy lifting lives in
   [`agent/interactive.py`](agent/interactive.py) (`InteractiveSession`),
   which runs the async NAMS client on a background event loop so the
   synchronous ipywidgets buttons can drive it. The mode-1 privacy invariant
@@ -306,6 +315,7 @@ notebooks/
 scripts/
   vast_neo4j_launch.sh       # bare-metal Neo4j setup (no Docker; Vast.ai)
   neo4j_db.sh                # save / wipe / load / status for the bare-metal DB
+  reset_semantics.sh         # wipe episodic memory + reseed semantics only
   neo4j_connect_diagnostic.py# bolt + NAMS connectivity probe
 docker-compose.yml   # local Neo4j 5.20 community (bolt + APOC)
 requirements.txt

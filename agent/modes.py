@@ -30,15 +30,24 @@ SYSTEM_PROMPT_GAME = (
     "framed by four boundary walls; there is exactly one gold piece (small "
     "yellow circle). You are the green circle with a red eye showing the "
     "direction you are facing. Your goal is to collect the gold.\n\n"
-    "Available moves: CLOCK (turn clockwise by pi/30), ANTICLOCK (turn "
-    "counter-clockwise by pi/30), FORWARD (advance up to 1/16 of the board "
-    "in the facing direction).\n\n"
-    "When asked to make a move, reply with exactly one move keyword on its "
-    "own line (CLOCK, ANTICLOCK, or FORWARD). You may add a brief one-line "
-    "reason first. When asked a question about the screen, answer it in "
-    "plain prose without making a move. When asked to 'solve the game', "
-    "emit one move at a time; the harness will re-render the screen and "
-    "call you again until the gold is eaten."
+    "You make moves by emitting exactly one of these move tokens:\n"
+    "  [CLOCK]     - turn clockwise by pi/30 (rotate in place)\n"
+    "  [ANTICLOCK] - turn counter-clockwise by pi/30 (rotate in place)\n"
+    "  [FORWARD]   - advance up to 1/16 of the board in the facing direction\n"
+    "Only [FORWARD] moves you; [CLOCK] and [ANTICLOCK] only rotate you.\n\n"
+    "IMPORTANT: ONLY those exact bracketed tokens trigger a move. Talking about "
+    "moving in prose (e.g. writing the word 'forward') does NOTHING. You may "
+    "reason in plain prose as much as you like; nothing happens until you emit "
+    "a bracketed move token, so emit one only when you truly intend that move.\n\n"
+    "The instant you emit a move token it is executed, the screen is "
+    "re-rendered, and you are shown the updated screen and asked for your next "
+    "move. So a turn is a sequence of moves -- reason, emit one move token, see "
+    "the result, repeat -- e.g. [CLOCK] [CLOCK] [FORWARD] [FORWARD] ... to "
+    "navigate to the gold. Making a move does NOT end your turn.\n\n"
+    "To END your turn, simply finish your reply WITHOUT emitting a move token "
+    "(just stop normally). Do this once you have collected the gold or wish to "
+    "stop. If the user asks a question about the screen rather than asking you "
+    "to play, answer in prose with no move token (which likewise ends the turn)."
 )
 
 SYSTEM_PROMPT_DISCUSS = (
@@ -90,16 +99,29 @@ async def _record_turn(
     gold_collected: int,
     snapshot_before_id: str,
     snapshot_before_path: str,
+    *,
+    include_user_message: bool = True,
+    triggered_by_message_id: str | None = None,
 ) -> dict[str, Any]:
-    """Persist one mode-1 turn to NAMS: user message + assistant message +
-    reasoning trace + before/after GameSnapshot nodes."""
-    # 1. User message linked to the 'before' snapshot.
-    user_msg = await mem.add_user_question(
-        client, session_id, question, snapshot_id=snapshot_before_id
-    )
-    await image_store.link_snapshot_to_message(
-        client, user_msg.id, snapshot_before_id, role="before"
-    )
+    """Persist one mode-1 step to NAMS: (optional) user message + assistant
+    message + reasoning trace + before/after GameSnapshot nodes.
+
+    In the interactive multi-move loop a single user instruction ("solve the
+    game") drives many agent moves. Only the first step should record the user
+    message; set ``include_user_message=False`` on continuation steps and pass
+    ``triggered_by_message_id`` (the first step's user message id) so the move
+    traces still link back to the instruction that started the turn.
+    """
+    # 1. User message linked to the 'before' snapshot (first step only).
+    user_msg = None
+    if include_user_message:
+        user_msg = await mem.add_user_question(
+            client, session_id, question, snapshot_id=snapshot_before_id
+        )
+        await image_store.link_snapshot_to_message(
+            client, user_msg.id, snapshot_before_id, role="before"
+        )
+        triggered_by_message_id = str(user_msg.id)
 
     # 2. Assistant message (the raw model output; if it was a move, also tag it).
     assistant_content = raw_out if raw_out else (action or "")
@@ -110,11 +132,19 @@ async def _record_turn(
         kind="move" if action else "answer",
     )
 
+    # On continuation steps there is no fresh user turn, so attach the 'before'
+    # frame (the exact image the model acted on) to the assistant move instead.
+    if not include_user_message:
+        await image_store.link_snapshot_to_message(
+            client, assistant_msg.id, snapshot_before_id, role="before"
+        )
+
     # 3. Reasoning trace for the move (if any).
     trace = None
     if action:
         trace = await mem.start_move_trace(
-            client, session_id, task=f"apply {action}", triggered_by_message_id=user_msg.id
+            client, session_id, task=f"apply {action}",
+            triggered_by_message_id=triggered_by_message_id,
         )
         await mem.record_move_trace(client, trace, thought=raw_out, action=action, gold_collected=gold_collected)
         await mem.complete_move_trace(
@@ -139,9 +169,9 @@ async def _record_turn(
         )
 
     return {
-        "user_msg_id": user_msg.id,
-        "assistant_msg_id": assistant_msg.id,
-        "trace_id": trace.id if trace else None,
+        "user_msg_id": str(user_msg.id) if user_msg else None,
+        "assistant_msg_id": str(assistant_msg.id),
+        "trace_id": str(trace.id) if trace else None,
         "snapshot_before_id": snapshot_before_id,
         "snapshot_before_path": snapshot_before_path,
         "snapshot_after_id": snapshot_after_id,
@@ -187,7 +217,7 @@ async def mode_game(
         # Recompute context with the current image each step.
         ctx = await mem.get_game_context(client, session_id, query=question)
         messages = _build_game_messages(SYSTEM_PROMPT_GAME, snapshot_before_path, ctx, question)
-        raw = model.generate(messages)
+        raw = model.generate(messages, stop_strings=game_io.MOVE_STOP_STRINGS)
         action = game_io.parse_action(raw)
 
         if action:

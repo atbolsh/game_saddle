@@ -79,7 +79,18 @@ class Gemma4E4B:
             return url[len("file://"):]
         return url
 
-    def generate(self, messages: list[dict], max_new_tokens: int | None = None) -> str:
+    def generate(
+        self,
+        messages: list[dict],
+        max_new_tokens: int | None = None,
+        stop_strings: list[str] | None = None,
+    ) -> str:
+        """Run one generation. If ``stop_strings`` is given, generation halts as
+        soon as any of those strings is emitted (HF ``StopStringCriteria``); the
+        stop string is included at the tail of the returned text. Gemma's native
+        ``<end_of_turn>`` / ``<eos>`` still terminate generation on their own
+        (they are in ``model.config.eos_token_id``), so a reply that emits no
+        stop string simply ends the turn."""
         if not self._loaded:
             self.load()
         # Normalise image URLs (paths) in content lists.
@@ -114,12 +125,16 @@ class Gemma4E4B:
                     inputs[k] = v.to(model_dtype)
         except StopIteration:
             pass
+        gen_kwargs: dict[str, Any] = {
+            "max_new_tokens": max_new_tokens or self.cfg.gemma_max_new_tokens,
+            "do_sample": False,
+        }
+        if stop_strings:
+            # StopStringCriteria requires the tokenizer to be passed to generate.
+            gen_kwargs["stop_strings"] = stop_strings
+            gen_kwargs["tokenizer"] = getattr(self.processor, "tokenizer", self.processor)
         with torch.inference_mode():
-            out = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens or self.cfg.gemma_max_new_tokens,
-                do_sample=False,
-            )
+            out = self.model.generate(**inputs, **gen_kwargs)
         in_len = inputs["input_ids"].shape[-1]
         gen = out[0][in_len:]
         return self.processor.decode(gen, skip_special_tokens=True).strip()

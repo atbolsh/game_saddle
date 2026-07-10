@@ -44,7 +44,7 @@ class AgentConfig:
     gemma_dtype: str = field(default_factory=lambda: _env("GEMMA_DTYPE", "bfloat16"))
     gemma_device: str = field(default_factory=lambda: _env("GEMMA_DEVICE", "auto"))
     gemma_max_new_tokens: int = field(
-        default_factory=lambda: _env_int("GEMMA_MAX_NEW_TOKENS", 256)
+        default_factory=lambda: _env_int("GEMMA_MAX_NEW_TOKENS", 2048)
     )
 
     # Embeddings (local sentence-transformers; NAMS embedding provider string)

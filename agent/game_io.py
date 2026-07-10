@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,16 @@ ACTION_MAP: dict[str, str] = {
     "FORWARD": "stepForward",
 }
 ACTIONS = list(ACTION_MAP.keys())
+
+# Wire format the model emits to make a move: distinctive bracketed tokens
+# (e.g. ``[FORWARD]``). They never collide with ordinary prose and tokenize
+# cleanly, so we can use them as generation stop strings: the model's turn is
+# a loop of "reason -> emit one move token -> we stop, apply it, re-render,
+# generate again on the new frame". Ending the turn needs no special token --
+# the model just finishes its message (Gemma's native ``<end_of_turn>``) without
+# emitting a move token.
+MOVE_STOP_STRINGS = [f"[{a}]" for a in ACTIONS]  # ["[CLOCK]", "[ANTICLOCK]", "[FORWARD]"]
+_MOVE_RE = re.compile(r"\[(" + "|".join(ACTIONS) + r")\]", re.IGNORECASE)
 
 # Keys we serialise on a Settings object. ``walls`` and ``gold`` are lists
 # of lists of floats; everything else is a scalar.
@@ -159,15 +170,17 @@ def gold_remaining(game: discreteGame) -> int:
 
 
 def parse_action(text: str) -> str | None:
-    """Find the first occurring action keyword in ``text`` (case-insensitive,
-    word-boundary aware). Returns one of ACTIONS or None."""
-    import re
+    """Return the engine action for the move token in ``text`` (one of
+    ``ACTIONS``), or ``None`` if the model emitted no move token.
 
-    pattern = r"\b(" + "|".join(ACTIONS) + r")\b"
-    m = re.search(pattern, text, re.IGNORECASE)
-    if m:
-        return m.group(1).upper()
-    return None
+    Only the bracketed tokens (``[CLOCK]`` / ``[ANTICLOCK]`` / ``[FORWARD]``)
+    count as moves -- plain prose that merely mentions "forward" does not. When
+    generation is stopped via :data:`MOVE_STOP_STRINGS` the move token sits at
+    the tail, so we take the last match to be safe."""
+    matches = _MOVE_RE.findall(text)
+    if not matches:
+        return None
+    return matches[-1].upper()
 
 
 def dump_settings_json(d: dict[str, Any]) -> str:
