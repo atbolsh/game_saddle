@@ -25,6 +25,7 @@ import torch
 from transformers import AutoModelForMultimodalLM, AutoProcessor
 
 from .config import AgentConfig, CONFIG
+from . import run_logging
 
 logger = logging.getLogger(__name__)
 
@@ -133,11 +134,41 @@ class Gemma4E4B:
             # StopStringCriteria requires the tokenizer to be passed to generate.
             gen_kwargs["stop_strings"] = stop_strings
             gen_kwargs["tokenizer"] = getattr(self.processor, "tokenizer", self.processor)
-        with torch.inference_mode():
-            out = self.model.generate(**inputs, **gen_kwargs)
-        in_len = inputs["input_ids"].shape[-1]
-        gen = out[0][in_len:]
-        return self.processor.decode(gen, skip_special_tokens=True).strip()
+
+        raw_out: str | None = None
+        err: str | None = None
+        try:
+            with torch.inference_mode():
+                out = self.model.generate(**inputs, **gen_kwargs)
+            in_len = inputs["input_ids"].shape[-1]
+            gen = out[0][in_len:]
+            raw_out = self.processor.decode(gen, skip_special_tokens=True).strip()
+            return raw_out
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            # Log every generate call (input + output), on by default when a run
+            # logger is active. Best-effort: never let logging break generation.
+            rendered = None
+            try:
+                rendered = self.processor.decode(
+                    inputs["input_ids"][0], skip_special_tokens=False
+                )
+            except Exception:
+                rendered = None
+            run_logging.log_llm_call(
+                model=self.cfg.gemma_model_id,
+                kind="generate",
+                request={"messages": messages, "rendered_prompt": rendered},
+                params={
+                    "max_new_tokens": gen_kwargs.get("max_new_tokens"),
+                    "do_sample": gen_kwargs.get("do_sample"),
+                    "stop_strings": stop_strings,
+                },
+                response=None if raw_out is None else {"raw": raw_out},
+                error=err,
+            )
 
 
 _DEFAULT: Gemma4E4B | None = None

@@ -51,6 +51,7 @@ from . import game_io
 from . import image_store
 from . import memory as mem
 from . import modes
+from . import run_logging
 from .model import get_model
 
 logger = logging.getLogger(__name__)
@@ -64,8 +65,24 @@ class InteractiveSession:
     :meth:`close` when done.
     """
 
-    def __init__(self, cfg: AgentConfig | None = None, load_model: bool = True):
+    def __init__(
+        self,
+        cfg: AgentConfig | None = None,
+        load_model: bool = True,
+        enable_logging: bool = True,
+        log_label: str | None = None,
+    ):
         self.cfg = cfg or CONFIG
+
+        # Per-run logging (LLM calls + DB retrievals) is on by default; it lands
+        # in a fresh logs/<label>_<timestamp>/ directory and captures every
+        # generate call and memory retrieval for this session. Pass
+        # enable_logging=False to turn it off.
+        self.logger = (
+            run_logging.new_run_logger(label=log_label or "play")
+            if enable_logging
+            else None
+        )
 
         # Background event loop for all async NAMS calls.
         self._loop = asyncio.new_event_loop()
@@ -268,6 +285,23 @@ class InteractiveSession:
             "trace_id": str(trace.id) if trace else None,
             "success": success,
         }
+
+    def dump_db(self, name: str | None = None, include_embeddings: bool = False) -> dict[str, Any]:
+        """Dump the current DB status (all nodes + relationships) to a ``.dump``
+        JSON file for offline inspection. Reads over the live bolt connection --
+        it does NOT stop Neo4j, so it is safe to call mid-session.
+
+        The file lands in this run's log directory (or a fresh ``logs/`` file if
+        logging is disabled). Returns ``{path, nodes, relationships}``."""
+        if self.logger is not None:
+            path = self.logger.dump_path(name)
+        else:
+            import datetime
+            stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            path = Path("logs") / f"{(name or 'db_snapshot')}_{stamp}.dump"
+        return self._run(
+            mem.dump_database_to_file(self.client, path, include_embeddings=include_embeddings)
+        )
 
     def reset_memory_to_seed(self) -> dict[str, int]:
         """Wipe all episodic memory (conversations, messages, game snapshots,

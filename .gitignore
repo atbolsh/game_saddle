@@ -12,3 +12,7 @@ memory_images/
 neo4j_data/
 neo4j_logs/
 brain_checkpoints/
+
+# Per-run logs: LLM-call logs, DB-retrieval logs, and .dump snapshots
+logs/
+*.dump

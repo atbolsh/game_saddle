@@ -26,6 +26,7 @@ from typing import Any
 from pydantic import SecretStr
 
 from .config import AgentConfig, CONFIG
+from . import run_logging
 
 logger = logging.getLogger(__name__)
 
@@ -236,6 +237,11 @@ async def get_recent_messages(client: Any, session_id: str, window: int) -> str:
             logger.warning("recent-message fetch failed: %s", exc2)
             return ""
     if not msgs:
+        run_logging.log_db_retrieval(
+            function="get_recent_messages",
+            arguments={"session_id": session_id, "window": window},
+            result="",
+        )
         return ""
     # Defensive: ensure chronological order before taking the tail.
     try:
@@ -244,7 +250,35 @@ async def get_recent_messages(client: Any, session_id: str, window: int) -> str:
     except Exception:  # pragma: no cover - heterogeneous timestamps
         pass
     recent = msgs[-window:]
-    return "\n".join(_format_message_line(m) for m in recent)
+    result = "\n".join(_format_message_line(m) for m in recent)
+    run_logging.log_db_retrieval(
+        function="get_recent_messages",
+        arguments={"session_id": session_id, "window": window},
+        result=result,
+    )
+    return result
+
+
+async def retrieve_context(client: Any, query: str, session_id: str) -> Any:
+    """Thin wrapper over NAMS ``client.get_context`` (the semantic search across
+    all memory tiers) that logs the retrieval. Returns the raw context object /
+    string exactly as NAMS provides it -- callers do their own scrubbing."""
+    ctx = await client.get_context(query=query, session_id=session_id)
+    if isinstance(ctx, str):
+        result = ctx
+    else:
+        import json as _json
+
+        try:
+            result = _json.dumps(ctx, default=str, indent=2)
+        except Exception:
+            result = str(ctx)
+    run_logging.log_db_retrieval(
+        function="client.get_context",
+        arguments={"query": query, "session_id": session_id},
+        result=result,
+    )
+    return ctx
 
 
 async def get_game_context(
@@ -258,7 +292,7 @@ async def get_game_context(
 
     Passing ``recent_window=0`` reproduces the old behaviour (semantic only).
     """
-    ctx = await client.get_context(query=query, session_id=session_id)
+    ctx = await retrieve_context(client, query=query, session_id=session_id)
     if isinstance(ctx, str):
         semantic = _strip_settings_from_text(ctx)
     else:
@@ -327,7 +361,93 @@ async def get_semantic_model(client: Any) -> str:
         for r in pref_rows:
             d = dict(r)
             lines.append(f"  - [{d.get('category')}] {d.get('preference')}")
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    run_logging.log_db_retrieval(
+        function="get_semantic_model",
+        arguments={"entities": len(ent_rows), "preferences": len(pref_rows)},
+        result=result,
+    )
+    return result
+
+
+# -------------------------------------------------------------------- DB dump
+
+async def dump_database_to_file(
+    client: Any, path: Any, include_embeddings: bool = False
+) -> dict[str, Any]:
+    """Dump the whole graph (all nodes + relationships) to ``path`` as a JSON
+    ``.dump`` file, over the **live** bolt connection (no need to stop Neo4j, so
+    it is safe to call from a running notebook session).
+
+    This is a *logical* snapshot for inspection/analysis -- distinct from the
+    native binary ``neo4j-admin database dump`` that ``scripts/neo4j_db.sh save``
+    produces (which requires stopping the DB and is only loadable by
+    ``neo4j-admin``). Embedding vectors are dropped by default (huge, not
+    human-useful); pass ``include_embeddings=True`` to keep them.
+    """
+    from pathlib import Path as _Path
+
+    def _clean(props: Any) -> dict:
+        d = dict(props or {})
+        if not include_embeddings:
+            d = {k: v for k, v in d.items() if "embedding" not in k.lower()}
+        return d
+
+    node_rows = await client.graph.execute_write(
+        "MATCH (n) RETURN elementId(n) AS id, labels(n) AS labels, "
+        "properties(n) AS props",
+        {},
+    ) or []
+    rel_rows = await client.graph.execute_write(
+        "MATCH (a)-[r]->(b) RETURN elementId(r) AS id, type(r) AS type, "
+        "elementId(a) AS start, elementId(b) AS end, properties(r) AS props",
+        {},
+    ) or []
+
+    nodes = []
+    for r in node_rows:
+        d = dict(r)
+        nodes.append({
+            "id": d.get("id"),
+            "labels": d.get("labels"),
+            "properties": _clean(d.get("props")),
+        })
+    relationships = []
+    for r in rel_rows:
+        d = dict(r)
+        relationships.append({
+            "id": d.get("id"),
+            "type": d.get("type"),
+            "start": d.get("start"),
+            "end": d.get("end"),
+            "properties": _clean(d.get("props")),
+        })
+
+    import datetime as _dt
+    import json as _json
+
+    payload = {
+        "meta": {
+            "dumped_at": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "node_count": len(nodes),
+            "relationship_count": len(relationships),
+            "include_embeddings": include_embeddings,
+        },
+        "nodes": nodes,
+        "relationships": relationships,
+    }
+    out_path = _Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(_json.dumps(payload, default=str, indent=2), encoding="utf-8")
+    logger.info(
+        "DB dump written: %s (%d nodes, %d relationships)",
+        out_path, len(nodes), len(relationships),
+    )
+    return {
+        "path": str(out_path),
+        "nodes": len(nodes),
+        "relationships": len(relationships),
+    }
 
 
 # ---------------------------------------------------------- semantic model

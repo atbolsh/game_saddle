@@ -25,6 +25,7 @@ from typing import Any
 from .config import CONFIG
 from . import memory as mem
 from . import modes
+from . import run_logging
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -57,6 +58,7 @@ async def _cmd_link(args: argparse.Namespace) -> int:
 
 async def _cmd_game(args: argparse.Namespace) -> int:
     session_id = args.session or mem.new_session_id()
+    run_logging.new_run_logger(label=f"game-{session_id[:8]}")
     client = await mem.connect()
     try:
         result = await modes.mode_game(
@@ -71,6 +73,7 @@ async def _cmd_game(args: argparse.Namespace) -> int:
 
 async def _cmd_discuss(args: argparse.Namespace) -> int:
     session_id = args.session or mem.new_session_id()
+    run_logging.new_run_logger(label=f"discuss-{session_id[:8]}")
     client = await mem.connect()
     try:
         result = await modes.mode_discuss(client, session_id, args.text)
@@ -84,12 +87,27 @@ async def _cmd_eval(args: argparse.Namespace) -> int:
     if not args.session:
         print("error: --session is required for eval", file=sys.stderr)
         return 2
+    run_logging.new_run_logger(label=f"eval-{args.session[:8]}")
     client = await mem.connect()
     try:
         result = await modes.mode_self_eval(client, args.session)
     finally:
         await client.close()
     print(json.dumps(result, default=str, indent=2))
+    return 0
+
+
+async def _cmd_dump(args: argparse.Namespace) -> int:
+    logger = run_logging.new_run_logger(label="dump")
+    client = await mem.connect()
+    try:
+        path = args.out or str(logger.dump_path())
+        info = await mem.dump_database_to_file(
+            client, path, include_embeddings=args.embeddings
+        )
+    finally:
+        await client.close()
+    print(json.dumps(info, default=str, indent=2))
     return 0
 
 
@@ -125,6 +143,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_eval = sub.add_parser("eval", help="Mode 3: self-evaluate a recorded session.")
     p_eval.add_argument("--session", required=True)
     p_eval.set_defaults(func=_cmd_eval)
+
+    p_dump = sub.add_parser(
+        "dump",
+        help="Dump the DB status (all nodes + relationships) to a .dump JSON "
+             "file over the live connection (no Neo4j stop).",
+    )
+    p_dump.add_argument("--out", default=None,
+                        help="Output path (default: a timestamped file in logs/dump_<stamp>/).")
+    p_dump.add_argument("--embeddings", action="store_true",
+                        help="Include embedding vectors (large; dropped by default).")
+    p_dump.set_defaults(func=_cmd_dump)
     return p
 
 

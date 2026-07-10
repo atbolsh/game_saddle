@@ -205,6 +205,42 @@ python -m agent.runner eval --session <session_id_printed_by_game>
 generated and printed in the JSON output). `--session` is required for
 `eval`.
 
+## Logs & DB dumps
+
+Logging is **on by default**. Every entry point (`InteractiveSession`, the
+`game` / `discuss` / `eval` runner commands) creates a fresh, timestamped run
+directory under `logs/` — e.g. `logs/play_2026-07-10_16-25-07/` — and writes:
+
+* `llm_calls.{jsonl,txt}` — **every `model.generate` call**: the exact input
+  (messages + the chat-templated `rendered_prompt`), sampling params, and the
+  raw output. The `.jsonl` is the machine-readable source of truth; the `.txt`
+  is a banner-delimited, human-readable transcript (same order).
+* `db_retrieval.{jsonl,txt}` — **every memory retrieval**: which function
+  (`get_recent_messages`, `client.get_context`, `get_semantic_model`,
+  `_fetch_session_traces`), its arguments, and the result.
+
+Logging never breaks a run — any write failure degrades to a one-time warning.
+The implementation is [`agent/run_logging.py`](agent/run_logging.py); disable it
+per session with `InteractiveSession(enable_logging=False)`.
+
+**DB dump.** Snapshot the whole memory graph (all nodes + relationships) to a
+`.dump` JSON file in the run directory, over the *live* bolt connection (does
+**not** stop Neo4j, so it is safe mid-session). Embedding vectors are dropped by
+default. From the `play.ipynb` **"Dump DB status"** cell, from a session
+(`session.dump_db()`), or from the shell:
+
+```bash
+python -m agent.runner dump                 # -> logs/dump_<stamp>/db_snapshot_<stamp>.dump
+python -m agent.runner dump --out my.dump    # explicit path
+python -m agent.runner dump --embeddings     # keep the (large) embedding vectors
+```
+
+This logical JSON dump is for inspection/analysis and is distinct from the
+native binary `neo4j-admin database dump` produced by `scripts/neo4j_db.sh save`
+(which requires stopping Neo4j and is only loadable by `neo4j-admin`).
+
+`logs/` and `*.dump` are git-ignored.
+
 ## Interactive notebooks
 
 Two Jupyter notebooks live in `notebooks/`. Install the extra deps
@@ -311,9 +347,10 @@ agent/
   model.py           # Gemma 4 E4B multimodal wrapper
   game_io.py         # bare level gen, Settings <-> dict, render to PNG, apply_action
   image_store.py     # disk PNG + 64x64 thumbnail b64 + GameSnapshot node + linking
-  memory.py          # NAMS MemoryClient factory; context stripping; semantic-model seed
+  memory.py          # NAMS MemoryClient factory; context stripping; semantic-model seed; DB dump
   modes.py           # mode_game / mode_discuss / mode_self_eval
   interactive.py     # InteractiveSession: persistent-game mode-1 for notebooks
+  run_logging.py     # per-run LLM-call + DB-retrieval logs (on by default)
   runner.py          # CLI
 notebooks/
   play.ipynb            # interactive mode-1 play (Ask + Restart conversation)
@@ -323,6 +360,7 @@ scripts/
   neo4j_db.sh                # save / wipe / load / status for the bare-metal DB
   reset_semantics.sh         # wipe episodic memory + reseed semantics only
   neo4j_connect_diagnostic.py# bolt + NAMS connectivity probe
+logs/                # per-run logs + .dump snapshots (git-ignored)
 docker-compose.yml   # local Neo4j 5.20 community (bolt + APOC)
 requirements.txt
 README.md

@@ -19,6 +19,7 @@ from .config import AgentConfig, CONFIG
 from . import game_io
 from . import image_store
 from . import memory as mem
+from . import run_logging
 from .model import get_model
 
 logger = logging.getLogger(__name__)
@@ -382,7 +383,7 @@ async def mode_discuss(
     # the PRIOR turns, and the semantic search should not just echo back the
     # message we are about to answer.
     recent = await mem.get_recent_messages(client, session_id, cfg.recent_messages_window)
-    ctx = await client.get_context(query=user_text, session_id=session_id)
+    ctx = await mem.retrieve_context(client, query=user_text, session_id=session_id)
     ctx_text = ctx if isinstance(ctx, str) else json.dumps(ctx, default=str, indent=2)
 
     context_parts: list[str] = []
@@ -538,4 +539,9 @@ async def _fetch_session_traces(client: Any, session_id: str) -> list[dict[str, 
         traces = [dict(r["t"]) for r in rows if "t" in r]
     except Exception as exc:  # pragma: no cover
         logger.debug("Cypher trace fetch failed: %s", exc)
+    run_logging.log_db_retrieval(
+        function="_fetch_session_traces",
+        arguments={"session_id": session_id},
+        result=traces,
+    )
     return traces
