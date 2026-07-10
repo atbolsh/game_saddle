@@ -104,19 +104,25 @@ sees Settings.
 
 ## Setup
 
-1. **Python deps.**
+1. **Python deps.** Use the setup script — it runs `pip install` **and**
+   downloads the entity-extraction model weights that pip can't
+   (spaCy's `en_core_web_sm` and GLiNER's weights). NAMS runs a spaCy → GLiNER
+   extraction pipeline on every stored message, so without these you'll see
+   `Stage 'SpacyEntityExtractor' failed` / `Stage 'GLiNEREntityExtractor'
+   failed` on every run and no entities get auto-discovered:
 
    ```bash
-   pip install -r requirements.txt
+   bash scripts/setup_env.sh
    ```
 
    If your host has NVIDIA driver < 580 (CUDA ≤ 12.x), install torch from
-   the CUDA 12 index instead of the default wheel (see the note at the top
-   of `requirements.txt`):
+   the CUDA 12 index first, then run the setup script with `SKIP_TORCH=1`
+   (see the note at the top of `requirements.txt`):
 
    ```bash
    pip install -U "torch>=2.7" torchvision torchaudio \
        --index-url https://download.pytorch.org/whl/cu124
+   SKIP_TORCH=1 bash scripts/setup_env.sh
    ```
 
 2. **Local Neo4j.** Either start the bundled compose stack:

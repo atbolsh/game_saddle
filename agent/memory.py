@@ -44,6 +44,12 @@ def make_memory_settings(cfg: AgentConfig | None = None):
     # the fallback explicitly: extraction stays fully local (spaCy / GLiNER /
     # sentence-transformers) and the warning goes away -- no openai/litellm
     # extra needs installing.
+    #
+    # The spaCy + GLiNER stages ARE enabled (NAMS defaults) so entities are
+    # auto-discovered from messages during runs. Those two stages need their
+    # packages AND model weights installed -- run ``scripts/setup_env.sh`` (not
+    # just ``pip install -r requirements.txt``), or every stored message logs
+    # "Stage 'SpacyEntityExtractor'/'GLiNEREntityExtractor' failed".
     return MemorySettings(
         backend="bolt",
         neo4j={

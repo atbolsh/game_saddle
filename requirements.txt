@@ -46,6 +46,17 @@ neo4j>=5.20.0
 # NAMS extra does not silently fall back to a different version).
 sentence-transformers>=2.7.0
 
+# NAMS local entity-extraction pipeline. NAMS' default ExtractionConfig runs a
+# spaCy -> GLiNER pipeline on every message it stores (we only disable the LLM
+# fallback stage). Without these two packages BOTH stages fail at runtime with
+# "spaCy is required..." / "GLiNER is required..." and no entities are ever
+# auto-discovered. pip alone is not enough: spaCy needs its model downloaded
+# (`python -m spacy download en_core_web_sm`) and GLiNER lazily pulls its
+# weights from HuggingFace on first use -- so install via scripts/setup_env.sh,
+# which does the pip install AND the two model downloads.
+spacy>=3.7.0
+gliner>=0.2.5
+
 # Pydantic v2 (NAMS SecretStr / settings models).
 pydantic>=2.7.0
 

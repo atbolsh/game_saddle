@@ -6,9 +6,14 @@ generated for now: 4 boundary walls + 1 gold piece near the agent, via
 ``discreteGame.random_bare_settings``.
 
 Moves exposed to the agent:
-  - ``CLOCK``    -> ``swivel_clock``     (turn clockwise)
-  - ``ANTICLOCK``-> ``swivel_anticlock`` (turn counter-clockwise)
+  - ``CLOCK``    -> ``swivel_anticlock`` (turn clockwise on screen)
+  - ``ANTICLOCK``-> ``swivel_clock``     (turn counter-clockwise on screen)
   - ``FORWARD``  -> ``stepForward``      (advance one step)
+
+The engine's ``swivel_clock``/``swivel_anticlock`` rotate the world direction,
+but various rendering/visualization conventions invert the apparent on-screen
+rotation, so the agent-facing tokens are wired to the *opposite* engine method
+to match what the agent actually sees.
 """
 
 from __future__ import annotations
@@ -31,8 +36,8 @@ from game.levels.skeleton import Settings as SettingsClass  # noqa: F401
 
 # Map agent-facing action names to engine method names.
 ACTION_MAP: dict[str, str] = {
-    "CLOCK": "swivel_clock",
-    "ANTICLOCK": "swivel_anticlock",
+    "CLOCK": "swivel_anticlock",
+    "ANTICLOCK": "swivel_clock",
     "FORWARD": "stepForward",
 }
 ACTIONS = list(ACTION_MAP.keys())
