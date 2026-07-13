@@ -85,5 +85,9 @@ print("[setup-env] spaCy model loads and NAMS extractors import OK.", flush=True
 PY
 
 log "done. Extraction (spaCy -> GLiNER) is ready; runs will auto-discover entities."
-log "Next: seed the semantic model with"
-log "  python -m agent.runner seed"
+log ""
+log "NOTE: this script sets up the PYTHON environment only. Neo4j is a separate"
+log "server and is NOT started here. Bring it up next, THEN seed:"
+log "  bash scripts/vast_neo4j_launch.sh          # install + start Neo4j (+ APOC, .env)"
+log "  python scripts/neo4j_connect_diagnostic.py # verify connectivity (optional)"
+log "  python -m agent.runner seed                # seed the semantic model"

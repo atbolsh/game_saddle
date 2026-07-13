@@ -13,7 +13,9 @@ Two probes:
                          ``get_context`` call. Exercises the exact path the
                          notebook / runner use.
 
-Run from the repo root so the ``agent`` package and ``.env`` are found:
+Invoke from anywhere -- the script puts the repo root on ``sys.path`` itself and
+``.env`` is located relative to the ``agent`` package, so neither depends on the
+current working directory:
     python scripts/neo4j_connect_diagnostic.py
 """
 from __future__ import annotations
@@ -22,6 +24,13 @@ import asyncio
 import datetime
 import sys
 import time
+from pathlib import Path
+
+# Running a script *file* puts this script's own directory (scripts/) on
+# sys.path -- NOT the repo root -- so ``import agent`` would fail regardless of
+# the current working directory. Put the repo root (this file's parent's parent)
+# first so the ``agent`` package is importable however this script is invoked.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent.config import CONFIG
 from agent import memory as mem
