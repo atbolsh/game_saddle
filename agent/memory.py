@@ -200,14 +200,18 @@ def _message_timestamp(m: Any) -> Any:
     return getattr(m, "timestamp", None) or getattr(m, "created_at", None)
 
 
-def _format_message_line(m: Any) -> str:
+def _format_message_line(m: Any, scrub: bool = True) -> str:
     role = getattr(m, "role", "?")
     role = role.value if hasattr(role, "value") else str(role)
-    content = _strip_settings_from_text(str(getattr(m, "content", "")))
+    content = str(getattr(m, "content", ""))
+    if scrub:
+        content = _strip_settings_from_text(content)
     return f"[{role}] {content}"
 
 
-async def get_recent_messages(client: Any, session_id: str, window: int) -> str:
+async def get_recent_messages(
+    client: Any, session_id: str, window: int, scrub: bool = True
+) -> str:
     """Return the last ``window`` messages of this session by **recency**
     (chronological, most-recent last), independent of semantic similarity.
 
@@ -218,8 +222,10 @@ async def get_recent_messages(client: Any, session_id: str, window: int) -> str:
     over the ``(:Conversation {session_id})-[:HAS_MESSAGE]->(:Message)`` chain
     -- which stays constant-time as the conversation grows. Falls back to
     fetching the whole conversation and slicing the tail if the direct query
-    fails (e.g. a NAMS schema change). Settings are stripped for the mode-1
-    privacy invariant. Returns "" if there are none / on error.
+    fails (e.g. a NAMS schema change). With ``scrub=True`` (the default),
+    settings-leaking fields are stripped for the mode-1 privacy invariant;
+    privileged modes (e.g. the mode-4 debrief) pass ``scrub=False``.
+    Returns "" if there are none / on error.
     """
     if window <= 0:
         return ""
@@ -234,11 +240,13 @@ async def get_recent_messages(client: Any, session_id: str, window: int) -> str:
         # DESC gave us newest-first; reverse to chronological, most-recent last.
         for r in reversed(list(rows or [])):
             d = dict(r)
-            content = _strip_settings_from_text(str(d.get("content", "")))
+            content = str(d.get("content", ""))
+            if scrub:
+                content = _strip_settings_from_text(content)
             lines.append(f"[{d.get('role', '?')}] {content}")
     except Exception as exc:
         logger.debug("direct recent-message query failed (%s); falling back", exc)
-        lines = await _recent_messages_fallback(client, session_id, window)
+        lines = await _recent_messages_fallback(client, session_id, window, scrub)
     result = "\n".join(lines)
     run_logging.log_db_retrieval(
         function="get_recent_messages",
@@ -249,7 +257,7 @@ async def get_recent_messages(client: Any, session_id: str, window: int) -> str:
 
 
 async def _recent_messages_fallback(
-    client: Any, session_id: str, window: int
+    client: Any, session_id: str, window: int, scrub: bool = True
 ) -> list[str]:
     """Slow path: fetch the WHOLE conversation via the NAMS API and slice the
     tail. limit=None is deliberate -- NAMS orders ASC, so a small limit would
@@ -276,7 +284,7 @@ async def _recent_messages_fallback(
             msgs = sorted(msgs, key=_message_timestamp)
     except Exception:  # pragma: no cover - heterogeneous timestamps
         pass
-    return [_format_message_line(m) for m in msgs[-window:]]
+    return [_format_message_line(m, scrub=scrub) for m in msgs[-window:]]
 
 
 async def retrieve_context(client: Any, query: str, session_id: str) -> Any:

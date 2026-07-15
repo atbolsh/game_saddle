@@ -21,13 +21,51 @@ import logging
 import os
 from typing import Any
 
+import re
+
 import torch
-from transformers import AutoModelForMultimodalLM, AutoProcessor
+from transformers import (
+    AutoModelForMultimodalLM,
+    AutoProcessor,
+    StoppingCriteria,
+    StoppingCriteriaList,
+)
 
 from .config import AgentConfig, CONFIG
 from . import run_logging
 
 logger = logging.getLogger(__name__)
+
+
+class RegexStopCriteria(StoppingCriteria):
+    """Stop generation as soon as ``pattern`` matches the decoded tail of the
+    generated text.
+
+    HF's built-in ``StopStringCriteria`` handles only literal strings, which
+    cannot capture parameterized tokens like ``[SHOW 42]`` (stopping on
+    ``[SHOW`` would halt before the parameter is generated). This criteria
+    decodes a small tail window of the generated tokens each step and applies
+    a regex, so generation halts right after the complete call.
+    """
+
+    #: How many of the most recent generated tokens to decode per check. Sized
+    #: generously so a junk-padded call (e.g. ``[SHOW: step 42 ]``) still fits.
+    TAIL_TOKENS = 16
+
+    def __init__(self, pattern: str | re.Pattern, tokenizer: Any, prompt_len: int):
+        self.pattern = re.compile(pattern) if isinstance(pattern, str) else pattern
+        self.tokenizer = tokenizer
+        self.prompt_len = prompt_len
+
+    def __call__(self, input_ids: torch.LongTensor, scores: Any, **kwargs: Any) -> bool:
+        # Only consider generated tokens (not the prompt, which may legitimately
+        # contain tool-call examples).
+        gen = input_ids[0][self.prompt_len:]
+        if len(gen) == 0:
+            return False
+        tail = gen[-self.TAIL_TOKENS:]
+        text = self.tokenizer.decode(tail, skip_special_tokens=True)
+        return bool(self.pattern.search(text))
 
 
 _DTYPE_MAP = {
@@ -85,13 +123,18 @@ class Gemma4E4B:
         messages: list[dict],
         max_new_tokens: int | None = None,
         stop_strings: list[str] | None = None,
+        stop_regex: str | None = None,
     ) -> str:
         """Run one generation. If ``stop_strings`` is given, generation halts as
         soon as any of those strings is emitted (HF ``StopStringCriteria``); the
-        stop string is included at the tail of the returned text. Gemma's native
-        ``<end_of_turn>`` / ``<eos>`` still terminate generation on their own
-        (they are in ``model.config.eos_token_id``), so a reply that emits no
-        stop string simply ends the turn."""
+        stop string is included at the tail of the returned text. If
+        ``stop_regex`` is given, generation halts as soon as the pattern matches
+        the decoded tail of the generated text (see :class:`RegexStopCriteria`)
+        -- use this for parameterized tokens like ``[SHOW 42]`` that literal
+        stop strings cannot capture. Gemma's native ``<end_of_turn>`` / ``<eos>``
+        still terminate generation on their own (they are in
+        ``model.config.eos_token_id``), so a reply that emits no stop token
+        simply ends the turn."""
         if not self._loaded:
             self.load()
         # Normalise image URLs (paths) in content lists.
@@ -138,6 +181,13 @@ class Gemma4E4B:
             # StopStringCriteria requires the tokenizer to be passed to generate.
             gen_kwargs["stop_strings"] = stop_strings
             gen_kwargs["tokenizer"] = getattr(self.processor, "tokenizer", self.processor)
+        if stop_regex:
+            tokenizer = getattr(self.processor, "tokenizer", self.processor)
+            gen_kwargs["stopping_criteria"] = StoppingCriteriaList([
+                RegexStopCriteria(
+                    stop_regex, tokenizer, prompt_len=inputs["input_ids"].shape[-1]
+                )
+            ])
 
         raw_out: str | None = None
         err: str | None = None
@@ -172,6 +222,7 @@ class Gemma4E4B:
                     "top_p": gen_kwargs.get("top_p"),
                     "top_k": gen_kwargs.get("top_k"),
                     "stop_strings": stop_strings,
+                    "stop_regex": stop_regex,
                 },
                 response=None if raw_out is None else {"raw": raw_out},
                 error=err,

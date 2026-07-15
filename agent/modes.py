@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from .config import AgentConfig, CONFIG
@@ -706,3 +707,188 @@ async def _fetch_session_traces(client: Any, session_id: str) -> list[dict[str, 
         result=traces,
     )
     return traces
+
+
+# --------------------------------------------------------------- mode 4
+#
+# Privileged interactive debrief: a chat over a recorded play conversation with
+# full access to ground truth (snapshot images + exact Settings JSON), plus a
+# [SHOW <n>] tool to pull up any recorded step's frames. See
+# :class:`agent.debrief.DebriefSession` for the session/loop machinery.
+
+SYSTEM_PROMPT_DEBRIEF = (
+    "You are a privileged game analyst reviewing a recorded session of a 2D "
+    "discrete game. The board is the unit square [0,1]x[0,1] framed by four "
+    "boundary walls; the agent is the green circle with a red eye showing its "
+    "facing direction; the gold is a small yellow circle. During play the "
+    "agent saw ONLY the screen image. You, the analyst, additionally see the "
+    "exact game Settings at each recorded step (coordinates, angles, walls), "
+    "and you discuss the session openly with the user. Be precise and "
+    "quantitative; compute angles and distances from the settings rather than "
+    "eyeballing the image whenever settings are available.\n\n"
+    "GEOMETRY (verified against the renderer -- trust this over intuition):\n"
+    "  - 'direction' is theta in radians, kept in [0, 2*pi). The board's y "
+    "axis points DOWNWARD on screen.\n"
+    "  - The eye points along (cos theta, sin theta): theta=0 faces right, "
+    "pi/2 faces down-screen, pi faces left, 3*pi/2 faces up-screen. "
+    "Increasing theta looks CLOCKWISE in the image.\n"
+    "  - The [CLOCK] move INCREASES theta by pi/30 (6 degrees) and looks "
+    "clockwise; [ANTICLOCK] decreases theta.\n"
+    "  - The agent faces the gold when theta ~= atan2(gold_y - agent_y, "
+    "gold_x - agent_x) mod 2*pi. NO sign flip: both angles live in the same "
+    "y-down convention.\n"
+    "  - One [FORWARD] advances up to 1/16 of the board along "
+    "(cos theta, sin theta).\n\n"
+    "TOOL: you may inspect any recorded step. To do so, end your reply with "
+    "the token [SHOW n] where n is the step number from the move list (e.g. "
+    "[SHOW 42]). That step's screen image(s) and exact settings will be shown "
+    "to you, and you will be asked to continue. Emit at most one [SHOW n] per "
+    "reply, at the very end, with nothing after it. When you have what you "
+    "need, reply normally without a [SHOW n] token to finish your answer.\n\n"
+    "You may also be asked to produce a final structured verdict on the play "
+    "(overall_score 0-10, strengths, weaknesses, per-move notes); do so only "
+    "when asked."
+)
+
+# One lenient matcher shared by the generation-time stop criteria and the
+# parser, so stopping and parsing can never disagree. The prompt teaches only
+# the canonical [SHOW 42], but the model is a small LLM and will occasionally
+# mangle the call ([SHOW(42)], [SHOW: 42], [42 SHOW], ...). We accept any
+# SINGLE bracket pair containing SHOW and a number, in either order, with
+# arbitrary junk in between; the first number inside the brackets is the step.
+# [^\[\]] confines the match to one bracket pair, so stray brackets or prose
+# can neither trigger a stop nor corrupt a parse; an incomplete mangle (no
+# closing bracket / missing SHOW / missing number) matches nothing and the
+# reply simply ends the turn. Case-insensitivity is inline ((?i)) so the SAME
+# pattern string drives both this module's parser and the generation-time
+# RegexStopCriteria.
+SHOW_CALL_PATTERN = r"(?i)\[(?=[^\[\]]*?SHOW)[^\[\]]*?(\d+)[^\[\]]*?\]"
+SHOW_CALL_RE = re.compile(SHOW_CALL_PATTERN)
+
+
+def parse_show_call(text: str) -> tuple[int | None, str]:
+    """Return ``(step, text)`` for the FIRST [SHOW n] tool call in ``text``,
+    truncating the text right after the call (anything beyond it is
+    model-hallucinated tool output -- discard it). ``(None, text)`` if no
+    complete call is present."""
+    m = SHOW_CALL_RE.search(text)
+    if not m:
+        return None, text
+    return int(m.group(1)), text[: m.end()]
+
+
+def build_debrief_messages(
+    move_listing: str,
+    recent: str,
+    frames: list[dict[str, Any]],
+    question: str,
+) -> list[dict]:
+    """Assemble one debrief generation's prompt.
+
+    ``move_listing``: indexed move list of the analyzed play session (defines
+    the step numbers [SHOW n] refers to). ``recent``: recency window of the
+    DEBRIEF conversation (unscrubbed -- this mode is privileged). ``frames``:
+    dicts with ``path`` (image file), ``caption`` and ``settings_json``, in
+    display order. ``question``: the user text or continuation nudge.
+    """
+    user_content: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": "Recorded moves of the play session under analysis "
+                    "(step numbers for [SHOW n]):\n" + move_listing,
+        }
+    ]
+    if recent:
+        user_content.append(
+            {
+                "type": "text",
+                "text": "Debrief conversation so far (most recent last):\n" + recent,
+            }
+        )
+    for f in frames:
+        user_content.append({"type": "text", "text": f["caption"]})
+        user_content.append({"type": "image", "url": f["path"]})
+        if f.get("settings_json"):
+            user_content.append(
+                {"type": "text", "text": "Exact settings for this frame:\n" + f["settings_json"]}
+            )
+    user_content.append({"type": "text", "text": question})
+    return [
+        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT_DEBRIEF}]},
+        {"role": "user", "content": user_content},
+    ]
+
+
+async def persist_debrief_verdict(
+    client: Any,
+    play_session_id: str,
+    debrief_session_id: str,
+    model: Any,
+    cfg: AgentConfig | None = None,
+) -> dict[str, Any]:
+    """Distill the debrief conversation into a mode-3-format structured verdict
+    and store it on the ANALYZED play conversation: assistant message with
+    ``kind='self_evaluation'`` plus a reasoning trace -- the exact convention
+    :func:`mode_self_eval` uses, so downstream tooling treats both identically.
+    """
+    cfg = cfg or CONFIG
+    # The whole debrief conversation (large window = effectively all of it);
+    # unscrubbed -- the verdict is privileged, like mode 3.
+    transcript = await mem.get_recent_messages(
+        client, debrief_session_id, window=10000, scrub=False
+    )
+    if not transcript:
+        raise ValueError(
+            f"Debrief conversation {debrief_session_id!r} is empty; "
+            "nothing to distill into a verdict."
+        )
+
+    messages = [
+        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT_EVAL}]},
+        {"role": "user", "content": [
+            {
+                "type": "text",
+                "text": (
+                    f"Session id: {play_session_id}\n\n"
+                    "The following is a privileged debrief conversation about "
+                    "the recorded session (the analyst saw the screens and the "
+                    "exact settings). Distill it into your structured verdict "
+                    "on the PLAY -- overall_score (0-10), strengths, "
+                    "weaknesses, and per-move notes where relevant.\n\n"
+                    "# Debrief conversation\n" + transcript
+                ),
+            },
+        ]},
+    ]
+    verdict = model.generate(messages, max_new_tokens=cfg.gemma_max_new_tokens)
+
+    eval_msg = await client.short_term.add_message(
+        session_id=play_session_id, role="assistant", content=verdict,
+        metadata={
+            "kind": "self_evaluation",
+            "evaluated_session": play_session_id,
+            "debrief_session": debrief_session_id,
+        },
+    )
+    trace = await client.reasoning.start_trace(
+        play_session_id,
+        task=f"debrief-distilled self-evaluation of session {play_session_id}",
+        triggered_by_message_id=eval_msg.id,
+    )
+    step = await client.reasoning.add_step(trace.id, thought=verdict)
+    await client.reasoning.record_tool_call(
+        step.id,
+        "save_self_eval",
+        {"play_session_id": play_session_id, "debrief_session_id": debrief_session_id},
+        result={"verdict_length": len(verdict)},
+    )
+    await client.reasoning.complete_trace(
+        trace.id, outcome="debrief verdict appended to play conversation", success=True,
+    )
+    return {
+        "play_session_id": play_session_id,
+        "debrief_session_id": debrief_session_id,
+        "verdict": verdict,
+        "eval_message_id": str(eval_msg.id),
+        "trace_id": str(trace.id),
+    }
