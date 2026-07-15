@@ -126,7 +126,11 @@ class InteractiveSession:
         return str(abs_path)
 
     def _step(
-        self, question: str, step: int, recent_actions: list[str] | None = None
+        self,
+        question: str,
+        step: int,
+        recent_actions: list[str] | None = None,
+        reflection: str | None = None,
     ) -> dict[str, Any]:
         """Run one step of a turn: snapshot -> context -> model -> apply move
         -> persist (messages + snapshots). The turn-level reasoning trace is
@@ -169,7 +173,8 @@ class InteractiveSession:
                 f"move token to end your turn.)"
             )
         messages = modes._build_game_messages(
-            modes.SYSTEM_PROMPT_GAME, before_path, ctx, prompt_text
+            modes.SYSTEM_PROMPT_GAME, before_path, ctx, prompt_text,
+            reflection=reflection,
         )
         # Stop generation the instant a move token appears; apply it, then the
         # next step re-generates on the freshly rendered frame. A reply with no
@@ -208,6 +213,37 @@ class InteractiveSession:
             "user_msg_id": turn["user_msg_id"],
         }
 
+    def _reflect(
+        self, question: str, trace: Any, steps: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Run one reflection pause (generative-agents style, arXiv:2304.03442):
+        render the CURRENT frame, ask the model to re-examine the situation
+        (was I ever facing the gold? am I facing it now? am I still turning the
+        right way?) with NO move this step, and persist the reflection to memory
+        (assistant message kind='reflection' + a reasoning step on the turn
+        trace). Returns a result dict with ``kind='reflection'`` suitable for
+        the same ``on_step`` callback as ordinary move steps."""
+        frame_path = self.current_frame_path()
+        actions = [s["action"] for s in steps if s.get("action")]
+        messages = modes.build_reflection_messages(frame_path, question, actions)
+        raw = self.model.generate(
+            messages, max_new_tokens=self.cfg.gemma_max_new_tokens
+        )
+        reflection = raw.strip()
+        self._run(
+            modes.persist_reflection(self.client, self.session_id, trace, reflection)
+        )
+        logger.info("reflection after %d move(s): %s", len(actions), reflection)
+        return {
+            "kind": "reflection",
+            "session_id": self.session_id,
+            "step": len(steps),
+            "raw": raw,
+            "reflection": reflection,
+            "action": None,
+            "frame_path": frame_path,
+        }
+
     def ask(
         self,
         question: str,
@@ -235,10 +271,20 @@ class InteractiveSession:
         # each step becomes a reasoning step within it. Opened after step 0's
         # user message exists and completed once the turn ends.
         trace: Any = None
+        # Reflection bookkeeping (generative-agents style): every applied move
+        # accrues cfg.reflection_points_per_move importance points; at
+        # cfg.reflection_threshold the agent pauses to reflect (default: every
+        # 30 moves = one 180-degree sweep of rotations) and the total resets.
+        # The latest reflection is injected into every subsequent prompt.
+        reflection_points = 0
+        last_reflection: str | None = None
 
         try:
             for i in range(max_steps):
-                step_result = self._step(question, i, modes._recent_actions(steps))
+                step_result = self._step(
+                    question, i, modes._recent_actions(steps),
+                    reflection=last_reflection,
+                )
                 steps.append(step_result)
 
                 # Open the turn trace once the first user message exists, then
@@ -267,6 +313,15 @@ class InteractiveSession:
                     break
                 if step_result["gold_remaining"] == 0:
                     break
+
+                # Reflection pause: enough importance points have accrued.
+                reflection_points += self.cfg.reflection_points_per_move
+                if reflection_points >= self.cfg.reflection_threshold:
+                    reflection_result = self._reflect(question, trace, steps)
+                    last_reflection = reflection_result["reflection"]
+                    reflection_points = 0
+                    if on_step is not None:
+                        on_step(reflection_result)
         finally:
             outcome, success = modes._turn_trace_outcome(
                 steps, game_io.gold_remaining(self.game)

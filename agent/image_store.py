@@ -143,10 +143,13 @@ async def fetch_messages_with_snapshots(client: Any, session_id: str) -> list[di
     session's messages through the Conversation.
     """
     rows = await client.query.cypher(
+        # NAMS Message nodes carry ``timestamp`` (not ``created_at``); ordering
+        # by a nonexistent property would leave the conversation in undefined
+        # order for the evaluator.
         "MATCH (c:Conversation {session_id: $sid})-[:HAS_MESSAGE]->(m:Message) "
         "OPTIONAL MATCH (m)-[:CAPTURED_STATE]->(s:GameSnapshot) "
         "RETURN m, collect(s) AS snaps "
-        "ORDER BY m.created_at ASC",
+        "ORDER BY m.timestamp ASC",
         {"sid": session_id},
     )
     out = []

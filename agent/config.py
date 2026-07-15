@@ -29,6 +29,20 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(os.environ.get(key, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    val = os.environ.get(key)
+    if val is None:
+        return default
+    return val.strip().lower() not in ("0", "false", "no", "off", "")
+
+
 @dataclass(frozen=True)
 class AgentConfig:
     # Neo4j (local, bolt-based; no external service)
@@ -45,6 +59,25 @@ class AgentConfig:
     gemma_device: str = field(default_factory=lambda: _env("GEMMA_DEVICE", "auto"))
     gemma_max_new_tokens: int = field(
         default_factory=lambda: _env_int("GEMMA_MAX_NEW_TOKENS", 2048)
+    )
+
+    # Sampling. Google's standardized recommendation for Gemma 4 E4B (model
+    # card / HF card) is temperature=1.0, top_p=0.95, top_k=64 across all use
+    # cases. Sampling (vs. the old greedy do_sample=False) also breaks the
+    # degenerate fixed point where a near-identical prompt deterministically
+    # reproduces the exact same move + reasoning sentence forever. Set
+    # GEMMA_DO_SAMPLE=0 to restore deterministic greedy decoding.
+    gemma_do_sample: bool = field(
+        default_factory=lambda: _env_bool("GEMMA_DO_SAMPLE", True)
+    )
+    gemma_temperature: float = field(
+        default_factory=lambda: _env_float("GEMMA_TEMPERATURE", 1.0)
+    )
+    gemma_top_p: float = field(
+        default_factory=lambda: _env_float("GEMMA_TOP_P", 0.95)
+    )
+    gemma_top_k: int = field(
+        default_factory=lambda: _env_int("GEMMA_TOP_K", 64)
     )
 
     # Embeddings (local sentence-transformers; NAMS embedding provider string)
@@ -73,6 +106,21 @@ class AgentConfig:
     # has reliable "what did I just do" continuity mid-turn.
     recent_messages_window: int = field(
         default_factory=lambda: _env_int("RECENT_MESSAGES_WINDOW", 7)
+    )
+
+    # Reflection (generative-agents style, arXiv:2304.03442). Every *applied*
+    # move accrues ``reflection_points_per_move`` importance points; when the
+    # running total reaches ``reflection_threshold`` mid-turn, the agent pauses
+    # to reflect (no move that step: it re-examines the current frame and its
+    # recent moves, then the reflection is fed into subsequent prompts) and the
+    # total resets. Defaults: 5 points/move, threshold 150 -> reflect every 30
+    # moves, i.e. after at most a 180-degree turn (one rotation is pi/30 = 6
+    # degrees) if the agent is stuck spinning.
+    reflection_points_per_move: int = field(
+        default_factory=lambda: _env_int("REFLECTION_POINTS_PER_MOVE", 5)
+    )
+    reflection_threshold: int = field(
+        default_factory=lambda: _env_int("REFLECTION_THRESHOLD", 150)
     )
 
     # HuggingFace token (optional; some Gemma weights are gated)

@@ -211,19 +211,51 @@ async def get_recent_messages(client: Any, session_id: str, window: int) -> str:
     """Return the last ``window`` messages of this session by **recency**
     (chronological, most-recent last), independent of semantic similarity.
 
-    NAMS stores messages ``ORDER BY timestamp ASC`` and its ``get_context`` recall
-    is pure vector similarity, so recent moves are not guaranteed to surface.
-    This fetches the full session chain (no limit) and slices the tail so the
-    agent always sees its latest turns verbatim. Settings are stripped for the
-    mode-1 privacy invariant. Returns "" if there are none / on error.
+    NAMS' ``get_context`` recall is pure vector similarity (and its built-in
+    "Recent Conversation" section is ordered ASC, i.e. actually the OLDEST
+    messages), so recent moves are not guaranteed to surface. This queries the
+    session's message tail directly -- ``ORDER BY timestamp DESC LIMIT window``
+    over the ``(:Conversation {session_id})-[:HAS_MESSAGE]->(:Message)`` chain
+    -- which stays constant-time as the conversation grows. Falls back to
+    fetching the whole conversation and slicing the tail if the direct query
+    fails (e.g. a NAMS schema change). Settings are stripped for the mode-1
+    privacy invariant. Returns "" if there are none / on error.
     """
     if window <= 0:
         return ""
+    lines: list[str] = []
+    try:
+        rows = await client.query.cypher(
+            "MATCH (c:Conversation {session_id: $sid})-[:HAS_MESSAGE]->(m:Message) "
+            "RETURN m.role AS role, m.content AS content "
+            "ORDER BY m.timestamp DESC LIMIT $window",
+            {"sid": session_id, "window": window},
+        )
+        # DESC gave us newest-first; reverse to chronological, most-recent last.
+        for r in reversed(list(rows or [])):
+            d = dict(r)
+            content = _strip_settings_from_text(str(d.get("content", "")))
+            lines.append(f"[{d.get('role', '?')}] {content}")
+    except Exception as exc:
+        logger.debug("direct recent-message query failed (%s); falling back", exc)
+        lines = await _recent_messages_fallback(client, session_id, window)
+    result = "\n".join(lines)
+    run_logging.log_db_retrieval(
+        function="get_recent_messages",
+        arguments={"session_id": session_id, "window": window},
+        result=result,
+    )
+    return result
+
+
+async def _recent_messages_fallback(
+    client: Any, session_id: str, window: int
+) -> list[str]:
+    """Slow path: fetch the WHOLE conversation via the NAMS API and slice the
+    tail. limit=None is deliberate -- NAMS orders ASC, so a small limit would
+    return the OLDEST messages instead of the most recent ones."""
     msgs: list[Any] = []
     try:
-        # limit=None -> the whole conversation; we only inject the tail, but we
-        # must fetch past any low LIMIT to actually reach the most-recent ones
-        # (NAMS orders ASC, so a small limit would return the OLDEST messages).
         convo = await client.short_term.get_conversation(session_id=session_id, limit=None)
         msgs = list(getattr(convo, "messages", None) or [])
     except Exception as exc:  # pragma: no cover - fall back to get_messages
@@ -235,28 +267,16 @@ async def get_recent_messages(client: Any, session_id: str, window: int) -> str:
             )
         except Exception as exc2:
             logger.warning("recent-message fetch failed: %s", exc2)
-            return ""
+            return []
     if not msgs:
-        run_logging.log_db_retrieval(
-            function="get_recent_messages",
-            arguments={"session_id": session_id, "window": window},
-            result="",
-        )
-        return ""
+        return []
     # Defensive: ensure chronological order before taking the tail.
     try:
         if all(_message_timestamp(m) is not None for m in msgs):
             msgs = sorted(msgs, key=_message_timestamp)
     except Exception:  # pragma: no cover - heterogeneous timestamps
         pass
-    recent = msgs[-window:]
-    result = "\n".join(_format_message_line(m) for m in recent)
-    run_logging.log_db_retrieval(
-        function="get_recent_messages",
-        arguments={"session_id": session_id, "window": window},
-        result=result,
-    )
-    return result
+    return [_format_message_line(m) for m in msgs[-window:]]
 
 
 async def retrieve_context(client: Any, query: str, session_id: str) -> Any:
@@ -279,6 +299,27 @@ async def retrieve_context(client: Any, query: str, session_id: str) -> Any:
         result=result,
     )
     return ctx
+
+
+# NAMS ``get_context`` embeds its own "### Recent Conversation" section in the
+# formatted context it returns. We already inject the session's recent messages
+# explicitly (see :func:`get_recent_messages`), so keeping NAMS's copy puts the
+# same recent moves into the prompt twice. The intended split is: the recency
+# window is the ONE channel for recent moves; the semantic block carries only
+# general memories (relevant past messages, entities, preferences, traces).
+# This regex removes NAMS's recent-conversation subsection (up to the next
+# heading), leaving the rest of its output intact.
+_NAMS_RECENT_CONVO_RE = re.compile(
+    r"### Recent Conversation\n.*?(?=\n#{2,3} |\Z)", re.DOTALL
+)
+
+
+def strip_nams_recent_conversation(text: str) -> str:
+    out = _NAMS_RECENT_CONVO_RE.sub("", text)
+    # If that emptied the whole '## Conversation History' section, drop its
+    # now-dangling header too.
+    out = re.sub(r"## Conversation History\s*(?=\n## |\Z)", "", out)
+    return out.strip("\n")
 
 
 async def get_game_context(
@@ -304,6 +345,8 @@ async def get_game_context(
             semantic = _json.dumps(cleaned, default=str, indent=2)
         except Exception:
             semantic = str(cleaned)
+    # Recent moves belong to the recency window below, not the semantic block.
+    semantic = strip_nams_recent_conversation(semantic)
 
     recent = await get_recent_messages(client, session_id, recent_window)
 

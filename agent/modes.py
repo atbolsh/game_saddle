@@ -63,7 +63,35 @@ SYSTEM_PROMPT_GAME = (
     "rotating that way (or reverse if you overshoot) until your eye lines up with "
     "the gold -- then emit [FORWARD].\n"
     "Always state this reasoning before the move token; reasoning first, then a "
-    "single move, is how you decide well."
+    "single move, is how you decide well.\n\n"
+    "DO NOT just copy prior observations from your memories. Make sure you "
+    "evaluate whether you are facing the gold *right now*. Your memories "
+    "describe PAST screens; every move changes the screen, so re-derive where "
+    "your red eye points and where the gold is from the CURRENT image before "
+    "every single move."
+)
+
+SYSTEM_PROMPT_REFLECT = (
+    "You are an agent playing a 2D discrete game on a 224x224 board. The board "
+    "is the unit square framed by four boundary walls; there is exactly one "
+    "gold piece (small yellow circle). You are the green circle with a red eye "
+    "showing the direction you are facing.\n\n"
+    "This is NOT a move request. This is a REFLECTION pause: you have made many "
+    "moves without collecting the gold, so you must stop, look at the CURRENT "
+    "screen with fresh eyes, and re-examine your plan before continuing. Your "
+    "recent reasoning may have been repeating itself without checking the "
+    "screen; assume nothing you previously said is still true.\n\n"
+    "Study the CURRENT image and answer, concretely and honestly:\n"
+    "1. Am I *certain* that I was never facing the gold at any point during my "
+    "recent moves? Each rotation is 6 degrees, so 30 rotations sweep 180 "
+    "degrees -- could my eye have swept past the gold without me noticing?\n"
+    "2. Am I possibly facing it now? Describe where the red eye points and "
+    "where the gold is in the CURRENT image, not from memory.\n"
+    "3. Am I still turning in the right direction? Would reversing direction, "
+    "or simply going FORWARD, get my eye onto the gold faster?\n\n"
+    "Do NOT emit any move token ([CLOCK]/[ANTICLOCK]/[FORWARD]) in this reply "
+    "-- it would not be executed. End with the single move you intend to make "
+    "next and why; you will act on it when the next screen is shown."
 )
 
 SYSTEM_PROMPT_DISCUSS = (
@@ -133,10 +161,27 @@ def _recent_actions(turns: list[dict], limit: int = _RECENT_ACTIONS_FOR_QUERY) -
     return [t["action"] for t in turns if t.get("action")][-limit:]
 
 
-def _build_game_messages(system: str, image_path: str, context: str, question: str) -> list[dict]:
+def _build_game_messages(
+    system: str,
+    image_path: str,
+    context: str,
+    question: str,
+    reflection: str | None = None,
+) -> list[dict]:
     user_text = []
     if context:
         user_text.append({"type": "text", "text": f"Memory context:\n{context}"})
+    if reflection:
+        user_text.append(
+            {
+                "type": "text",
+                "text": (
+                    "Your latest self-reflection (you wrote this after pausing "
+                    "to re-examine the board; trust it over older, repetitive "
+                    "memories):\n" + reflection
+                ),
+            }
+        )
     user_text.append({"type": "image", "url": image_path})
     user_text.append(
         {
@@ -148,6 +193,66 @@ def _build_game_messages(system: str, image_path: str, context: str, question: s
         {"role": "system", "content": [{"type": "text", "text": system}]},
         {"role": "user", "content": user_text},
     ]
+
+
+# ------------------------------------------------------------- reflection
+#
+# Generative-agents style reflection (arXiv:2304.03442): every applied move is
+# worth ``cfg.reflection_points_per_move`` importance points, and when the
+# running total reaches ``cfg.reflection_threshold`` the agent pauses to
+# reflect instead of blindly continuing. With the defaults (5 points/move,
+# threshold 150) a stuck agent reflects every 30 moves -- exactly one 180-degree
+# sweep of rotations -- forcing it to ask whether it rotated past the gold.
+
+def _summarize_actions(actions: list[str]) -> str:
+    """Run-length compress a move list: CLOCK x30 reads better than 30 lines."""
+    if not actions:
+        return "(no moves yet)"
+    runs: list[str] = []
+    current, count = actions[0], 0
+    for a in actions:
+        if a == current:
+            count += 1
+        else:
+            runs.append(f"{current} x{count}")
+            current, count = a, 1
+    runs.append(f"{current} x{count}")
+    return ", ".join(runs)
+
+
+def build_reflection_messages(
+    image_path: str, question: str, actions: list[str]
+) -> list[dict]:
+    """Prompt for one reflection pause: the CURRENT frame + a compressed record
+    of every move made this turn, under the reflection system prompt. Memory
+    context is deliberately omitted -- the whole point is to break the loop of
+    re-reading (and re-copying) stale observations."""
+    n = len(actions)
+    user_text = (
+        f"Original instruction: {question}\n\n"
+        f"You have made {n} move(s) this turn without collecting the gold: "
+        f"{_summarize_actions(actions)}.\n\n"
+        "This is the CURRENT screen. Reflect now: answer the three questions "
+        "from your instructions based on what you actually see in this image."
+    )
+    return [
+        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT_REFLECT}]},
+        {"role": "user", "content": [
+            {"type": "image", "url": image_path},
+            {"type": "text", "text": user_text},
+        ]},
+    ]
+
+
+async def persist_reflection(
+    client: Any, session_id: str, trace: Any, text: str
+) -> None:
+    """Store a reflection in memory: as an assistant message (so it enters the
+    recency window and semantic search like any other memory, per the paper)
+    and as a reasoning step on the turn trace (action=None -- no move made)."""
+    content = f"(reflection) {text}"
+    await mem.add_assistant_message(client, session_id, content, kind="reflection")
+    await mem.add_reasoning_step(client, trace, thought=content, action=None)
 
 
 async def _record_step(
@@ -269,6 +374,10 @@ async def mode_game(
     turns: list[dict[str, Any]] = []
 
     steps = 0
+    # Reflection bookkeeping (see the "reflection" section above): points accrue
+    # per applied move; at the threshold the agent reflects and the total resets.
+    reflection_points = 0
+    last_reflection: str | None = None
     # One reasoning trace for the whole turn; opened after the first step's user
     # message exists (so it can be triggered_by that message) and completed once
     # the loop ends.
@@ -296,12 +405,16 @@ async def mode_game(
                 client, session_id, query=query,
                 recent_window=cfg.recent_messages_window,
             )
-            messages = _build_game_messages(SYSTEM_PROMPT_GAME, snapshot_before_path, ctx, question)
+            messages = _build_game_messages(
+                SYSTEM_PROMPT_GAME, snapshot_before_path, ctx, question,
+                reflection=last_reflection,
+            )
             raw = model.generate(messages, stop_strings=game_io.MOVE_STOP_STRINGS)
             action = game_io.parse_action(raw)
 
             if action:
                 gold_collected = game_io.apply_action(game, action)
+                reflection_points += cfg.reflection_points_per_move
             else:
                 gold_collected = 0
 
@@ -350,6 +463,22 @@ async def mode_game(
             if steps >= max_steps:
                 logger.warning("Hit max_steps=%d without eating the gold.", max_steps)
                 break
+
+            # Reflection pause: enough importance points have accrued (default:
+            # 30 moves, i.e. up to a 180-degree sweep of rotations). Generate a
+            # reflection on the freshly rendered frame (no move this step),
+            # persist it, and feed it into every subsequent prompt.
+            if reflection_points >= cfg.reflection_threshold:
+                actions_so_far = [t["action"] for t in turns if t.get("action")]
+                refl_messages = build_reflection_messages(
+                    snapshot_before_path, question, actions_so_far
+                )
+                last_reflection = model.generate(
+                    refl_messages, max_new_tokens=cfg.gemma_max_new_tokens
+                ).strip()
+                await persist_reflection(client, session_id, trace, last_reflection)
+                reflection_points = 0
+                logger.info("step %d: reflection pause: %s", steps, last_reflection)
     finally:
         gold_remaining = game_io.gold_remaining(game)
         outcome, success = _turn_trace_outcome(turns, gold_remaining)
@@ -385,6 +514,10 @@ async def mode_discuss(
     recent = await mem.get_recent_messages(client, session_id, cfg.recent_messages_window)
     ctx = await mem.retrieve_context(client, query=user_text, session_id=session_id)
     ctx_text = ctx if isinstance(ctx, str) else json.dumps(ctx, default=str, indent=2)
+    # Same channel separation as mode 1: our recency window is the one source
+    # of recent messages; drop NAMS' built-in "Recent Conversation" section
+    # (which is ordered ASC and actually contains the OLDEST messages anyway).
+    ctx_text = mem.strip_nams_recent_conversation(ctx_text)
 
     context_parts: list[str] = []
     if recent:
@@ -468,6 +601,21 @@ async def mode_self_eval(
 
     messages_with_snaps = await image_store.fetch_messages_with_snapshots(client, session_id)
     traces = await _fetch_session_traces(client, session_id)
+    # Sanity check: every recorded turn opens a reasoning trace, so a session
+    # that has assistant messages but zero traces means trace retrieval (or
+    # recording) is broken -- warn loudly rather than silently evaluating a
+    # session dump with its "# Reasoning traces" section missing.
+    has_assistant_msgs = any(
+        (row.get("message") or {}).get("role") == "assistant"
+        for row in messages_with_snaps
+    )
+    if has_assistant_msgs and not traces:
+        logger.warning(
+            "Session %s has assistant messages but no reasoning traces were "
+            "retrieved; the self-evaluation will run without traces. Trace "
+            "recording or retrieval is likely broken.",
+            session_id,
+        )
     dump = _format_session_for_eval(messages_with_snaps, traces)
     # The full long-term semantic model = the intended rules/strategy. Give it to
     # the evaluator as the rubric to judge the recorded play against.
@@ -518,27 +666,40 @@ async def mode_self_eval(
 
 
 async def _fetch_session_traces(client: Any, session_id: str) -> list[dict[str, Any]]:
-    """Best-effort retrieval of reasoning traces for a session.
+    """Retrieve the session's reasoning traces.
 
-    Tries ``client.reasoning.search_traces`` first; falls back to a Cypher
-    match on ``(:Trace)`` linked to messages in the session.
+    The exact Cypher match on ``(:ReasoningTrace {session_id})`` is the ONE
+    primary path: it either returns exactly this session's traces or fails
+    loudly. ``client.reasoning.search_traces`` is deliberately NOT tried first
+    -- it is a *semantic similarity* search whose first argument is a free-text
+    query, so passing a session id returns whatever traces happen to embed
+    nearest to a hex string, possibly from other sessions. A non-empty-but-
+    wrong result from it would mask a broken primary query ("sometimes works"
+    fuzziness); we only fall back to it if the exact query itself errors, and
+    we log a WARNING so the degradation is visible, never silent.
     """
     traces: list[dict[str, Any]] = []
     try:
-        found = await client.reasoning.search_traces(session_id, limit=100)  # type: ignore[arg-type]
-        traces = [dict(t) for t in (found or [])]
-        if traces:
-            return traces
-    except Exception as exc:  # pragma: no cover
-        logger.debug("search_traces failed: %s", exc)
-    try:
         rows = await client.query.cypher(
-            "MATCH (t:Trace {session_id: $sid}) RETURN t ORDER BY t.created_at ASC",
+            # NAMS labels traces ``ReasoningTrace`` (with ``started_at``), not
+            # ``Trace``/``created_at`` -- an old query using those always
+            # returned nothing.
+            "MATCH (t:ReasoningTrace {session_id: $sid}) "
+            "RETURN t ORDER BY t.started_at ASC",
             {"sid": session_id},
         )
         traces = [dict(r["t"]) for r in rows if "t" in r]
-    except Exception as exc:  # pragma: no cover
-        logger.debug("Cypher trace fetch failed: %s", exc)
+    except Exception as exc:
+        logger.warning(
+            "Exact trace query failed (%s); falling back to semantic "
+            "search_traces -- results may include other sessions' traces.",
+            exc,
+        )
+        try:
+            found = await client.reasoning.search_traces(session_id, limit=100)  # type: ignore[arg-type]
+            traces = [dict(t) for t in (found or [])]
+        except Exception as exc2:  # pragma: no cover
+            logger.warning("search_traces fallback also failed: %s", exc2)
     run_logging.log_db_retrieval(
         function="_fetch_session_traces",
         arguments={"session_id": session_id},

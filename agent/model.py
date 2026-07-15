@@ -128,8 +128,12 @@ class Gemma4E4B:
             pass
         gen_kwargs: dict[str, Any] = {
             "max_new_tokens": max_new_tokens or self.cfg.gemma_max_new_tokens,
-            "do_sample": False,
+            "do_sample": self.cfg.gemma_do_sample,
         }
+        if self.cfg.gemma_do_sample:
+            gen_kwargs["temperature"] = self.cfg.gemma_temperature
+            gen_kwargs["top_p"] = self.cfg.gemma_top_p
+            gen_kwargs["top_k"] = self.cfg.gemma_top_k
         if stop_strings:
             # StopStringCriteria requires the tokenizer to be passed to generate.
             gen_kwargs["stop_strings"] = stop_strings
@@ -164,6 +168,9 @@ class Gemma4E4B:
                 params={
                     "max_new_tokens": gen_kwargs.get("max_new_tokens"),
                     "do_sample": gen_kwargs.get("do_sample"),
+                    "temperature": gen_kwargs.get("temperature"),
+                    "top_p": gen_kwargs.get("top_p"),
+                    "top_k": gen_kwargs.get("top_k"),
                     "stop_strings": stop_strings,
                 },
                 response=None if raw_out is None else {"raw": raw_out},
