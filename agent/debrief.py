@@ -94,6 +94,10 @@ class DebriefSession:
         self._move_index: list[dict[str, Any]] = []
         self._move_listing: str = "(no moves recorded)"
         self._snapshots: list[dict[str, Any]] = []
+        # Navigation cursor: the step the analyst is currently looking at
+        # ('Current frame' in the prompt). [SHOW n] jumps it, [NEXT]/[BACK]
+        # move it by one. Persists across ask() turns; reset by select().
+        self._cursor: int | None = None
 
     # ------------------------------------------------------------------ bridge
     def _run(self, coro: Any) -> Any:
@@ -175,8 +179,10 @@ class DebriefSession:
                 [e["action"] for e in self._move_index]
             )
             self._move_listing += f"\n(summary: {summary})"
+            self._cursor = len(self._move_index) - 1
         else:
             self._move_listing = "(no moves recorded)"
+            self._cursor = None
 
         latest_frame = self._resolve_path(self._snapshots[-1]["path"]) if self._snapshots else None
         info = {
@@ -243,14 +249,15 @@ class DebriefSession:
                     )
                 )
                 messages = modes.build_debrief_messages(
-                    self._move_listing, recent, frames, prompt_text
+                    self._move_listing + "\n" + self._cursor_line(),
+                    recent, frames, prompt_text,
                 )
                 raw = self.model.generate(
                     messages,
                     max_new_tokens=self.cfg.gemma_max_new_tokens,
-                    stop_regex=modes.SHOW_CALL_PATTERN,
+                    stop_regex=modes.DEBRIEF_TOOL_PATTERN,
                 )
-                show_step, text = modes.parse_show_call(raw)
+                call, text = modes.parse_debrief_call(raw)
 
                 assistant_msg = self._run(
                     self.client.short_term.add_message(
@@ -263,17 +270,20 @@ class DebriefSession:
                 )
 
                 frames = []
-                if show_step is not None:
-                    found = 0 <= show_step < len(self._move_index)
+                if call is not None:
+                    target, reason = self._resolve_tool_target(call)
+                    found = target is not None
                     self._run(
                         self.client.reasoning.record_tool_call(
-                            step_node.id, "SHOW", {"step": show_step},
-                            result={"found": found},
+                            step_node.id, call["tool"],
+                            {k: v for k, v in call.items() if k != "tool"},
+                            result={"found": found, "step": target},
                         )
                     )
                     tool_calls += 1
                     if found:
-                        frames = self._frames_for_step(show_step)
+                        self._cursor = target
+                        frames = self._frames_for_step(target)
                         for f in frames:
                             self._run(
                                 image_store.link_snapshot_to_message(
@@ -283,18 +293,17 @@ class DebriefSession:
                             )
                         prompt_text = (
                             f"(Continuing your reply to: {question}\n"
-                            f"The frames for step {show_step} are attached "
-                            "above. Continue your analysis; emit another "
-                            "[SHOW n] if you need another step, or finish "
-                            "your answer.)"
+                            f"The frames for step {target} are attached above "
+                            f"and it is now the current frame. Continue your "
+                            "analysis; emit another tool token ([SHOW n], "
+                            "[NEXT], [BACK]) if you need another step, or "
+                            "finish your answer.)"
                         )
                     else:
                         prompt_text = (
                             f"(Continuing your reply to: {question}\n"
-                            f"Step {show_step} does not exist -- valid steps "
-                            f"are 0..{len(self._move_index) - 1}. Continue "
-                            "your analysis; emit a valid [SHOW n] or finish "
-                            "your answer.)"
+                            f"{reason} Continue your analysis; emit a valid "
+                            "tool token or finish your answer.)"
                         )
 
                 result = {
@@ -302,18 +311,19 @@ class DebriefSession:
                     "generation": len(replies),
                     "raw": raw,
                     "text": text,
-                    "show_step": show_step,
+                    "tool_call": call,
+                    "cursor": self._cursor,
                     "frames": [f["path"] for f in frames],
                 }
                 replies.append(result)
                 if on_step is not None:
                     on_step(result)
 
-                if show_step is None:
+                if call is None:
                     break
                 if tool_calls >= self.cfg.debrief_max_tool_calls:
                     logger.warning(
-                        "Debrief tool budget exhausted (%d [SHOW] calls); "
+                        "Debrief tool budget exhausted (%d tool calls); "
                         "ending the turn with the last reply.",
                         tool_calls,
                     )
@@ -415,7 +425,8 @@ class DebriefSession:
         return frames
 
     def _frames_for_step(self, step: int) -> list[dict[str, Any]]:
-        """Before/after frames (image + settings) for move ``step``."""
+        """Before/after frames (image + settings) for move ``step``, plus the
+        reasoning recorded at that step (as a ``note`` on the last frame)."""
         entry = self._move_index[step]
         frames = []
         for label, snap in (("BEFORE", entry["before"]), ("AFTER", entry["after"])):
@@ -425,9 +436,51 @@ class DebriefSession:
                 "snapshot_id": snap.get("id"),
                 "path": self._resolve_path(snap["path"]),
                 "caption": (
-                    f"[SHOW {step}] result: step {step} "
-                    f"({entry['action']}) -- screen {label} the move:"
+                    f"Step {step} ({entry['action']}) -- "
+                    f"screen {label} the move:"
                 ),
                 "settings_json": snap.get("settings_json"),
             })
+        if frames and entry.get("content"):
+            frames[-1]["note"] = (
+                f"Reasoning you recorded at step {step}:\n{entry['content']}"
+            )
         return frames
+
+    def _cursor_line(self) -> str:
+        """The 'Current frame' line for the prompt context."""
+        if self._cursor is None:
+            return "Current frame: (none -- no moves recorded)"
+        return (
+            f"Current frame: step {self._cursor} "
+            f"(valid steps: 0..{len(self._move_index) - 1})"
+        )
+
+    def _resolve_tool_target(self, call: dict[str, Any]) -> tuple[int | None, str]:
+        """Map a parsed tool call to a step number. Returns ``(step, '')`` on
+        success or ``(None, reason)`` explaining why the call is invalid."""
+        n_steps = len(self._move_index)
+        if n_steps == 0:
+            return None, "This session has no recorded moves, so there are no frames to show."
+        tool = call["tool"]
+        if tool == "SHOW":
+            step = call["step"]
+            if 0 <= step < n_steps:
+                return step, ""
+            return None, (
+                f"Step {step} does not exist -- valid steps are "
+                f"0..{n_steps - 1}."
+            )
+        if self._cursor is None:
+            # Unreachable when moves exist (select() sets the cursor), but
+            # fail loudly rather than guess a position.
+            return None, "There is no current frame to navigate from; use [SHOW n] first."
+        step = self._cursor + 1 if tool == "NEXT" else self._cursor - 1
+        if 0 <= step < n_steps:
+            return step, ""
+        edge = "last" if tool == "NEXT" else "first"
+        return None, (
+            f"[{tool}] failed: you are already at the {edge} step "
+            f"(current frame: step {self._cursor}, valid steps: "
+            f"0..{n_steps - 1})."
+        )

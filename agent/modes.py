@@ -712,9 +712,10 @@ async def _fetch_session_traces(client: Any, session_id: str) -> list[dict[str, 
 # --------------------------------------------------------------- mode 4
 #
 # Privileged interactive debrief: a chat over a recorded play conversation with
-# full access to ground truth (snapshot images + exact Settings JSON), plus a
-# [SHOW <n>] tool to pull up any recorded step's frames. See
-# :class:`agent.debrief.DebriefSession` for the session/loop machinery.
+# full access to ground truth (snapshot images + exact Settings JSON), plus
+# [SHOW <n>] / [NEXT] / [BACK] tools to pull up any recorded step's frames,
+# settings, and recorded reasoning. See :class:`agent.debrief.DebriefSession`
+# for the session/loop machinery.
 
 SYSTEM_PROMPT_DEBRIEF = (
     "You are a privileged game analyst reviewing a recorded session of a 2D "
@@ -739,12 +740,17 @@ SYSTEM_PROMPT_DEBRIEF = (
     "y-down convention.\n"
     "  - One [FORWARD] advances up to 1/16 of the board along "
     "(cos theta, sin theta).\n\n"
-    "TOOL: you may inspect any recorded step. To do so, end your reply with "
-    "the token [SHOW n] where n is the step number from the move list (e.g. "
-    "[SHOW 42]). That step's screen image(s) and exact settings will be shown "
-    "to you, and you will be asked to continue. Emit at most one [SHOW n] per "
-    "reply, at the very end, with nothing after it. When you have what you "
-    "need, reply normally without a [SHOW n] token to finish your answer.\n\n"
+    "TOOLS: you may inspect any recorded step. Your context includes a "
+    "'Current frame' line telling you which step you are looking at. To "
+    "navigate, end your reply with exactly one of these tokens:\n"
+    "  [SHOW n] - jump to step n from the move list (e.g. [SHOW 42])\n"
+    "  [NEXT]   - advance to the step after the current frame\n"
+    "  [BACK]   - go to the step before the current frame\n"
+    "The requested step's screen image(s), exact settings, and the reasoning "
+    "recorded at that step will be shown to you, and you will be asked to "
+    "continue. Emit at most one tool token per reply, at the very end, with "
+    "nothing after it. When you have what you need, reply normally without a "
+    "tool token to finish your answer.\n\n"
     "You may also be asked to produce a final structured verdict on the play "
     "(overall_score 0-10, strengths, weaknesses, per-move notes); do so only "
     "when asked."
@@ -752,29 +758,43 @@ SYSTEM_PROMPT_DEBRIEF = (
 
 # One lenient matcher shared by the generation-time stop criteria and the
 # parser, so stopping and parsing can never disagree. The prompt teaches only
-# the canonical [SHOW 42], but the model is a small LLM and will occasionally
-# mangle the call ([SHOW(42)], [SHOW: 42], [42 SHOW], ...). We accept any
-# SINGLE bracket pair containing SHOW and a number, in either order, with
-# arbitrary junk in between; the first number inside the brackets is the step.
-# [^\[\]] confines the match to one bracket pair, so stray brackets or prose
-# can neither trigger a stop nor corrupt a parse; an incomplete mangle (no
-# closing bracket / missing SHOW / missing number) matches nothing and the
-# reply simply ends the turn. Case-insensitivity is inline ((?i)) so the SAME
-# pattern string drives both this module's parser and the generation-time
-# RegexStopCriteria.
-SHOW_CALL_PATTERN = r"(?i)\[(?=[^\[\]]*?SHOW)[^\[\]]*?(\d+)[^\[\]]*?\]"
-SHOW_CALL_RE = re.compile(SHOW_CALL_PATTERN)
+# the canonical forms ([SHOW 42], [NEXT], [BACK]), but the model is a small
+# LLM and will occasionally mangle a call ([SHOW(42)], [SHOW: 42], [42 SHOW],
+# [ next ], ...). Leniency rules:
+#   - SHOW: any SINGLE bracket pair containing SHOW and a number, in either
+#     order, with arbitrary junk in between; the first number inside the
+#     brackets is the step.
+#   - NEXT/BACK: a bracket pair containing the word with only non-alphanumeric
+#     padding (\W) allowed -- deliberately TIGHTER than SHOW, because 'next'
+#     and 'back' are common English words and bracketed prose like
+#     '[the next frame]' must not fire a tool call.
+# [^\[\]] / \W confine each match to one bracket pair, so stray brackets or
+# prose can neither trigger a stop nor corrupt a parse; an incomplete mangle
+# matches nothing and the reply simply ends the turn. Case-insensitivity is
+# inline ((?i)) so the SAME pattern string drives both this module's parser
+# and the generation-time RegexStopCriteria.
+DEBRIEF_TOOL_PATTERN = (
+    r"(?i)(?:"
+    r"\[(?=[^\[\]]*?SHOW)[^\[\]]*?(?P<show_step>\d+)[^\[\]]*?\]"
+    r"|\[\W*(?P<nav>NEXT|BACK)\W*\]"
+    r")"
+)
+DEBRIEF_TOOL_RE = re.compile(DEBRIEF_TOOL_PATTERN)
 
 
-def parse_show_call(text: str) -> tuple[int | None, str]:
-    """Return ``(step, text)`` for the FIRST [SHOW n] tool call in ``text``,
+def parse_debrief_call(text: str) -> tuple[dict[str, Any] | None, str]:
+    """Return ``(call, text)`` for the FIRST debrief tool call in ``text``,
     truncating the text right after the call (anything beyond it is
-    model-hallucinated tool output -- discard it). ``(None, text)`` if no
-    complete call is present."""
-    m = SHOW_CALL_RE.search(text)
+    model-hallucinated tool output -- discard it). ``call`` is
+    ``{"tool": "SHOW", "step": n}`` or ``{"tool": "NEXT"}`` /
+    ``{"tool": "BACK"}``; ``(None, text)`` if no complete call is present."""
+    m = DEBRIEF_TOOL_RE.search(text)
     if not m:
         return None, text
-    return int(m.group(1)), text[: m.end()]
+    truncated = text[: m.end()]
+    if m.group("show_step") is not None:
+        return {"tool": "SHOW", "step": int(m.group("show_step"))}, truncated
+    return {"tool": m.group("nav").upper()}, truncated
 
 
 def build_debrief_messages(
@@ -786,10 +806,12 @@ def build_debrief_messages(
     """Assemble one debrief generation's prompt.
 
     ``move_listing``: indexed move list of the analyzed play session (defines
-    the step numbers [SHOW n] refers to). ``recent``: recency window of the
-    DEBRIEF conversation (unscrubbed -- this mode is privileged). ``frames``:
-    dicts with ``path`` (image file), ``caption`` and ``settings_json``, in
-    display order. ``question``: the user text or continuation nudge.
+    the step numbers [SHOW n] refers to), including the 'Current frame' line.
+    ``recent``: recency window of the DEBRIEF conversation (unscrubbed -- this
+    mode is privileged). ``frames``: dicts with ``path`` (image file),
+    ``caption``, ``settings_json`` and optionally ``note`` (e.g. the reasoning
+    recorded at that step), in display order. ``question``: the user text or
+    continuation nudge.
     """
     user_content: list[dict[str, Any]] = [
         {
@@ -812,6 +834,8 @@ def build_debrief_messages(
             user_content.append(
                 {"type": "text", "text": "Exact settings for this frame:\n" + f["settings_json"]}
             )
+        if f.get("note"):
+            user_content.append({"type": "text", "text": f["note"]})
     user_content.append({"type": "text", "text": question})
     return [
         {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT_DEBRIEF}]},

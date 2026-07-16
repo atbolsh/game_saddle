@@ -126,8 +126,8 @@ class AgentConfig:
     # Debrief (mode 4). ``debrief_max_frames`` recent snapshots are attached to
     # each debrief question by default (the newest is the session's current
     # state); the model can additionally pull up any recorded step's frames via
-    # its [SHOW <n>] tool, capped at ``debrief_max_tool_calls`` fetches per
-    # ask() turn.
+    # its [SHOW <n>] / [NEXT] / [BACK] tools, capped at
+    # ``debrief_max_tool_calls`` fetches per ask() turn.
     debrief_max_frames: int = field(
         default_factory=lambda: _env_int("DEBRIEF_MAX_FRAMES", 3)
     )
