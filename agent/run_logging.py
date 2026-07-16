@@ -215,6 +215,18 @@ def set_active_logger(logger: Optional[RunLogger]) -> None:
         _active = logger
 
 
+def resolve_dump_path(
+    logger: Optional["RunLogger"], name: Optional[str] = None
+) -> Path:
+    """Where a DB dump should land: inside ``logger``'s run directory, or a
+    fresh timestamped file under ``logs/`` when logging is disabled. Shared by
+    every ``dump_db`` entry point so the naming convention stays in one place."""
+    if logger is not None:
+        return logger.dump_path(name)
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    return Path("logs") / f"{(name or 'db_snapshot')}_{stamp}.dump"
+
+
 def new_run_logger(
     label: Optional[str] = None, base_dir: str | Path = "logs", activate: bool = True
 ) -> RunLogger:

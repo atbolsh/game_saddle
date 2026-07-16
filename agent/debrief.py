@@ -364,6 +364,18 @@ class DebriefSession:
             )
         )
 
+    def dump_db(self, name: str | None = None, include_embeddings: bool = False) -> dict[str, Any]:
+        """Dump the current DB status (all nodes + relationships) to a ``.dump``
+        JSON file for offline inspection. Reads over the live bolt connection --
+        it does NOT stop Neo4j, so it is safe to call mid-session.
+
+        The file lands in this run's log directory (or a fresh ``logs/`` file if
+        logging is disabled). Returns ``{path, nodes, relationships}``."""
+        path = run_logging.resolve_dump_path(self.logger, name)
+        return self._run(
+            mem.dump_database_to_file(self.client, path, include_embeddings=include_embeddings)
+        )
+
     def close(self) -> None:
         """Close the memory client and stop the background loop."""
         try:

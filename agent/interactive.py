@@ -348,12 +348,7 @@ class InteractiveSession:
 
         The file lands in this run's log directory (or a fresh ``logs/`` file if
         logging is disabled). Returns ``{path, nodes, relationships}``."""
-        if self.logger is not None:
-            path = self.logger.dump_path(name)
-        else:
-            import datetime
-            stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            path = Path("logs") / f"{(name or 'db_snapshot')}_{stamp}.dump"
+        path = run_logging.resolve_dump_path(self.logger, name)
         return self._run(
             mem.dump_database_to_file(self.client, path, include_embeddings=include_embeddings)
         )
