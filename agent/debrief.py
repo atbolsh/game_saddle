@@ -9,12 +9,21 @@ One :meth:`ask` is a *multi-generation turn*, mirroring play mode's structure:
 a cursor points at one of the player's recorded messages (the "current
 message"), whose text + the ONE frame the player saw + exact settings are
 always in context, alongside the user instruction the player was answering.
-The model may end a reply with a ``[SHOW n]`` / ``[NEXT]`` / ``[BACK]`` tool
-token to move the cursor; we stop generation at the token (generation-time
-regex stop -- see :class:`agent.model.RegexStopCriteria`), swap the current
-message, and generate again. The turn ends when a reply carries no tool
-token, or the per-turn tool budget (``cfg.debrief_max_tool_calls``) is
-exhausted.
+The model may end a reply with a tool token; we stop generation at the token
+(generation-time regex stop -- see :class:`agent.model.RegexStopCriteria`),
+run the tool, and generate again. The tools:
+
+  * ``[SHOW n]`` / ``[NEXT]`` / ``[BACK]`` -- move the cursor; the target
+    message's text + frame + settings are swapped into context.
+  * ``[SEARCH <query>]`` -- semantic search over this play session's recorded
+    messages (hits labeled with their ``[SHOW n]`` numbers, clearly marked as
+    NOT the current message) plus the general memory tiers (tips, reasoning).
+  * ``[WRITE_TIP]`` (with a ``TIP: <one line>`` line in the reply) -- persist
+    a user-approved tip to long-term memory (:func:`agent.memory.add_tip`);
+    the system prompt requires explicit user approval of the exact wording.
+
+The turn ends when a reply carries no tool token, or the per-turn tool budget
+(``cfg.debrief_max_tool_calls``, shared by all tools) is exhausted.
 
 Persistence: every debrief is a real NAMS conversation with session id
 ``debrief-<uuid>``. After its first message exists, the ``Conversation`` node
@@ -195,6 +204,7 @@ class DebriefSession:
             )
             self._msg_index.append({
                 "n": len(self._msg_index),
+                "id": str(m.get("id")),
                 "kind": _msg_kind(m),
                 "action": game_io.parse_action(content),
                 "content": content,
@@ -278,6 +288,9 @@ class DebriefSession:
         # window (persisted above), so don't repeat it verbatim here.
         prompt_text = "Answer the newest user message in the debrief conversation above."
         tool_calls = 0
+        # Accumulated [SEARCH] result blocks for this turn (fed back into
+        # every subsequent generation of the turn).
+        search_notes: list[str] = []
         try:
             while True:
                 recent = self._run(
@@ -289,6 +302,7 @@ class DebriefSession:
                 messages = modes.build_debrief_messages(
                     self._trace_block + "\n" + self._cursor_line(),
                     recent, current, prompt_text,
+                    search_results="\n\n".join(search_notes) or None,
                 )
                 raw = self.model.generate(
                     messages,
@@ -308,45 +322,90 @@ class DebriefSession:
                 )
 
                 moved = False
+                tip_saved = None
                 if call is not None:
-                    target, reason = self._resolve_tool_target(call)
-                    found = target is not None
-                    self._run(
-                        self.client.reasoning.record_tool_call(
-                            step_node.id, call["tool"],
-                            {k: v for k, v in call.items() if k != "tool"},
-                            result={"found": found, "message": target},
-                        )
-                    )
                     tool_calls += 1
-                    if found:
-                        moved = True
-                        self._cursor = target
-                        current = self._message_block(target)
-                        if current.get("snapshot_id"):
-                            self._run(
-                                image_store.link_snapshot_to_message(
-                                    self.client, assistant_msg.id,
-                                    current["snapshot_id"], role="observation",
+                    tool = call["tool"]
+                    if tool == "SEARCH":
+                        note = self._search(call["query"])
+                        search_notes.append(note)
+                        self._record_tool(
+                            step_node, call, {"result_chars": len(note)}
+                        )
+                        prompt_text = (
+                            f"(Continuing your reply to: {question}\n"
+                            f"Your [SEARCH {call['query']}] results are in "
+                            "your context above. Recorded-message hits are "
+                            "labeled with their message numbers -- use "
+                            "[SHOW n] to inspect one. Continue your "
+                            "analysis; emit another tool token or finish "
+                            "your answer.)"
+                        )
+                    elif tool == "WRITE_TIP":
+                        tip = call.get("tip")
+                        if tip:
+                            info = self._run(
+                                mem.add_tip(
+                                    self.client, tip,
+                                    source_session=self.play_session_id,
                                 )
                             )
-                        prompt_text = (
-                            f"(Continuing your reply to: {question}\n"
-                            f"Message {target} is now the current message: "
-                            "its recorded text, frame, and exact settings are "
-                            "in your context above. Continue your analysis; "
-                            "emit another tool token ([SHOW n], [NEXT], "
-                            "[BACK]) to inspect a different message, or "
-                            "finish your answer.)"
+                            tip_saved = info
+                            self._record_tool(step_node, call, info)
+                            prompt_text = (
+                                f"(Continuing your reply to: {question}\n"
+                                f"Your tip was saved to long-term memory as "
+                                f"[{info['category']}]. Confirm this to the "
+                                "user and finish your answer.)"
+                            )
+                        else:
+                            self._record_tool(
+                                step_node, call, {"error": "missing TIP: line"}
+                            )
+                            prompt_text = (
+                                f"(Continuing your reply to: {question}\n"
+                                "You emitted [WRITE_TIP] without a "
+                                "'TIP: <one line>' line, so nothing was "
+                                "saved. If the user has approved an exact "
+                                "wording, restate it on a line starting "
+                                "with 'TIP:' and end with [WRITE_TIP]; "
+                                "otherwise finish your answer.)"
+                            )
+                    else:  # SHOW / NEXT / BACK navigation
+                        target, reason = self._resolve_tool_target(call)
+                        found = target is not None
+                        self._record_tool(
+                            step_node, call,
+                            {"found": found, "message": target},
                         )
-                    else:
-                        prompt_text = (
-                            f"(Continuing your reply to: {question}\n"
-                            f"{reason} Remember: [SHOW n] retrieves recorded "
-                            "message n's text, frame, and exact settings. "
-                            "Continue your analysis; emit a valid tool token "
-                            "or finish your answer.)"
-                        )
+                        if found:
+                            moved = True
+                            self._cursor = target
+                            current = self._message_block(target)
+                            if current.get("snapshot_id"):
+                                self._run(
+                                    image_store.link_snapshot_to_message(
+                                        self.client, assistant_msg.id,
+                                        current["snapshot_id"], role="observation",
+                                    )
+                                )
+                            prompt_text = (
+                                f"(Continuing your reply to: {question}\n"
+                                f"Message {target} is now the current message: "
+                                "its recorded text, frame, and exact settings are "
+                                "in your context above. Continue your analysis; "
+                                "emit another tool token ([SHOW n], [NEXT], "
+                                "[BACK], [SEARCH <query>]) to inspect further, or "
+                                "finish your answer.)"
+                            )
+                        else:
+                            prompt_text = (
+                                f"(Continuing your reply to: {question}\n"
+                                f"{reason} Remember: [SHOW n] retrieves recorded "
+                                "message n's text, frame, and exact settings. "
+                                "Continue your analysis; emit a valid tool token "
+                                "or finish your answer.)"
+                            )
 
                 result = {
                     "kind": "debrief_generation",
@@ -355,6 +414,7 @@ class DebriefSession:
                     "text": text,
                     "tool_call": call,
                     "cursor": self._cursor,
+                    "tip_saved": tip_saved,
                     "frames": (
                         [current["path"]]
                         if moved and current and current.get("path") else []
@@ -480,6 +540,68 @@ class DebriefSession:
             "settings_json": frame.get("settings_json") if frame else None,
             "snapshot_id": frame.get("id") if frame else None,
         }
+
+    def _record_tool(
+        self, step_node: Any, call: dict[str, Any], result: dict[str, Any]
+    ) -> None:
+        """Record one tool call on the current reasoning step."""
+        self._run(
+            self.client.reasoning.record_tool_call(
+                step_node.id, call["tool"],
+                {k: v for k, v in call.items() if k != "tool"},
+                result=result,
+            )
+        )
+
+    #: How much of a recorded message to quote in a search-result line -- a
+    #: snippet is enough to decide whether it is worth a full [SHOW n].
+    _SEARCH_SNIPPET_CHARS = 200
+
+    def _search(self, query: str) -> str:
+        """Run one debrief [SEARCH]: semantic search over THIS play session's
+        recorded messages (labeled with their [SHOW n] numbers, clearly marked
+        as NOT the current message) plus the general memory search (long-term
+        semantic model + past reasoning; episodic messages are covered by the
+        session block, so the general block skips that tier). Returns one
+        formatted note for the turn's accumulated search results."""
+        id_to_n = {e["id"]: e["n"] for e in self._msg_index if e.get("id")}
+        hits = self._run(
+            mem.search_session_messages(
+                self.client, query, self.play_session_id,
+                allowed_ids=set(id_to_n),
+                top_k=self.cfg.memory_search_top_k,
+            )
+        )
+        lines: list[str] = []
+        if hits:
+            lines.append(
+                "Matching messages from the RECORDED play session (these are "
+                "NOT the current message; use [SHOW n] to inspect one in "
+                "full, with its frame and settings):"
+            )
+            for h in hits:
+                e = self._msg_index[id_to_n[str(h.id)]]
+                desc = (
+                    f"move: {e['action']}" if e["action"]
+                    else (e["kind"] or "commentary") + ", no move"
+                )
+                snippet = e["content"][: self._SEARCH_SNIPPET_CHARS]
+                if len(e["content"]) > self._SEARCH_SNIPPET_CHARS:
+                    snippet += "..."
+                lines.append(f"  #{e['n']} ({desc}): \"{snippet}\"")
+        else:
+            lines.append(
+                "No recorded messages of this play session matched the query."
+            )
+        general = self._run(
+            mem.search_memory(
+                self.client, query, tiers=("semantic", "reasoning"),
+                top_k=self.cfg.memory_search_top_k, scrub=False,
+            )
+        )
+        lines.append("General memory search results (tips, past reasoning):")
+        lines.append(general)
+        return modes.format_search_note(query, "\n".join(lines))
 
     def _cursor_line(self) -> str:
         """The 'Current message' line for the prompt context."""

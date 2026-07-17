@@ -49,8 +49,12 @@ class RegexStopCriteria(StoppingCriteria):
     """
 
     #: How many of the most recent generated tokens to decode per check. Sized
-    #: generously so a junk-padded call (e.g. ``[SHOW: step 42 ]``) still fits.
-    TAIL_TOKENS = 16
+    #: generously so a junk-padded call (e.g. ``[SHOW: step 42 ]``) or a
+    #: multi-word ``[SEARCH ...]`` query still fits entirely in the window --
+    #: if the opening ``[SEARCH`` scrolled out of the decoded tail before the
+    #: closing ``]`` arrived, the pattern would never match and generation
+    #: would run on.
+    TAIL_TOKENS = 48
 
     def __init__(self, pattern: str | re.Pattern, tokenizer: Any, prompt_len: int):
         self.pattern = re.compile(pattern) if isinstance(pattern, str) else pattern

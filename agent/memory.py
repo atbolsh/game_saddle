@@ -372,6 +372,208 @@ async def get_game_context(
     return "\n\n".join(parts)
 
 
+# ------------------------------------------------------- agent-driven search
+#
+# Backing for the agent's [SEARCH <query>] tool. Unlike ``get_context`` (which
+# NAMS assembles as one opaque fan-out), each tier is queried through its own
+# NAMS search API so modes can scope what the agent may see: play gets only
+# the long-term semantic model + reasoning tiers; privileged modes also get
+# episodic messages. Method names verified against neo4j-agent-memory >= 0.5
+# (memory/{long_term,reasoning,short_term}.py): ``search_entities``,
+# ``search_preferences``, ``search_steps``, ``get_similar_traces``,
+# ``search_messages``.
+
+SEARCH_TIERS = ("semantic", "reasoning", "messages")
+
+
+def _fmt_similarity(obj: Any) -> str:
+    sim = None
+    meta = getattr(obj, "metadata", None)
+    if isinstance(meta, dict):
+        sim = meta.get("similarity")
+    if sim is None:
+        sim = getattr(obj, "similarity", None)
+    return f" (relevance {float(sim):.2f})" if sim is not None else ""
+
+
+async def _search_semantic_tier(client: Any, query: str, top_k: int) -> list[str]:
+    lines: list[str] = []
+    entities = await client.long_term.search_entities(query, limit=top_k)
+    if entities:
+        lines.append("Entities:")
+        for e in entities:
+            lines.append(
+                f"  - {e.name} ({e.type}): {getattr(e, 'description', '') or ''}"
+                f"{_fmt_similarity(e)}"
+            )
+    prefs = await client.long_term.search_preferences(query, limit=top_k)
+    if prefs:
+        lines.append("Preferences / tips:")
+        for p in prefs:
+            lines.append(
+                f"  - [{p.category}] {p.preference}{_fmt_similarity(p)}"
+            )
+    return lines
+
+
+async def _search_reasoning_tier(client: Any, query: str, top_k: int) -> list[str]:
+    lines: list[str] = []
+    # Step-level search: past *thoughts* on similar situations, each paired
+    # with its parent task/outcome. Failures included on purpose -- a wrong
+    # past decision is exactly what a searching agent may need to see.
+    steps = await client.reasoning.search_steps(
+        query, limit=top_k, success_only=False
+    )
+    if steps:
+        lines.append("Past reasoning steps (with their task and outcome):")
+        for s in steps:
+            step = s.step
+            outcome = s.parent_outcome or "(trace unfinished)"
+            success = s.parent_success
+            lines.append(
+                f"  - thought: {step.thought or ''}"
+                + (f" | action: {step.action}" if step.action else "")
+                + f" | task: {s.parent_task} | outcome: {outcome}"
+                + ("" if success is None else f" | success: {success}")
+                + f" (relevance {float(s.similarity):.2f})"
+            )
+    traces = await client.reasoning.get_similar_traces(
+        query, limit=top_k, success_only=False
+    )
+    if traces:
+        lines.append("Similar past reasoning traces:")
+        for t in traces:
+            lines.append(
+                f"  - task: {t.task} | outcome: {getattr(t, 'outcome', None)}"
+                f" | success: {getattr(t, 'success', None)}"
+            )
+    return lines
+
+
+async def _search_messages_tier(
+    client: Any, query: str, top_k: int, scrub: bool
+) -> list[str]:
+    msgs = await client.short_term.search_messages(query, limit=top_k)
+    lines: list[str] = []
+    if msgs:
+        lines.append("Past conversation messages (any session):")
+        for m in msgs:
+            lines.append(f"  - {_format_message_line(m, scrub=scrub)}{_fmt_similarity(m)}")
+    return lines
+
+
+async def search_memory(
+    client: Any,
+    query: str,
+    tiers: tuple[str, ...] = SEARCH_TIERS,
+    top_k: int = 5,
+    scrub: bool = True,
+) -> str:
+    """Run the agent's [SEARCH] tool: query each requested memory tier through
+    its own NAMS search API and return one formatted text block.
+
+    ``tiers`` is a subset of :data:`SEARCH_TIERS`:
+      * ``semantic``  -- long-term Entity + Preference (tips) search
+      * ``reasoning`` -- past reasoning steps + similar traces
+      * ``messages``  -- episodic message search across ALL conversations
+        (privileged modes only)
+
+    With ``scrub=True`` message contents are stripped of settings-leaking
+    fields (mode-1 privacy invariant). A tier whose search *errors* degrades
+    visibly: WARNING log + an explicit failure line in the returned block --
+    never a silent empty section (no-fuzzy-fallbacks).
+    """
+    unknown = set(tiers) - set(SEARCH_TIERS)
+    if unknown:
+        raise ValueError(f"Unknown search tiers: {sorted(unknown)}")
+
+    sections: list[str] = []
+    for tier in tiers:
+        try:
+            if tier == "semantic":
+                lines = await _search_semantic_tier(client, query, top_k)
+            elif tier == "reasoning":
+                lines = await _search_reasoning_tier(client, query, top_k)
+            else:
+                lines = await _search_messages_tier(client, query, top_k, scrub)
+        except Exception as exc:
+            logger.warning("memory search tier %r failed: %s", tier, exc)
+            lines = [f"(search of the {tier!r} memory tier FAILED: {exc})"]
+        if scrub:
+            lines = [_strip_settings_from_text(line) for line in lines]
+        sections.extend(lines)
+
+    result = "\n".join(sections) if sections else "(no results)"
+    run_logging.log_db_retrieval(
+        function="search_memory",
+        arguments={"query": query, "tiers": list(tiers), "top_k": top_k},
+        result=result,
+    )
+    return result
+
+
+async def search_session_messages(
+    client: Any, query: str, session_id: str, allowed_ids: set[str], top_k: int = 5
+) -> list[Any]:
+    """Semantic search over ONE session's messages, for the debrief's
+    [SEARCH] tool (finding recorded play messages worth [SHOW]ing).
+
+    NAMS ``search_messages`` *advertises* a ``session_id`` filter but the
+    bolt implementation ignores it (``SEARCH_MESSAGES_BY_EMBEDDING`` carries
+    no session predicate) -- relying on it would fuzzily return other
+    sessions' messages. We pass it anyway (harmless now, honored if upstream
+    fixes it) and then post-filter EXACTLY against ``allowed_ids``, the known
+    message ids of the target session. Over-fetch so the filter still leaves
+    up to ``top_k`` survivors.
+    """
+    fetch = max(top_k * 10, 50)
+    msgs = await client.short_term.search_messages(
+        query, session_id=session_id, limit=fetch
+    )
+    hits = [m for m in (msgs or []) if str(m.id) in allowed_ids][:top_k]
+    run_logging.log_db_retrieval(
+        function="search_session_messages",
+        arguments={"query": query, "session_id": session_id, "top_k": top_k},
+        result=[str(m.id) for m in hits],
+    )
+    return hits
+
+
+# --------------------------------------------------------------------- tips
+
+async def add_tip(client: Any, tip: str, source_session: str | None = None) -> dict[str, Any]:
+    """Persist a user-approved tip as a long-term ``Preference`` node so it is
+    immediately searchable/retrievable in every mode (play's ``get_context``
+    recalls Preference nodes semantically).
+
+    Categories follow the seeded ``tip_*`` convention with a running index
+    (``tip_learned_1``, ``tip_learned_2``, ...) so each learned tip keeps its
+    own category (NAMS dedups near-identical preferences within a category).
+    """
+    tip = tip.strip()
+    if not tip:
+        raise ValueError("Refusing to store an empty tip.")
+    rows = await client.query.cypher(
+        "MATCH (p:Preference) WHERE p.category STARTS WITH 'tip_learned_' "
+        "RETURN count(p) AS n",
+        {},
+    )
+    n = int(dict(rows[0]).get("n", 0)) + 1 if rows else 1
+    category = f"tip_learned_{n}"
+    context = f"learned in debrief of session {source_session}" if source_session else None
+    pref = await client.long_term.add_preference(
+        category=category, preference=tip, context=context
+    )
+    info = {"category": category, "tip": tip, "preference_id": str(pref.id)}
+    logger.info("Tip saved: [%s] %s", category, tip)
+    run_logging.log_db_retrieval(
+        function="add_tip",
+        arguments={"tip": tip, "source_session": source_session},
+        result=info,
+    )
+    return info
+
+
 async def get_semantic_model(client: Any) -> str:
     """Return the full curated long-term semantic model (all ``Entity`` +
     ``Preference`` nodes) as a formatted string.

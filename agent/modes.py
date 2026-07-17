@@ -26,12 +26,30 @@ from .model import get_model
 logger = logging.getLogger(__name__)
 
 
-SYSTEM_PROMPT_GAME = (
-    "You are an agent playing a 2D discrete game on a 224x224 board. You see "
-    "the current game screen as an image. The board is the unit square "
-    "framed by four boundary walls; there is exactly one gold piece (small "
-    "yellow circle). You are the green circle with a red eye showing the "
-    "direction you are facing. Your goal is to collect the gold.\n\n"
+# ------------------------------------------------------------ prompt blocks
+#
+# System prompts are COMPOSED from the named blocks below (see
+# .cursor/rules/prompt-composition.mdc): a concept shared by two or more modes
+# lives in exactly ONE block, and each SYSTEM_PROMPT_* is a "\n\n".join of
+# blocks plus at most a short mode-specific paragraph. Fixing a fact in its
+# block fixes every mode that uses it.
+
+_SENT_GAME_INTRO = "You are an agent playing a 2D discrete game on a 224x224 board."
+_SENT_GAME_SCREEN = "You see the current game screen as an image."
+_SENT_GAME_WORLD = (
+    "The board is the unit square framed by four boundary walls; there is "
+    "exactly one gold piece (small yellow circle). You are the green circle "
+    "with a red eye showing the direction you are facing."
+)
+
+_BLOCK_GAME_INTRO = " ".join([
+    _SENT_GAME_INTRO,
+    _SENT_GAME_SCREEN,
+    _SENT_GAME_WORLD,
+    "Your goal is to collect the gold.",
+])
+
+_BLOCK_MOVE_TOKENS = (
     "You make moves by emitting exactly one of these move tokens:\n"
     "  [CLOCK]     - turn clockwise by pi/30 (rotate in place)\n"
     "  [ANTICLOCK] - turn counter-clockwise by pi/30 (rotate in place)\n"
@@ -40,7 +58,10 @@ SYSTEM_PROMPT_GAME = (
     "IMPORTANT: ONLY those exact bracketed tokens trigger a move. Talking about "
     "moving in prose (e.g. writing the word 'forward') does NOTHING. You may "
     "reason in plain prose as much as you like; nothing happens until you emit "
-    "a bracketed move token, so emit one only when you truly intend that move.\n\n"
+    "a bracketed move token, so emit one only when you truly intend that move."
+)
+
+_BLOCK_MULTI_MOVE_TURN = (
     "The instant you emit a move token it is executed, the screen is "
     "re-rendered, and you are shown the updated screen and asked for your next "
     "move. So a turn is a sequence of moves -- reason, emit one move token, see "
@@ -53,7 +74,10 @@ SYSTEM_PROMPT_GAME = (
     "NOTE: the default mode is to try to solve the game (get the gold), which is "
     "what the user usually asks for. However, you may instead be asked questions "
     "about the game; in that case answer in prose, and avoid using move tokens "
-    "unless it is very apparent that the user is asking you to play.\n\n"
+    "unless it is very apparent that the user is asking you to play."
+)
+
+_BLOCK_HOW_TO_PLAY = (
     "HOW TO PLAY -- take this reasoning step before every move. First REASON, in "
     "a sentence or two, about where the gold is relative to your red eye: the eye "
     "points in the direction you face, and [FORWARD] sends you straight that way. "
@@ -64,7 +88,10 @@ SYSTEM_PROMPT_GAME = (
     "rotating that way (or reverse if you overshoot) until your eye lines up with "
     "the gold -- then emit [FORWARD].\n"
     "Always state this reasoning before the move token; reasoning first, then a "
-    "single move, is how you decide well.\n\n"
+    "single move, is how you decide well."
+)
+
+_BLOCK_CURRENT_SCREEN = (
     "DO NOT just copy prior observations from your memories. Make sure you "
     "evaluate whether you are facing the gold *right now*. Your memories "
     "describe PAST screens; every move changes the screen, so re-derive where "
@@ -72,36 +99,96 @@ SYSTEM_PROMPT_GAME = (
     "every single move."
 )
 
-SYSTEM_PROMPT_REFLECT = (
-    "You are an agent playing a 2D discrete game on a 224x224 board. The board "
-    "is the unit square framed by four boundary walls; there is exactly one "
-    "gold piece (small yellow circle). You are the green circle with a red eye "
-    "showing the direction you are facing.\n\n"
-    "This is NOT a move request. This is a REFLECTION pause: you have made many "
-    "moves without collecting the gold, so you must stop, look at the CURRENT "
-    "screen with fresh eyes, and re-examine your plan before continuing. Your "
-    "recent reasoning may have been repeating itself without checking the "
-    "screen; assume nothing you previously said is still true.\n\n"
-    "Study the CURRENT image and answer, concretely and honestly:\n"
-    "1. Am I *certain* that I was never facing the gold at any point during my "
-    "recent moves? Each rotation is 6 degrees, so 30 rotations sweep 180 "
-    "degrees -- could my eye have swept past the gold without me noticing?\n"
-    "2. Am I possibly facing it now? Describe where the red eye points and "
-    "where the gold is in the CURRENT image, not from memory.\n"
-    "3. Am I still turning in the right direction? Would reversing direction, "
-    "or simply going FORWARD, get my eye onto the gold faster?\n\n"
-    "Do NOT emit any move token ([CLOCK]/[ANTICLOCK]/[FORWARD]) in this reply "
-    "-- it would not be executed. End with the single move you intend to make "
-    "next and why; you will act on it when the next screen is shown."
+
+def _search_tool_block(scope_note: str) -> str:
+    """The [SEARCH <query>] tool description, shared by every mode that gets
+    the tool; ``scope_note`` is the one sentence that varies by mode (what the
+    search covers)."""
+    return (
+        "MEMORY SEARCH: you can search your memory on your own. To do so, end "
+        "your reply with exactly one search token:\n"
+        "  [SEARCH <query>] - e.g. [SEARCH tips about facing the gold]\n"
+        + scope_note + " "
+        "The results will be placed in your context and you will be asked to "
+        "continue your reply. Emit at most one search token per reply, at the "
+        "very end, with nothing after it. Searching is never a substitute for "
+        "looking at the current information in front of you."
+    )
+
+
+_SEARCH_SCOPE_PLAY = (
+    "The search covers your long-term knowledge of the game (entities and "
+    "saved tips) and your past reasoning."
+)
+_SEARCH_SCOPE_FULL = (
+    "The search covers your long-term knowledge of the game (entities and "
+    "saved tips), your past reasoning, and past conversation messages."
 )
 
-SYSTEM_PROMPT_DISCUSS = (
-    "You are an agent that plays a 2D discrete game and is also able to "
-    "discuss it openly with the user. You have full access to your memory "
-    "database (conversations, the game's semantic model, and your past "
-    "reasoning traces). Be concise and helpful. You are not seeing a live "
-    "game screen in this mode; rely on memory and the user's description."
+_BLOCK_TIP_TOOL = (
+    "SAVING TIPS: you can permanently save a one-line tip to long-term memory "
+    "-- it becomes retrievable in every future mode, including live play. To "
+    "save one, put the exact tip on its own line in the form 'TIP: <one line>' "
+    "and end your reply with the token [WRITE_TIP].\n"
+    "The tool itself is tightly controlled. You MAY suggest a tip on your own "
+    "initiative if you feel strongly that a lesson is worth keeping -- but a "
+    "suggestion is just prose: propose the EXACT one-line wording and ask the "
+    "user whether to save it. The final decision always belongs to the user, "
+    "who may accept, reject, or reword it. Only after the user has approved "
+    "that exact wording in this conversation do you emit the TIP: line "
+    "followed by [WRITE_TIP]. Never emit [WRITE_TIP] without such an explicit "
+    "approval; if the wording changed after the approval, ask again before "
+    "saving."
 )
+
+
+# --------------------------------------------------------- composed prompts
+
+SYSTEM_PROMPT_GAME = "\n\n".join([
+    _BLOCK_GAME_INTRO,
+    _BLOCK_MOVE_TOKENS,
+    _BLOCK_MULTI_MOVE_TURN,
+    _BLOCK_HOW_TO_PLAY,
+    _BLOCK_CURRENT_SCREEN,
+    _search_tool_block(_SEARCH_SCOPE_PLAY),
+])
+
+SYSTEM_PROMPT_REFLECT = "\n\n".join([
+    " ".join([_SENT_GAME_INTRO, _SENT_GAME_WORLD]),
+    (
+        "This is NOT a move request. This is a REFLECTION pause: you have made many "
+        "moves without collecting the gold, so you must stop, look at the CURRENT "
+        "screen with fresh eyes, and re-examine your plan before continuing. Your "
+        "recent reasoning may have been repeating itself without checking the "
+        "screen; assume nothing you previously said is still true."
+    ),
+    (
+        "Study the CURRENT image and answer, concretely and honestly:\n"
+        "1. Am I *certain* that I was never facing the gold at any point during my "
+        "recent moves? Each rotation is 6 degrees, so 30 rotations sweep 180 "
+        "degrees -- could my eye have swept past the gold without me noticing?\n"
+        "2. Am I possibly facing it now? Describe where the red eye points and "
+        "where the gold is in the CURRENT image, not from memory.\n"
+        "3. Am I still turning in the right direction? Would reversing direction, "
+        "or simply going FORWARD, get my eye onto the gold faster?"
+    ),
+    (
+        "Do NOT emit any move token ([CLOCK]/[ANTICLOCK]/[FORWARD]) in this reply "
+        "-- it would not be executed. End with the single move you intend to make "
+        "next and why; you will act on it when the next screen is shown."
+    ),
+])
+
+SYSTEM_PROMPT_DISCUSS = "\n\n".join([
+    (
+        "You are an agent that plays a 2D discrete game and is also able to "
+        "discuss it openly with the user. You have full access to your memory "
+        "database (conversations, the game's semantic model, and your past "
+        "reasoning traces). Be concise and helpful. You are not seeing a live "
+        "game screen in this mode; rely on memory and the user's description."
+    ),
+    _search_tool_block(_SEARCH_SCOPE_FULL),
+])
 
 SYSTEM_PROMPT_EVAL = (
     "You are evaluating how well an earlier instance of yourself played a "
@@ -168,6 +255,7 @@ def _build_game_messages(
     context: str,
     question: str,
     reflection: str | None = None,
+    search_results: str | None = None,
 ) -> list[dict]:
     user_text = []
     if context:
@@ -180,6 +268,16 @@ def _build_game_messages(
                     "Your latest self-reflection (you wrote this after pausing "
                     "to re-examine the board; trust it over older, repetitive "
                     "memories):\n" + reflection
+                ),
+            }
+        )
+    if search_results:
+        user_text.append(
+            {
+                "type": "text",
+                "text": (
+                    "Results of the memory search(es) you ran while composing "
+                    "this reply:\n" + search_results
                 ),
             }
         )
@@ -408,12 +506,41 @@ async def mode_game(
                 client, session_id, query=query,
                 recent_window=cfg.recent_messages_window,
             )
-            messages = _build_game_messages(
-                SYSTEM_PROMPT_GAME, snapshot_before_path, ctx, question,
-                reflection=last_reflection,
-            )
-            raw = model.generate(messages, stop_strings=game_io.MOVE_STOP_STRINGS)
-            action = game_io.parse_action(raw)
+
+            # Inner [SEARCH] loop: the model may spend up to
+            # cfg.memory_search_max_calls searches before this step's move /
+            # answer. Each search's results are fed back and the step is
+            # regenerated; searches are recorded on the turn trace below
+            # (after the trace exists).
+            search_notes: list[str] = []
+            searches: list[dict[str, str]] = []
+            while True:
+                messages = _build_game_messages(
+                    SYSTEM_PROMPT_GAME, snapshot_before_path, ctx, question,
+                    reflection=last_reflection,
+                    search_results="\n\n".join(search_notes) or None,
+                )
+                over_budget = len(searches) >= cfg.memory_search_max_calls
+                raw = model.generate(
+                    messages,
+                    stop_strings=game_io.MOVE_STOP_STRINGS,
+                    # Once the budget is spent the stop pattern is dropped, so
+                    # a stray [SEARCH] is inert prose instead of a stall.
+                    stop_regex=None if over_budget else SEARCH_TOOL_PATTERN,
+                )
+                kind, payload, text = classify_move_or_search(raw)
+                if kind != "search" or over_budget:
+                    break
+                results = await mem.search_memory(
+                    client, payload, tiers=("semantic", "reasoning"),
+                    top_k=cfg.memory_search_top_k, scrub=True,
+                )
+                search_notes.append(format_search_note(payload, results))
+                searches.append({"query": payload, "results": results, "thought": text})
+                if len(searches) >= cfg.memory_search_max_calls:
+                    search_notes.append(SEARCH_BUDGET_NOTE)
+                logger.info("step %d: [SEARCH %s]", steps, payload)
+            action = game_io.parse_action(raw) if kind == "move" else None
 
             if action:
                 gold_collected = game_io.apply_action(game, action)
@@ -434,6 +561,10 @@ async def mode_game(
                 trace = await mem.start_turn_trace(
                     client, session_id, task=question,
                     triggered_by_message_id=turn["user_msg_id"],
+                )
+            for s in searches:
+                await record_search_tool_call(
+                    client, trace, s["thought"], s["query"], s["results"]
                 )
             await mem.add_reasoning_step(
                 client, trace, thought=raw, action=action, gold_collected=gold_collected
@@ -537,19 +668,49 @@ async def mode_discuss(
         metadata={"kind": "discussion"},
     )
 
-    messages = [
-        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT_DISCUSS}]},
-        {"role": "user", "content": [
+    # [SEARCH] loop: this privileged mode searches ALL tiers, unscrubbed.
+    search_notes: list[str] = []
+    n_searches = 0
+    while True:
+        content: list[dict[str, str]] = [
             {"type": "text", "text": f"Memory context:\n{context_block}"},
-            {"type": "text", "text": f"User: {user_text}"},
-        ]},
-    ]
-    reply = model.generate(messages)
+        ]
+        if search_notes:
+            content.append({
+                "type": "text",
+                "text": (
+                    "Results of the memory search(es) you ran while composing "
+                    "this reply:\n" + "\n\n".join(search_notes)
+                ),
+            })
+        content.append({"type": "text", "text": f"User: {user_text}"})
+        messages = [
+            {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT_DISCUSS}]},
+            {"role": "user", "content": content},
+        ]
+        over_budget = n_searches >= cfg.memory_search_max_calls
+        reply = model.generate(
+            messages,
+            stop_regex=None if over_budget else SEARCH_TOOL_PATTERN,
+        )
+        query, _ = parse_search_call(reply)
+        if query is None or over_budget:
+            break
+        results = await mem.search_memory(
+            client, query, tiers=mem.SEARCH_TIERS,
+            top_k=cfg.memory_search_top_k, scrub=False,
+        )
+        search_notes.append(format_search_note(query, results))
+        n_searches += 1
+        if n_searches >= cfg.memory_search_max_calls:
+            search_notes.append(SEARCH_BUDGET_NOTE)
+        logger.info("discuss: [SEARCH %s]", query)
+
     await client.short_term.add_message(
         session_id=session_id, role="assistant", content=reply,
         metadata={"kind": "discussion"},
     )
-    return {"session_id": session_id, "reply": reply}
+    return {"session_id": session_id, "reply": reply, "searches": n_searches}
 
 
 # --------------------------------------------------------------- mode 3
@@ -720,13 +881,16 @@ async def _fetch_session_traces(client: Any, session_id: str) -> list[dict[str, 
 # player saw + its settings). See :class:`agent.debrief.DebriefSession` for
 # the session/loop machinery.
 
-SYSTEM_PROMPT_DEBRIEF = (
-    "You are reviewing a RECORDED session of a 2D discrete game. The session "
-    "was played by an earlier instance of YOU; you have NO memory of playing "
-    "it. Everything you know about it comes from the recorded materials in "
-    "your context and from the tools below. The user may say 'you' meaning "
-    "the player -- do not get defensive, and NEVER claim you lack access to "
-    "the play: retrieve the recorded message with a tool instead.\n\n"
+_BLOCK_REVIEWER_STANCE = (
+    "The session was played by an earlier instance of YOU; you have NO memory "
+    "of playing it. Everything you know about it comes from the recorded "
+    "materials in your context and from the tools below. The user may say "
+    "'you' meaning the player -- do not get defensive, and NEVER claim you "
+    "lack access to the play: retrieve the recorded material with a tool "
+    "instead."
+)
+
+_BLOCK_PRIVILEGED_VIEW = (
     "The board is the unit square [0,1]x[0,1] framed by four boundary walls; "
     "the agent is the green circle with a red eye showing its facing "
     "direction; the gold is a small yellow circle. During play the player "
@@ -735,14 +899,10 @@ SYSTEM_PROMPT_DEBRIEF = (
     "walls). Be precise and quantitative: compute angles and distances from "
     "the settings rather than eyeballing the image. NEVER state settings "
     "values you have not actually seen for that exact message -- fetch the "
-    "message first.\n\n"
-    "HOW THE RECORD IS ORGANIZED: the player's messages are numbered from 0 "
-    "(see the 'Current message' line in your context for the valid range). "
-    "Most messages end in a move token ([CLOCK]/[ANTICLOCK]/[FORWARD]); "
-    "reflection messages (no move) occur roughly every 30 moves -- to find "
-    "one, [SHOW] a multiple of 30 and step with [NEXT]/[BACK] until you hit "
-    "it. The user instruction the player was answering is always shown "
-    "separately in your context.\n\n"
+    "message first."
+)
+
+_BLOCK_GEOMETRY_PRIVILEGED = (
     "GEOMETRY (verified against the renderer -- trust this over intuition):\n"
     "  - 'direction' is theta in radians, kept in [0, 2*pi). The board's y "
     "axis points DOWNWARD on screen.\n"
@@ -755,7 +915,20 @@ SYSTEM_PROMPT_DEBRIEF = (
     "gold_x - agent_x) mod 2*pi. NO sign flip: both angles live in the same "
     "y-down convention.\n"
     "  - One [FORWARD] advances up to 1/16 of the board along "
-    "(cos theta, sin theta).\n\n"
+    "(cos theta, sin theta)."
+)
+
+_BLOCK_DEBRIEF_RECORD = (
+    "HOW THE RECORD IS ORGANIZED: the player's messages are numbered from 0 "
+    "(see the 'Current message' line in your context for the valid range). "
+    "Most messages end in a move token ([CLOCK]/[ANTICLOCK]/[FORWARD]); "
+    "reflection messages (no move) occur roughly every 30 moves -- to find "
+    "one, [SHOW] a multiple of 30 and step with [NEXT]/[BACK] until you hit "
+    "it. The user instruction the player was answering is always shown "
+    "separately in your context."
+)
+
+_BLOCK_DEBRIEF_NAV = (
     "TOOLS: you may inspect any recorded message. To navigate, end your "
     "reply with exactly one of these tokens:\n"
     "  [SHOW n] - jump to recorded message n (e.g. [SHOW 42])\n"
@@ -763,52 +936,283 @@ SYSTEM_PROMPT_DEBRIEF = (
     "  [BACK]   - go to the message before the current one\n"
     "That message's recorded text, the frame the player saw at that moment, "
     "and its exact settings will be placed in your context, and you will be "
-    "asked to continue. Emit at most one tool token per reply, at the very "
-    "end, with nothing after it. When you have what you need, reply normally "
-    "without a tool token to finish your answer.\n\n"
+    "asked to continue. You may also end your reply with a [SEARCH <query>] "
+    "token (described below) instead of a navigation token; its results "
+    "include matching recorded messages of THIS session, so searching is the "
+    "fast way to find a message worth [SHOW]ing. Emit at most one tool token "
+    "per reply, at the very end, with nothing after it. When you have what "
+    "you need, reply normally without a tool token to finish your answer."
+)
+
+_BLOCK_DEBRIEF_VERDICT = (
     "You may also be asked to produce a final structured verdict on the play "
     "(overall_score 0-10, strengths, weaknesses, per-move notes); do so only "
     "when asked."
 )
 
+SYSTEM_PROMPT_DEBRIEF = "\n\n".join([
+    "You are reviewing a RECORDED session of a 2D discrete game. "
+    + _BLOCK_REVIEWER_STANCE,
+    _BLOCK_PRIVILEGED_VIEW,
+    _BLOCK_DEBRIEF_RECORD,
+    _BLOCK_GEOMETRY_PRIVILEGED,
+    _BLOCK_DEBRIEF_NAV,
+    _search_tool_block(_SEARCH_SCOPE_FULL),
+    _BLOCK_TIP_TOOL,
+    _BLOCK_DEBRIEF_VERDICT,
+])
+
+
+# ------------------------------------------------- interactive self-eval
+#
+# Two prompts for the interactive self-eval notebook, both recompositions of
+# the blocks above (per .cursor/rules/prompt-composition.mdc): the scene
+# player is the play prompt scoped to a single generation over the current
+# scene; the scene analyst is the debrief prompt scoped to exactly one
+# recorded player message (no [SHOW]/[NEXT]/[BACK] navigation).
+
+_BLOCK_SCENE_SCOPE = (
+    "You are responsible for THIS situation only -- the single screen in "
+    "front of you, nothing before or after it. For *this situation*, usually "
+    "the user will ask for the best move. In that case, reason briefly and "
+    "answer with exactly ONE of the available move tokens; your reply ends "
+    "there (you will not see the result this turn). The user may instead ask "
+    "general questions, like 'are you facing the gold?' or 'is the gold to "
+    "your left?' In that case, answer the question in prose with NO move "
+    "token."
+)
+
+SYSTEM_PROMPT_SCENE_PLAY = "\n\n".join([
+    _BLOCK_GAME_INTRO,
+    _BLOCK_MOVE_TOKENS,
+    _BLOCK_SCENE_SCOPE,
+    _BLOCK_HOW_TO_PLAY,
+    _BLOCK_CURRENT_SCREEN,
+    _search_tool_block(_SEARCH_SCOPE_PLAY),
+])
+
+_BLOCK_RATING = (
+    "Say explicitly which parts of the player's response were correct and "
+    "which were incorrect, and END your final answer with a single overall "
+    "rating of the response on the scale -1.0 (completely wrong) to 1.0 "
+    "(completely right), on its own line in the form 'RATING: <number>'."
+)
+
+_BLOCK_SCENE_ANALYST_SCOPE = (
+    "Exactly ONE recorded player message is under review: the player's "
+    "latest reply, shown in your context together with the user question it "
+    "answered, the frame the player saw, and that frame's exact settings. "
+    "There is nothing else to navigate to. If the player's reply ends in a "
+    "move token, that move has NOT been applied yet -- you are judging the "
+    "decision, not its outcome."
+)
+
+SYSTEM_PROMPT_SCENE_ANALYST = "\n\n".join([
+    "You are reviewing ONE RECORDED reply from a 2D discrete game. "
+    + _BLOCK_REVIEWER_STANCE,
+    _BLOCK_PRIVILEGED_VIEW,
+    _BLOCK_GEOMETRY_PRIVILEGED,
+    _BLOCK_SCENE_ANALYST_SCOPE,
+    _search_tool_block(_SEARCH_SCOPE_FULL),
+    _BLOCK_RATING,
+])
+
+
+def build_scene_analyst_messages(
+    player_question: str,
+    player_reply: str,
+    pending_action: str | None,
+    frame_path: str | None,
+    settings_json: str | None,
+    recent: str,
+    question: str,
+    search_results: str | None = None,
+) -> list[dict]:
+    """Assemble one scene-analyst generation's prompt, mirroring
+    :func:`build_debrief_messages`' structure (pre-joined text blocks, then
+    the ONE frame, then settings + question) but scoped to a single recorded
+    player reply instead of a navigable session."""
+    scene = [
+        "The player was answering this user question: "
+        f"\"{player_question}\"",
+        "The player's reply under review (this EXACT reply -- the frame the "
+        "player saw and its exact settings follow):\n" + player_reply,
+    ]
+    if pending_action:
+        scene.append(
+            f"The reply ends in the move token [{pending_action}]. That move "
+            "has NOT been applied yet -- judge the decision on the frame "
+            "below."
+        )
+    else:
+        scene.append("The reply contains no move token (a prose answer).")
+    blocks = ["\n\n".join(scene)]
+    if recent:
+        blocks.append(
+            "Conversation so far, including earlier scenes and analyses "
+            "(most recent last):\n" + recent
+        )
+    if search_results:
+        blocks.append(
+            "Results of the memory search(es) you ran this turn:\n"
+            + search_results
+        )
+    if frame_path:
+        blocks.append("The image below is the frame the player saw.")
+    else:
+        blocks.append("(No frame was saved for this reply.)")
+
+    user_content: list[dict[str, Any]] = [
+        {"type": "text", "text": "\n\n".join(blocks)}
+    ]
+    tail: list[str] = []
+    if frame_path:
+        user_content.append({"type": "image", "url": frame_path})
+        if settings_json:
+            tail.append("Exact settings for this frame:\n" + settings_json)
+    tail.append(question)
+    user_content.append({"type": "text", "text": "\n\n".join(tail)})
+    return [
+        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT_SCENE_ANALYST}]},
+        {"role": "user", "content": user_content},
+    ]
+
 # One lenient matcher shared by the generation-time stop criteria and the
 # parser, so stopping and parsing can never disagree. The prompt teaches only
-# the canonical forms ([SHOW 42], [NEXT], [BACK]), but the model is a small
-# LLM and will occasionally mangle a call ([SHOW(42)], [SHOW: 42], [42 SHOW],
-# [ next ], ...). Leniency rules:
+# the canonical forms ([SHOW 42], [NEXT], [BACK], [SEARCH gold tips],
+# [WRITE_TIP]), but the model is a small LLM and will occasionally mangle a
+# call ([SHOW(42)], [SHOW: 42], [42 SHOW], [ next ], [SEARCH: ...], ...).
+# Leniency rules:
+#   - SEARCH: a bracket pair that STARTS with the word SEARCH (after \W
+#     padding); everything after it up to the closing bracket is the query.
+#     Listed FIRST so a query that happens to contain 'show 12' still parses
+#     as a search.
 #   - SHOW: any SINGLE bracket pair containing SHOW and a number, in either
 #     order, with arbitrary junk in between; the first number inside the
 #     brackets is the step.
-#   - NEXT/BACK: a bracket pair containing the word with only non-alphanumeric
-#     padding (\W) allowed -- deliberately TIGHTER than SHOW, because 'next'
-#     and 'back' are common English words and bracketed prose like
-#     '[the next frame]' must not fire a tool call.
+#   - NEXT/BACK/WRITE_TIP: a bracket pair containing the word with only
+#     non-alphanumeric padding (\W) allowed -- deliberately TIGHTER than SHOW,
+#     because 'next' and 'back' are common English words and bracketed prose
+#     like '[the next frame]' must not fire a tool call.
 # [^\[\]] / \W confine each match to one bracket pair, so stray brackets or
 # prose can neither trigger a stop nor corrupt a parse; an incomplete mangle
 # matches nothing and the reply simply ends the turn. Case-insensitivity is
 # inline ((?i)) so the SAME pattern string drives both this module's parser
 # and the generation-time RegexStopCriteria.
+
+# The SEARCH-call fragment, shared verbatim by the standalone search pattern
+# (play / discuss / scene modes) and the full debrief pattern.
+_SEARCH_CALL_FRAGMENT = r"\[\W*SEARCH\b[:\s]*(?P<search_query>[^\[\]]+?)\W*\]"
+
+SEARCH_TOOL_PATTERN = r"(?i)" + _SEARCH_CALL_FRAGMENT
+SEARCH_TOOL_RE = re.compile(SEARCH_TOOL_PATTERN)
+
 DEBRIEF_TOOL_PATTERN = (
     r"(?i)(?:"
-    r"\[(?=[^\[\]]*?SHOW)[^\[\]]*?(?P<show_step>\d+)[^\[\]]*?\]"
+    + _SEARCH_CALL_FRAGMENT +
+    r"|\[(?=[^\[\]]*?SHOW)[^\[\]]*?(?P<show_step>\d+)[^\[\]]*?\]"
     r"|\[\W*(?P<nav>NEXT|BACK)\W*\]"
+    r"|\[\W*(?P<write_tip>WRITE[\s_\-]*TIP)\W*\]"
     r")"
 )
 DEBRIEF_TOOL_RE = re.compile(DEBRIEF_TOOL_PATTERN)
+
+# The 'TIP: <one line>' line that must accompany a [WRITE_TIP] call. The LAST
+# such line in the reply is the tip (the model may quote earlier proposals).
+TIP_LINE_RE = re.compile(r"(?im)^\s*TIP\s*:\s*(?P<tip>.+?)\s*$")
+
+
+def parse_search_call(text: str) -> tuple[str | None, str]:
+    """Return ``(query, text)`` for the FIRST ``[SEARCH <query>]`` call in
+    ``text``, truncating the text right after the call (anything beyond it is
+    model-hallucinated tool output -- discard it). ``(None, text)`` if no
+    complete call is present."""
+    m = SEARCH_TOOL_RE.search(text)
+    if not m:
+        return None, text
+    query = m.group("search_query").strip()
+    return (query or None), text[: m.end()]
+
+
+def classify_move_or_search(raw: str) -> tuple[str, Any, str]:
+    """Classify one game-mode generation stopped on either a move token or a
+    search token. Returns ``(kind, payload, text)``:
+
+      * ``("search", query, truncated)`` -- the reply's first tool token is a
+        [SEARCH]; text is truncated right after it.
+      * ``("move", action, raw)``        -- the reply's first tool token is a
+        move token.
+      * ``("answer", None, raw)``        -- no tool token: a prose answer /
+        end of turn.
+
+    Generation stops at the FIRST matching token, so normally only one is
+    present; if both somehow are (e.g. the regex stop missed by a token or
+    two), the earlier one is the model's actual first decision and wins."""
+    search_m = SEARCH_TOOL_RE.search(raw)
+    move_m = game_io._MOVE_RE.search(raw)
+    if search_m and (move_m is None or search_m.start() < move_m.start()):
+        query = search_m.group("search_query").strip()
+        if query:
+            return "search", query, raw[: search_m.end()]
+    if move_m:
+        # parse_action takes the LAST move token; consistent here because
+        # generation stops at the first one.
+        return "move", game_io.parse_action(raw), raw
+    return "answer", None, raw
+
+
+def format_search_note(query: str, results: str) -> str:
+    """One formatted entry for the accumulated search-results block that is
+    fed back into the prompt after a [SEARCH] call -- the ONE presentation of
+    search output, shared by every mode."""
+    return f"[SEARCH {query}] returned:\n{results}"
+
+
+SEARCH_BUDGET_NOTE = (
+    "(Your memory-search budget for this reply is exhausted; do NOT search "
+    "again. Answer or move now, using the results you already have.)"
+)
+
+
+async def record_search_tool_call(
+    client: Any, trace: Any, thought: str, query: str, results: str
+) -> None:
+    """Record one [SEARCH] call on the turn's reasoning trace: the reply text
+    that requested it as the step's thought, the query as the tool arguments."""
+    if trace is None:
+        return
+    step = await client.reasoning.add_step(trace.id, thought=thought)
+    await client.reasoning.record_tool_call(
+        step.id, "SEARCH", {"query": query}, result={"result_chars": len(results)}
+    )
+
+
+def parse_tip_line(text: str) -> str | None:
+    """The tip wording from the last 'TIP: <one line>' line in ``text``, or
+    ``None`` if the reply carries no such line."""
+    matches = TIP_LINE_RE.findall(text)
+    return matches[-1].strip() if matches else None
 
 
 def parse_debrief_call(text: str) -> tuple[dict[str, Any] | None, str]:
     """Return ``(call, text)`` for the FIRST debrief tool call in ``text``,
     truncating the text right after the call (anything beyond it is
-    model-hallucinated tool output -- discard it). ``call`` is
-    ``{"tool": "SHOW", "step": n}`` or ``{"tool": "NEXT"}`` /
-    ``{"tool": "BACK"}``; ``(None, text)`` if no complete call is present."""
+    model-hallucinated tool output -- discard it). ``call`` is one of
+    ``{"tool": "SHOW", "step": n}``, ``{"tool": "NEXT"}``,
+    ``{"tool": "BACK"}``, ``{"tool": "SEARCH", "query": q}``, or
+    ``{"tool": "WRITE_TIP", "tip": t}`` (``t`` is None when the reply lacks
+    the required 'TIP:' line); ``(None, text)`` if no complete call is
+    present."""
     m = DEBRIEF_TOOL_RE.search(text)
     if not m:
         return None, text
     truncated = text[: m.end()]
+    if m.group("search_query") is not None:
+        return {"tool": "SEARCH", "query": m.group("search_query").strip()}, truncated
     if m.group("show_step") is not None:
         return {"tool": "SHOW", "step": int(m.group("show_step"))}, truncated
+    if m.group("write_tip") is not None:
+        return {"tool": "WRITE_TIP", "tip": parse_tip_line(truncated)}, truncated
     return {"tool": m.group("nav").upper()}, truncated
 
 
@@ -817,6 +1221,7 @@ def build_debrief_messages(
     recent: str,
     current: dict[str, Any] | None,
     question: str,
+    search_results: str | None = None,
 ) -> list[dict]:
     """Assemble one debrief generation's prompt as at most three content
     parts. Gemma's chat template concatenates adjacent text parts with NO
@@ -824,7 +1229,8 @@ def build_debrief_messages(
     instead of being emitted as separate parts:
 
       1. text  -- session trace + hanging player instruction + debrief
-                  recency window + the current message's header and text
+                  recency window + accumulated search results + the current
+                  message's header and text
       2. image -- the ONE frame the player saw at the current message
       3. text  -- that frame's exact settings + the question/continuation
 
@@ -833,7 +1239,8 @@ def build_debrief_messages(
     this mode is privileged). ``current``: the message under inspection from
     ``DebriefSession._message_block`` ({header, content, instruction, path,
     settings_json}); None when the session has no player messages.
-    ``question``: the user text or continuation nudge.
+    ``question``: the user text or continuation nudge. ``search_results``:
+    accumulated results of this turn's [SEARCH] calls, if any.
     """
     blocks = ["Recorded play session under analysis:\n" + trace_block]
     if current is not None:
@@ -843,6 +1250,11 @@ def build_debrief_messages(
         )
     if recent:
         blocks.append("Debrief conversation so far (most recent last):\n" + recent)
+    if search_results:
+        blocks.append(
+            "Results of the memory search(es) you ran this turn:\n"
+            + search_results
+        )
     if current is not None:
         cur_text = current["header"] + "\nRecorded message text:\n" + current["content"]
         if current.get("path"):

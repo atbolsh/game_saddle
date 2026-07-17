@@ -172,21 +172,49 @@ class InteractiveSession:
                 f"Emit your next move token, or finish your reply without a "
                 f"move token to end your turn.)"
             )
-        messages = modes._build_game_messages(
-            modes.SYSTEM_PROMPT_GAME, before_path, ctx, prompt_text,
-            reflection=reflection,
-        )
-        # Stop generation the instant a move token appears; apply it, then the
-        # next step re-generates on the freshly rendered frame. A reply with no
-        # move token means the model ended its turn (Gemma's native end-of-turn).
-        raw = self.model.generate(
-            messages,
-            max_new_tokens=self.cfg.gemma_max_new_tokens,
-            stop_strings=game_io.MOVE_STOP_STRINGS,
-        )
+        # Inner [SEARCH] loop: the model may spend up to
+        # cfg.memory_search_max_calls memory searches before this step's move
+        # or answer; each search's results are fed back and the step is
+        # regenerated. Play-mode scope: semantic + reasoning tiers only (no
+        # episodic messages), scrubbed -- the mode-1 privacy invariant.
+        search_notes: list[str] = []
+        searches: list[dict[str, str]] = []
+        while True:
+            messages = modes._build_game_messages(
+                modes.SYSTEM_PROMPT_GAME, before_path, ctx, prompt_text,
+                reflection=reflection,
+                search_results="\n\n".join(search_notes) or None,
+            )
+            over_budget = len(searches) >= self.cfg.memory_search_max_calls
+            # Stop generation the instant a move token appears; apply it, then
+            # the next step re-generates on the freshly rendered frame. A reply
+            # with no move token means the model ended its turn (Gemma's native
+            # end-of-turn). A [SEARCH] token likewise stops generation -- until
+            # the search budget is spent, after which the stop pattern is
+            # dropped so a stray [SEARCH] is inert prose instead of a stall.
+            raw = self.model.generate(
+                messages,
+                max_new_tokens=self.cfg.gemma_max_new_tokens,
+                stop_strings=game_io.MOVE_STOP_STRINGS,
+                stop_regex=None if over_budget else modes.SEARCH_TOOL_PATTERN,
+            )
+            kind, payload, text = modes.classify_move_or_search(raw)
+            if kind != "search" or over_budget:
+                break
+            results = self._run(
+                mem.search_memory(
+                    self.client, payload, tiers=("semantic", "reasoning"),
+                    top_k=self.cfg.memory_search_top_k, scrub=True,
+                )
+            )
+            search_notes.append(modes.format_search_note(payload, results))
+            searches.append({"query": payload, "results": results, "thought": text})
+            if len(searches) >= self.cfg.memory_search_max_calls:
+                search_notes.append(modes.SEARCH_BUDGET_NOTE)
+            logger.info("step %d: [SEARCH %s]", step, payload)
 
         # 4. Parse the move (if any) and apply it to the persistent game.
-        action = game_io.parse_action(raw)
+        action = game_io.parse_action(raw) if kind == "move" else None
         gold_collected = game_io.apply_action(self.game, action) if action else 0
 
         # 5. Persist the step's messages + snapshots (user message on step 0
@@ -211,6 +239,7 @@ class InteractiveSession:
             "before_path": turn["snapshot_before_path"],
             "after_path": turn["snapshot_after_path"],
             "user_msg_id": turn["user_msg_id"],
+            "searches": searches,
         }
 
     def _reflect(
@@ -294,6 +323,13 @@ class InteractiveSession:
                         mem.start_turn_trace(
                             self.client, self.session_id, task=question,
                             triggered_by_message_id=step_result["user_msg_id"],
+                        )
+                    )
+                for s in step_result.get("searches", []):
+                    self._run(
+                        modes.record_search_tool_call(
+                            self.client, trace, s["thought"], s["query"],
+                            s["results"],
                         )
                     )
                 self._run(

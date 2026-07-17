@@ -171,9 +171,21 @@ class AgentConfig:
     # Debrief (mode 4). The context always carries exactly ONE frame -- the
     # one the player saw at the current message; the model moves the cursor
     # via its [SHOW <n>] / [NEXT] / [BACK] tools, capped at
-    # ``debrief_max_tool_calls`` moves per ask() turn.
+    # ``debrief_max_tool_calls`` moves per ask() turn ([SEARCH] and
+    # [WRITE_TIP] calls share the same budget).
     debrief_max_tool_calls: int = field(
         default_factory=lambda: _env_int("DEBRIEF_MAX_TOOL_CALLS", 6)
+    )
+
+    # Agent-initiated [SEARCH <query>] memory searches. Outside debrief (which
+    # has its own shared tool budget above), a single turn may run at most
+    # ``memory_search_max_calls`` searches; each search returns at most
+    # ``memory_search_top_k`` results per memory tier.
+    memory_search_max_calls: int = field(
+        default_factory=lambda: _env_int("MEMORY_SEARCH_MAX_CALLS", 3)
+    )
+    memory_search_top_k: int = field(
+        default_factory=lambda: _env_int("MEMORY_SEARCH_TOP_K", 5)
     )
 
     # HuggingFace token (optional; some Gemma weights are gated)
