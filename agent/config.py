@@ -8,7 +8,9 @@ model, and the LLM is Gemma 4 E4B loaded through HuggingFace transformers.
 
 from __future__ import annotations
 
+import logging
 import os
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -16,6 +18,49 @@ from dotenv import load_dotenv
 
 # Best-effort .env load; tolerate absence.
 load_dotenv()
+
+
+# ------------------------------------------------------- third-party noise
+# Targeted suppression of KNOWN-benign third-party warnings. Every filter is
+# pinned to an exact message so that new, potentially meaningful warnings
+# still surface (per the no-fuzzy-fallbacks rule: silence nothing broadly).
+
+# NAMS's sentence-transformers wrapper calls a renamed accessor
+# (get_sentence_embedding_dimension); upstream's to fix, fires on every
+# client connect.
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=r"The `get_sentence_embedding_dimension` method has been renamed",
+)
+# huggingface_hub deprecation raised from inside transformers' snapshot
+# download; nothing in this repo passes resume_download.
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    message=r"The `resume_download` argument is deprecated",
+)
+
+
+class _DropNeo4jDeprecationNotifications(logging.Filter):
+    """Drop the Neo4j driver's DEPRECATION server notifications only.
+
+    NAMS still calls the deprecated ``db.index.vector.queryNodes`` procedure,
+    so every semantic retrieval spams four WARNING lines through the
+    ``neo4j.notifications`` logger -- upstream's to fix, pure noise here.
+    Other notification classes stay visible on purpose: the UNRECOGNIZED
+    label/property warnings are exactly the guard this repo wants against
+    typo'd Cypher schemas (they also fire, benignly and only once, on a
+    fresh/empty DB before any message exists).
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "'DEPRECATION'" not in record.getMessage()
+
+
+logging.getLogger("neo4j.notifications").addFilter(
+    _DropNeo4jDeprecationNotifications()
+)
 
 
 def _env(key: str, default: str) -> str:
