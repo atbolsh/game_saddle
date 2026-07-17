@@ -123,14 +123,10 @@ class AgentConfig:
         default_factory=lambda: _env_int("REFLECTION_THRESHOLD", 150)
     )
 
-    # Debrief (mode 4). ``debrief_max_frames`` recent snapshots are attached to
-    # each debrief question by default (the newest is the session's current
-    # state); the model can additionally pull up any recorded step's frames via
-    # its [SHOW <n>] / [NEXT] / [BACK] tools, capped at
-    # ``debrief_max_tool_calls`` fetches per ask() turn.
-    debrief_max_frames: int = field(
-        default_factory=lambda: _env_int("DEBRIEF_MAX_FRAMES", 3)
-    )
+    # Debrief (mode 4). The context always carries exactly ONE frame -- the
+    # one the player saw at the current message; the model moves the cursor
+    # via its [SHOW <n>] / [NEXT] / [BACK] tools, capped at
+    # ``debrief_max_tool_calls`` moves per ask() turn.
     debrief_max_tool_calls: int = field(
         default_factory=lambda: _env_int("DEBRIEF_MAX_TOOL_CALLS", 6)
     )

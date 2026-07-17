@@ -6,12 +6,15 @@
 the saved snapshot images AND the exact Settings JSON the player never saw.
 
 One :meth:`ask` is a *multi-generation turn*, mirroring play mode's structure:
-the model may end a reply with a ``[SHOW n]`` tool token to pull up any
-recorded step's frames (before/after images + exact settings); we stop
-generation at the token (generation-time regex stop -- see
-:class:`agent.model.RegexStopCriteria`), fetch the frames, and generate again
-on the enriched context. The turn ends when a reply carries no tool token, or
-the per-turn tool budget (``cfg.debrief_max_tool_calls``) is exhausted.
+a cursor points at one of the player's recorded messages (the "current
+message"), whose text + the ONE frame the player saw + exact settings are
+always in context, alongside the user instruction the player was answering.
+The model may end a reply with a ``[SHOW n]`` / ``[NEXT]`` / ``[BACK]`` tool
+token to move the cursor; we stop generation at the token (generation-time
+regex stop -- see :class:`agent.model.RegexStopCriteria`), swap the current
+message, and generate again. The turn ends when a reply carries no tool
+token, or the per-turn tool budget (``cfg.debrief_max_tool_calls``) is
+exhausted.
 
 Persistence: every debrief is a real NAMS conversation with session id
 ``debrief-<uuid>``. After its first message exists, the ``Conversation`` node
@@ -19,7 +22,7 @@ is marked ``kind='debrief'`` / ``debrief_of=<play sid>`` and linked to the
 analyzed play conversation via a ``DEBRIEF_OF`` edge -- so debriefs are
 excluded from the play-conversation picker (:meth:`list_conversations`) and
 visible as their own threads in the graph. Each :meth:`ask` records one
-reasoning trace (task = the question) with ``[SHOW]`` fetches as tool calls;
+reasoning trace (task = the question) with cursor moves as tool calls;
 fetched snapshots are linked to the assistant message with
 ``CAPTURED_STATE {role:'observation'}``.
 
@@ -38,6 +41,7 @@ on the calling thread, not the loop.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 from pathlib import Path
@@ -52,6 +56,19 @@ from . import run_logging
 from .model import get_model
 
 logger = logging.getLogger(__name__)
+
+
+def _msg_kind(m: dict[str, Any]) -> str | None:
+    """The ``kind`` from a Message node's metadata. NAMS stores metadata as a
+    JSON string property; tolerate an already-parsed dict too."""
+    meta = m.get("metadata")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except ValueError:
+            logger.warning("Unparseable message metadata: %.80r", meta)
+            return None
+    return (meta or {}).get("kind")
 
 
 class DebriefSession:
@@ -89,13 +106,14 @@ class DebriefSession:
         self.play_session_id: str | None = None
         self.debrief_session_id: str | None = None
         self._conversation_marked = False
-        # Per-move index of the analyzed session: step number -> dict with
-        # action, content, before/after frame paths + settings.
-        self._move_index: list[dict[str, Any]] = []
-        self._move_listing: str = "(no moves recorded)"
+        # Index of the player's recorded (assistant) messages: n -> dict with
+        # kind, action, content, the ONE frame the player saw, and the user
+        # instruction that was live at that message.
+        self._msg_index: list[dict[str, Any]] = []
+        self._trace_block: str = "(no player messages recorded)"
         self._snapshots: list[dict[str, Any]] = []
-        # Navigation cursor: the step the analyst is currently looking at
-        # ('Current frame' in the prompt). [SHOW n] jumps it, [NEXT]/[BACK]
+        # Navigation cursor: the message the reviewer is currently looking at
+        # ('Current message' in the prompt). [SHOW n] jumps it, [NEXT]/[BACK]
         # move it by one. Persists across ask() turns; reset by select().
         self._cursor: int | None = None
 
@@ -130,11 +148,14 @@ class DebriefSession:
     def select(self, play_session_id: str) -> dict[str, Any]:
         """Set the analysis target and start a NEW debrief conversation.
 
-        Prefetches the play session's message+snapshot index: assistant move
-        messages in chronological order define the step numbering that
-        ``[SHOW n]`` refers to (snapshots do not reliably carry a step
-        property). The previous debrief conversation (if any) simply remains
-        stored in NAMS; this session stops appending to it.
+        Prefetches the play session's message+snapshot index: ALL assistant
+        messages in chronological order -- moves, reflections and answers --
+        define the message numbering that ``[SHOW n]`` refers to. Each entry
+        carries the ONE frame the player saw when writing it (the 'before'
+        snapshot; 'after' / any linked snapshot as fallbacks) and the user
+        instruction that was live at that point. The previous debrief
+        conversation (if any) simply remains stored in NAMS; this session
+        stops appending to it.
         """
         rows = self._run(
             image_store.fetch_messages_with_snapshots(self.client, play_session_id)
@@ -148,40 +169,49 @@ class DebriefSession:
         self.play_session_id = play_session_id
         self.debrief_session_id = "debrief-" + mem.new_session_id()
         self._conversation_marked = False
-        self._move_index = []
+        self._msg_index = []
         self._snapshots = self._run(
             image_store.fetch_session_snapshots(self.client, play_session_id)
         )
 
+        instruction = "(no user instruction recorded)"
         for row in rows:
             m = row.get("message") or {}
-            if m.get("role") != "assistant":
+            content = str(m.get("content", ""))
+            role = m.get("role")
+            if role == "user":
+                # The most recent user message is the instruction the player
+                # was answering from here on -- it 'hangs' over every
+                # subsequent player message, exactly as it did during play.
+                instruction = content
                 continue
-            action = game_io.parse_action(str(m.get("content", "")))
-            if not action:
-                continue  # answers / reflections are not moves
+            if role != "assistant":
+                continue
             snaps = row.get("snapshots") or []
-            before = next((s for s in snaps if s.get("label") == "before"), None)
-            after = next((s for s in snaps if s.get("label") == "after"), None)
-            self._move_index.append({
-                "step": len(self._move_index),
-                "action": action,
-                "content": str(m.get("content", "")),
-                "before": before,
-                "after": after,
+            frame = (
+                next((s for s in snaps if s.get("label") == "before"), None)
+                or next((s for s in snaps if s.get("label") == "after"), None)
+                or (snaps[0] if snaps else None)
+            )
+            self._msg_index.append({
+                "n": len(self._msg_index),
+                "kind": _msg_kind(m),
+                "action": game_io.parse_action(content),
+                "content": content,
+                "frame": frame,
+                "instruction": instruction,
             })
 
-        if self._move_index:
-            self._move_listing = "\n".join(
-                f"step {e['step']}: {e['action']}" for e in self._move_index
+        if self._msg_index:
+            moves = [e["action"] for e in self._msg_index if e["action"]]
+            n = len(self._msg_index)
+            self._trace_block = (
+                f"{n} recorded player messages (0..{n - 1}); "
+                f"the player's moves in order: {modes._summarize_actions(moves)}"
             )
-            summary = modes._summarize_actions(
-                [e["action"] for e in self._move_index]
-            )
-            self._move_listing += f"\n(summary: {summary})"
-            self._cursor = len(self._move_index) - 1
+            self._cursor = 0
         else:
-            self._move_listing = "(no moves recorded)"
+            self._trace_block = "(no player messages recorded)"
             self._cursor = None
 
         latest_frame = self._resolve_path(self._snapshots[-1]["path"]) if self._snapshots else None
@@ -189,7 +219,8 @@ class DebriefSession:
             "play_session_id": play_session_id,
             "debrief_session_id": self.debrief_session_id,
             "n_messages": len(rows),
-            "n_moves": len(self._move_index),
+            "n_player_messages": len(self._msg_index),
+            "n_moves": sum(1 for e in self._msg_index if e["action"]),
             "n_snapshots": len(self._snapshots),
             "latest_frame_path": latest_frame,
         }
@@ -199,9 +230,10 @@ class DebriefSession:
             result=info,
         )
         logger.info(
-            "Debrief target selected: play=%s debrief=%s (%d moves, %d snapshots)",
+            "Debrief target selected: play=%s debrief=%s "
+            "(%d player messages, %d snapshots)",
             play_session_id, self.debrief_session_id,
-            len(self._move_index), len(self._snapshots),
+            len(self._msg_index), len(self._snapshots),
         )
         return info
 
@@ -212,11 +244,13 @@ class DebriefSession:
     ) -> dict[str, Any]:
         """One multi-generation debrief turn (play-mode style).
 
-        The model may end each reply with ``[SHOW n]``; we fetch that step's
-        frames and generate again, until a reply with no tool token ends the
-        turn or ``cfg.debrief_max_tool_calls`` fetches have been made.
-        ``on_step`` (if given) fires after every generation with the reply
-        text, any tool call, and the frames fetched for it.
+        The model may end each reply with ``[SHOW n]`` / ``[NEXT]`` /
+        ``[BACK]``; we move the cursor, swap the current message (text +
+        frame + settings) into context, and generate again, until a reply
+        with no tool token ends the turn or ``cfg.debrief_max_tool_calls``
+        moves have been made. ``on_step`` (if given) fires after every
+        generation with the reply text, any tool call, and the frame fetched
+        for it.
         """
         if self.debrief_session_id is None:
             raise ValueError("No play conversation selected; call select() first.")
@@ -237,8 +271,12 @@ class DebriefSession:
         )
 
         replies: list[dict[str, Any]] = []
-        frames = self._default_frames()
-        prompt_text = f"User question: {question}"
+        current = (
+            self._message_block(self._cursor) if self._cursor is not None else None
+        )
+        # The question itself is already the newest entry of the recency
+        # window (persisted above), so don't repeat it verbatim here.
+        prompt_text = "Answer the newest user message in the debrief conversation above."
         tool_calls = 0
         try:
             while True:
@@ -249,8 +287,8 @@ class DebriefSession:
                     )
                 )
                 messages = modes.build_debrief_messages(
-                    self._move_listing + "\n" + self._cursor_line(),
-                    recent, frames, prompt_text,
+                    self._trace_block + "\n" + self._cursor_line(),
+                    recent, current, prompt_text,
                 )
                 raw = self.model.generate(
                     messages,
@@ -269,7 +307,7 @@ class DebriefSession:
                     self.client.reasoning.add_step(trace.id, thought=text)
                 )
 
-                frames = []
+                moved = False
                 if call is not None:
                     target, reason = self._resolve_tool_target(call)
                     found = target is not None
@@ -277,33 +315,37 @@ class DebriefSession:
                         self.client.reasoning.record_tool_call(
                             step_node.id, call["tool"],
                             {k: v for k, v in call.items() if k != "tool"},
-                            result={"found": found, "step": target},
+                            result={"found": found, "message": target},
                         )
                     )
                     tool_calls += 1
                     if found:
+                        moved = True
                         self._cursor = target
-                        frames = self._frames_for_step(target)
-                        for f in frames:
+                        current = self._message_block(target)
+                        if current.get("snapshot_id"):
                             self._run(
                                 image_store.link_snapshot_to_message(
                                     self.client, assistant_msg.id,
-                                    f["snapshot_id"], role="observation",
+                                    current["snapshot_id"], role="observation",
                                 )
                             )
                         prompt_text = (
                             f"(Continuing your reply to: {question}\n"
-                            f"The frames for step {target} are attached above "
-                            f"and it is now the current frame. Continue your "
-                            "analysis; emit another tool token ([SHOW n], "
-                            "[NEXT], [BACK]) if you need another step, or "
+                            f"Message {target} is now the current message: "
+                            "its recorded text, frame, and exact settings are "
+                            "in your context above. Continue your analysis; "
+                            "emit another tool token ([SHOW n], [NEXT], "
+                            "[BACK]) to inspect a different message, or "
                             "finish your answer.)"
                         )
                     else:
                         prompt_text = (
                             f"(Continuing your reply to: {question}\n"
-                            f"{reason} Continue your analysis; emit a valid "
-                            "tool token or finish your answer.)"
+                            f"{reason} Remember: [SHOW n] retrieves recorded "
+                            "message n's text, frame, and exact settings. "
+                            "Continue your analysis; emit a valid tool token "
+                            "or finish your answer.)"
                         )
 
                 result = {
@@ -313,7 +355,10 @@ class DebriefSession:
                     "text": text,
                     "tool_call": call,
                     "cursor": self._cursor,
-                    "frames": [f["path"] for f in frames],
+                    "frames": (
+                        [current["path"]]
+                        if moved and current and current.get("path") else []
+                    ),
                 }
                 replies.append(result)
                 if on_step is not None:
@@ -334,7 +379,7 @@ class DebriefSession:
                     self.client, trace,
                     outcome=(
                         f"debrief turn ended after {len(replies)} "
-                        f"generation(s), {tool_calls} [SHOW] call(s)"
+                        f"generation(s), {tool_calls} tool call(s)"
                     ),
                     success=True,
                 )
@@ -415,84 +460,67 @@ class DebriefSession:
         )
         self._conversation_marked = True
 
-    def _default_frames(self) -> list[dict[str, Any]]:
-        """The last ``cfg.debrief_max_frames`` saved snapshots (chronological;
-        the final one is the session's current state)."""
-        tail = self._snapshots[-self.cfg.debrief_max_frames:]
-        frames = []
-        n = len(tail)
-        for i, s in enumerate(tail):
-            is_last = i == n - 1
-            caption = (
-                f"Attached frame {i + 1}/{n} (label={s.get('label')})"
-                + (" -- the MOST RECENT saved frame, i.e. the session's "
-                   "current state:" if is_last else ":")
-            )
-            frames.append({
-                "snapshot_id": s.get("id"),
-                "path": self._resolve_path(s["path"]),
-                "caption": caption,
-                "settings_json": s.get("settings_json"),
-            })
-        return frames
-
-    def _frames_for_step(self, step: int) -> list[dict[str, Any]]:
-        """Before/after frames (image + settings) for move ``step``, plus the
-        reasoning recorded at that step (as a ``note`` on the last frame)."""
-        entry = self._move_index[step]
-        frames = []
-        for label, snap in (("BEFORE", entry["before"]), ("AFTER", entry["after"])):
-            if snap is None:
-                continue
-            frames.append({
-                "snapshot_id": snap.get("id"),
-                "path": self._resolve_path(snap["path"]),
-                "caption": (
-                    f"Step {step} ({entry['action']}) -- "
-                    f"screen {label} the move:"
-                ),
-                "settings_json": snap.get("settings_json"),
-            })
-        if frames and entry.get("content"):
-            frames[-1]["note"] = (
-                f"Reasoning you recorded at step {step}:\n{entry['content']}"
-            )
-        return frames
+    def _message_block(self, n: int) -> dict[str, Any]:
+        """The current-message context block for message ``n``: header,
+        recorded text, the ONE frame the player saw (before-the-move
+        snapshot), its settings, and the instruction live at that message."""
+        e = self._msg_index[n]
+        if e["action"]:
+            desc = f"move: {e['action']}"
+        elif e["kind"] == "reflection":
+            desc = "reflection, no move"
+        else:
+            desc = f"{e['kind'] or 'commentary'}, no move"
+        frame = e["frame"]
+        return {
+            "header": f"Current message under inspection -- message {n} ({desc}):",
+            "content": e["content"],
+            "instruction": e["instruction"],
+            "path": self._resolve_path(frame["path"]) if frame else None,
+            "settings_json": frame.get("settings_json") if frame else None,
+            "snapshot_id": frame.get("id") if frame else None,
+        }
 
     def _cursor_line(self) -> str:
-        """The 'Current frame' line for the prompt context."""
+        """The 'Current message' line for the prompt context."""
         if self._cursor is None:
-            return "Current frame: (none -- no moves recorded)"
+            return "Current message: (none -- no player messages recorded)"
         return (
-            f"Current frame: step {self._cursor} "
-            f"(valid steps: 0..{len(self._move_index) - 1})"
+            f"Current message: {self._cursor} "
+            f"(valid messages: 0..{len(self._msg_index) - 1})"
         )
 
     def _resolve_tool_target(self, call: dict[str, Any]) -> tuple[int | None, str]:
-        """Map a parsed tool call to a step number. Returns ``(step, '')`` on
+        """Map a parsed tool call to a message number. Returns ``(n, '')`` on
         success or ``(None, reason)`` explaining why the call is invalid."""
-        n_steps = len(self._move_index)
-        if n_steps == 0:
-            return None, "This session has no recorded moves, so there are no frames to show."
+        n_msgs = len(self._msg_index)
+        if n_msgs == 0:
+            return None, (
+                "This session has no recorded player messages, so there is "
+                "nothing to show."
+            )
         tool = call["tool"]
         if tool == "SHOW":
-            step = call["step"]
-            if 0 <= step < n_steps:
-                return step, ""
+            n = call["step"]
+            if 0 <= n < n_msgs:
+                return n, ""
             return None, (
-                f"Step {step} does not exist -- valid steps are "
-                f"0..{n_steps - 1}."
+                f"Message {n} does not exist -- valid messages are "
+                f"0..{n_msgs - 1}."
             )
         if self._cursor is None:
-            # Unreachable when moves exist (select() sets the cursor), but
+            # Unreachable when messages exist (select() sets the cursor), but
             # fail loudly rather than guess a position.
-            return None, "There is no current frame to navigate from; use [SHOW n] first."
-        step = self._cursor + 1 if tool == "NEXT" else self._cursor - 1
-        if 0 <= step < n_steps:
-            return step, ""
+            return None, (
+                "There is no current message to navigate from; use "
+                "[SHOW n] first."
+            )
+        n = self._cursor + 1 if tool == "NEXT" else self._cursor - 1
+        if 0 <= n < n_msgs:
+            return n, ""
         edge = "last" if tool == "NEXT" else "first"
         return None, (
-            f"[{tool}] failed: you are already at the {edge} step "
-            f"(current frame: step {self._cursor}, valid steps: "
-            f"0..{n_steps - 1})."
+            f"[{tool}] failed: you are already at the {edge} message "
+            f"(current message: {self._cursor}, valid messages: "
+            f"0..{n_msgs - 1})."
         )

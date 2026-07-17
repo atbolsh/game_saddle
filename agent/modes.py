@@ -206,7 +206,8 @@ def _build_game_messages(
 # sweep of rotations -- forcing it to ask whether it rotated past the gold.
 
 def _summarize_actions(actions: list[str]) -> str:
-    """Run-length compress a move list: CLOCK x30 reads better than 30 lines."""
+    """Run-length compress a move list into 'CLOCKx61 FORWARDx1 ...' -- the ONE
+    canonical way a move trace is presented to the model, in every mode."""
     if not actions:
         return "(no moves yet)"
     runs: list[str] = []
@@ -215,10 +216,10 @@ def _summarize_actions(actions: list[str]) -> str:
         if a == current:
             count += 1
         else:
-            runs.append(f"{current} x{count}")
+            runs.append(f"{current}x{count}")
             current, count = a, 1
-    runs.append(f"{current} x{count}")
-    return ", ".join(runs)
+    runs.append(f"{current}x{count}")
+    return " ".join(runs)
 
 
 def build_reflection_messages(
@@ -345,7 +346,8 @@ def _turn_trace_outcome(
     if made_moves:
         actions = [t["action"] for t in turns if t.get("action")]
         outcome = (
-            f"turn ended after {n} step(s); actions={actions}; "
+            f"turn ended after {n} step(s); "
+            f"actions: {_summarize_actions(actions)}; "
             f"solved={solved}; gold_remaining={gold_remaining}"
         )
         return outcome, solved
@@ -713,20 +715,34 @@ async def _fetch_session_traces(client: Any, session_id: str) -> list[dict[str, 
 #
 # Privileged interactive debrief: a chat over a recorded play conversation with
 # full access to ground truth (snapshot images + exact Settings JSON), plus
-# [SHOW <n>] / [NEXT] / [BACK] tools to pull up any recorded step's frames,
-# settings, and recorded reasoning. See :class:`agent.debrief.DebriefSession`
-# for the session/loop machinery.
+# [SHOW <n>] / [NEXT] / [BACK] tools that move a cursor over the player's
+# recorded messages (each fetch = that message's text + the ONE frame the
+# player saw + its settings). See :class:`agent.debrief.DebriefSession` for
+# the session/loop machinery.
 
 SYSTEM_PROMPT_DEBRIEF = (
-    "You are a privileged game analyst reviewing a recorded session of a 2D "
-    "discrete game. The board is the unit square [0,1]x[0,1] framed by four "
-    "boundary walls; the agent is the green circle with a red eye showing its "
-    "facing direction; the gold is a small yellow circle. During play the "
-    "agent saw ONLY the screen image. You, the analyst, additionally see the "
-    "exact game Settings at each recorded step (coordinates, angles, walls), "
-    "and you discuss the session openly with the user. Be precise and "
-    "quantitative; compute angles and distances from the settings rather than "
-    "eyeballing the image whenever settings are available.\n\n"
+    "You are reviewing a RECORDED session of a 2D discrete game. The session "
+    "was played by an earlier instance of YOU; you have NO memory of playing "
+    "it. Everything you know about it comes from the recorded materials in "
+    "your context and from the tools below. The user may say 'you' meaning "
+    "the player -- do not get defensive, and NEVER claim you lack access to "
+    "the play: retrieve the recorded message with a tool instead.\n\n"
+    "The board is the unit square [0,1]x[0,1] framed by four boundary walls; "
+    "the agent is the green circle with a red eye showing its facing "
+    "direction; the gold is a small yellow circle. During play the player "
+    "saw ONLY the screen image. You, the reviewer, additionally see the "
+    "exact game Settings for each recorded message (coordinates, angles, "
+    "walls). Be precise and quantitative: compute angles and distances from "
+    "the settings rather than eyeballing the image. NEVER state settings "
+    "values you have not actually seen for that exact message -- fetch the "
+    "message first.\n\n"
+    "HOW THE RECORD IS ORGANIZED: the player's messages are numbered from 0 "
+    "(see the 'Current message' line in your context for the valid range). "
+    "Most messages end in a move token ([CLOCK]/[ANTICLOCK]/[FORWARD]); "
+    "reflection messages (no move) occur roughly every 30 moves -- to find "
+    "one, [SHOW] a multiple of 30 and step with [NEXT]/[BACK] until you hit "
+    "it. The user instruction the player was answering is always shown "
+    "separately in your context.\n\n"
     "GEOMETRY (verified against the renderer -- trust this over intuition):\n"
     "  - 'direction' is theta in radians, kept in [0, 2*pi). The board's y "
     "axis points DOWNWARD on screen.\n"
@@ -740,17 +756,16 @@ SYSTEM_PROMPT_DEBRIEF = (
     "y-down convention.\n"
     "  - One [FORWARD] advances up to 1/16 of the board along "
     "(cos theta, sin theta).\n\n"
-    "TOOLS: you may inspect any recorded step. Your context includes a "
-    "'Current frame' line telling you which step you are looking at. To "
-    "navigate, end your reply with exactly one of these tokens:\n"
-    "  [SHOW n] - jump to step n from the move list (e.g. [SHOW 42])\n"
-    "  [NEXT]   - advance to the step after the current frame\n"
-    "  [BACK]   - go to the step before the current frame\n"
-    "The requested step's screen image(s), exact settings, and the reasoning "
-    "recorded at that step will be shown to you, and you will be asked to "
-    "continue. Emit at most one tool token per reply, at the very end, with "
-    "nothing after it. When you have what you need, reply normally without a "
-    "tool token to finish your answer.\n\n"
+    "TOOLS: you may inspect any recorded message. To navigate, end your "
+    "reply with exactly one of these tokens:\n"
+    "  [SHOW n] - jump to recorded message n (e.g. [SHOW 42])\n"
+    "  [NEXT]   - advance to the message after the current one\n"
+    "  [BACK]   - go to the message before the current one\n"
+    "That message's recorded text, the frame the player saw at that moment, "
+    "and its exact settings will be placed in your context, and you will be "
+    "asked to continue. Emit at most one tool token per reply, at the very "
+    "end, with nothing after it. When you have what you need, reply normally "
+    "without a tool token to finish your answer.\n\n"
     "You may also be asked to produce a final structured verdict on the play "
     "(overall_score 0-10, strengths, weaknesses, per-move notes); do so only "
     "when asked."
@@ -798,45 +813,56 @@ def parse_debrief_call(text: str) -> tuple[dict[str, Any] | None, str]:
 
 
 def build_debrief_messages(
-    move_listing: str,
+    trace_block: str,
     recent: str,
-    frames: list[dict[str, Any]],
+    current: dict[str, Any] | None,
     question: str,
 ) -> list[dict]:
-    """Assemble one debrief generation's prompt.
+    """Assemble one debrief generation's prompt as at most three content
+    parts. Gemma's chat template concatenates adjacent text parts with NO
+    separator, so logical blocks are pre-joined with explicit newlines here
+    instead of being emitted as separate parts:
 
-    ``move_listing``: indexed move list of the analyzed play session (defines
-    the step numbers [SHOW n] refers to), including the 'Current frame' line.
-    ``recent``: recency window of the DEBRIEF conversation (unscrubbed -- this
-    mode is privileged). ``frames``: dicts with ``path`` (image file),
-    ``caption``, ``settings_json`` and optionally ``note`` (e.g. the reasoning
-    recorded at that step), in display order. ``question``: the user text or
-    continuation nudge.
+      1. text  -- session trace + hanging player instruction + debrief
+                  recency window + the current message's header and text
+      2. image -- the ONE frame the player saw at the current message
+      3. text  -- that frame's exact settings + the question/continuation
+
+    ``trace_block``: condensed move trace + 'Current message' line.
+    ``recent``: recency window of the DEBRIEF conversation (unscrubbed --
+    this mode is privileged). ``current``: the message under inspection from
+    ``DebriefSession._message_block`` ({header, content, instruction, path,
+    settings_json}); None when the session has no player messages.
+    ``question``: the user text or continuation nudge.
     """
-    user_content: list[dict[str, Any]] = [
-        {
-            "type": "text",
-            "text": "Recorded moves of the play session under analysis "
-                    "(step numbers for [SHOW n]):\n" + move_listing,
-        }
-    ]
-    if recent:
-        user_content.append(
-            {
-                "type": "text",
-                "text": "Debrief conversation so far (most recent last):\n" + recent,
-            }
+    blocks = ["Recorded play session under analysis:\n" + trace_block]
+    if current is not None:
+        blocks.append(
+            "The player was answering this user instruction: "
+            f"\"{current['instruction']}\""
         )
-    for f in frames:
-        user_content.append({"type": "text", "text": f["caption"]})
-        user_content.append({"type": "image", "url": f["path"]})
-        if f.get("settings_json"):
-            user_content.append(
-                {"type": "text", "text": "Exact settings for this frame:\n" + f["settings_json"]}
+    if recent:
+        blocks.append("Debrief conversation so far (most recent last):\n" + recent)
+    if current is not None:
+        cur_text = current["header"] + "\nRecorded message text:\n" + current["content"]
+        if current.get("path"):
+            cur_text += "\nThe image below is the frame the player saw at this message."
+        else:
+            cur_text += "\n(No frame was saved for this message.)"
+        blocks.append(cur_text)
+
+    user_content: list[dict[str, Any]] = [
+        {"type": "text", "text": "\n\n".join(blocks)}
+    ]
+    tail: list[str] = []
+    if current is not None and current.get("path"):
+        user_content.append({"type": "image", "url": current["path"]})
+        if current.get("settings_json"):
+            tail.append(
+                "Exact settings for this frame:\n" + current["settings_json"]
             )
-        if f.get("note"):
-            user_content.append({"type": "text", "text": f["note"]})
-    user_content.append({"type": "text", "text": question})
+    tail.append(question)
+    user_content.append({"type": "text", "text": "\n\n".join(tail)})
     return [
         {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT_DEBRIEF}]},
         {"role": "user", "content": user_content},
