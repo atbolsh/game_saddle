@@ -719,6 +719,7 @@ _SEMANTIC_MODEL_PREFERENCES = [
     ("goal", "Collect the gold piece. In bare levels there is exactly one gold piece; the game ends for the agent once it is eaten (overlap of agent and gold circles)."),
     ("tip_distance", "Tip: the agent does not need to know its exact coordinates. Use the visual angle between the agent's red eye and the gold to decide CLOCK vs ANTICLOCK, then FORWARD."),
     ("tip_facing", "Tip: if the gold is roughly in front of the agent's eye, FORWARD is the best move. If it is to the right, CLOCK until it is centered. If to the left, ANTICLOCK."),
+    ("tip_aim_tolerance", "Tip: it can be hard to tell the exact facing direction from the screen, so do not demand pixel-perfect aim. If the gold is estimated to lie within about 45 degrees of the facing direction, FORWARD is a good move -- step forward and re-assess on the new screen."),
     ("tip_overshoot", "Tip: only FORWARD moves the agent (up to 1/16 of the board per step); CLOCK and ANTICLOCK merely rotate it in place and never move it, so they cannot collect gold on their own. FORWARD can overshoot the gold, so aim carefully with CLOCK/ANTICLOCK first, then step FORWARD."),
 ]
 

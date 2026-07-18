@@ -99,6 +99,27 @@ _BLOCK_CURRENT_SCREEN = (
     "every single move."
 )
 
+# The one statement of the aim-tolerance rule. Shown verbatim to the player
+# (all player-prompt variants) and quoted verbatim to every reviewer via
+# _BLOCK_AIM_TOLERANCE_REVIEW, so player and judge always share one wording.
+_BLOCK_AIM_TOLERANCE = (
+    "AIM TOLERANCE: it can be hard to tell your exact facing direction from "
+    "the screen, so do not demand pixel-perfect aim. If your best estimate "
+    "is that the gold lies within about 45 degrees of your facing direction, "
+    "[FORWARD] is a good move -- step forward and re-assess on the new "
+    "screen. Reserve [CLOCK]/[ANTICLOCK] fine-tuning for when the gold is "
+    "clearly off to one side or behind you."
+)
+
+_BLOCK_AIM_TOLERANCE_REVIEW = (
+    "The player's instructions included this aim-tolerance rule, quoted "
+    "verbatim:\n\"" + _BLOCK_AIM_TOLERANCE + "\"\n"
+    "Judge the play against it: a [FORWARD] emitted while the gold was "
+    "within roughly 45 degrees of the facing direction follows instructions "
+    "and must not be penalized as imprecise aim; conversely, long "
+    "rotate-only fine-tuning inside that tolerance goes against them."
+)
+
 
 def _search_tool_block(scope_note: str) -> str:
     """The [SEARCH <query>] tool description, shared by every mode that gets
@@ -149,6 +170,7 @@ SYSTEM_PROMPT_GAME = "\n\n".join([
     _BLOCK_MOVE_TOKENS,
     _BLOCK_MULTI_MOVE_TURN,
     _BLOCK_HOW_TO_PLAY,
+    _BLOCK_AIM_TOLERANCE,
     _BLOCK_CURRENT_SCREEN,
     _search_tool_block(_SEARCH_SCOPE_PLAY),
 ])
@@ -172,6 +194,7 @@ SYSTEM_PROMPT_REFLECT = "\n\n".join([
         "3. Am I still turning in the right direction? Would reversing direction, "
         "or simply going FORWARD, get my eye onto the gold faster?"
     ),
+    _BLOCK_AIM_TOLERANCE,
     (
         "Do NOT emit any move token ([CLOCK]/[ANTICLOCK]/[FORWARD]) in this reply "
         "-- it would not be executed. End with the single move you intend to make "
@@ -190,15 +213,18 @@ SYSTEM_PROMPT_DISCUSS = "\n\n".join([
     _search_tool_block(_SEARCH_SCOPE_FULL),
 ])
 
-SYSTEM_PROMPT_EVAL = (
-    "You are evaluating how well an earlier instance of yourself played a "
-    "2D discrete game. You are given the full Conversation (user questions "
-    "and assistant moves), the reasoning traces recorded for each move, "
-    "and the underlying game Settings at each step (which the player did "
-    "NOT have access to at the time). Be specific and critical. Output a "
-    "structured verdict with: overall_score (0-10), strengths, weaknesses, "
-    "and per-move notes where relevant."
-)
+SYSTEM_PROMPT_EVAL = "\n\n".join([
+    (
+        "You are evaluating how well an earlier instance of yourself played a "
+        "2D discrete game. You are given the full Conversation (user questions "
+        "and assistant moves), the reasoning traces recorded for each move, "
+        "and the underlying game Settings at each step (which the player did "
+        "NOT have access to at the time). Be specific and critical. Output a "
+        "structured verdict with: overall_score (0-10), strengths, weaknesses, "
+        "and per-move notes where relevant."
+    ),
+    _BLOCK_AIM_TOLERANCE_REVIEW,
+])
 
 
 # --------------------------------------------------------------- mode 1
@@ -956,6 +982,7 @@ SYSTEM_PROMPT_DEBRIEF = "\n\n".join([
     _BLOCK_PRIVILEGED_VIEW,
     _BLOCK_DEBRIEF_RECORD,
     _BLOCK_GEOMETRY_PRIVILEGED,
+    _BLOCK_AIM_TOLERANCE_REVIEW,
     _BLOCK_DEBRIEF_NAV,
     _search_tool_block(_SEARCH_SCOPE_FULL),
     _BLOCK_TIP_TOOL,
@@ -987,6 +1014,7 @@ SYSTEM_PROMPT_SCENE_PLAY = "\n\n".join([
     _BLOCK_MOVE_TOKENS,
     _BLOCK_SCENE_SCOPE,
     _BLOCK_HOW_TO_PLAY,
+    _BLOCK_AIM_TOLERANCE,
     _BLOCK_CURRENT_SCREEN,
     _search_tool_block(_SEARCH_SCOPE_PLAY),
 ])
@@ -1012,6 +1040,7 @@ SYSTEM_PROMPT_SCENE_ANALYST = "\n\n".join([
     + _BLOCK_REVIEWER_STANCE,
     _BLOCK_PRIVILEGED_VIEW,
     _BLOCK_GEOMETRY_PRIVILEGED,
+    _BLOCK_AIM_TOLERANCE_REVIEW,
     _BLOCK_SCENE_ANALYST_SCOPE,
     _search_tool_block(_SEARCH_SCOPE_FULL),
     _BLOCK_RATING,
