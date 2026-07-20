@@ -178,7 +178,7 @@ class AgentConfig:
     # ``debrief_max_tool_calls`` moves per ask() turn ([SEARCH] and
     # [WRITE_TIP] calls share the same budget).
     debrief_max_tool_calls: int = field(
-        default_factory=lambda: _env_int("DEBRIEF_MAX_TOOL_CALLS", 6)
+        default_factory=lambda: _env_int("DEBRIEF_MAX_TOOL_CALLS", 64)
     )
 
     # Agent-initiated [SEARCH <query>] memory searches. Outside debrief (which
