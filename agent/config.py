@@ -16,8 +16,12 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Best-effort .env load; tolerate absence.
-load_dotenv()
+# Load the repo-root .env into os.environ (HF_TOKEN, Neo4j creds, ...). Path is
+# anchored to this file so it does not depend on the process cwd -- notebooks,
+# ``python -m agent.runner``, and scripts invoked from other directories all see
+# the same values. Tolerates a missing file (e.g. a fresh clone before
+# ``cp .env.example .env``).
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 
 # ------------------------------------------------------- third-party noise

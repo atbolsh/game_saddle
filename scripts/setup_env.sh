@@ -63,8 +63,17 @@ python -m spacy download "${SPACY_MODEL}"
 # else is needed at runtime. This is the "python command for loading the model
 # weights" that pip can't express.
 log "pre-fetching GLiNER weights: ${GLINER_MODEL}"
-python - "${GLINER_MODEL}" <<'PY'
+# Load repo .env into os.environ first so HF_TOKEN (and any other HF auth
+# vars) reach huggingface_hub during from_pretrained -- this script never
+# imports agent.config, so bare shell env alone would miss a copied-over .env.
+python - "${GLINER_MODEL}" "${REPO_ROOT}/.env" <<'PY'
 import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(sys.argv[2]))
+
 from gliner import GLiNER
 
 model_id = sys.argv[1]
