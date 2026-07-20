@@ -162,21 +162,34 @@ sees Settings.
    bash scripts/neo4j_db.sh load logs/mem.dump  # restore a saved graph
    ```
 
-3. **Env file.**
+3. **Env file — the one place for credentials and config.**
 
    ```bash
    cp .env.example .env
-   # edit .env: set NEO4J_PASSWORD, optionally GEMMA_MODEL_ID, HF_TOKEN, ...
+   # edit .env: set NEO4J_PASSWORD, HF_TOKEN (Gemma weights are gated),
+   # optionally GEMMA_MODEL_ID, ...
    ```
 
-4. **HuggingFace token** (only needed because some Gemma weights are
-   gated):
+   Setting variables in `.env` is **enough**: everything that runs Python —
+   the runner, the notebooks, and `scripts/setup_env.sh`'s model
+   downloads — loads the repo-root `.env` via `python-dotenv` (anchored to
+   the repo, not the cwd). There is no need to `export` OS environment
+   variables or run `huggingface-cli login`. (Exported shell variables
+   still work and take precedence if you have them, since `load_dotenv`
+   does not override existing environment values.)
 
-   ```bash
-   huggingface-cli login   # or export HF_TOKEN=...
-   ```
+   If you copy an existing `.env` onto a fresh box, do it **before**
+   running `scripts/setup_env.sh` so the HuggingFace downloads
+   authenticate with your `HF_TOKEN`.
 
-5. **Seed the semantic model** (run once):
+   The only exceptions are the pure-bash Neo4j admin scripts
+   (`vast_neo4j_launch.sh`, `neo4j_db.sh`): they default to the
+   `.env.example` password `changeme`, so pass
+   `NEO4J_PASSWORD=… bash scripts/…` only if you changed it.
+   `vast_neo4j_launch.sh` writes the connection vars it used into `.env`
+   for you.
+
+4. **Seed the semantic model** (run once):
 
    ```bash
    python -m agent.runner seed

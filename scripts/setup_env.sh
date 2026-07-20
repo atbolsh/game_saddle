@@ -63,6 +63,8 @@ python -m spacy download "${SPACY_MODEL}"
 # else is needed at runtime. This is the "python command for loading the model
 # weights" that pip can't express.
 log "pre-fetching GLiNER weights: ${GLINER_MODEL}"
+log "  (HF credentials: ${REPO_ROOT}/.env is loaded via python-dotenv first --"
+log "   set HF_TOKEN there; no shell export / huggingface-cli login needed)"
 # Load repo .env into os.environ first so HF_TOKEN (and any other HF auth
 # vars) reach huggingface_hub during from_pretrained -- this script never
 # imports agent.config, so bare shell env alone would miss a copied-over .env.
@@ -94,6 +96,11 @@ print("[setup-env] spaCy model loads and NAMS extractors import OK.", flush=True
 PY
 
 log "done. Extraction (spaCy -> GLiNER) is ready; runs will auto-discover entities."
+log ""
+log "NOTE: credentials/config live in ${REPO_ROOT}/.env (cp .env.example .env)."
+log "Every Python entry point -- this script's downloads, the runner, and the"
+log "notebooks -- loads it via python-dotenv, so setting HF_TOKEN / NEO4J_*"
+log "there is enough; no OS env variables need to be exported."
 log ""
 log "NOTE: this script sets up the PYTHON environment only. Neo4j is a separate"
 log "server and is NOT started here. Bring it up next, THEN seed:"
