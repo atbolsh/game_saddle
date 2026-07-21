@@ -144,7 +144,12 @@ class AgentConfig:
     )
 
     # Game defaults
-    game_size: int = field(default_factory=lambda: _env_int("GAME_SIZE", 224))
+    # Native render size in pixels. 768x768 is deliberate: Gemma 4's image
+    # processor (default 280-soft-token budget, patch 16, pooling 3) resizes
+    # square inputs to at most 768x768 anyway -- rendering natively at that
+    # size feeds it real detail instead of an upscaled 224px frame, at ZERO
+    # change in token count (256 soft tokens per frame either way).
+    game_size: int = field(default_factory=lambda: _env_int("GAME_SIZE", 768))
     max_solve_steps: int = field(default_factory=lambda: _env_int("MAX_SOLVE_STEPS", 200))
 
     # How many of the most-recent session messages to always thread into the

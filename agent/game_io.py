@@ -72,7 +72,7 @@ MIN_GOLD_DISTANCE = 0.6
 
 
 def new_bare_game(
-    gameSize: int = 224,
+    gameSize: int = 768,
     min_gold_distance: float = MIN_GOLD_DISTANCE,
 ) -> discreteGame:
     """Create a fresh bare discrete game (env mode, no GUI window).

@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # blocks plus at most a short mode-specific paragraph. Fixing a fact in its
 # block fixes every mode that uses it.
 
-_SENT_GAME_INTRO = "You are an agent playing a 2D discrete game on a 224x224 board."
+_SENT_GAME_INTRO = "You are an agent playing a 2D discrete game on a square board."
 _SENT_GAME_SCREEN = "You see the current game screen as an image."
 _SENT_GAME_WORLD = (
     "The board is the unit square framed by four boundary walls; there is "
@@ -78,17 +78,24 @@ _BLOCK_MULTI_MOVE_TURN = (
 )
 
 _BLOCK_HOW_TO_PLAY = (
-    "HOW TO PLAY -- take this reasoning step before every move. First REASON, in "
-    "a sentence or two, about where the gold is relative to your red eye: the eye "
-    "points in the direction you face, and [FORWARD] sends you straight that way. "
-    "Then choose your move from that reasoning:\n"
+    "HOW TO PLAY -- take these steps before every move. START your reply with "
+    "one structured observation line, read fresh off the CURRENT screen, in "
+    "exactly this form:\n"
+    "  OBS: I am at <where on the board>; my eye points toward <clock "
+    "direction, e.g. 4 o'clock>; the gold is at <where on the board>, toward "
+    "<clock direction> of me.\n"
+    "(Clock directions are as seen on screen: 12 o'clock is up-screen, 3 is "
+    "right, 6 is down, 9 is left.) Then REASON, in a sentence or two, about "
+    "where the gold is relative to your red eye: the eye points in the "
+    "direction you face, and [FORWARD] sends you straight that way. Then "
+    "choose your move from that reasoning:\n"
     "  - If your eye is pointing roughly at the gold, emit [FORWARD].\n"
     "  - Otherwise, aim your eye at the gold: emit [CLOCK] or [ANTICLOCK], then "
     "check the re-rendered screen to see which way your eye swung, and keep "
     "rotating that way (or reverse if you overshoot) until your eye lines up with "
     "the gold -- then emit [FORWARD].\n"
-    "Always state this reasoning before the move token; reasoning first, then a "
-    "single move, is how you decide well."
+    "Always state the observation and reasoning before the move token; looking "
+    "first, then reasoning, then a single move, is how you decide well."
 )
 
 _BLOCK_CURRENT_SCREEN = (
@@ -940,6 +947,13 @@ _BLOCK_GEOMETRY_PRIVILEGED = (
     "  - The agent faces the gold when theta ~= atan2(gold_y - agent_y, "
     "gold_x - agent_x) mod 2*pi. NO sign flip: both angles live in the same "
     "y-down convention.\n"
+    "  - ROTATION DIRECTION: to decide between [CLOCK] and [ANTICLOCK], "
+    "compute the WRAPPED difference delta = ((theta_target - theta + pi) "
+    "mod 2*pi) - pi, which lies in (-pi, pi]. If delta > 0, [CLOCK] is the "
+    "shorter rotation; if delta < 0, [ANTICLOCK] is. |delta| / (pi/30) is "
+    "roughly the number of rotation steps needed. NEVER compare raw angles "
+    "without wrapping: whenever the raw gap |theta_target - theta| exceeds "
+    "pi, the OTHER direction is shorter.\n"
     "  - One [FORWARD] advances up to 1/16 of the board along "
     "(cos theta, sin theta)."
 )
@@ -965,9 +979,12 @@ _BLOCK_DEBRIEF_NAV = (
     "asked to continue. You may also end your reply with a [SEARCH <query>] "
     "token (described below) instead of a navigation token; its results "
     "include matching recorded messages of THIS session, so searching is the "
-    "fast way to find a message worth [SHOW]ing. Emit at most one tool token "
-    "per reply, at the very end, with nothing after it. When you have what "
-    "you need, reply normally without a tool token to finish your answer."
+    "fast way to find a message worth [SHOW]ing. [SEARCH] matches recorded "
+    "message CONTENT semantically; message numbers are not content -- to "
+    "open message n, always use [SHOW n], never [SEARCH]. Emit at most one "
+    "tool token per reply, at the very end, with nothing after it. When you "
+    "have what you need, reply normally without a tool token to finish your "
+    "answer."
 )
 
 _BLOCK_DEBRIEF_VERDICT = (
@@ -1032,7 +1049,11 @@ _BLOCK_SCENE_ANALYST_SCOPE = (
     "answered, the frame the player saw, and that frame's exact settings. "
     "There is nothing else to navigate to. If the player's reply ends in a "
     "move token, that move has NOT been applied yet -- you are judging the "
-    "decision, not its outcome."
+    "decision, not its outcome. The player was instructed to open with an "
+    "'OBS:' observation line; grade that line against the exact settings "
+    "separately from the move choice -- correct perception with a wrong "
+    "move, and wrong perception with a lucky move, should both be called "
+    "out explicitly."
 )
 
 SYSTEM_PROMPT_SCENE_ANALYST = "\n\n".join([
@@ -1151,6 +1172,14 @@ DEBRIEF_TOOL_RE = re.compile(DEBRIEF_TOOL_PATTERN)
 TIP_LINE_RE = re.compile(r"(?im)^\s*TIP\s*:\s*(?P<tip>.+?)\s*$")
 
 
+def _clean_search_query(query: str) -> str:
+    """Normalize a captured [SEARCH] query: models often quote it (e.g.
+    [SEARCH "Message 24"]), and the capture regex's trailing ``\\W*`` eats the
+    closing quote but not the opening one -- strip surrounding whitespace and
+    quotes symmetrically so the query is never lopsided."""
+    return query.strip().strip("\"'").strip()
+
+
 def parse_search_call(text: str) -> tuple[str | None, str]:
     """Return ``(query, text)`` for the FIRST ``[SEARCH <query>]`` call in
     ``text``, truncating the text right after the call (anything beyond it is
@@ -1159,7 +1188,7 @@ def parse_search_call(text: str) -> tuple[str | None, str]:
     m = SEARCH_TOOL_RE.search(text)
     if not m:
         return None, text
-    query = m.group("search_query").strip()
+    query = _clean_search_query(m.group("search_query"))
     return (query or None), text[: m.end()]
 
 
@@ -1180,7 +1209,7 @@ def classify_move_or_search(raw: str) -> tuple[str, Any, str]:
     search_m = SEARCH_TOOL_RE.search(raw)
     move_m = game_io._MOVE_RE.search(raw)
     if search_m and (move_m is None or search_m.start() < move_m.start()):
-        query = search_m.group("search_query").strip()
+        query = _clean_search_query(search_m.group("search_query"))
         if query:
             return "search", query, raw[: search_m.end()]
     if move_m:
@@ -1237,7 +1266,10 @@ def parse_debrief_call(text: str) -> tuple[dict[str, Any] | None, str]:
         return None, text
     truncated = text[: m.end()]
     if m.group("search_query") is not None:
-        return {"tool": "SEARCH", "query": m.group("search_query").strip()}, truncated
+        return (
+            {"tool": "SEARCH", "query": _clean_search_query(m.group("search_query"))},
+            truncated,
+        )
     if m.group("show_step") is not None:
         return {"tool": "SHOW", "step": int(m.group("show_step"))}, truncated
     if m.group("write_tip") is not None:

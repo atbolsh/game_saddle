@@ -416,14 +416,39 @@ async def _search_semantic_tier(client: Any, query: str, top_k: int) -> list[str
     return lines
 
 
-async def _search_reasoning_tier(client: Any, query: str, top_k: int) -> list[str]:
+async def _session_trace_ids(client: Any, session_id: str) -> set[str]:
+    """Exact ids of all ReasoningTrace nodes belonging to one session (used
+    to exclude that session's own steps from search results; NAMS step
+    results carry a ``trace_id`` but no session id)."""
+    rows = await client.query.cypher(
+        "MATCH (t:ReasoningTrace {session_id: $sid}) RETURN t.id AS id",
+        {"sid": session_id},
+    )
+    return {str(r["id"]) for r in (rows or [])}
+
+
+async def _search_reasoning_tier(
+    client: Any, query: str, top_k: int, exclude_session: str | None = None
+) -> list[str]:
     lines: list[str] = []
+    # With an exclusion active, over-fetch so the filter can still leave up
+    # to top_k survivors. Filtering is EXACT: traces by their session_id
+    # property, steps via the excluded session's trace ids (attribute access
+    # is deliberately unguarded -- if NAMS renames a field this fails loudly
+    # into search_memory's visible per-tier error, never silently).
+    fetch = top_k if exclude_session is None else max(top_k * 2, top_k + 5)
+    excluded_traces: set[str] = (
+        await _session_trace_ids(client, exclude_session)
+        if exclude_session is not None
+        else set()
+    )
     # Step-level search: past *thoughts* on similar situations, each paired
     # with its parent task/outcome. Failures included on purpose -- a wrong
     # past decision is exactly what a searching agent may need to see.
     steps = await client.reasoning.search_steps(
-        query, limit=top_k, success_only=False
+        query, limit=fetch, success_only=False
     )
+    steps = [s for s in steps if str(s.step.trace_id) not in excluded_traces][:top_k]
     if steps:
         lines.append("Past reasoning steps (with their task and outcome):")
         for s in steps:
@@ -438,8 +463,11 @@ async def _search_reasoning_tier(client: Any, query: str, top_k: int) -> list[st
                 + f" (relevance {float(s.similarity):.2f})"
             )
     traces = await client.reasoning.get_similar_traces(
-        query, limit=top_k, success_only=False
+        query, limit=fetch, success_only=False
     )
+    if exclude_session is not None:
+        traces = [t for t in traces if t.session_id != exclude_session]
+    traces = traces[:top_k]
     if traces:
         lines.append("Similar past reasoning traces:")
         for t in traces:
@@ -468,6 +496,7 @@ async def search_memory(
     tiers: tuple[str, ...] = SEARCH_TIERS,
     top_k: int = 5,
     scrub: bool = True,
+    exclude_session: str | None = None,
 ) -> str:
     """Run the agent's [SEARCH] tool: query each requested memory tier through
     its own NAMS search API and return one formatted text block.
@@ -477,6 +506,10 @@ async def search_memory(
       * ``reasoning`` -- past reasoning steps + similar traces
       * ``messages``  -- episodic message search across ALL conversations
         (privileged modes only)
+
+    ``exclude_session`` drops that session's own traces/steps from the
+    reasoning tier -- a searching session should never be shown its own
+    in-flight reasoning echoed back as a "similar past trace".
 
     With ``scrub=True`` message contents are stripped of settings-leaking
     fields (mode-1 privacy invariant). A tier whose search *errors* degrades
@@ -493,7 +526,9 @@ async def search_memory(
             if tier == "semantic":
                 lines = await _search_semantic_tier(client, query, top_k)
             elif tier == "reasoning":
-                lines = await _search_reasoning_tier(client, query, top_k)
+                lines = await _search_reasoning_tier(
+                    client, query, top_k, exclude_session=exclude_session
+                )
             else:
                 lines = await _search_messages_tier(client, query, top_k, scrub)
         except Exception as exc:
@@ -506,7 +541,10 @@ async def search_memory(
     result = "\n".join(sections) if sections else "(no results)"
     run_logging.log_db_retrieval(
         function="search_memory",
-        arguments={"query": query, "tiers": list(tiers), "top_k": top_k},
+        arguments={
+            "query": query, "tiers": list(tiers), "top_k": top_k,
+            "exclude_session": exclude_session,
+        },
         result=result,
     )
     return result
@@ -709,7 +747,7 @@ _SEMANTIC_MODEL_ENTITIES = [
     ("Agent", "PERSON", "The green circle controlled by the player; has a red eye showing its facing direction."),
     ("Gold", "OBJECT", "Small yellow circle the agent must collect. Bare levels have exactly one."),
     ("BoundaryWall", "OBJECT", "The four fixed walls framing the play area. Always present."),
-    ("DiscreteGame", "SYSTEM", "The 2D discrete game engine: 224x224 board, agent + gold + walls."),
+    ("DiscreteGame", "SYSTEM", "The 2D discrete game engine: square board, agent + gold + walls."),
     ("Direction", "ATTRIBUTE", "The agent's facing angle in radians, 0..2pi, measured CCW from +x."),
 ]
 

@@ -52,6 +52,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import threading
 from pathlib import Path
 from typing import Any, Callable
@@ -557,13 +558,35 @@ class DebriefSession:
     #: snippet is enough to decide whether it is worth a full [SHOW n].
     _SEARCH_SNIPPET_CHARS = 200
 
+    #: A [SEARCH] query that is really a message number in disguise (e.g.
+    #: 'Message 24', 'msg #7', '42'). Semantic search over message CONTENT
+    #: can never resolve these -- numbers are index metadata, not text -- so
+    #: running the search would return misleading emptiness.
+    _NUMERIC_QUERY_RE = re.compile(r"(?i)^(?:message|msg)?\s*#?\s*(?P<n>\d+)$")
+
     def _search(self, query: str) -> str:
         """Run one debrief [SEARCH]: semantic search over THIS play session's
         recorded messages (labeled with their [SHOW n] numbers, clearly marked
         as NOT the current message) plus the general memory search (long-term
         semantic model + past reasoning; episodic messages are covered by the
         session block, so the general block skips that tier). Returns one
-        formatted note for the turn's accumulated search results."""
+        formatted note for the turn's accumulated search results.
+
+        Number-like queries are redirected instead of searched: [SEARCH]
+        matches message content semantically and cannot fetch a message by
+        its number, so the note tells the model to use [SHOW n] -- a visible
+        redirect, never a silently empty result."""
+        num_m = self._NUMERIC_QUERY_RE.match(query)
+        if num_m:
+            n = int(num_m.group("n"))
+            return modes.format_search_note(
+                query,
+                f"This query looks like a message NUMBER, but [SEARCH] "
+                f"matches recorded message content semantically and cannot "
+                f"fetch a message by its number, so no search was run. To "
+                f"inspect message {n} (its text, frame, and exact settings), "
+                f"use [SHOW {n}] instead.",
+            )
         id_to_n = {e["id"]: e["n"] for e in self._msg_index if e.get("id")}
         hits = self._run(
             mem.search_session_messages(
@@ -597,6 +620,9 @@ class DebriefSession:
             mem.search_memory(
                 self.client, query, tiers=("semantic", "reasoning"),
                 top_k=self.cfg.memory_search_top_k, scrub=False,
+                # Never echo this debrief's own in-flight reasoning back to
+                # itself as a "similar past trace".
+                exclude_session=self.debrief_session_id,
             )
         )
         lines.append("General memory search results (tips, past reasoning):")
