@@ -8,49 +8,41 @@ whatever the user had typed. Buttons remain the only submit mechanism.
 
 from __future__ import annotations
 
-import uuid
-
 from IPython.display import HTML, display
 
-# One keydown listener per tagged <textarea>, attached in the CAPTURE phase so
-# it runs before Jupyter's own Shift-Enter (run cell) shortcut can see the
-# event. A data- attribute guards against double-binding when the widget cell
-# is re-run. setInterval keeps polling because ipywidgets renders (and can
-# re-render) its DOM nodes asynchronously after the script executes.
-_SCRIPT_TEMPLATE = """
+#: CSS class marking a Textarea widget as Shift-Enter-tamed.
+_TAMED_CLASS = "tame-shift-enter"
+
+# WHY window + capture: JupyterLab / Notebook 7 dispatches keyboard shortcuts
+# (including Shift-Enter = run cell) from a keydown listener on `document` in
+# the CAPTURE phase. Capture runs top-down (window -> document -> ... ->
+# textarea), so a listener on the textarea itself -- capture or bubble --
+# always fires AFTER Jupyter's and cannot stop the run-cell command. A capture
+# listener on `window` is the only DOM node upstream of `document`, so it
+# preempts Jupyter reliably. One global listener (guarded against rebinding on
+# cell re-run) handles every tamed textarea; no per-widget binding or polling
+# is needed because the check happens per-event on the event's target.
+_SCRIPT = """
 <script>
 (function () {
-  function insertNewline(ta) {
+  if (window.__tameShiftEnterBound) { return; }
+  window.__tameShiftEnterBound = true;
+  window.addEventListener("keydown", function (ev) {
+    if (ev.key !== "Enter" || !ev.shiftKey) { return; }
+    var ta = ev.target;
+    if (!ta || ta.tagName !== "TEXTAREA" || !ta.closest(".__CLASS__")) { return; }
+    ev.preventDefault();
+    ev.stopPropagation();
+    ev.stopImmediatePropagation();
     var start = ta.selectionStart, end = ta.selectionEnd;
     ta.value = ta.value.slice(0, start) + "\\n" + ta.value.slice(end);
     ta.selectionStart = ta.selectionEnd = start + 1;
     // Bubbling input event so ipywidgets syncs the value to the kernel.
     ta.dispatchEvent(new Event("input", { bubbles: true }));
-  }
-  function bind(ta) {
-    if (ta.dataset.shiftEnterTamed) { return; }
-    ta.dataset.shiftEnterTamed = "1";
-    ta.addEventListener("keydown", function (ev) {
-      if (ev.key === "Enter" && ev.shiftKey) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        ev.stopImmediatePropagation();
-        insertNewline(ta);
-      }
-    }, true);
-  }
-  var classes = __CLASSES__;
-  var timer = setInterval(function () {
-    classes.forEach(function (cls) {
-      document.querySelectorAll("." + cls + " textarea").forEach(bind);
-    });
-  }, 300);
-  // Widgets can re-render much later (e.g. scrolling a big notebook), so
-  // keep the poller alive but cheap; stop after 10 minutes regardless.
-  setTimeout(function () { clearInterval(timer); }, 600000);
+  }, true);
 })();
 </script>
-"""
+""".replace("__CLASS__", _TAMED_CLASS)
 
 
 def tame_shift_enter(*text_widgets) -> None:
@@ -59,15 +51,13 @@ def tame_shift_enter(*text_widgets) -> None:
     Shift+Enter must behave exactly like Enter inside the box: it does NOT
     submit anything, and it must not reach Jupyter's run-cell shortcut (which
     re-runs the widget cell and erases the input). Each widget is tagged with
-    a unique CSS class, and one injected script attaches a capture-phase
-    keydown handler to the underlying <textarea> of each.
+    a marker CSS class, and one injected window-level capture-phase keydown
+    listener intercepts Shift+Enter on any tagged textarea before Jupyter's
+    own document-level shortcut handler can see it.
 
     Call AFTER creating the widgets, in the same cell that displays them.
+    Safe to call repeatedly (cell re-runs): the listener binds once per page.
     """
-    classes = []
     for w in text_widgets:
-        cls = "tame-shift-enter-" + uuid.uuid4().hex[:8]
-        w.add_class(cls)
-        classes.append(cls)
-    class_list = "[" + ", ".join(f'"{c}"' for c in classes) + "]"
-    display(HTML(_SCRIPT_TEMPLATE.replace("__CLASSES__", class_list)))
+        w.add_class(_TAMED_CLASS)
+    display(HTML(_SCRIPT))
