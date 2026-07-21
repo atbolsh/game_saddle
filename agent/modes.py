@@ -948,12 +948,18 @@ _BLOCK_GEOMETRY_PRIVILEGED = (
     "gold_x - agent_x) mod 2*pi. NO sign flip: both angles live in the same "
     "y-down convention.\n"
     "  - ROTATION DIRECTION: to decide between [CLOCK] and [ANTICLOCK], "
-    "compute the WRAPPED difference delta = ((theta_target - theta + pi) "
-    "mod 2*pi) - pi, which lies in (-pi, pi]. If delta > 0, [CLOCK] is the "
-    "shorter rotation; if delta < 0, [ANTICLOCK] is. |delta| / (pi/30) is "
-    "roughly the number of rotation steps needed. NEVER compare raw angles "
-    "without wrapping: whenever the raw gap |theta_target - theta| exceeds "
-    "pi, the OTHER direction is shorter.\n"
+    "compute diff = theta_target - theta, then bring it into (-pi, pi] by "
+    "adding 2*pi if diff <= -pi, or subtracting 2*pi if diff > pi (one "
+    "adjustment always suffices for angles in [0, 2*pi)). Call the result "
+    "delta. If delta > 0, [CLOCK] is the shorter rotation; if delta < 0, "
+    "[ANTICLOCK] is. |delta| / (pi/30) is roughly the number of rotation "
+    "steps needed. Do NOT use the mod operator here: mod of a negative "
+    "number is convention-dependent and can flip your answer -- stick to "
+    "the add/subtract-2*pi rule. NEVER compare raw angles without this "
+    "normalization: whenever the raw gap |theta_target - theta| exceeds pi, "
+    "the OTHER direction is shorter. Worked example: theta = 5.68, "
+    "theta_target = 0.75 -> diff = -4.93 -> add 2*pi -> delta = +1.35 -> "
+    "[CLOCK] (about 13 steps).\n"
     "  - One [FORWARD] advances up to 1/16 of the board along "
     "(cos theta, sin theta)."
 )
@@ -987,6 +993,20 @@ _BLOCK_DEBRIEF_NAV = (
     "answer."
 )
 
+# Shared by every reviewer prompt (scene analyst + debrief): what "analyze
+# the player's response" covers. Player replies are multi-part by
+# construction (_BLOCK_HOW_TO_PLAY), and reviewers must not fixate on the
+# reasoning alone.
+_BLOCK_REVIEW_WHOLE_REPLY = (
+    "A player reply has multiple parts: the 'OBS:' observation line, the "
+    "reasoning prose, and (usually) a move token. When asked to analyze the "
+    "player's response, review ALL of these parts, not just the reasoning. "
+    "Grade the OBS line against the exact settings separately from the move "
+    "choice: perception errors are as important as move errors, and correct "
+    "perception with a wrong move, or wrong perception with a lucky move, "
+    "should both be called out explicitly."
+)
+
 _BLOCK_DEBRIEF_VERDICT = (
     "You may also be asked to produce a final structured verdict on the play "
     "(overall_score 0-10, strengths, weaknesses, per-move notes); do so only "
@@ -1000,6 +1020,7 @@ SYSTEM_PROMPT_DEBRIEF = "\n\n".join([
     _BLOCK_DEBRIEF_RECORD,
     _BLOCK_GEOMETRY_PRIVILEGED,
     _BLOCK_AIM_TOLERANCE_REVIEW,
+    _BLOCK_REVIEW_WHOLE_REPLY,
     _BLOCK_DEBRIEF_NAV,
     _search_tool_block(_SEARCH_SCOPE_FULL),
     _BLOCK_TIP_TOOL,
@@ -1049,11 +1070,7 @@ _BLOCK_SCENE_ANALYST_SCOPE = (
     "answered, the frame the player saw, and that frame's exact settings. "
     "There is nothing else to navigate to. If the player's reply ends in a "
     "move token, that move has NOT been applied yet -- you are judging the "
-    "decision, not its outcome. The player was instructed to open with an "
-    "'OBS:' observation line; grade that line against the exact settings "
-    "separately from the move choice -- correct perception with a wrong "
-    "move, and wrong perception with a lucky move, should both be called "
-    "out explicitly."
+    "decision, not its outcome."
 )
 
 SYSTEM_PROMPT_SCENE_ANALYST = "\n\n".join([
@@ -1063,6 +1080,7 @@ SYSTEM_PROMPT_SCENE_ANALYST = "\n\n".join([
     _BLOCK_GEOMETRY_PRIVILEGED,
     _BLOCK_AIM_TOLERANCE_REVIEW,
     _BLOCK_SCENE_ANALYST_SCOPE,
+    _BLOCK_REVIEW_WHOLE_REPLY,
     _search_tool_block(_SEARCH_SCOPE_FULL),
     _BLOCK_RATING,
 ])
@@ -1170,6 +1188,32 @@ DEBRIEF_TOOL_RE = re.compile(DEBRIEF_TOOL_PATTERN)
 # The 'TIP: <one line>' line that must accompany a [WRITE_TIP] call. The LAST
 # such line in the reply is the tip (the model may quote earlier proposals).
 TIP_LINE_RE = re.compile(r"(?im)^\s*TIP\s*:\s*(?P<tip>.+?)\s*$")
+
+# A reviewer's per-error span: WRONG: "<exact words from the player reply>".
+# Quotes optional -- small models drop them -- but the words must still match.
+WRONG_SPAN_RE = re.compile(r"(?im)^\s*WRONG\s*:\s*\"?(?P<span>.+?)\"?\s*$")
+
+
+def parse_wrong_spans(analysis: str, source_text: str) -> dict[str, list[str]]:
+    """Extract the reviewer's ``WRONG: "..."`` error spans from ``analysis``
+    and verify each against ``source_text`` (the recorded player reply) by
+    EXACT substring match.
+
+    Returns ``{"verified": [...], "unverified": [...]}`` (deduplicated, in
+    order of first appearance). Unverified spans are returned rather than
+    dropped so callers can surface them loudly -- a span the player never
+    wrote must never be silently presented as a highlight
+    (no-fuzzy-fallbacks)."""
+    verified: list[str] = []
+    unverified: list[str] = []
+    seen: set[str] = set()
+    for m in WRONG_SPAN_RE.finditer(analysis):
+        span = m.group("span").strip()
+        if not span or span in seen:
+            continue
+        seen.add(span)
+        (verified if span in source_text else unverified).append(span)
+    return {"verified": verified, "unverified": unverified}
 
 
 def _clean_search_query(query: str) -> str:

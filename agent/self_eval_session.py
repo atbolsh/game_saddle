@@ -16,18 +16,25 @@ Each round:
      as the pending action so the analyst can judge the decision before its
      outcome exists.
 
-  2. **Analyst phase** (:meth:`ask_analyst`). Control returns to the user,
-     who may edit the default analysis question or submit it as-is. The
+  2. **Analyst phase** (:meth:`ask_analyst`, repeatable). Control returns to
+     the user, who may edit the default analysis question or submit it as-is,
+     and then go BACK AND FORTH with the analyst as long as they like (each
+     follow-up is another :meth:`ask_analyst` call in the same round). The
      analyst reviews ONLY the player's latest reply, under
      ``SYSTEM_PROMPT_SCENE_ANALYST``, with privileged access: the exact frame
      the player saw AND its Settings JSON (which the player never sees), plus
      ``[SEARCH]`` over all memory tiers. No [SHOW]/[NEXT]/[BACK] navigation
-     exists in this mode -- there is exactly one message to review. The
-     analyst's verdict is stored in the SAME conversation (assistant message,
+     exists in this mode -- there is exactly one message to review. Each
+     verdict is stored in the SAME conversation (assistant message,
      ``kind='analysis'``, content prefixed "(analyst)") so the player's
-     recency window naturally includes past analyses. Only after the analysis
-     is the pending move propagated to the game and the 'after' frame
-     rendered.
+     recency window naturally includes past analyses. Any ``WRONG: "..."``
+     error spans in a verdict are verified against the recorded player reply
+     by exact substring match (:func:`agent.modes.parse_wrong_spans`).
+
+  3. **End of round** (:meth:`end_round`). When the user is satisfied with
+     the analysis, the pending move is propagated to the game, the 'after'
+     frame rendered, the round's trace completed, and the phase flips back
+     to "player".
 
 The player's memory access works exactly as in play mode -- and because the
 analyst writes into the same session, the player sees the analyst's feedback
@@ -62,8 +69,13 @@ logger = logging.getLogger(__name__)
 #: or submit it unchanged.
 DEFAULT_ANALYST_QUESTION = (
     "Analyze the player's performance, using newly available privileged "
-    "information; look at which parts of the response were correct and "
-    "incorrect, and give a final rating from -1.0 to 1.0."
+    "information. Go through the response part by part -- the OBS line, the "
+    "reasoning, and the move token -- and say which parts were correct and "
+    "which were incorrect.\n"
+    "For EVERY mistaken phrase, add a line of the form:\n"
+    "WRONG: \"<the exact words copied from the player's reply>\"\n"
+    "(one line per mistake, copied verbatim so the words can be found in "
+    "the reply). Then give a final rating from -1.0 to 1.0."
 )
 
 
@@ -136,8 +148,8 @@ class InteractiveSelfEvalSession(InteractiveSession):
         """Player phase: one single-generation answer about the CURRENT scene.
 
         A move token in the reply is parsed and stored as the pending action
-        but NOT applied -- propagation happens at the end of
-        :meth:`ask_analyst`. Flips ``phase`` to "analyst".
+        but NOT applied -- propagation happens in :meth:`end_round`, after
+        the analyst exchanges. Flips ``phase`` to "analyst".
         """
         if self.phase != "player":
             raise ValueError(
@@ -248,6 +260,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
             "settings_json": before_props.get("settings_json"),
             "assistant_msg_id": str(assistant_msg.id),
             "trace": trace,
+            "n_analyses": 0,
         }
         self.phase = "analyst"
         logger.info(
@@ -269,18 +282,27 @@ class InteractiveSelfEvalSession(InteractiveSession):
         question: str | None = None,
         on_step: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
-        """Analyst phase: privileged review of the player's latest reply,
-        then propagation of the pending move.
+        """Analyst phase: one privileged review exchange about the player's
+        latest reply. Repeatable -- the round stays open (``phase`` stays
+        "analyst") until :meth:`end_round` propagates the pending move.
 
-        ``question`` defaults to :data:`DEFAULT_ANALYST_QUESTION`. ``on_step``
-        (if given) fires after every analyst generation (search calls
-        included). Flips ``phase`` back to "player" and returns the analysis
-        plus the post-propagation frame.
+        On the FIRST call of a round an empty ``question`` defaults to
+        :data:`DEFAULT_ANALYST_QUESTION`; on follow-up calls an empty
+        question is rejected so a stray click cannot burn a generation.
+        ``on_step`` (if given) fires after every analyst generation (search
+        calls included).
         """
         if self.phase != "analyst" or self._pending is None:
             raise ValueError("No player reply awaiting analysis; ask the player first.")
-        question = (question or "").strip() or DEFAULT_ANALYST_QUESTION
         pending = self._pending
+        question = (question or "").strip()
+        if not question:
+            if pending["n_analyses"] > 0:
+                raise ValueError(
+                    "Empty follow-up question; type one, or press 'Back to "
+                    "player' to end the round."
+                )
+            question = DEFAULT_ANALYST_QUESTION
         trace = pending["trace"]
 
         # The analysis request lives in the same conversation; the "(to
@@ -355,9 +377,38 @@ class InteractiveSelfEvalSession(InteractiveSession):
                 kind="analysis",
             )
         )
+        pending["n_analyses"] += 1
 
-        # NOW propagate the deferred move and record the player step with its
-        # actual outcome on the round's trace.
+        # Harness-verified error spans: exact substring match against the
+        # recorded player reply. Unverified spans are surfaced, never kept.
+        wrong_spans = modes.parse_wrong_spans(analysis, pending["raw"])
+
+        logger.info(
+            "analyst exchange %d done (%d verified / %d unverified WRONG "
+            "spans); round still open.",
+            pending["n_analyses"],
+            len(wrong_spans["verified"]), len(wrong_spans["unverified"]),
+        )
+        return {
+            "session_id": self.session_id,
+            "question": question,
+            "analysis": analysis,
+            "replies": replies,
+            "wrong_spans": wrong_spans,
+            "player_raw": pending["raw"],
+            "n_analyses": pending["n_analyses"],
+            "phase": self.phase,
+        }
+
+    def end_round(self) -> dict[str, Any]:
+        """End the analyst phase: propagate the pending move, record the
+        player step with its actual outcome, complete the round's trace, and
+        flip ``phase`` back to "player"."""
+        if self.phase != "analyst" or self._pending is None:
+            raise ValueError("No round is open; ask the player first.")
+        pending = self._pending
+        trace = pending["trace"]
+
         action = pending["action"]
         gold_collected = game_io.apply_action(self.game, action) if action else 0
         self._run(
@@ -385,9 +436,11 @@ class InteractiveSelfEvalSession(InteractiveSession):
             )
 
         gold_remaining = game_io.gold_remaining(self.game)
+        n_analyses = pending["n_analyses"]
         outcome = (
             f"scene round: action={action or 'none'}; "
-            f"gold_collected={gold_collected}; analyzed=True; "
+            f"gold_collected={gold_collected}; "
+            f"analyst_exchanges={n_analyses}; "
             f"gold_remaining={gold_remaining}"
         )
         self._run(
@@ -400,18 +453,17 @@ class InteractiveSelfEvalSession(InteractiveSession):
         self._pending = None
         self.phase = "player"
         logger.info(
-            "analysis done; move %s propagated (gold_collected=%d).",
-            action or "none", gold_collected,
+            "round ended after %d analyst exchange(s); move %s propagated "
+            "(gold_collected=%d).",
+            n_analyses, action or "none", gold_collected,
         )
         return {
             "session_id": self.session_id,
-            "question": question,
-            "analysis": analysis,
-            "replies": replies,
             "action": action,
             "gold_collected": gold_collected,
             "gold_remaining": gold_remaining,
             "after_path": after_path,
             "frame_path": self.current_frame_path(),
+            "n_analyses": n_analyses,
             "phase": self.phase,
         }
