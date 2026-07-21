@@ -937,31 +937,40 @@ _BLOCK_PRIVILEGED_VIEW = (
 
 _BLOCK_GEOMETRY_PRIVILEGED = (
     "GEOMETRY (verified against the renderer -- trust this over intuition):\n"
-    "  - 'direction' is theta in radians, kept in [0, 2*pi). The board's y "
-    "axis points DOWNWARD on screen.\n"
-    "  - The eye points along (cos theta, sin theta): theta=0 faces right, "
-    "pi/2 faces down-screen, pi faces left, 3*pi/2 faces up-screen. "
-    "Increasing theta looks CLOCKWISE in the image.\n"
-    "  - The [CLOCK] move INCREASES theta by pi/30 (6 degrees) and looks "
-    "clockwise; [ANTICLOCK] decreases theta.\n"
-    "  - The agent faces the gold when theta ~= atan2(gold_y - agent_y, "
-    "gold_x - agent_x) mod 2*pi. NO sign flip: both angles live in the same "
-    "y-down convention.\n"
-    "  - ROTATION DIRECTION: to decide between [CLOCK] and [ANTICLOCK], "
-    "compute diff = theta_target - theta, then bring it into (-pi, pi] by "
-    "adding 2*pi if diff <= -pi, or subtracting 2*pi if diff > pi (one "
-    "adjustment always suffices for angles in [0, 2*pi)). Call the result "
-    "delta. If delta > 0, [CLOCK] is the shorter rotation; if delta < 0, "
-    "[ANTICLOCK] is. |delta| / (pi/30) is roughly the number of rotation "
-    "steps needed. Do NOT use the mod operator here: mod of a negative "
-    "number is convention-dependent and can flip your answer -- stick to "
-    "the add/subtract-2*pi rule. NEVER compare raw angles without this "
+    "  - Coordinates are in [0, 1]. The x axis points RIGHT and the y axis "
+    "points UP on screen: larger y = higher in the image, exactly as in "
+    "ordinary graphs.\n"
+    "  - 'direction' is theta in radians, kept in [0, 2*pi), measured "
+    "CLOCKWISE: increasing theta sweeps the eye the way a clock's hand "
+    "sweeps. theta=0 faces right (3 o'clock), pi/2 faces down (6 o'clock), "
+    "pi faces left (9 o'clock), 3*pi/2 faces up (12 o'clock).\n"
+    "  - ANGLE TO CLOCK DIRECTION: hour = 3 + theta / (pi/6); subtract 12 "
+    "if the result exceeds 12. Worked example: theta = 4.55 -> hour = 3 + "
+    "8.7 = 11.7 -> between 11 and 12 o'clock, i.e. just shy of straight up, "
+    "slightly toward the LEFT (anticlockwise) side. Use this whenever you "
+    "translate an angle into words -- do not eyeball it.\n"
+    "  - The agent faces a target when theta ~= theta_target = "
+    "atan2(y_agent - y_target, x_target - x_agent). NOTE the y-difference "
+    "enters NEGATED (agent minus target) while the x-difference is target "
+    "minus agent: theta runs clockwise while y points up, so the usual "
+    "atan2(dy, dx) would give the wrong sign. The same formula also gives "
+    "any point's clock direction from the agent, via the hour rule above.\n"
+    "  - ROTATION DIRECTION: to decide which way to rotate, compute diff = "
+    "theta_target - theta, then bring it into (-pi, pi] by adding 2*pi if "
+    "diff <= -pi, or subtracting 2*pi if diff > pi (one adjustment always "
+    "suffices for angles in [0, 2*pi)). Call the result delta. If delta > "
+    "0, CLOCKWISE is the shorter rotation; if delta < 0, COUNTER-CLOCKWISE "
+    "is. |delta| / (pi/30) is roughly the number of rotation steps needed. "
+    "Do NOT use the mod operator here: mod of a negative number is "
+    "convention-dependent and can flip your answer -- stick to the "
+    "add/subtract-2*pi rule. NEVER compare raw angles without this "
     "normalization: whenever the raw gap |theta_target - theta| exceeds pi, "
     "the OTHER direction is shorter. Worked example: theta = 5.68, "
     "theta_target = 0.75 -> diff = -4.93 -> add 2*pi -> delta = +1.35 -> "
-    "[CLOCK] (about 13 steps).\n"
-    "  - One [FORWARD] advances up to 1/16 of the board along "
-    "(cos theta, sin theta)."
+    "clockwise (about 13 steps).\n"
+    "  - The [CLOCK] move INCREASES theta by pi/30 (6 degrees) and rotates "
+    "clockwise on screen; [ANTICLOCK] decreases theta. One [FORWARD] "
+    "advances up to 1/16 of the board along the facing direction."
 )
 
 _BLOCK_DEBRIEF_RECORD = (
@@ -1113,7 +1122,18 @@ def build_scene_analyst_messages(
             "below."
         )
     else:
-        scene.append("The reply contains no move token (a prose answer).")
+        bare = game_io.find_bare_move(player_reply)
+        if bare:
+            scene.append(
+                f"FORMAT ERROR (harness-verified): the reply contains the "
+                f"bare word '{bare}' WITHOUT brackets. That is NOT a valid "
+                f"move token -- only [{bare}] would be -- so NO move will be "
+                f"propagated. The player almost certainly intended a move "
+                f"and fumbled the format; call this mistake out explicitly "
+                f"in your analysis."
+            )
+        else:
+            scene.append("The reply contains no move token (a prose answer).")
     blocks = ["\n\n".join(scene)]
     if recent:
         blocks.append(

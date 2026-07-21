@@ -234,6 +234,9 @@ class InteractiveSession:
             "question": question if step == 0 else None,
             "raw": raw,
             "action": action,
+            # Bare (unbracketed) move word: never applied, but surfaced so
+            # the UI can flag the format fumble instead of calling it prose.
+            "bare_move": game_io.find_bare_move(raw) if action is None else None,
             "gold_collected": gold_collected,
             "gold_remaining": game_io.gold_remaining(self.game),
             "before_path": turn["snapshot_before_path"],

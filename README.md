@@ -5,11 +5,14 @@ persistent, graph-shaped memory backed by the **Neo4j Agent Memory System
 (NAMS)** running locally over Bolt. No external DB, no NAMS API key, no
 cloud LLM provider.
 
-The game itself lives in `game/discreteEngine.py` (untouched — we wrap it,
-we do not patch it). For now the agent only sees **bare levels**: four
-boundary walls, exactly one gold piece near the agent, generated via
-`discreteGame.random_bare_settings()`. See `FUTURE_GOALS.md` for what is
-deliberately deferred.
+The game itself lives in `game/discreteEngine.py`. Its world is **y-up**
+(larger y = higher on screen, as in ordinary graphs) and the facing angle
+theta is measured **clockwise** on screen from 3 o'clock — the engine, the
+Settings JSON, and every prompt share this one convention (see the
+docstring of `agent/game_io.py`). For now the agent only sees **bare
+levels**: four boundary walls, exactly one gold piece near the agent,
+generated via `discreteGame.random_bare_settings()`. See `FUTURE_GOALS.md`
+for what is deliberately deferred.
 
 ## What it does
 
@@ -349,7 +352,8 @@ has the high-res frame on disk for re-feeding into Gemma 4 E4B.
 * The project is **local bolt-only by design**: there is no plan to add
   the hosted NAMS service or any external API key.
 * The game package (`game/discreteEngine.py`, `game/levels/skeleton.py`)
-  is wrapped, not modified — this is a permanent constraint.
+  is owned by this repo and follows the y-up / clockwise-theta convention
+  documented in `agent/game_io.py`; keep engine edits convention-consistent.
 
 ## Project layout
 

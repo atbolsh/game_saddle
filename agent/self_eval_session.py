@@ -263,14 +263,21 @@ class InteractiveSelfEvalSession(InteractiveSession):
             "n_analyses": 0,
         }
         self.phase = "analyst"
+        # A bare move word (e.g. 'ANTICLOCK' without brackets) is never
+        # applied, but it is a format fumble worth surfacing loudly rather
+        # than mislabeling the reply as a prose answer.
+        bare_move = game_io.find_bare_move(raw) if action is None else None
         logger.info(
-            "player replied (action=%s); awaiting analysis.", action or "none"
+            "player replied (action=%s%s); awaiting analysis.",
+            action or "none",
+            f", bare move word {bare_move!r}" if bare_move else "",
         )
         return {
             "session_id": self.session_id,
             "question": question,
             "raw": raw,
             "action": action,
+            "bare_move": bare_move,
             "before_path": before_path,
             "searches": searches,
             "phase": self.phase,

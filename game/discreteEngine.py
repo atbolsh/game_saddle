@@ -53,6 +53,9 @@ class discreteGame:
         self.sprite_files = { 'arrow': "game_images_and_modifications/Arrow_example_for_import.png", \
                               'line' : "game_images_and_modifications/LineSprite.png" }
 
+        # Index 3 rotates CLOCKWISE on screen, index 4 counter-clockwise
+        # (method names match their on-screen effect under the y-up
+        # presentation convention).
         self.actions = [(lambda : 0), self.stepForward, self.stepBackward, self.swivel_clock, self.swivel_anticlock]
         self.settings = settings
 
@@ -119,33 +122,11 @@ class discreteGame:
         return coords[0]*self.settings.gameSize, coords[1]*self.settings.gameSize
 
     def direction_angle(self, xo, yo, xt, yt):
-        # Finds the angle from (xo, yo) to (xt, yt)
-        # Degenerate cases first, just in case
-        if xo == xt:
-            if yo < yt:
-                return math.pi / 2
-            else:
-                return 3 * math.pi / 2
-        if yo == yt:
-            if xo < xt:
-                return 0.0
-            else:
-                return math.pi
-        candidate = math.atan((yt - yo) / (xt - xo))
-        if (yt > yo):
-            # Quadrant 1
-            if (xt > xo):
-                return candidate
-            # Quadrant 2
-            else:
-                return math.pi + candidate # candidate is negative in this case
-        else:
-            # Quadrant 3
-            if (xt < xo):
-                return math.pi + candidate # candidate is positive in this case.
-            # Quadrant 4
-            else:
-                return (2 * math.pi) + candidate # candidate is negative
+        """Facing angle theta from (xo, yo) toward (xt, yt), in [0, 2*pi).
+
+        The facing vector is (cos theta, -sin theta) in the y-up world (theta
+        is clockwise on screen), so the y-difference enters NEGATED."""
+        return self.mod2pi(math.atan2(yo - yt, xt - xo))
 
     def draw_arrow(self, extension = 1.0, direction = None, sprite = None):
         """Drawing arrows is an important cognitive tool / middle step that I will teach the agent.
@@ -154,6 +135,14 @@ class discreteGame:
         is purely for the sake of drawing 'target' images, which the agent will be trained on."""
         if direction is None:
             direction = self.settings.direction
+        # This drawing pipeline (offsets, top_corner_adjustment, rotate) was
+        # built for the internal y-down surface, where the old convention's
+        # angle t pointed along (cos t, sin t). The new convention's facing
+        # vector (cos t, -sin t) is exactly the old pipeline's vector for -t,
+        # so negate once here (wrapped back into [0, 2*pi) for
+        # top_corner_adjustment's quadrant logic) and keep the drawing math
+        # untouched.
+        direction = self.mod2pi(0 - direction)
         if sprite is None:
             sprite = 'line'
         # in the future, I may choose a different asset.
@@ -209,8 +198,10 @@ class discreteGame:
         agent_y = self.settings.agent_y * self.settings.gameSize
         agent_r = self.settings.agent_r * self.settings.gameSize
 #        indicator_length = self.settings.indicator_length * self.settings.gameSize
+        # Facing vector in world coords is (cos theta, -sin theta): y-up
+        # world, theta clockwise-on-screen (see stepForward).
         eye_x = (self.settings.agent_x + (0.6 * self.settings.agent_r * math.cos(self.settings.direction))) * self.settings.gameSize
-        eye_y = (self.settings.agent_y + (0.6 * self.settings.agent_r * math.sin(self.settings.direction))) * self.settings.gameSize
+        eye_y = (self.settings.agent_y - (0.6 * self.settings.agent_r * math.sin(self.settings.direction))) * self.settings.gameSize
         eye_r = 0.4 * agent_r
         pygame.draw.circle(self.windowSurface, \
                            self.GREEN, \
@@ -256,6 +247,12 @@ class discreteGame:
         if not ignore_gold:
             self.draw_gold()
         if not self.envMode:
+            # Presentation is y-up: the internal surface keeps its native
+            # y-down layout, and the ONE vertical flip happens at display /
+            # export time (here and in getData).
+            self.windowSurface.blit(
+                pygame.transform.flip(self.windowSurface, False, True), (0, 0)
+            )
             pygame.display.update()
     
     ####### Overlap detection / updating function
@@ -344,27 +341,34 @@ class discreteGame:
         return 0
     
     ## Full definition of actions from here.    
+    # CONVENTION: world coordinates are y-UP (larger y = higher on the
+    # presented screen; the flip to pygame's y-down surface happens once at
+    # presentation). 'direction' theta is measured CLOCKWISE as seen on
+    # screen, theta=0 pointing right -- so the facing vector in world
+    # coordinates is (cos theta, -sin theta).
     def stepForward(self, lim=None):
         if lim is None:
             lim = 1.0/16 # big enough for most pixelations, small enough to make gameSize 800 interesting.
-        stepSize = self.biggest_step(lim, lambda step : (self.settings.agent_x + step*math.cos(self.settings.direction), self.settings.agent_y + step*math.sin(self.settings.direction)))
+        stepSize = self.biggest_step(lim, lambda step : (self.settings.agent_x + step*math.cos(self.settings.direction), self.settings.agent_y - step*math.sin(self.settings.direction)))
         self.settings.agent_x += stepSize*math.cos(self.settings.direction)
-        self.settings.agent_y += stepSize*math.sin(self.settings.direction)
+        self.settings.agent_y -= stepSize*math.sin(self.settings.direction)
         return self.universal_update() # returns the gold collected this step.
     
     def stepBackward(self, lim=None):
         if lim is None:
             lim = 1.0/16 # big enough for most pixelations, small enough to make gameSize 800 interesting.
-        stepSize = self.biggest_step(lim, lambda step : (self.settings.agent_x - step*math.cos(self.settings.direction), self.settings.agent_y - step*math.sin(self.settings.direction)))
+        stepSize = self.biggest_step(lim, lambda step : (self.settings.agent_x - step*math.cos(self.settings.direction), self.settings.agent_y + step*math.sin(self.settings.direction)))
         self.settings.agent_x -= stepSize*math.cos(self.settings.direction)
-        self.settings.agent_y -= stepSize*math.sin(self.settings.direction)
-        return self.universal_update()
-    
-    def swivel_anticlock(self):
-        self.settings.direction = self.mod2pi(self.settings.direction + math.pi/30)
+        self.settings.agent_y += stepSize*math.sin(self.settings.direction)
         return self.universal_update()
     
     def swivel_clock(self):
+        """Rotate CLOCKWISE as seen on screen: theta increases."""
+        self.settings.direction = self.mod2pi(self.settings.direction + math.pi/30)
+        return self.universal_update()
+    
+    def swivel_anticlock(self):
+        """Rotate COUNTER-CLOCKWISE as seen on screen: theta decreases."""
         self.settings.direction = self.mod2pi(self.settings.direction - math.pi/30)
         return self.universal_update()
 
@@ -379,9 +383,9 @@ class discreteGame:
         while True:
             keys=pygame.key.get_pressed()
             if keys[K_LEFT]:
-                self.swivel_clock()
-            if keys[K_RIGHT]:
                 self.swivel_anticlock()
+            if keys[K_RIGHT]:
+                self.swivel_clock()
             if keys[K_UP]:
                 self.stepForward()
             if keys[K_DOWN]:
@@ -401,7 +405,11 @@ class discreteGame:
         return obs, reward, terminated, truncated, info
 
     def getData(self):
-        return pygame.surfarray.array3d(self.windowSurface)/255
+        # y-up presentation: flip the internal (y-down) surface along its
+        # height axis on export, so a LARGER stored y appears HIGHER in the
+        # image. surfarray shape is (width, height, 3) -> flip axis 1.
+        # (envMode only: in display mode draw() already flips the surface.)
+        return pygame.surfarray.array3d(self.windowSurface)[:, ::-1, :]/255
 
     def blowup(self, factor):
         bigSettings = deepcopy(self.settings)
@@ -413,7 +421,9 @@ class discreteGame:
         bigSize = int(factor*self.settings.gameSize)
         maxCenterCoord = int(bigSize - (self.settings.gameSize/2))
         centerX = min(int(center[0]*factor*self.settings.gameSize), maxCenterCoord)
-        centerY = min(int(center[1]*factor*self.settings.gameSize), maxCenterCoord)
+        # canvas comes from getData() and is therefore y-flipped: a world y
+        # maps to array row (1 - y) * size. Convert before cropping.
+        centerY = min(int((1 - center[1])*factor*self.settings.gameSize), maxCenterCoord)
         leftPoint = max(int(centerX - (self.settings.gameSize / 2)), 0)
         topPoint = max(int(centerY - (self.settings.gameSize / 2)), 0)
         return canvas[leftPoint:leftPoint + self.settings.gameSize, topPoint:topPoint + self.settings.gameSize]

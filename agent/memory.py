@@ -748,12 +748,12 @@ _SEMANTIC_MODEL_ENTITIES = [
     ("Gold", "OBJECT", "Small yellow circle the agent must collect. Bare levels have exactly one."),
     ("BoundaryWall", "OBJECT", "The four fixed walls framing the play area. Always present."),
     ("DiscreteGame", "SYSTEM", "The 2D discrete game engine: square board, agent + gold + walls."),
-    ("Direction", "ATTRIBUTE", "The agent's facing angle in radians, 0..2pi, measured CCW from +x."),
+    ("Direction", "ATTRIBUTE", "The agent's facing angle theta in radians, 0..2pi, measured CLOCKWISE on screen from +x (3 o'clock): pi/2 faces down, pi left, 3pi/2 up."),
 ]
 
 _SEMANTIC_MODEL_PREFERENCES = [
     ("controls", "Available moves are CLOCK (turn clockwise), ANTICLOCK (turn counter-clockwise), and FORWARD (advance one step). One CLOCK/ANTICLOCK step is pi/30 radians; one FORWARD step is up to 1/16 of the board."),
-    ("geometry", "The board is the unit square [0,1]x[0,1]. All coordinates are normalised; agent_r ~ 0.05, gold_r ~ 1/64."),
+    ("geometry", "The board is the unit square [0,1]x[0,1] with x pointing right and y pointing UP on screen (larger y = higher, as in ordinary graphs). All coordinates are normalised; agent_r ~ 0.05, gold_r ~ 1/64."),
     ("goal", "Collect the gold piece. In bare levels there is exactly one gold piece; the game ends for the agent once it is eaten (overlap of agent and gold circles)."),
     ("tip_distance", "Tip: the agent does not need to know its exact coordinates. Use the visual angle between the agent's red eye and the gold to decide CLOCK vs ANTICLOCK, then FORWARD."),
     ("tip_facing", "Tip: if the gold is roughly in front of the agent's eye, FORWARD is the best move. If it is to the right, CLOCK until it is centered. If to the left, ANTICLOCK."),

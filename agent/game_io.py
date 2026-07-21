@@ -1,19 +1,28 @@
 """Game level generation, rendering, and Settings serialization.
 
-We **wrap** the existing ``game.discreteEngine`` package; we do not modify
-``discreteEngine.py`` or ``game/levels/skeleton.py``. Only "bare" levels are
-generated for now: 4 boundary walls + 1 gold piece near the agent, via
+Wraps the ``game.discreteEngine`` package. Only "bare" levels are generated
+for now: 4 boundary walls + 1 gold piece near the agent, via
 ``discreteGame.random_bare_settings``.
 
-Moves exposed to the agent:
-  - ``CLOCK``    -> ``swivel_anticlock`` (turn clockwise on screen)
-  - ``ANTICLOCK``-> ``swivel_clock``     (turn counter-clockwise on screen)
-  - ``FORWARD``  -> ``stepForward``      (advance one step)
+COORDINATE CONVENTION (single source of truth, engine and prompts agree):
+  - The world is y-UP: larger y = higher on the presented screen. The engine
+    draws on a y-down pygame surface internally and flips ONCE at
+    presentation (``getData``), so the Settings numbers match the picture.
+  - ``direction`` (theta) is measured CLOCKWISE as seen on screen, theta=0
+    pointing right. The facing vector in world coordinates is therefore
+    ``(cos theta, -sin theta)``, and the agent faces a target when
+    ``theta ~= atan2(y_agent - y_target, x_target - x_agent)`` (the
+    y-difference enters NEGATED: y-up plus clockwise theta is left-handed).
+  - Wall caveat: a wall's ``[x, y, w, h, angle]`` anchor is its display
+    bottom-left corner with ``h`` extending up-screen, but a nonzero wall
+    ``angle`` still appears ANTICLOCKWISE on screen (the wall-drawing math
+    predates the flip). All bare-game walls have angle 0, so this never
+    surfaces in current levels.
 
-The engine's ``swivel_clock``/``swivel_anticlock`` rotate the world direction,
-but various rendering/visualization conventions invert the apparent on-screen
-rotation, so the agent-facing tokens are wired to the *opposite* engine method
-to match what the agent actually sees.
+Moves exposed to the agent map directly onto same-named engine methods:
+  - ``CLOCK``    -> ``swivel_clock``     (turn clockwise on screen)
+  - ``ANTICLOCK``-> ``swivel_anticlock`` (turn counter-clockwise on screen)
+  - ``FORWARD``  -> ``stepForward``      (advance one step)
 """
 
 from __future__ import annotations
@@ -34,10 +43,11 @@ from PIL import Image
 from game.discreteEngine import discreteGame, Settings  # noqa: F401
 from game.levels.skeleton import Settings as SettingsClass  # noqa: F401
 
-# Map agent-facing action names to engine method names.
+# Map agent-facing action names to engine method names (identity: engine
+# method names match their on-screen effect).
 ACTION_MAP: dict[str, str] = {
-    "CLOCK": "swivel_anticlock",
-    "ANTICLOCK": "swivel_clock",
+    "CLOCK": "swivel_clock",
+    "ANTICLOCK": "swivel_anticlock",
     "FORWARD": "stepForward",
 }
 ACTIONS = list(ACTION_MAP.keys())
@@ -51,6 +61,12 @@ ACTIONS = list(ACTION_MAP.keys())
 # emitting a move token.
 MOVE_STOP_STRINGS = [f"[{a}]" for a in ACTIONS]  # ["[CLOCK]", "[ANTICLOCK]", "[FORWARD]"]
 _MOVE_RE = re.compile(r"\[(" + "|".join(ACTIONS) + r")\]", re.IGNORECASE)
+
+# A move word WITHOUT brackets (e.g. plain 'ANTICLOCK'). Never a move -- but
+# when a reply contains one and no bracketed token, the model almost
+# certainly INTENDED a move and fumbled the format, which the harness should
+# describe loudly rather than mislabel as a prose answer.
+BARE_MOVE_RE = re.compile(r"\b(" + "|".join(ACTIONS) + r")\b", re.IGNORECASE)
 
 # Keys we serialise on a Settings object. ``walls`` and ``gold`` are lists
 # of lists of floats; everything else is a scalar.
@@ -183,6 +199,22 @@ def parse_action(text: str) -> str | None:
     generation is stopped via :data:`MOVE_STOP_STRINGS` the move token sits at
     the tail, so we take the last match to be safe."""
     matches = _MOVE_RE.findall(text)
+    if not matches:
+        return None
+    return matches[-1].upper()
+
+
+def find_bare_move(text: str) -> str | None:
+    """Return the LAST bare (unbracketed) move word in ``text`` -- e.g.
+    'ANTICLOCK' without brackets -- or ``None``.
+
+    Only meaningful when :func:`parse_action` found no bracketed token: a
+    bare word is never applied as a move, but its presence means the model
+    probably intended one and got the format wrong, and callers should say
+    so explicitly instead of treating the reply as plain prose."""
+    if parse_action(text) is not None:
+        return None
+    matches = BARE_MOVE_RE.findall(text)
     if not matches:
         return None
     return matches[-1].upper()
