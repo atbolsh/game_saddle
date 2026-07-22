@@ -65,6 +65,10 @@ from .interactive import InteractiveSession
 logger = logging.getLogger(__name__)
 
 
+#: Pre-filled into the player text box in the notebook; the user may edit it
+#: or submit it unchanged.
+DEFAULT_PLAYER_QUESTION = "Please make the right move for this position."
+
 #: Pre-filled into the analyst text box in the notebook; the user may edit it
 #: or submit it unchanged.
 DEFAULT_ANALYST_QUESTION = (
@@ -89,6 +93,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
     enable.
     """
 
+    DEFAULT_PLAYER_QUESTION = DEFAULT_PLAYER_QUESTION
     DEFAULT_ANALYST_QUESTION = DEFAULT_ANALYST_QUESTION
 
     def __init__(self, *args: Any, log_label: str | None = None, **kwargs: Any):
