@@ -748,7 +748,7 @@ _SEMANTIC_MODEL_ENTITIES = [
     ("Gold", "OBJECT", "Small yellow circle the agent must collect. Bare levels have exactly one."),
     ("BoundaryWall", "OBJECT", "The four fixed walls framing the play area. Always present."),
     ("DiscreteGame", "SYSTEM", "The 2D discrete game engine: square board, agent + gold + walls."),
-    ("Direction", "ATTRIBUTE", "The agent's facing angle theta in radians, 0..2pi, measured CLOCKWISE on screen from +x (3 o'clock): pi/2 faces down, pi left, 3pi/2 up."),
+    ("Direction", "ATTRIBUTE", "The agent's facing angle theta in radians, 0..2pi: a compass bearing, 0 = straight up (12 o'clock), measured CLOCKWISE on screen. pi/2 faces right, pi down, 3pi/2 left."),
 ]
 
 _SEMANTIC_MODEL_PREFERENCES = [

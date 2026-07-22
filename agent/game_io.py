@@ -8,11 +8,12 @@ COORDINATE CONVENTION (single source of truth, engine and prompts agree):
   - The world is y-UP: larger y = higher on the presented screen. The engine
     draws on a y-down pygame surface internally and flips ONCE at
     presentation (``getData``), so the Settings numbers match the picture.
-  - ``direction`` (theta) is measured CLOCKWISE as seen on screen, theta=0
-    pointing right. The facing vector in world coordinates is therefore
-    ``(cos theta, -sin theta)``, and the agent faces a target when
-    ``theta ~= atan2(y_agent - y_target, x_target - x_agent)`` (the
-    y-difference enters NEGATED: y-up plus clockwise theta is left-handed).
+  - ``direction`` (theta) is a COMPASS BEARING: theta=0 points straight up
+    (12 o'clock) and theta increases CLOCKWISE as seen on screen. The facing
+    vector in world coordinates is the standard bearing idiom
+    ``(sin theta, cos theta)``, and the agent faces a target when
+    ``theta ~= atan2(x_target - x_agent, y_target - y_agent)`` (x-difference
+    FIRST -- ``bearing = atan2(east, north)``, no sign flips anywhere).
   - Wall caveat: a wall's ``[x, y, w, h, angle]`` anchor is its display
     bottom-left corner with ``h`` extending up-screen, but a nonzero wall
     ``angle`` still appears ANTICLOCKWISE on screen (the wall-drawing math

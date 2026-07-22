@@ -7,9 +7,9 @@ cloud LLM provider.
 
 The game itself lives in `game/discreteEngine.py`. Its world is **y-up**
 (larger y = higher on screen, as in ordinary graphs) and the facing angle
-theta is measured **clockwise** on screen from 3 o'clock — the engine, the
-Settings JSON, and every prompt share this one convention (see the
-docstring of `agent/game_io.py`). For now the agent only sees **bare
+theta is a **compass bearing**: 0 = straight up (12 o'clock), measured
+**clockwise** on screen — the engine, the Settings JSON, and every prompt
+share this one convention (see the docstring of `agent/game_io.py`). For now the agent only sees **bare
 levels**: four boundary walls, exactly one gold piece near the agent,
 generated via `discreteGame.random_bare_settings()`. See `FUTURE_GOALS.md`
 for what is deliberately deferred.

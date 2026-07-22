@@ -122,11 +122,12 @@ class discreteGame:
         return coords[0]*self.settings.gameSize, coords[1]*self.settings.gameSize
 
     def direction_angle(self, xo, yo, xt, yt):
-        """Facing angle theta from (xo, yo) toward (xt, yt), in [0, 2*pi).
+        """Compass bearing theta from (xo, yo) toward (xt, yt), in [0, 2*pi).
 
-        The facing vector is (cos theta, -sin theta) in the y-up world (theta
-        is clockwise on screen), so the y-difference enters NEGATED."""
-        return self.mod2pi(math.atan2(yo - yt, xt - xo))
+        The facing vector is (sin theta, cos theta) in the y-up world (theta
+        is a bearing: 0 = up, clockwise), so this is the standard
+        bearing = atan2(dx, dy) idiom -- x-difference FIRST."""
+        return self.mod2pi(math.atan2(xt - xo, yt - yo))
 
     def draw_arrow(self, extension = 1.0, direction = None, sprite = None):
         """Drawing arrows is an important cognitive tool / middle step that I will teach the agent.
@@ -136,13 +137,13 @@ class discreteGame:
         if direction is None:
             direction = self.settings.direction
         # This drawing pipeline (offsets, top_corner_adjustment, rotate) was
-        # built for the internal y-down surface, where the old convention's
-        # angle t pointed along (cos t, sin t). The new convention's facing
-        # vector (cos t, -sin t) is exactly the old pipeline's vector for -t,
-        # so negate once here (wrapped back into [0, 2*pi) for
-        # top_corner_adjustment's quadrant logic) and keep the drawing math
-        # untouched.
-        direction = self.mod2pi(0 - direction)
+        # built for the internal y-down surface, where the legacy angle t
+        # pointed along (cos t, sin t). The bearing convention's facing
+        # vector (sin theta, cos theta) equals the legacy pipeline's vector
+        # for t = pi/2 - theta, so convert once here (wrapped back into
+        # [0, 2*pi) for top_corner_adjustment's quadrant logic) and keep the
+        # drawing math untouched.
+        direction = self.mod2pi(math.pi/2 - direction)
         if sprite is None:
             sprite = 'line'
         # in the future, I may choose a different asset.
@@ -198,10 +199,10 @@ class discreteGame:
         agent_y = self.settings.agent_y * self.settings.gameSize
         agent_r = self.settings.agent_r * self.settings.gameSize
 #        indicator_length = self.settings.indicator_length * self.settings.gameSize
-        # Facing vector in world coords is (cos theta, -sin theta): y-up
-        # world, theta clockwise-on-screen (see stepForward).
-        eye_x = (self.settings.agent_x + (0.6 * self.settings.agent_r * math.cos(self.settings.direction))) * self.settings.gameSize
-        eye_y = (self.settings.agent_y - (0.6 * self.settings.agent_r * math.sin(self.settings.direction))) * self.settings.gameSize
+        # Facing vector in world coords is (sin theta, cos theta): theta is
+        # a compass bearing, 0 = up, clockwise (see stepForward).
+        eye_x = (self.settings.agent_x + (0.6 * self.settings.agent_r * math.sin(self.settings.direction))) * self.settings.gameSize
+        eye_y = (self.settings.agent_y + (0.6 * self.settings.agent_r * math.cos(self.settings.direction))) * self.settings.gameSize
         eye_r = 0.4 * agent_r
         pygame.draw.circle(self.windowSurface, \
                            self.GREEN, \
@@ -343,23 +344,24 @@ class discreteGame:
     ## Full definition of actions from here.    
     # CONVENTION: world coordinates are y-UP (larger y = higher on the
     # presented screen; the flip to pygame's y-down surface happens once at
-    # presentation). 'direction' theta is measured CLOCKWISE as seen on
-    # screen, theta=0 pointing right -- so the facing vector in world
-    # coordinates is (cos theta, -sin theta).
+    # presentation). 'direction' theta is a COMPASS BEARING: theta=0 points
+    # straight up (12 o'clock) and theta increases CLOCKWISE as seen on
+    # screen -- so the facing vector in world coordinates is
+    # (sin theta, cos theta), the standard bearing idiom.
     def stepForward(self, lim=None):
         if lim is None:
             lim = 1.0/16 # big enough for most pixelations, small enough to make gameSize 800 interesting.
-        stepSize = self.biggest_step(lim, lambda step : (self.settings.agent_x + step*math.cos(self.settings.direction), self.settings.agent_y - step*math.sin(self.settings.direction)))
-        self.settings.agent_x += stepSize*math.cos(self.settings.direction)
-        self.settings.agent_y -= stepSize*math.sin(self.settings.direction)
+        stepSize = self.biggest_step(lim, lambda step : (self.settings.agent_x + step*math.sin(self.settings.direction), self.settings.agent_y + step*math.cos(self.settings.direction)))
+        self.settings.agent_x += stepSize*math.sin(self.settings.direction)
+        self.settings.agent_y += stepSize*math.cos(self.settings.direction)
         return self.universal_update() # returns the gold collected this step.
     
     def stepBackward(self, lim=None):
         if lim is None:
             lim = 1.0/16 # big enough for most pixelations, small enough to make gameSize 800 interesting.
-        stepSize = self.biggest_step(lim, lambda step : (self.settings.agent_x - step*math.cos(self.settings.direction), self.settings.agent_y + step*math.sin(self.settings.direction)))
-        self.settings.agent_x -= stepSize*math.cos(self.settings.direction)
-        self.settings.agent_y += stepSize*math.sin(self.settings.direction)
+        stepSize = self.biggest_step(lim, lambda step : (self.settings.agent_x - step*math.sin(self.settings.direction), self.settings.agent_y - step*math.cos(self.settings.direction)))
+        self.settings.agent_x -= stepSize*math.sin(self.settings.direction)
+        self.settings.agent_y -= stepSize*math.cos(self.settings.direction)
         return self.universal_update()
     
     def swivel_clock(self):
