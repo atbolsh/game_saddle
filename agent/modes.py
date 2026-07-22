@@ -127,6 +127,19 @@ _BLOCK_AIM_TOLERANCE_REVIEW = (
     "rotate-only fine-tuning inside that tolerance goes against them."
 )
 
+# Grading calibration shared by every reviewer prompt (scene analyst +
+# debrief): how forgiving to be about verbal direction estimates, and the one
+# clear-cut case that must always be penalized.
+_BLOCK_GRADING_TOLERANCE = (
+    "GRADING CALIBRATION: verbal direction estimates are approximate by "
+    "nature. If the player's stated direction is within 2 clock hours "
+    "(about 60 degrees) of the true one -- e.g. '7 o'clock' when the truth "
+    "is 8 o'clock -- do NOT mark it as a mistake. One case IS clear-cut, "
+    "though: when the gold lies within about 10 degrees of the facing "
+    "direction, [FORWARD] is unambiguously correct, and choosing to rotate "
+    "instead is a real mistake -- call it out and penalize it."
+)
+
 
 def _search_tool_block(scope_note: str) -> str:
     """The [SEARCH <query>] tool description, shared by every mode that gets
@@ -1039,6 +1052,7 @@ SYSTEM_PROMPT_DEBRIEF = "\n\n".join([
     _BLOCK_DEBRIEF_RECORD,
     _BLOCK_GEOMETRY_PRIVILEGED,
     _BLOCK_AIM_TOLERANCE_REVIEW,
+    _BLOCK_GRADING_TOLERANCE,
     _BLOCK_REVIEW_WHOLE_REPLY,
     _BLOCK_DEBRIEF_NAV,
     _search_tool_block(_SEARCH_SCOPE_FULL),
@@ -1098,6 +1112,7 @@ SYSTEM_PROMPT_SCENE_ANALYST = "\n\n".join([
     _BLOCK_PRIVILEGED_VIEW,
     _BLOCK_GEOMETRY_PRIVILEGED,
     _BLOCK_AIM_TOLERANCE_REVIEW,
+    _BLOCK_GRADING_TOLERANCE,
     _BLOCK_SCENE_ANALYST_SCOPE,
     _BLOCK_REVIEW_WHOLE_REPLY,
     _search_tool_block(_SEARCH_SCOPE_FULL),
