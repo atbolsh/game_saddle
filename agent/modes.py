@@ -78,7 +78,7 @@ _BLOCK_MULTI_MOVE_TURN = (
 )
 
 _BLOCK_HOW_TO_PLAY = (
-    "HOW TO PLAY -- take these steps before every move. START your reply with "
+    "HOW TO PLAY -- take these steps in every reply. START your reply with "
     "one structured observation line, read fresh off the CURRENT screen, in "
     "exactly this form:\n"
     "  OBS: I am at <where on the board>; my eye points toward <clock "
@@ -87,15 +87,19 @@ _BLOCK_HOW_TO_PLAY = (
     "(Clock directions are as seen on screen: 12 o'clock is up-screen, 3 is "
     "right, 6 is down, 9 is left.) Then REASON, in a sentence or two, about "
     "where the gold is relative to your red eye: the eye points in the "
-    "direction you face, and [FORWARD] sends you straight that way. Then "
-    "choose your move from that reasoning:\n"
+    "direction you face, and [FORWARD] sends you straight that way.\n"
+    "IF (and only if) the user asked you to play or make a move, choose the "
+    "move from that reasoning:\n"
     "  - If your eye is pointing roughly at the gold, emit [FORWARD].\n"
     "  - Otherwise, aim your eye at the gold: emit [CLOCK] or [ANTICLOCK], then "
     "check the re-rendered screen to see which way your eye swung, and keep "
     "rotating that way (or reverse if you overshoot) until your eye lines up with "
     "the gold -- then emit [FORWARD].\n"
-    "Always state the observation and reasoning before the move token; looking "
-    "first, then reasoning, then a single move, is how you decide well."
+    "If the user instead asked a question (e.g. 'is the gold to your left?'), "
+    "answer it in prose after the observation and reasoning and STOP -- "
+    "emitting a move token nobody asked for is a format mistake.\n"
+    "Always state the observation and reasoning first; looking, then "
+    "reasoning, then (only when asked) a single move, is how you decide well."
 )
 
 _BLOCK_CURRENT_SCREEN = (
@@ -1036,7 +1040,10 @@ _BLOCK_REVIEW_WHOLE_REPLY = (
     "Grade the OBS line against the exact settings separately from the move "
     "choice: perception errors are as important as move errors, and correct "
     "perception with a wrong move, or wrong perception with a lucky move, "
-    "should both be called out explicitly."
+    "should both be called out explicitly. A move token belongs in the reply "
+    "ONLY when the user asked for a move: a question answered in prose with "
+    "no move token is the CORRECT format and must not be penalized, while an "
+    "unrequested move token is itself a mistake to call out."
 )
 
 _BLOCK_DEBRIEF_VERDICT = (
@@ -1158,7 +1165,12 @@ def build_scene_analyst_messages(
                 f"in your analysis."
             )
         else:
-            scene.append("The reply contains no move token (a prose answer).")
+            scene.append(
+                "The reply contains no move token (a prose answer). If the "
+                "user's question asked for information rather than a move, "
+                "this is the CORRECT format -- do not penalize the absence "
+                "of a move token; grade the answer's content instead."
+            )
     blocks = ["\n\n".join(scene)]
     if recent:
         blocks.append(
