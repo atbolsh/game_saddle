@@ -1,6 +1,8 @@
 # game_saddle
 
-A Gemma 4 E4B multimodal agent that plays a small 2D discrete game, with
+A multimodal-LLM agent (Gemma 4 E4B by default; any `agent.model.MODEL_REGISTRY`
+entry via `MODEL_KEY` or the notebooks' model dropdown — see
+`MODEL_CANDIDATES.md`) that plays a small 2D discrete game, with
 persistent, graph-shaped memory backed by the **Neo4j Agent Memory System
 (NAMS)** running locally over Bolt. No external DB, no NAMS API key, no
 cloud LLM provider.
@@ -169,8 +171,8 @@ sees Settings.
 
    ```bash
    cp .env.example .env
-   # edit .env: set NEO4J_PASSWORD, HF_TOKEN (Gemma weights are gated),
-   # optionally GEMMA_MODEL_ID, ...
+   # edit .env: set NEO4J_PASSWORD, HF_TOKEN (needed for gated weights),
+   # optionally MODEL_KEY (which registry model to load; gemma-4-e4b default), ...
    ```
 
    Setting variables in `.env` is **enough**: everything that runs Python —
@@ -267,6 +269,23 @@ launch Jupyter from the repo root:
 jupyter notebook   # or: jupyter lab
 ```
 
+**Model dropdown.** The play, debrief, and interactive-self-eval notebooks
+all start their control panel with a shared model picker
+(`agent.notebook_ui.model_picker`): a dropdown over every
+`agent.model.MODEL_REGISTRY` entry in recommendation order (see
+`MODEL_CANDIDATES.md`), an explicit **Switch model** button (a misclick on
+the dropdown never starts a download), and a **"Save only one set of weights
+at a time"** checkbox. Unchecked (default), switching keeps the conversation
+and leaves other models' weights cached on disk; checked, a switch first
+restarts the conversation (debrief: a fresh thread over the same play
+conversation), then deletes every other registry model's cached HF weights
+before downloading the new ones — non-registry caches (GLiNER, spaCy,
+sentence-transformers) are never touched. Thinking models (Qwen3-VL Thinking,
+GLM-4.1V, Kimi-VL, MiMo-VL, ...) are handled transparently: think blocks are
+stripped before parsing/persisting, a move token inside a think block never
+counts, and a reply that forgets its think-close tag is kept fully visible
+(so an intended move is still honored) but flagged as a FORMAT ERROR.
+
 * **`notebooks/play.ipynb`** — interactive mode-1 play. It holds **one
   persistent game** and **one conversation thread**. Asking the agent to play
   starts a **multi-move turn**: it sees the *current* live frame plus its
@@ -361,7 +380,7 @@ has the high-res frame on disk for re-feeding into Gemma 4 E4B.
 agent/
   __init__.py
   config.py          # env-driven AgentConfig
-  model.py           # Gemma 4 E4B multimodal wrapper
+  model.py           # model registry + family adapters + VLModel wrapper
   game_io.py         # bare level gen, Settings <-> dict, render to PNG, apply_action
   image_store.py     # disk PNG + 64x64 thumbnail b64 + GameSnapshot node + linking
   memory.py          # NAMS MemoryClient factory; context stripping; semantic-model seed; DB dump

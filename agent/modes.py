@@ -5,7 +5,7 @@
   * :func:`mode_self_eval`-- self-evaluation over a Conversation + traces (mode 3)
 
 All modes are async and share one NAMS ``MemoryClient`` and one
-``Gemma4E4B`` instance. Mode 1 never lets the Settings dict reach the model;
+``VLModel`` instance. Mode 1 never lets the Settings dict reach the model;
 mode 3 is the only mode where Settings JSON is included in the prompt.
 """
 
@@ -658,7 +658,7 @@ async def mode_game(
                     snapshot_before_path, question, actions_so_far
                 )
                 last_reflection = model.generate(
-                    refl_messages, max_new_tokens=cfg.gemma_max_new_tokens
+                    refl_messages, max_new_tokens=cfg.max_new_tokens
                 ).strip()
                 await persist_reflection(client, session_id, trace, last_reflection)
                 reflection_points = 0
@@ -849,7 +849,7 @@ async def mode_self_eval(
             {"type": "text", "text": "\n\n".join(sections)},
         ]},
     ]
-    verdict = model.generate(messages, max_new_tokens=cfg.gemma_max_new_tokens)
+    verdict = model.generate(messages, max_new_tokens=cfg.max_new_tokens)
 
     # Append the verdict to the same Conversation.
     eval_msg = await client.short_term.add_message(
@@ -1136,6 +1136,7 @@ def build_scene_analyst_messages(
     recent: str,
     question: str,
     search_results: str | None = None,
+    missing_think_close: bool = False,
 ) -> list[dict]:
     """Assemble one scene-analyst generation's prompt, mirroring
     :func:`build_debrief_messages`' structure (pre-joined text blocks, then
@@ -1172,6 +1173,14 @@ def build_scene_analyst_messages(
                 "is the CORRECT format -- do not penalize the absence; grade "
                 "the answer's content instead."
             )
+    if missing_think_close:
+        scene.append(
+            "FORMAT ERROR (harness-verified): the player is a thinking "
+            "model and never emitted its think-close tag, so the reply "
+            "above is an unterminated reasoning stream. Any move token in "
+            "it was still honored, but call this format error out "
+            "explicitly in your analysis."
+        )
     blocks = ["\n\n".join(scene)]
     if recent:
         blocks.append(
@@ -1491,7 +1500,7 @@ async def persist_debrief_verdict(
             },
         ]},
     ]
-    verdict = model.generate(messages, max_new_tokens=cfg.gemma_max_new_tokens)
+    verdict = model.generate(messages, max_new_tokens=cfg.max_new_tokens)
 
     eval_msg = await client.short_term.add_message(
         session_id=play_session_id, role="assistant", content=verdict,

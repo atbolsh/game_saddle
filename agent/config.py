@@ -3,7 +3,8 @@
 All settings are read from environment variables (loaded from .env via
 python-dotenv if present). No external API keys are required: Neo4j runs
 locally over bolt, embeddings come from a local sentence-transformers
-model, and the LLM is Gemma 4 E4B loaded through HuggingFace transformers.
+model, and the LLM (any agent.model.MODEL_REGISTRY entry; Gemma 4 E4B by
+default) is loaded through HuggingFace transformers.
 """
 
 from __future__ import annotations
@@ -92,6 +93,37 @@ def _env_bool(key: str, default: bool) -> bool:
     return val.strip().lower() not in ("0", "false", "no", "off", "")
 
 
+def _env_chain(*keys: str) -> str | None:
+    """First non-empty value among the given env vars, or None. Used for the
+    MODEL_* names with their legacy GEMMA_* fallbacks, so existing .env files
+    keep working after the model layer went multi-model."""
+    for k in keys:
+        v = os.environ.get(k)
+        if v is not None and v.strip() != "":
+            return v
+    return None
+
+
+def _env_chain_float(*keys: str) -> float | None:
+    v = _env_chain(*keys)
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except ValueError:
+        return None
+
+
+def _env_chain_int(*keys: str) -> int | None:
+    v = _env_chain(*keys)
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except ValueError:
+        return None
+
+
 @dataclass(frozen=True)
 class AgentConfig:
     # Neo4j (local, bolt-based; no external service)
@@ -100,33 +132,47 @@ class AgentConfig:
     neo4j_password: str = field(default_factory=lambda: _env("NEO4J_PASSWORD", "changeme"))
     neo4j_database: str = field(default_factory=lambda: _env("NEO4J_DATABASE", "neo4j"))
 
-    # Gemma 4 E4B
-    gemma_model_id: str = field(
-        default_factory=lambda: _env("GEMMA_MODEL_ID", "google/gemma-4-E4B-it")
+    # Model selection. ``model_key`` picks an entry from
+    # agent.model.MODEL_REGISTRY (see MODEL_CANDIDATES.md for the lineup);
+    # the notebooks can switch models at runtime via their dropdown.
+    model_key: str = field(
+        default_factory=lambda: _env("MODEL_KEY", "gemma-4-e4b")
     )
-    gemma_dtype: str = field(default_factory=lambda: _env("GEMMA_DTYPE", "bfloat16"))
-    gemma_device: str = field(default_factory=lambda: _env("GEMMA_DEVICE", "auto"))
-    gemma_max_new_tokens: int = field(
-        default_factory=lambda: _env_int("GEMMA_MAX_NEW_TOKENS", 2048)
+    model_dtype: str = field(
+        default_factory=lambda: _env_chain("MODEL_DTYPE", "GEMMA_DTYPE") or "bfloat16"
+    )
+    model_device: str = field(
+        default_factory=lambda: _env_chain("MODEL_DEVICE", "GEMMA_DEVICE") or "auto"
+    )
+    max_new_tokens: int = field(
+        default_factory=lambda: _env_chain_int(
+            "MODEL_MAX_NEW_TOKENS", "GEMMA_MAX_NEW_TOKENS"
+        ) or 2048
     )
 
-    # Sampling. Google's standardized recommendation for Gemma 4 E4B (model
-    # card / HF card) is temperature=1.0, top_p=0.95, top_k=64 across all use
-    # cases. Sampling (vs. the old greedy do_sample=False) also breaks the
-    # degenerate fixed point where a near-identical prompt deterministically
-    # reproduces the exact same move + reasoning sentence forever. Set
-    # GEMMA_DO_SAMPLE=0 to restore deterministic greedy decoding.
-    gemma_do_sample: bool = field(
-        default_factory=lambda: _env_bool("GEMMA_DO_SAMPLE", True)
+    # Sampling. Sampling (vs. greedy do_sample=False) breaks the degenerate
+    # fixed point where a near-identical prompt deterministically reproduces
+    # the exact same move + reasoning sentence forever; set MODEL_DO_SAMPLE=0
+    # to restore deterministic greedy decoding. Temperature/top_p/top_k are
+    # OPTIONAL overrides: when unset (the default) each model's per-spec
+    # defaults apply (e.g. Gemma's 1.0/0.95/64, Kimi Thinking's 0.8), falling
+    # back to the model's own generation_config. Setting MODEL_TEMPERATURE
+    # etc. forces one value for EVERY model.
+    do_sample: bool = field(
+        default_factory=lambda: _env_bool(
+            "MODEL_DO_SAMPLE", _env_bool("GEMMA_DO_SAMPLE", True)
+        )
     )
-    gemma_temperature: float = field(
-        default_factory=lambda: _env_float("GEMMA_TEMPERATURE", 1.0)
+    temperature: float | None = field(
+        default_factory=lambda: _env_chain_float(
+            "MODEL_TEMPERATURE", "GEMMA_TEMPERATURE"
+        )
     )
-    gemma_top_p: float = field(
-        default_factory=lambda: _env_float("GEMMA_TOP_P", 0.95)
+    top_p: float | None = field(
+        default_factory=lambda: _env_chain_float("MODEL_TOP_P", "GEMMA_TOP_P")
     )
-    gemma_top_k: int = field(
-        default_factory=lambda: _env_int("GEMMA_TOP_K", 64)
+    top_k: int | None = field(
+        default_factory=lambda: _env_chain_int("MODEL_TOP_K", "GEMMA_TOP_K")
     )
 
     # Embeddings (local sentence-transformers; NAMS embedding provider string)

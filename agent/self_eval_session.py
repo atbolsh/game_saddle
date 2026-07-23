@@ -196,7 +196,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
             over_budget = len(searches) >= self.cfg.memory_search_max_calls
             raw = self.model.generate(
                 messages,
-                max_new_tokens=self.cfg.gemma_max_new_tokens,
+                max_new_tokens=self.cfg.max_new_tokens,
                 stop_strings=game_io.MOVE_STOP_STRINGS,
                 stop_regex=None if over_budget else modes.SEARCH_TOOL_PATTERN,
             )
@@ -262,6 +262,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
             "question": question,
             "raw": raw,
             "action": action,
+            "missing_think_close": getattr(raw, "missing_think_close", False),
             "before_path": before_path,
             "settings_json": before_props.get("settings_json"),
             "assistant_msg_id": str(assistant_msg.id),
@@ -284,6 +285,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
             "raw": raw,
             "action": action,
             "bare_move": bare_move,
+            "missing_think_close": getattr(raw, "missing_think_close", False),
             "before_path": before_path,
             "searches": searches,
             "phase": self.phase,
@@ -345,11 +347,12 @@ class InteractiveSelfEvalSession(InteractiveSession):
                 pending["before_path"], pending["settings_json"],
                 recent, question,
                 search_results="\n\n".join(search_notes) or None,
+                missing_think_close=pending.get("missing_think_close", False),
             )
             over_budget = n_searches >= self.cfg.memory_search_max_calls
             raw = self.model.generate(
                 messages,
-                max_new_tokens=self.cfg.gemma_max_new_tokens,
+                max_new_tokens=self.cfg.max_new_tokens,
                 stop_regex=None if over_budget else modes.SEARCH_TOOL_PATTERN,
             )
             q, text = modes.parse_search_call(raw)
@@ -359,6 +362,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
                 "raw": raw,
                 "text": text,
                 "search_query": q,
+                "missing_think_close": getattr(raw, "missing_think_close", False),
             }
             replies.append(step_result)
             if on_step is not None:

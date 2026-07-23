@@ -63,7 +63,7 @@ from . import image_store
 from . import memory as mem
 from . import modes
 from . import run_logging
-from .model import get_model
+from .model import get_model, switch_session_model
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +133,23 @@ class DebriefSession:
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
 
     # ------------------------------------------------------------------ public
+    def restart(self) -> dict[str, Any]:
+        """Start a FRESH debrief thread over the currently selected play
+        conversation (the previous debrief conversation stays stored in
+        NAMS); a no-op when nothing is selected yet."""
+        if self.play_session_id:
+            return self.select(self.play_session_id)
+        return {"play_session_id": None, "debrief_session_id": None}
+
+    def switch_model(self, key: str, purge_others: bool = False) -> dict[str, Any]:
+        """Switch to registry model ``key`` (see ``agent.model.MODEL_REGISTRY``).
+
+        With ``purge_others=True`` ("save only one set of weights at a
+        time"), a fresh debrief thread is started first (over the same play
+        conversation) and every other registry model's cached weights are
+        deleted from disk before the new ones are downloaded."""
+        return switch_session_model(self, key, purge_others)
+
     def list_conversations(self) -> list[dict[str, Any]]:
         """All PLAY conversations (debriefs excluded), newest first, with
         message counts -- feeds the notebook's conversation picker."""
@@ -307,7 +324,7 @@ class DebriefSession:
                 )
                 raw = self.model.generate(
                     messages,
-                    max_new_tokens=self.cfg.gemma_max_new_tokens,
+                    max_new_tokens=self.cfg.max_new_tokens,
                     stop_regex=modes.DEBRIEF_TOOL_PATTERN,
                 )
                 call, text = modes.parse_debrief_call(raw)
@@ -416,6 +433,8 @@ class DebriefSession:
                     "tool_call": call,
                     "cursor": self._cursor,
                     "tip_saved": tip_saved,
+                    # Thinking model that never closed its think block.
+                    "missing_think_close": getattr(raw, "missing_think_close", False),
                     "frames": (
                         [current["path"]]
                         if moved and current and current.get("path") else []

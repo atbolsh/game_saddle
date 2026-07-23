@@ -1,13 +1,19 @@
 """Small ipywidgets UI helpers shared by the notebooks.
 
-Currently: :func:`tame_shift_enter`, which makes Shift+Enter behave exactly
-like Enter (insert a newline) inside notebook text boxes instead of reaching
-Jupyter's run-cell shortcut -- which would re-run the widget cell and erase
-whatever the user had typed. Buttons remain the only submit mechanism.
+- :func:`tame_shift_enter` makes Shift+Enter behave exactly like Enter
+  (insert a newline) inside notebook text boxes instead of reaching Jupyter's
+  run-cell shortcut -- which would re-run the widget cell and erase whatever
+  the user had typed. Buttons remain the only submit mechanism.
+- :func:`model_picker` is the model dropdown + "save only one set of weights
+  at a time" checkbox + Switch button shown at the top of every notebook,
+  wired to the session's ``switch_model``.
 """
 
 from __future__ import annotations
 
+from typing import Any, Callable
+
+import ipywidgets as widgets
 from IPython.display import HTML, display
 
 #: CSS class marking a Textarea widget as Shift-Enter-tamed.
@@ -43,6 +49,91 @@ _SCRIPT = """
 })();
 </script>
 """.replace("__CLASS__", _TAMED_CLASS)
+
+
+def model_picker(
+    session: Any,
+    on_switched: Callable[[dict[str, Any]], None] | None = None,
+) -> widgets.VBox:
+    """The shared model-switching panel (display it at the TOP of a notebook's
+    control cell).
+
+    Dropdown lists every ``agent.model.MODEL_REGISTRY`` entry in
+    recommendation order. Switching is an explicit button press (a dropdown
+    misclick must never start a multi-GB download). The checkbox implements
+    "save only one set of weights at a time": when checked, a switch first
+    restarts the conversation, then deletes every OTHER registry model's
+    cached weights before downloading the new ones; when unchecked, the
+    conversation continues under the new model and old weights stay cached.
+
+    ``on_switched(info)`` (if given) fires after a successful switch so the
+    notebook can refresh its own view; ``info["restarted"]`` says whether the
+    conversation was restarted.
+    """
+    from .model import MODEL_REGISTRY
+
+    current = (
+        session.model.spec.key if session.model is not None
+        else session.cfg.model_key
+    )
+    dropdown = widgets.Dropdown(
+        options=[(spec.label, key) for key, spec in MODEL_REGISTRY.items()],
+        value=current if current in MODEL_REGISTRY else None,
+        description="Model:",
+        layout=widgets.Layout(width="460px"),
+    )
+    one_copy = widgets.Checkbox(
+        value=False,
+        indent=False,
+        description="Save only one set of weights at a time "
+                    "(switching restarts the conversation and deletes the "
+                    "other cached weights)",
+        layout=widgets.Layout(width="640px"),
+    )
+    switch_btn = widgets.Button(description="Switch model", button_style="warning")
+    status = widgets.Output()
+
+    def _on_switch(_):
+        key = dropdown.value
+        if key is None:
+            return
+        already = session.model is not None and key == session.model.spec.key
+        if already and not one_copy.value:
+            with status:
+                status.clear_output()
+                print(f"'{key}' is already the loaded model.")
+            return
+        switch_btn.disabled = dropdown.disabled = one_copy.disabled = True
+        try:
+            with status:
+                status.clear_output()
+                spec = MODEL_REGISTRY[key]
+                if one_copy.value:
+                    print("[one-weights mode] restarting the conversation and "
+                          "purging other cached weights ...")
+                print(f"Switching to {spec.label} ({spec.hf_id}); first use "
+                      f"downloads the weights -- this can take a while ...")
+                info = session.switch_model(key, purge_others=one_copy.value)
+                purge = info.get("purge") or {}
+                if purge.get("purged"):
+                    print(f"Purged {len(purge['purged'])} cached repo(s), "
+                          f"freed {purge['freed_bytes'] / 1e9:.1f} GB: "
+                          + ", ".join(purge["purged"]))
+                elif one_copy.value:
+                    print("No other registry weights were cached; nothing to purge.")
+                print(f"Model ready: {info['label']}"
+                      + ("  [conversation restarted]" if info["restarted"] else ""))
+            if on_switched is not None:
+                on_switched(info)
+        finally:
+            switch_btn.disabled = dropdown.disabled = one_copy.disabled = False
+
+    switch_btn.on_click(_on_switch)
+    return widgets.VBox([
+        widgets.HBox([dropdown, switch_btn]),
+        one_copy,
+        status,
+    ])
 
 
 def tame_shift_enter(*text_widgets) -> None:

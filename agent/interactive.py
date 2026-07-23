@@ -52,7 +52,7 @@ from . import image_store
 from . import memory as mem
 from . import modes
 from . import run_logging
-from .model import get_model
+from .model import get_model, switch_session_model
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +116,16 @@ class InteractiveSession:
             "frame_path": self.current_frame_path(),
             "gold_remaining": game_io.gold_remaining(self.game),
         }
+
+    def switch_model(self, key: str, purge_others: bool = False) -> dict[str, Any]:
+        """Switch to registry model ``key`` (see ``agent.model.MODEL_REGISTRY``).
+
+        With ``purge_others=True`` ("save only one set of weights at a
+        time"), the conversation is restarted first and every other registry
+        model's cached weights are deleted from disk before the new ones are
+        downloaded. Without it, the conversation continues under the new
+        model."""
+        return switch_session_model(self, key, purge_others)
 
     def current_frame_path(self) -> str:
         """Render the current game frame to disk (no DB write) and return its
@@ -194,7 +204,7 @@ class InteractiveSession:
             # dropped so a stray [SEARCH] is inert prose instead of a stall.
             raw = self.model.generate(
                 messages,
-                max_new_tokens=self.cfg.gemma_max_new_tokens,
+                max_new_tokens=self.cfg.max_new_tokens,
                 stop_strings=game_io.MOVE_STOP_STRINGS,
                 stop_regex=None if over_budget else modes.SEARCH_TOOL_PATTERN,
             )
@@ -237,6 +247,9 @@ class InteractiveSession:
             # Bare (unbracketed) move word: never applied, but surfaced so
             # the UI can flag the format fumble instead of calling it prose.
             "bare_move": game_io.find_bare_move(raw) if action is None else None,
+            # Thinking model that never closed its think block (the full raw
+            # text stayed visible; an intended move was still honored).
+            "missing_think_close": getattr(raw, "missing_think_close", False),
             "gold_collected": gold_collected,
             "gold_remaining": game_io.gold_remaining(self.game),
             "before_path": turn["snapshot_before_path"],
@@ -259,7 +272,7 @@ class InteractiveSession:
         actions = [s["action"] for s in steps if s.get("action")]
         messages = modes.build_reflection_messages(frame_path, question, actions)
         raw = self.model.generate(
-            messages, max_new_tokens=self.cfg.gemma_max_new_tokens
+            messages, max_new_tokens=self.cfg.max_new_tokens
         )
         reflection = raw.strip()
         self._run(
