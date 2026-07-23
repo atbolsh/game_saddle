@@ -348,11 +348,17 @@ class RegexStopCriteria(StoppingCriteria):
     so generation halts right after the complete call.
 
     THINK GATE. For thinking models pass ``gate`` (the family adapter): the
-    FULL generation is decoded each step and the pattern may only match in
+    FULL generation is decoded each step and the patterns may only match in
     the region the adapter allows -- after the think-close tag, or anywhere
     if the reply provably has no think block. A move token inside an
     unterminated think block therefore never stops generation; the reply runs
     to its natural end and the missing-close salvage happens at parse time.
+
+    ``patterns`` may be one pattern or a list. Each is compiled SEPARATELY
+    and generation stops when any of them matches -- never spliced into one
+    alternation, because a pattern may legally begin with a global inline
+    flag like ``(?i)`` (SEARCH_TOOL_PATTERN does), which Python rejects
+    anywhere but position 0 of an expression.
     """
 
     #: How many of the most recent generated tokens to decode per check (the
@@ -365,15 +371,22 @@ class RegexStopCriteria(StoppingCriteria):
 
     def __init__(
         self,
-        pattern: str | re.Pattern,
+        patterns: str | re.Pattern | list,
         tokenizer: Any,
         prompt_len: int,
         gate: FamilyAdapter | None = None,
     ):
-        self.pattern = re.compile(pattern) if isinstance(pattern, str) else pattern
+        if isinstance(patterns, (str, re.Pattern)):
+            patterns = [patterns]
+        self.patterns = [
+            re.compile(p) if isinstance(p, str) else p for p in patterns
+        ]
         self.tokenizer = tokenizer
         self.prompt_len = prompt_len
         self.gate = gate
+
+    def _hit(self, text: str) -> bool:
+        return any(p.search(text) for p in self.patterns)
 
     def __call__(self, input_ids: torch.LongTensor, scores: Any, **kwargs: Any) -> bool:
         # Only consider generated tokens (not the prompt, which may legitimately
@@ -384,12 +397,12 @@ class RegexStopCriteria(StoppingCriteria):
         if self.gate is None:
             tail = gen[-self.TAIL_TOKENS:]
             text = self.tokenizer.decode(tail, skip_special_tokens=True)
-            return bool(self.pattern.search(text))
+            return self._hit(text)
         # Gated: the think-close tag may be arbitrarily far back, so decode
         # the whole generation (bounded by max_new_tokens; fine at our scale).
         text = self.tokenizer.decode(gen, skip_special_tokens=True)
         region = self.gate.stop_region(text)
-        return bool(region is not None and self.pattern.search(region))
+        return region is not None and self._hit(region)
 
 
 _DTYPE_MAP = {
@@ -501,7 +514,7 @@ class VLModel:
         soon as the pattern matches the decoded generated text (see
         :class:`RegexStopCriteria`) -- use this for parameterized tokens like
         ``[SHOW 42]`` that literal stop strings cannot capture. For thinking
-        models BOTH are folded into one think-gated regex criteria so a move
+        models BOTH go through one think-gated regex criteria so a move
         token inside a think block never halts generation. The model's native
         end-of-turn/eos still terminates generation on its own, so a reply
         that emits no stop token simply ends the turn."""
@@ -534,15 +547,16 @@ class VLModel:
         prompt_len = inputs["input_ids"].shape[-1]
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
         if self.spec.thinking:
-            # Fold literal stop strings + the regex into ONE think-gated
-            # criteria: nothing may stop generation from inside a think block.
+            # Literal stop strings + the regex all go through ONE think-gated
+            # criteria (as separate patterns -- see RegexStopCriteria): nothing
+            # may stop generation from inside a think block.
             parts = [re.escape(s) for s in (stop_strings or [])]
             if stop_regex:
                 parts.append(stop_regex)
             if parts:
                 gen_kwargs["stopping_criteria"] = StoppingCriteriaList([
                     RegexStopCriteria(
-                        "|".join(f"(?:{p})" for p in parts), tokenizer,
+                        parts, tokenizer,
                         prompt_len=prompt_len, gate=self.adapter,
                     )
                 ])
