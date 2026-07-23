@@ -34,6 +34,17 @@ logger = logging.getLogger(__name__)
 # blocks plus at most a short mode-specific paragraph. Fixing a fact in its
 # block fixes every mode that uses it.
 
+# The move-token vocabulary is defined ONCE, in game_io (ACTION_MAP -> ACTIONS
+# -> MOVE_STOP_STRINGS -> the parser regexes). Every prompt block references
+# it through these constants -- never as fresh string literals -- so the wire
+# format, the parser, and all prompts can only ever change together. The dict
+# lookups fail loudly at import if an action name ever changes underneath us.
+_TOK = {name: f"[{name}]" for name in game_io.ACTIONS}
+_TOK_CLOCK = _TOK["CLOCK"]
+_TOK_ANTICLOCK = _TOK["ANTICLOCK"]
+_TOK_FORWARD = _TOK["FORWARD"]
+_TOK_TRIO = "/".join(_TOK.values())  # "[CLOCK]/[ANTICLOCK]/[FORWARD]"
+
 _SENT_GAME_INTRO = "You are an agent playing a 2D discrete game on a square board."
 _SENT_GAME_SCREEN = "You see the current game screen as an image."
 _SENT_GAME_WORLD = (
@@ -51,10 +62,10 @@ _BLOCK_GAME_INTRO = " ".join([
 
 _BLOCK_MOVE_TOKENS = (
     "You make moves by emitting exactly one of these move tokens:\n"
-    "  [CLOCK]     - turn clockwise by pi/30 (rotate in place)\n"
-    "  [ANTICLOCK] - turn counter-clockwise by pi/30 (rotate in place)\n"
-    "  [FORWARD]   - advance up to 1/16 of the board in the facing direction\n"
-    "Only [FORWARD] moves you; [CLOCK] and [ANTICLOCK] only rotate you.\n\n"
+    f"  {_TOK_CLOCK}     - turn clockwise by pi/30 (rotate in place)\n"
+    f"  {_TOK_ANTICLOCK} - turn counter-clockwise by pi/30 (rotate in place)\n"
+    f"  {_TOK_FORWARD}   - advance up to 1/16 of the board in the facing direction\n"
+    f"Only {_TOK_FORWARD} moves you; {_TOK_CLOCK} and {_TOK_ANTICLOCK} only rotate you.\n\n"
     "IMPORTANT: ONLY those exact bracketed tokens trigger a move. Talking about "
     "moving in prose (e.g. writing the word 'forward') does NOTHING. You may "
     "reason in plain prose as much as you like; nothing happens until you emit "
@@ -65,7 +76,7 @@ _BLOCK_MULTI_MOVE_TURN = (
     "The instant you emit a move token it is executed, the screen is "
     "re-rendered, and you are shown the updated screen and asked for your next "
     "move. So a turn is a sequence of moves -- reason, emit one move token, see "
-    "the result, repeat -- e.g. [CLOCK] [CLOCK] [FORWARD] [FORWARD] ... to "
+    f"the result, repeat -- e.g. {_TOK_CLOCK} {_TOK_CLOCK} {_TOK_FORWARD} {_TOK_FORWARD} ... to "
     "navigate to the gold. Making a move does NOT end your turn.\n\n"
     "To END your turn, simply finish your reply WITHOUT emitting a move token "
     "(just stop normally). Do this once you have collected the gold or wish to "
@@ -87,14 +98,14 @@ _BLOCK_HOW_TO_PLAY = (
     "(Clock directions are as seen on screen: 12 o'clock is up-screen, 3 is "
     "right, 6 is down, 9 is left.) Then REASON, in a sentence or two, about "
     "where the gold is relative to your red eye: the eye points in the "
-    "direction you face, and [FORWARD] sends you straight that way.\n"
+    f"direction you face, and {_TOK_FORWARD} sends you straight that way.\n"
     "IF (and only if) the user asked you to play or make a move, choose the "
     "move from that reasoning:\n"
-    "  - If your eye is pointing roughly at the gold, emit [FORWARD].\n"
-    "  - Otherwise, aim your eye at the gold: emit [CLOCK] or [ANTICLOCK], then "
+    f"  - If your eye is pointing roughly at the gold, emit {_TOK_FORWARD}.\n"
+    f"  - Otherwise, aim your eye at the gold: emit {_TOK_CLOCK} or {_TOK_ANTICLOCK}, then "
     "check the re-rendered screen to see which way your eye swung, and keep "
     "rotating that way (or reverse if you overshoot) until your eye lines up with "
-    "the gold -- then emit [FORWARD].\n"
+    f"the gold -- then emit {_TOK_FORWARD}.\n"
     "If the user instead asked a question (e.g. 'is the gold to your left?'), "
     "answer it in prose after the observation and reasoning and STOP -- "
     "emitting a move token nobody asked for is a format mistake.\n"
@@ -117,15 +128,15 @@ _BLOCK_AIM_TOLERANCE = (
     "AIM TOLERANCE: it can be hard to tell your exact facing direction from "
     "the screen, so do not demand pixel-perfect aim. If your best estimate "
     "is that the gold lies within about 45 degrees of your facing direction, "
-    "[FORWARD] is a good move -- step forward and re-assess on the new "
-    "screen. Reserve [CLOCK]/[ANTICLOCK] fine-tuning for when the gold is "
+    f"{_TOK_FORWARD} is a good move -- step forward and re-assess on the new "
+    f"screen. Reserve {_TOK_CLOCK}/{_TOK_ANTICLOCK} fine-tuning for when the gold is "
     "clearly off to one side or behind you."
 )
 
 _BLOCK_AIM_TOLERANCE_REVIEW = (
     "The player's instructions included this aim-tolerance rule, quoted "
     "verbatim:\n\"" + _BLOCK_AIM_TOLERANCE + "\"\n"
-    "Judge the play against it: a [FORWARD] emitted while the gold was "
+    f"Judge the play against it: a {_TOK_FORWARD} emitted while the gold was "
     "within roughly 45 degrees of the facing direction follows instructions "
     "and must not be penalized as imprecise aim; conversely, long "
     "rotate-only fine-tuning inside that tolerance goes against them."
@@ -140,7 +151,7 @@ _BLOCK_GRADING_TOLERANCE = (
     "(about 60 degrees) of the true one -- e.g. '7 o'clock' when the truth "
     "is 8 o'clock -- do NOT mark it as a mistake. One case IS clear-cut, "
     "though: when the gold lies within about 10 degrees of the facing "
-    "direction, [FORWARD] is unambiguously correct, and choosing to rotate "
+    f"direction, {_TOK_FORWARD} is unambiguously correct, and choosing to rotate "
     "instead is a real mistake -- call it out and penalize it."
 )
 
@@ -220,7 +231,7 @@ SYSTEM_PROMPT_REFLECT = "\n\n".join([
     ),
     _BLOCK_AIM_TOLERANCE,
     (
-        "Do NOT emit any move token ([CLOCK]/[ANTICLOCK]/[FORWARD]) in this reply "
+        f"Do NOT emit any move token ({_TOK_TRIO}) in this reply "
         "-- it would not be executed. End with the single move you intend to make "
         "next and why; you will act on it when the next screen is shown."
     ),
@@ -805,7 +816,7 @@ async def mode_self_eval(
 
     Pulls the Conversation (with linked GameSnapshot nodes incl. their
     Settings JSON), pulls the reasoning traces for the session, feeds them
-    to Gemma 4 E4B with the evaluator system prompt, then appends the
+    to the model with the evaluator system prompt, then appends the
     verdict to the SAME Conversation as an assistant message
     (metadata.kind='self_evaluation') and records a new reasoning trace
     capturing the evaluation reasoning.
@@ -995,15 +1006,15 @@ _BLOCK_GEOMETRY_PRIVILEGED = (
     "(-3.14, 3.14] -> delta = -0.47 -> counter-clockwise, about 5 steps "
     "-- and |delta| = 0.47 < 0.79 (45 degrees), so within aim tolerance "
     "stepping forward is also reasonable.\n"
-    "  - The [CLOCK] move INCREASES theta by pi/30 (6 degrees) and rotates "
-    "clockwise on screen; [ANTICLOCK] decreases theta. One [FORWARD] "
+    f"  - The {_TOK_CLOCK} move INCREASES theta by pi/30 (6 degrees) and rotates "
+    f"clockwise on screen; {_TOK_ANTICLOCK} decreases theta. One {_TOK_FORWARD} "
     "advances up to 1/16 of the board along the facing direction."
 )
 
 _BLOCK_DEBRIEF_RECORD = (
     "HOW THE RECORD IS ORGANIZED: the player's messages are numbered from 0 "
     "(see the 'Current message' line in your context for the valid range). "
-    "Most messages end in a move token ([CLOCK]/[ANTICLOCK]/[FORWARD]); "
+    f"Most messages end in a move token ({_TOK_TRIO}); "
     "reflection messages (no move) occur roughly every 30 moves -- to find "
     "one, [SHOW] a multiple of 30 and step with [NEXT]/[BACK] until you hit "
     "it. The user instruction the player was answering is always shown "
@@ -1402,9 +1413,9 @@ def build_debrief_messages(
     search_results: str | None = None,
 ) -> list[dict]:
     """Assemble one debrief generation's prompt as at most three content
-    parts. Gemma's chat template concatenates adjacent text parts with NO
-    separator, so logical blocks are pre-joined with explicit newlines here
-    instead of being emitted as separate parts:
+    parts. Chat templates (Gemma's among them) may concatenate adjacent text
+    parts with NO separator, so logical blocks are pre-joined with explicit
+    newlines here instead of being emitted as separate parts:
 
       1. text  -- session trace + hanging player instruction + debrief
                   recency window + accumulated search results + the current

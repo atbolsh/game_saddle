@@ -58,8 +58,8 @@ ACTIONS = list(ACTION_MAP.keys())
 # cleanly, so we can use them as generation stop strings: the model's turn is
 # a loop of "reason -> emit one move token -> we stop, apply it, re-render,
 # generate again on the new frame". Ending the turn needs no special token --
-# the model just finishes its message (Gemma's native ``<end_of_turn>``) without
-# emitting a move token.
+# the model just finishes its message (its native end-of-turn/eos token)
+# without emitting a move token.
 MOVE_STOP_STRINGS = [f"[{a}]" for a in ACTIONS]  # ["[CLOCK]", "[ANTICLOCK]", "[FORWARD]"]
 _MOVE_RE = re.compile(r"\[(" + "|".join(ACTIONS) + r")\]", re.IGNORECASE)
 
