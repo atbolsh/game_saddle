@@ -78,6 +78,11 @@ class ModelSpec:
     trust_remote_code: bool = False
     #: whether the model emits think blocks the harness must strip/gate.
     thinking: bool = False
+    #: minimum transformers release whose native code knows this architecture
+    #: (None = anything satisfying requirements.txt works). Checked at load
+    #: time so the failure is instant and actionable instead of a cryptic
+    #: "model type not recognized" after a multi-GB download.
+    min_transformers: str | None = None
     #: sampling defaults for THIS model (env overrides win; None = leave the
     #: knob to the model's own generation_config).
     temperature: float | None = None
@@ -108,6 +113,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {s.key: s for s in [
     ModelSpec(
         key="gemma-4-12b", label="Gemma 4 12B Unified",
         hf_id="google/gemma-4-12B-it", family="gemma",
+        min_transformers="5.10.0",  # gemma4_unified arch added in 5.10.0
         temperature=1.0, top_p=0.95, top_k=64,
         notes="12B dense, encoder-free unified architecture, 256K context.",
     ),
@@ -433,6 +439,18 @@ class VLModel:
         if self._loaded:
             return self
         spec = self.spec
+        if spec.min_transformers is not None:
+            import transformers
+            from packaging.version import Version
+
+            installed = transformers.__version__
+            if Version(installed) < Version(spec.min_transformers):
+                raise RuntimeError(
+                    f"Model {spec.key!r} ({spec.hf_id}) requires transformers "
+                    f">= {spec.min_transformers} (its architecture is not in "
+                    f"older releases), but {installed} is installed. Run: "
+                    f"pip install -U 'transformers>={spec.min_transformers}'"
+                )
         dtype = _DTYPE_MAP.get(self.cfg.model_dtype.lower(), "auto")
         logger.info(
             "Loading model %s (%s, dtype=%s, trust_remote_code=%s)",

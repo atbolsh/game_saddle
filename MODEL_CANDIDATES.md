@@ -38,7 +38,9 @@ simple synthetic scene, and grounding-RL'd models are optimized for exactly
 "where is the thing, in numbers". Thinking variant adds reasoning RL. At 9B,
 full fine-tune is feasible on the A100; LoRA trivial.
 
-**Gemma 4 12B Unified** (released 2026-07-02 — newer than our E4B). Two
+**Gemma 4 12B Unified** (released 2026-07-02 — newer than our E4B; its
+`gemma4_unified` architecture needs **transformers >= 5.10.0**, enforced at
+load time via the registry's `min_transformers`). Two
 arguments: (1) the whole harness (chat template, image token budgeting,
 stop-string behavior, RegexStopCriteria) already speaks Gemma, so switching
 cost is near zero; (2) it is the encoder-free "unified" design — raw image

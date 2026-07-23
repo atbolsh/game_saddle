@@ -10,9 +10,13 @@ torchvision>=0.22.0
 einops>=0.7.0
 
 # Hugging Face ecosystem
-# Gemma 4 requires a recent transformers (AutoModelForMultimodalLM, gemma4 arch).
-# transformers 4.57.1 does NOT have AutoModelForMultimodalLM; bump or pip install -U.
-transformers>=4.60.0
+# Gemma 4 requires a recent transformers (AutoModelForMultimodalLM, gemma4 arch);
+# transformers 4.57.1 does NOT have AutoModelForMultimodalLM.
+# The model registry's newest architecture (gemma-4-12b, `gemma4_unified`) was
+# added in transformers 5.10.0, so that is the repo-wide floor. Models with a
+# stricter need declare `min_transformers` in agent.model.MODEL_REGISTRY and
+# fail fast with instructions if the installed version is older.
+transformers>=5.10.0
 datasets>=2.18.0
 huggingface_hub>=0.30.0
 tokenizers>=0.15.0
