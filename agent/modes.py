@@ -1166,10 +1166,11 @@ def build_scene_analyst_messages(
             )
         else:
             scene.append(
-                "The reply contains no move token (a prose answer). If the "
-                "user's question asked for information rather than a move, "
-                "this is the CORRECT format -- do not penalize the absence "
-                "of a move token; grade the answer's content instead."
+                "WARNING: no move token detected. If a move was intended, "
+                "this is a Format Error. If the user's question asked for "
+                "information rather than a move, prose with no move token "
+                "is the CORRECT format -- do not penalize the absence; grade "
+                "the answer's content instead."
             )
     blocks = ["\n\n".join(scene)]
     if recent:
@@ -1248,7 +1249,12 @@ TIP_LINE_RE = re.compile(r"(?im)^\s*TIP\s*:\s*(?P<tip>.+?)\s*$")
 
 # A reviewer's per-error span: WRONG: "<exact words from the player reply>".
 # Quotes optional -- small models drop them -- but the words must still match.
-WRONG_SPAN_RE = re.compile(r"(?im)^\s*WRONG\s*:\s*\"?(?P<span>.+?)\"?\s*$")
+# Whitespace after the colon is SAME-LINE only ([^\S\n]): a bare "WRONG:"
+# followed by a newline and then "SCORE:" / "RATING:" is a template leftover
+# with no span, not a span whose text is "SCORE:".
+WRONG_SPAN_RE = re.compile(
+    r"(?im)^[^\S\n]*WRONG[^\S\n]*:[^\S\n]*\"?(?P<span>.+?)\"?[^\S\n]*$"
+)
 
 
 def parse_wrong_spans(analysis: str, source_text: str) -> dict[str, list[str]]:
@@ -1260,12 +1266,13 @@ def parse_wrong_spans(analysis: str, source_text: str) -> dict[str, list[str]]:
     order of first appearance). Unverified spans are returned rather than
     dropped so callers can surface them loudly -- a span the player never
     wrote must never be silently presented as a highlight
-    (no-fuzzy-fallbacks)."""
+    (no-fuzzy-fallbacks). An empty ``WRONG:`` line (no words on that line)
+    is ignored: producing zero error spans is a valid analyst outcome."""
     verified: list[str] = []
     unverified: list[str] = []
     seen: set[str] = set()
     for m in WRONG_SPAN_RE.finditer(analysis):
-        span = m.group("span").strip()
+        span = m.group("span").strip().strip("\"'").strip()
         if not span or span in seen:
             continue
         seen.add(span)
