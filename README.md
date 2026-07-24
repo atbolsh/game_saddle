@@ -401,5 +401,7 @@ docker-compose.yml   # local Neo4j 5.20 community (bolt + APOC)
 requirements.txt
 README.md
 FUTURE_GOALS.md
+MODEL_CANDIDATES.md    # comparable multimodal models for the fine-tuning bake-off
+IMAGE_DECODER_GRAFT.md # how-to: graft an image decoder (visual imagination) onto the VLM
 .env.example
 ```
