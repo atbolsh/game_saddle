@@ -56,7 +56,13 @@ correlates with our task. Less tooling support than Qwen, more than Kimi.
 **Step3-VL-10B** (StepFun) — newest of the four; heavy RLVR + RLHF
 post-training, explicitly strong on counting, grounding, geometry-flavored
 perception. Most capability per parameter; ecosystem maturity is the open
-question.
+question. Verified against the repo (2026-07-24): **always-thinking** (the
+chat template auto-opens `<think>`; vendor deployments use the DeepSeek-R1
+reasoning parser), loads via `AutoModelForCausalLM` + the model card's
+`key_mapping`, and the official example decodes **greedily** (its
+`generation_config` is unfiltered 1.0/1.0/0) — all encoded in the registry
+spec. Reasoning runs long (benchmarks use up to 64K tokens), so raise
+`MODEL_MAX_NEW_TOKENS` if replies truncate mid-think.
 
 ## Solid second tier
 
@@ -122,9 +128,11 @@ strip think blocks before parsing/persisting, generation stopping is gated
 so a move token inside a think block never halts generation, and a reply
 that forgets its think-close tag stays fully visible (an intended move is
 still honored) but is flagged as a FORMAT ERROR. Two caveats remain for the
-first REMOTE run of a new family: (1) models loading custom code
-(Step3-VL, Phi-4-Reasoning-Vision, Kimi-VL, InternVL3.5) may not expose the
-standard `AutoProcessor.apply_chat_template` / `AutoModelForMultimodalLM`
-path — the loader fails loudly with the model key + repo id if so;
-(2) chat-template/token differences can shift stop behavior, so watch the
-first few generations in the run logs.
+first REMOTE run of a new family: (1) the custom-code repos (Step3-VL,
+Phi-4-Reasoning-Vision, Kimi-VL, InternVL3.5, Ovis2.5) register their model
+classes under `AutoModelForCausalLM` only, so the registry loads them
+through that Auto class (`ModelSpec.loader="causal"`, verified against each
+repo's `auto_map`); their *processor*/chat-template behavior is the
+remaining unverified surface and fails loudly with the model key + repo id
+if incompatible; (2) chat-template/token differences can shift stop
+behavior, so watch the first few generations in the run logs.

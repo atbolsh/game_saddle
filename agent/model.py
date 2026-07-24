@@ -44,6 +44,7 @@ models (:func:`switch_default`) unloads the old weights from the GPU first.
 
 from __future__ import annotations
 
+import dataclasses
 import gc
 import logging
 from dataclasses import dataclass
@@ -53,6 +54,7 @@ import re
 
 import torch
 from transformers import (
+    AutoModelForCausalLM,
     AutoModelForMultimodalLM,
     AutoProcessor,
     StoppingCriteria,
@@ -83,8 +85,19 @@ class ModelSpec:
     #: time so the failure is instant and actionable instead of a cryptic
     #: "model type not recognized" after a multi-GB download.
     min_transformers: str | None = None
+    #: which Auto class loads the model. In-tree multimodal architectures
+    #: register under AutoModelForMultimodalLM; the trust_remote_code repos
+    #: in this registry all declare their model class under
+    #: AutoModelForCausalLM in their auto_map (verified per repo config.json,
+    #: 2026-07-24) and register nothing for the multimodal Auto class.
+    loader: str = "multimodal"  # "multimodal" | "causal"
+    #: extra kwargs for from_pretrained beyond the standard set (e.g.
+    #: Step3-VL's checkpoint key_mapping, required by its model card).
+    load_kwargs: dict[str, Any] = dataclasses.field(default_factory=dict)
     #: sampling defaults for THIS model (env overrides win; None = leave the
-    #: knob to the model's own generation_config).
+    #: knob to the model's own generation_config / harness default).
+    #: do_sample=False marks models whose vendor demonstrates greedy decoding.
+    do_sample: bool | None = None
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
@@ -125,21 +138,33 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {s.key: s for s in [
     ModelSpec(
         key="step3-vl-10b", label="Step3-VL 10B",
         hf_id="stepfun-ai/Step3-VL-10B", family="step",
-        trust_remote_code=True, thinking=True,
-        notes="10B; RLVR+RLHF. Custom code (auto_map) -- first remote load "
-              "may need loader attention.",
+        trust_remote_code=True, thinking=True, loader="causal",
+        # Required by the model card's official HF snippet: the checkpoint's
+        # weight names predate the repo's module tree, and without this
+        # remap from_pretrained puts weights on the wrong submodules.
+        load_kwargs={"key_mapping": {
+            "^vision_model": "model.vision_model",
+            r"^model(?!\.(language_model|vision_model))": "model.language_model",
+            "vit_large_projector": "model.vit_large_projector",
+        }},
+        do_sample=False,  # official example decodes greedily; gen_config is unfiltered 1.0/1.0/0
+        notes="10B; RLVR+RLHF. Always-thinking (template auto-opens <think>; "
+              "DeepSeek-R1-style reasoning parser in vendor deployments). "
+              "Custom code loaded via AutoModelForCausalLM + key_mapping per "
+              "the model card. Long reasoning: raise MODEL_MAX_NEW_TOKENS if "
+              "replies get truncated mid-think.",
     ),
     ModelSpec(
         key="phi-4-reasoning-vision-15b", label="Phi-4 Reasoning Vision 15B",
         hf_id="microsoft/Phi-4-reasoning-vision-15B", family="phi",
-        trust_remote_code=True, thinking=True,
+        trust_remote_code=True, thinking=True, loader="causal",
         notes="15B dense; optional think blocks. 16K context -- tight for "
               "long debriefs. Custom code (auto_map).",
     ),
     ModelSpec(
         key="kimi-vl-a3b-thinking-2506", label="Kimi-VL A3B Thinking (2506)",
         hf_id="moonshotai/Kimi-VL-A3B-Thinking-2506", family="kimi",
-        trust_remote_code=True, thinking=True, temperature=0.8,
+        trust_remote_code=True, thinking=True, loader="causal", temperature=0.8,
         notes="16B total / 2.8B active MoE; native-resolution encoder. "
               "Moonshot recommends temperature 0.8. Custom code (auto_map).",
     ),
@@ -152,20 +177,21 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {s.key: s for s in [
     ModelSpec(
         key="internvl3.5-8b", label="InternVL3.5 8B",
         hf_id="OpenGVLab/InternVL3_5-8B", family="internvl",
-        trust_remote_code=True,
-        notes="8B dense; Cascade-RL. Custom code (InternVLChatModel) -- "
-              "first remote load may need loader attention.",
+        trust_remote_code=True, loader="causal",
+        notes="8B dense; Cascade-RL. Custom code (InternVLChatModel) loaded "
+              "via AutoModelForCausalLM; its chat API may still need "
+              "adapter work on first remote use.",
     ),
     ModelSpec(
         key="internvl3.5-14b", label="InternVL3.5 14B",
         hf_id="OpenGVLab/InternVL3_5-14B", family="internvl",
-        trust_remote_code=True,
+        trust_remote_code=True, loader="causal",
         notes="14B dense; strongest dense InternVL under 20B. Custom code.",
     ),
     ModelSpec(
         key="ovis2.5-9b", label="Ovis2.5 9B",
         hf_id="ATH-MaaS/Ovis2.5-9B", family="ovis",
-        trust_remote_code=True,
+        trust_remote_code=True, loader="causal",
         notes="9B; native-resolution ViT. Repo moved from AIDC-AI to "
               "ATH-MaaS. Custom code likely.",
     ),
@@ -183,7 +209,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {s.key: s for s in [
     ModelSpec(
         key="internvl3.5-30b-a3b", label="InternVL3.5 30B-A3B (QLoRA-only FT)",
         hf_id="OpenGVLab/InternVL3_5-30B-A3B", family="internvl",
-        trust_remote_code=True,
+        trust_remote_code=True, loader="causal",
         notes="30B total / 3B active MoE. Custom code.",
     ),
 ]}
@@ -329,7 +355,10 @@ ADAPTERS: dict[str, FamilyAdapter] = {
     "gemma": FamilyAdapter(),
     "qwen": FamilyAdapter(always_thinks=True),
     "glm": GlmAdapter(always_thinks=True),
-    "step": FamilyAdapter(),
+    # Step3-VL's chat template ends the generation prompt with '<think>\n'
+    # (verified in the repo's chat_template.jinja), so every reply is an
+    # auto-opened think block closed by '</think>'.
+    "step": FamilyAdapter(always_thinks=True),
     "phi": FamilyAdapter(),
     "kimi": FamilyAdapter(
         think_open="\u25c1think\u25b7", think_close="\u25c1/think\u25b7",
@@ -421,6 +450,13 @@ _DTYPE_MAP = {
     "auto": "auto",
 }
 
+#: Auto classes by ModelSpec.loader (exact lookup -- an unknown value is a
+#: hard KeyError, never a guessed loader).
+_LOADERS = {
+    "multimodal": AutoModelForMultimodalLM,
+    "causal": AutoModelForCausalLM,
+}
+
 
 # ================================================================== wrapper
 
@@ -468,13 +504,15 @@ class VLModel:
             kwargs["trust_remote_code"] = True
         if self.cfg.hf_token:
             kwargs["token"] = self.cfg.hf_token
+        kwargs.update(spec.load_kwargs)
+        auto_cls = _LOADERS[spec.loader]
         try:
             self.processor = AutoProcessor.from_pretrained(
                 spec.hf_id,
                 token=self.cfg.hf_token or None,
                 trust_remote_code=spec.trust_remote_code,
             )
-            self.model = AutoModelForMultimodalLM.from_pretrained(spec.hf_id, **kwargs)
+            self.model = auto_cls.from_pretrained(spec.hf_id, **kwargs)
         except Exception as exc:
             # No fallback loaders (no-fuzzy-fallbacks): name the model so the
             # failure is actionable, then re-raise.
@@ -501,9 +539,15 @@ class VLModel:
     # ---------------------------------------------------------- sampling
     def _sampling_kwargs(self) -> dict[str, Any]:
         """Resolve sampling knobs: env override > spec default > the model's
-        own generation_config (i.e. pass nothing)."""
-        out: dict[str, Any] = {"do_sample": self.cfg.do_sample}
-        if not self.cfg.do_sample:
+        own generation_config (i.e. pass nothing). ``do_sample`` resolves the
+        same way, with a global default of True (sampling on)."""
+        do_sample = self.cfg.do_sample
+        if do_sample is None:
+            do_sample = self.spec.do_sample
+        if do_sample is None:
+            do_sample = True
+        out: dict[str, Any] = {"do_sample": do_sample}
+        if not do_sample:
             return out
         for name, env_val, spec_val in [
             ("temperature", self.cfg.temperature, self.spec.temperature),

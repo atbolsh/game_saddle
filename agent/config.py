@@ -124,6 +124,13 @@ def _env_chain_int(*keys: str) -> int | None:
         return None
 
 
+def _env_chain_bool(*keys: str) -> bool | None:
+    v = _env_chain(*keys)
+    if v is None:
+        return None
+    return v.strip().lower() not in ("0", "false", "no", "off", "")
+
+
 @dataclass(frozen=True)
 class AgentConfig:
     # Neo4j (local, bolt-based; no external service)
@@ -153,15 +160,14 @@ class AgentConfig:
     # Sampling. Sampling (vs. greedy do_sample=False) breaks the degenerate
     # fixed point where a near-identical prompt deterministically reproduces
     # the exact same move + reasoning sentence forever; set MODEL_DO_SAMPLE=0
-    # to restore deterministic greedy decoding. Temperature/top_p/top_k are
+    # to force deterministic greedy decoding everywhere. All four knobs are
     # OPTIONAL overrides: when unset (the default) each model's per-spec
-    # defaults apply (e.g. Gemma's 1.0/0.95/64, Kimi Thinking's 0.8), falling
-    # back to the model's own generation_config. Setting MODEL_TEMPERATURE
-    # etc. forces one value for EVERY model.
-    do_sample: bool = field(
-        default_factory=lambda: _env_bool(
-            "MODEL_DO_SAMPLE", _env_bool("GEMMA_DO_SAMPLE", True)
-        )
+    # defaults apply (e.g. Gemma's 1.0/0.95/64, Kimi Thinking's 0.8,
+    # Step3-VL's vendor-demonstrated greedy decoding), falling back to
+    # sampling on / the model's own generation_config. Setting MODEL_DO_SAMPLE
+    # or MODEL_TEMPERATURE etc. forces one value for EVERY model.
+    do_sample: bool | None = field(
+        default_factory=lambda: _env_chain_bool("MODEL_DO_SAMPLE", "GEMMA_DO_SAMPLE")
     )
     temperature: float | None = field(
         default_factory=lambda: _env_chain_float(
