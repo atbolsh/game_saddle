@@ -149,9 +149,15 @@ _BLOCK_GRADING_TOLERANCE = (
     "GRADING CALIBRATION: verbal direction estimates are approximate by "
     "nature. If the player's stated direction is within 2 clock hours "
     "(about 60 degrees) of the true one -- e.g. '7 o'clock' when the truth "
-    "is 8 o'clock -- do NOT mark it as a mistake. One case IS clear-cut, "
-    "though: when the gold lies within about 10 degrees of the facing "
-    f"direction, {_TOK_FORWARD} is unambiguously correct, and choosing to rotate "
+    "is 8 o'clock, or '3 o'clock' when the truth is 1.9 o'clock -- do NOT "
+    "mark it as a mistake, and NEVER describe such a deviation as a "
+    "'significant error'. In particular, when the stated direction is "
+    "within that tolerance AND the player chose the correct move, the "
+    "direction words are simply correct -- do not mark them WRONG at all. "
+    "If the chosen move was incorrect, DO mark the direction words that "
+    "led to it as wrong. One case IS clear-cut regardless: when the gold "
+    "lies within about 10 degrees of the facing direction, "
+    f"{_TOK_FORWARD} is unambiguously correct, and choosing to rotate "
     "instead is a real mistake -- call it out and penalize it."
 )
 
@@ -1147,7 +1153,6 @@ def build_scene_analyst_messages(
     recent: str,
     question: str,
     search_results: str | None = None,
-    missing_think_close: bool = False,
 ) -> list[dict]:
     """Assemble one scene-analyst generation's prompt, mirroring
     :func:`build_debrief_messages`' structure (pre-joined text blocks, then
@@ -1184,14 +1189,6 @@ def build_scene_analyst_messages(
                 "is the CORRECT format -- do not penalize the absence; grade "
                 "the answer's content instead."
             )
-    if missing_think_close:
-        scene.append(
-            "FORMAT ERROR (harness-verified): the player is a thinking "
-            "model and never emitted its think-close tag, so the reply "
-            "above is an unterminated reasoning stream. Any move token in "
-            "it was still honored, but call this format error out "
-            "explicitly in your analysis."
-        )
     blocks = ["\n\n".join(scene)]
     if recent:
         blocks.append(
@@ -1268,12 +1265,18 @@ DEBRIEF_TOOL_RE = re.compile(DEBRIEF_TOOL_PATTERN)
 TIP_LINE_RE = re.compile(r"(?im)^\s*TIP\s*:\s*(?P<tip>.+?)\s*$")
 
 # A reviewer's per-error span: WRONG: "<exact words from the player reply>".
-# Quotes optional -- small models drop them -- but the words must still match.
-# Whitespace after the colon is SAME-LINE only ([^\S\n]): a bare "WRONG:"
-# followed by a newline and then "SCORE:" / "RATING:" is a template leftover
-# with no span, not a span whose text is "SCORE:".
+# If the span is double-quoted, ONLY the quoted words count -- models
+# (Gemma 4 12B especially) like to append commentary on the same line
+# ('WRONG: "..." Actually, the player should have ...'), and swallowing it
+# into the span would fail the exact-substring verification. Quotes are
+# still optional -- small models drop them -- in which case the whole rest
+# of the line is the span, as before. Whitespace after the colon is
+# SAME-LINE only ([^\S\n]): a bare "WRONG:" followed by a newline and then
+# "SCORE:" / "RATING:" is a template leftover with no span, not a span
+# whose text is "SCORE:".
 WRONG_SPAN_RE = re.compile(
-    r"(?im)^[^\S\n]*WRONG[^\S\n]*:[^\S\n]*\"?(?P<span>.+?)\"?[^\S\n]*$"
+    r"(?im)^[^\S\n]*WRONG[^\S\n]*:[^\S\n]*"
+    r"(?:\"(?P<quoted>[^\"\n]+)\"[^\n]*|(?P<span>.+?))[^\S\n]*$"
 )
 
 
@@ -1287,12 +1290,15 @@ def parse_wrong_spans(analysis: str, source_text: str) -> dict[str, list[str]]:
     dropped so callers can surface them loudly -- a span the player never
     wrote must never be silently presented as a highlight
     (no-fuzzy-fallbacks). An empty ``WRONG:`` line (no words on that line)
-    is ignored: producing zero error spans is a valid analyst outcome."""
+    is ignored: producing zero error spans is a valid analyst outcome. A
+    double-quoted span keeps only the quoted words -- same-line commentary
+    after the closing quote is the reviewer talking, not the span."""
     verified: list[str] = []
     unverified: list[str] = []
     seen: set[str] = set()
     for m in WRONG_SPAN_RE.finditer(analysis):
-        span = m.group("span").strip().strip("\"'").strip()
+        span = m.group("quoted") or m.group("span") or ""
+        span = span.strip().strip("\"'").strip()
         if not span or span in seen:
             continue
         seen.add(span)

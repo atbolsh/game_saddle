@@ -13,7 +13,7 @@ Each step:
   2. Retrieve NAMS context with the Settings dict stripped out -- the mode-1
      privacy invariant is preserved: the model never sees exact coordinates.
   3. Build the multimodal prompt (system + memory context + image + question)
-     and call Gemma 4 E4B (with a high ``max_new_tokens`` ceiling).
+     and call the model (with a high ``max_new_tokens`` ceiling).
   4. Generation is stopped early the instant a move token (``[FORWARD]`` etc.)
      appears; we apply that move, re-render, and loop back to step 1 feeding
      the *updated* view.
@@ -247,9 +247,6 @@ class InteractiveSession:
             # Bare (unbracketed) move word: never applied, but surfaced so
             # the UI can flag the format fumble instead of calling it prose.
             "bare_move": game_io.find_bare_move(raw) if action is None else None,
-            # Thinking model that never closed its think block (the full raw
-            # text stayed visible; an intended move was still honored).
-            "missing_think_close": getattr(raw, "missing_think_close", False),
             "gold_collected": gold_collected,
             "gold_remaining": game_io.gold_remaining(self.game),
             "before_path": turn["snapshot_before_path"],

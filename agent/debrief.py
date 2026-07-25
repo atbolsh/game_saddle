@@ -433,8 +433,6 @@ class DebriefSession:
                     "tool_call": call,
                     "cursor": self._cursor,
                     "tip_saved": tip_saved,
-                    # Thinking model that never closed its think block.
-                    "missing_think_close": getattr(raw, "missing_think_close", False),
                     "frames": (
                         [current["path"]]
                         if moved and current and current.get("path") else []

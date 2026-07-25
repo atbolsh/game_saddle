@@ -26,21 +26,23 @@ Each round:
      ``[SEARCH]`` over all memory tiers. No [SHOW]/[NEXT]/[BACK] navigation
      exists in this mode -- there is exactly one message to review. Each
      verdict is stored in the SAME conversation (assistant message,
-     ``kind='analysis'``, content prefixed "(analyst)") so the player's
-     recency window naturally includes past analyses. Any ``WRONG: "..."``
-     error spans in a verdict are verified against the recorded player reply
-     by exact substring match (:func:`agent.modes.parse_wrong_spans`).
+     ``kind='analysis'``, content prefixed "(analyst)") for the record and
+     for the analyst's own continuity. Any ``WRONG: "..."`` error spans in a
+     verdict are verified against the recorded player reply by exact
+     substring match (:func:`agent.modes.parse_wrong_spans`).
 
   3. **End of round** (:meth:`end_round`). When the user is satisfied with
      the analysis, the pending move is propagated to the game, the 'after'
      frame rendered, the round's trace completed, and the phase flips back
      to "player".
 
-The player's memory access works exactly as in play mode -- and because the
-analyst writes into the same session, the player sees the analyst's feedback
-in later rounds. The privacy asymmetry holds: analyst messages are prose
-(ratings + reasoning), and the recency window / semantic search remain
-settings-scrubbed for the player.
+The player's memory access works as in play mode, with one EXTRA privacy
+rule: analyst-voice content (the "(analyst) " verdicts and "(to analyst) "
+requests) is MASKED from the player's context -- recency window, semantic
+block, and the reasoning tier of [SEARCH] (via ``exclude_analyst`` /
+``exclude_session``). A capable player model otherwise peeks at the
+privileged analysis instead of reading the screen. The analyst itself still
+sees the full conversation, its own past verdicts included.
 
 :meth:`reset_game` swaps in a brand-new random bare board mid-conversation
 and records that fact as a message, so the agent's memory never silently
@@ -80,7 +82,9 @@ DEFAULT_ANALYST_QUESTION = (
     "For EVERY mistaken phrase, add a line of the form:\n"
     "WRONG: \"<the exact words copied from the player's reply>\"\n"
     "(one line per mistake, copied verbatim so the words can be found in "
-    "the reply). Then give a final rating from -1.0 to 1.0."
+    "the reply). Put NOTHING else on a WRONG line -- corrections or "
+    "suggested alternatives go on their own following line. Then give a "
+    "final rating from -1.0 to 1.0."
 )
 
 
@@ -181,6 +185,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
             mem.get_game_context(
                 self.client, self.session_id, query=query,
                 recent_window=self.cfg.recent_messages_window,
+                exclude_analyst=True,
             )
         )
 
@@ -207,6 +212,10 @@ class InteractiveSelfEvalSession(InteractiveSession):
                 mem.search_memory(
                     self.client, payload, tiers=("semantic", "reasoning"),
                     top_k=self.cfg.memory_search_top_k, scrub=True,
+                    # The round's trace records the ANALYST's search thoughts
+                    # too; excluding this session keeps the player from
+                    # fishing privileged analysis out of the reasoning tier.
+                    exclude_session=self.session_id,
                 )
             )
             search_notes.append(modes.format_search_note(payload, results))
@@ -262,7 +271,6 @@ class InteractiveSelfEvalSession(InteractiveSession):
             "question": question,
             "raw": raw,
             "action": action,
-            "missing_think_close": getattr(raw, "missing_think_close", False),
             "before_path": before_path,
             "settings_json": before_props.get("settings_json"),
             "assistant_msg_id": str(assistant_msg.id),
@@ -285,7 +293,6 @@ class InteractiveSelfEvalSession(InteractiveSession):
             "raw": raw,
             "action": action,
             "bare_move": bare_move,
-            "missing_think_close": getattr(raw, "missing_think_close", False),
             "before_path": before_path,
             "searches": searches,
             "phase": self.phase,
@@ -347,7 +354,6 @@ class InteractiveSelfEvalSession(InteractiveSession):
                 pending["before_path"], pending["settings_json"],
                 recent, question,
                 search_results="\n\n".join(search_notes) or None,
-                missing_think_close=pending.get("missing_think_close", False),
             )
             over_budget = n_searches >= self.cfg.memory_search_max_calls
             raw = self.model.generate(
@@ -362,7 +368,6 @@ class InteractiveSelfEvalSession(InteractiveSession):
                 "raw": raw,
                 "text": text,
                 "search_query": q,
-                "missing_think_close": getattr(raw, "missing_think_close", False),
             }
             replies.append(step_result)
             if on_step is not None:
@@ -385,9 +390,10 @@ class InteractiveSelfEvalSession(InteractiveSession):
             logger.info("analyst: [SEARCH %s]", q)
         analysis = raw
 
-        # Store the analysis in the SAME conversation so the player's recency
-        # window carries it into later rounds; the "(analyst)" prefix is how
-        # the player recognizes the privileged reviewer's voice.
+        # Store the analysis in the SAME conversation for the record and for
+        # the analyst's own continuity; the "(analyst) " prefix is the exact
+        # marker the player-context masking filters on (see agent.memory
+        # ANALYST_CONTENT_PREFIXES) -- the player never sees these.
         self._run(
             mem.add_assistant_message(
                 self.client, self.session_id, "(analyst) " + analysis,

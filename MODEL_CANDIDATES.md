@@ -3,12 +3,19 @@
 Research snapshot: **2026-07-23**. Constraints: vision input, free/open
 weights, fine-tunable on a single A100 (80 GB). Soft cap ~20B parameters.
 
-> **Now implemented:** every model below except the "For completeness" tier
-> is a switchable entry in `agent.model.MODEL_REGISTRY` (registry key in
-> parentheses in the tables/lists below), selectable via the notebooks'
-> model dropdown or the `MODEL_KEY` env var. All HF repo ids were verified
-> against the HF API on 2026-07-23; the only correction was **Ovis2.5-9B**,
-> whose repo moved from `AIDC-AI` to **`ATH-MaaS/Ovis2.5-9B`**.
+> **Bake-off outcome (2026-07-25):** `agent.model.MODEL_REGISTRY` was
+> trimmed to just **Gemma 4 12B Unified** (default) and **Gemma 4 E4B**.
+> The 12B was the clear winner -- best per-frame analyst, only model to
+> handle the "search frames for conditions" debrief task, decent player.
+> The thinking-tag models never worked well in this harness (the think-tag
+> plumbing was removed with the trim; supporting them again would mean
+> re-engineering the harness). This document stays as the research record;
+> the registry/adapter architecture still accepts new prototypes as one
+> `ModelSpec` each.
+>
+> Historical notes from the trial period: all HF repo ids below were
+> verified against the HF API on 2026-07-23; the only correction was
+> **Ovis2.5-9B**, whose repo moved from `AIDC-AI` to `ATH-MaaS/Ovis2.5-9B`.
 > `trust_remote_code` (from each repo's `auto_map`) is needed for Step3-VL,
 > Phi-4-Reasoning-Vision, Kimi-VL, and InternVL3.5; none of the repos are
 > gated except the usual Google/Gemma license acknowledgment handled by

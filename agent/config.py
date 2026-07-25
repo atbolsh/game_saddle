@@ -3,8 +3,8 @@
 All settings are read from environment variables (loaded from .env via
 python-dotenv if present). No external API keys are required: Neo4j runs
 locally over bolt, embeddings come from a local sentence-transformers
-model, and the LLM (any agent.model.MODEL_REGISTRY entry; Gemma 4 E4B by
-default) is loaded through HuggingFace transformers.
+model, and the LLM (any agent.model.MODEL_REGISTRY entry; Gemma 4 12B
+Unified by default) is loaded through HuggingFace transformers.
 """
 
 from __future__ import annotations
@@ -133,10 +133,11 @@ class AgentConfig:
     neo4j_database: str = field(default_factory=lambda: _env("NEO4J_DATABASE", "neo4j"))
 
     # Model selection. ``model_key`` picks an entry from
-    # agent.model.MODEL_REGISTRY (see MODEL_CANDIDATES.md for the lineup);
-    # the notebooks can switch models at runtime via their dropdown.
+    # agent.model.MODEL_REGISTRY (Gemma 4 12B Unified and E4B; see
+    # MODEL_CANDIDATES.md for the bake-off record); the notebooks can switch
+    # models at runtime via their dropdown.
     model_key: str = field(
-        default_factory=lambda: _env("MODEL_KEY", "gemma-4-e4b")
+        default_factory=lambda: _env("MODEL_KEY", "gemma-4-12b")
     )
     model_dtype: str = field(
         default_factory=lambda: _env_chain("MODEL_DTYPE", "GEMMA_DTYPE") or "bfloat16"

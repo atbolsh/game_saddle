@@ -1,8 +1,9 @@
 # game_saddle
 
-A multimodal-LLM agent (Gemma 4 E4B by default; any `agent.model.MODEL_REGISTRY`
-entry via `MODEL_KEY` or the notebooks' model dropdown — see
-`MODEL_CANDIDATES.md`) that plays a small 2D discrete game, with
+A multimodal-LLM agent (Gemma 4 12B Unified by default, Gemma 4 E4B as the
+lighter alternative; pick via `MODEL_KEY` or the notebooks' model dropdown —
+`MODEL_CANDIDATES.md` records the bake-off that settled the lineup) that
+plays a small 2D discrete game, with
 persistent, graph-shaped memory backed by the **Neo4j Agent Memory System
 (NAMS)** running locally over Bolt. No external DB, no NAMS API key, no
 cloud LLM provider.
@@ -36,7 +37,7 @@ Available moves in mode 1: `CLOCK` (turn clockwise by π/30),
 flowchart TD
     User["User / CLI"] --> Runner["agent.runner"]
     Runner --> Modes["agent.modes"]
-    Modes --> Model["agent.model: Gemma 4 E4B multimodal"]
+    Modes --> Model["agent.model: Gemma 4 multimodal (12B / E4B)"]
     Modes --> Memory["agent.memory: NAMS MemoryClient"]
     Modes --> GameIO["agent.game_io: bare level gen + render"]
     Modes --> ImgStore["agent.image_store: disk + Neo4j GameSnapshot"]
@@ -91,8 +92,8 @@ flowchart TD
    snapshot via `CAPTURED_STATE {role:'before'}`.
 3. Retrieve NAMS context with settings-leaking fields stripped
    (`agent.memory.get_game_context`).
-4. Build the chat: system prompt + context + image + question; call Gemma
-   4 E4B.
+4. Build the chat: system prompt + context + image + question; call the
+   model.
 5. Parse the first `CLOCK|ANTICLOCK|FORWARD` keyword; if found, apply the
    move to the engine.
 6. Store the assistant `Message`; start a reasoning `Trace`, add a `Step`
@@ -172,7 +173,7 @@ sees Settings.
    ```bash
    cp .env.example .env
    # edit .env: set NEO4J_PASSWORD, HF_TOKEN (needed for gated weights),
-   # optionally MODEL_KEY (which registry model to load; gemma-4-e4b default), ...
+   # optionally MODEL_KEY (which registry model to load; gemma-4-12b default), ...
    ```
 
    Setting variables in `.env` is **enough**: everything that runs Python —
@@ -280,11 +281,9 @@ and leaves other models' weights cached on disk; checked, a switch first
 restarts the conversation (debrief: a fresh thread over the same play
 conversation), then deletes every other registry model's cached HF weights
 before downloading the new ones — non-registry caches (GLiNER, spaCy,
-sentence-transformers) are never touched. Thinking models (Qwen3-VL Thinking,
-GLM-4.1V, Kimi-VL, MiMo-VL, ...) are handled transparently: think blocks are
-stripped before parsing/persisting, a move token inside a think block never
-counts, and a reply that forgets its think-close tag is kept fully visible
-(so an intended move is still honored) but flagged as a FORMAT ERROR.
+sentence-transformers) are never touched. The registry currently holds the
+two Gemma 4 variants (12B Unified, E4B); the wider 2026-07 candidate
+field, and why it lost, is recorded in `MODEL_CANDIDATES.md`.
 
 * **`notebooks/play.ipynb`** — interactive mode-1 play. It holds **one
   persistent game** and **one conversation thread**. Asking the agent to play
@@ -341,7 +340,7 @@ We adopt the **hybrid** recommended option:
 So the binary never bloats the property store, but you can still eyeball
 each frame inline in the Neo4j Browser using `thumbnail_b64` (e.g. render
 with `apoc.load.jpg` / a data-URI renderer), and the agent harness always
-has the high-res frame on disk for re-feeding into Gemma 4 E4B.
+has the high-res frame on disk for re-feeding into the model.
 
 ## Schema sketch
 
@@ -364,8 +363,8 @@ has the high-res frame on disk for re-feeding into Gemma 4 E4B.
 * Only **bare levels** (4 boundary walls + 1 gold piece, via
   `random_bare_settings`) are generated for now. Generalisation to
   interior walls / multi-gold is tracked in `FUTURE_GOALS.md`.
-* Only **image + text** modalities of Gemma 4 E4B are used. Audio and
-  video are tracked in `FUTURE_GOALS.md`.
+* Only **image + text** modalities of the Gemma 4 models are used. Audio
+  and video are tracked in `FUTURE_GOALS.md`.
 * **Automatic finetuning dataset generation** from mode 1 + mode 3 is a
   future objective, not implemented here; see `FUTURE_GOALS.md`.
 * The project is **local bolt-only by design**: there is no plan to add

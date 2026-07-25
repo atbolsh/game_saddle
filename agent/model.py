@@ -14,29 +14,14 @@ parts, e.g.::
     ]
 
 REGISTRY. :data:`MODEL_REGISTRY` lists every model the notebooks can switch
-to, in recommendation order (see MODEL_CANDIDATES.md). Each
-:class:`ModelSpec` carries the HF repo id plus the family conventions the
-wrapper needs (trust_remote_code, thinking-tag protocol, sampling defaults).
+to, in recommendation order. After the 2026-07 bake-off (see
+MODEL_CANDIDATES.md) it holds only the two Gemma 4 variants -- the thinking
+models never worked well in this harness and their think-tag plumbing was
+removed -- but the registry/adapter architecture stays so future prototypes
+drop in as one :class:`ModelSpec` (+ adapter, if a new family).
 
 FAMILY ADAPTERS. Per-family quirks live in ONE place each
-(:data:`ADAPTERS`): message normalization and the think-block protocol.
-
-THINKING MODELS. Several registry models emit reasoning inside think tags
-(``<think>...</think>``, Kimi's ``◁think▷...◁/think▷``). The harness must
-never parse a move token from inside a think block, so:
-
-  * Generation-time stopping is GATED: stop patterns only match after the
-    close tag (or anywhere, if the reply provably has no think block). If the
-    close tag never arrives, generation runs to its natural end.
-  * :meth:`VLModel.generate` returns a :class:`ModelReply` -- a ``str`` of
-    the VISIBLE text only (thinking stripped), so every existing caller
-    parses/persists exactly what a user would see. The stripped thinking is
-    kept on the reply (``.thinking``) and in the run logs.
-  * Small thinking models sometimes FORGET the close tag. Per the harness
-    contract: if the close tag is missing entirely, the full raw text is the
-    visible text (so an intended move token is still accepted), and
-    ``.missing_think_close`` is set -- sessions surface it as a FORMAT ERROR
-    (same pattern as ``bare_move``).
+(:data:`ADAPTERS`): currently just message normalization.
 
 The model is loaded once per process and shared across modes; switching
 models (:func:`switch_default`) unloads the old weights from the GPU first.
@@ -76,8 +61,6 @@ class ModelSpec:
     hf_id: str         #: HuggingFace repo id (verified 2026-07-23)
     family: str        #: adapter key into ADAPTERS
     trust_remote_code: bool = False
-    #: whether the model emits think blocks the harness must strip/gate.
-    thinking: bool = False
     #: minimum transformers release whose native code knows this architecture
     #: (None = anything satisfying requirements.txt works). Checked at load
     #: time so the failure is instant and actionable instead of a cryptic
@@ -91,104 +74,26 @@ class ModelSpec:
     notes: str = ""
 
 
-#: All switchable models, in recommendation order (top = default; see
-#: MODEL_CANDIDATES.md for the reasoning). dict preserves insertion order.
+#: All switchable models, in recommendation order (top = default). dict
+#: preserves insertion order.
 MODEL_REGISTRY: dict[str, ModelSpec] = {s.key: s for s in [
-    ModelSpec(
-        key="gemma-4-e4b", label="Gemma 4 E4B (current baseline)",
-        hf_id="google/gemma-4-E4B-it", family="gemma",
-        temperature=1.0, top_p=0.95, top_k=64,
-        notes="4.5B effective dense; the model the harness was built on.",
-    ),
-    ModelSpec(
-        key="qwen3-vl-8b-thinking", label="Qwen3-VL 8B Thinking",
-        hf_id="Qwen/Qwen3-VL-8B-Thinking", family="qwen", thinking=True,
-        notes="~9B dense; grounding-RL lineage + reasoning RL. Top pick.",
-    ),
-    ModelSpec(
-        key="qwen3-vl-8b-instruct", label="Qwen3-VL 8B Instruct",
-        hf_id="Qwen/Qwen3-VL-8B-Instruct", family="qwen",
-        notes="~9B dense; same base as the Thinking variant, no think blocks.",
-    ),
     ModelSpec(
         key="gemma-4-12b", label="Gemma 4 12B Unified",
         hf_id="google/gemma-4-12B-it", family="gemma",
         min_transformers="5.10.0",  # gemma4_unified arch added in 5.10.0
         temperature=1.0, top_p=0.95, top_k=64,
-        notes="12B dense, encoder-free unified architecture, 256K context.",
+        notes="12B dense, encoder-free unified architecture, 256K context. "
+              "Won the 2026-07 bake-off: best analyst, best debrief.",
     ),
     ModelSpec(
-        key="glm-4.1v-9b-thinking", label="GLM-4.1V 9B Thinking",
-        hf_id="zai-org/GLM-4.1V-9B-Thinking", family="glm", thinking=True,
-        notes="9B dense; curriculum-RL reasoner (RLCS), strong grounding.",
-    ),
-    ModelSpec(
-        key="step3-vl-10b", label="Step3-VL 10B",
-        hf_id="stepfun-ai/Step3-VL-10B", family="step",
-        trust_remote_code=True, thinking=True,
-        notes="10B; RLVR+RLHF. Custom code (auto_map) -- first remote load "
-              "may need loader attention.",
-    ),
-    ModelSpec(
-        key="phi-4-reasoning-vision-15b", label="Phi-4 Reasoning Vision 15B",
-        hf_id="microsoft/Phi-4-reasoning-vision-15B", family="phi",
-        trust_remote_code=True, thinking=True,
-        notes="15B dense; optional think blocks. 16K context -- tight for "
-              "long debriefs. Custom code (auto_map).",
-    ),
-    ModelSpec(
-        key="kimi-vl-a3b-thinking-2506", label="Kimi-VL A3B Thinking (2506)",
-        hf_id="moonshotai/Kimi-VL-A3B-Thinking-2506", family="kimi",
-        trust_remote_code=True, thinking=True, temperature=0.8,
-        notes="16B total / 2.8B active MoE; native-resolution encoder. "
-              "Moonshot recommends temperature 0.8. Custom code (auto_map).",
-    ),
-    ModelSpec(
-        key="mimo-vl-7b-rl", label="MiMo-VL 7B RL",
-        hf_id="XiaomiMiMo/MiMo-VL-7B-RL", family="mimo", thinking=True,
-        notes="7B dense on the Qwen2.5-VL architecture (no custom code); "
-              "thinks by default.",
-    ),
-    ModelSpec(
-        key="internvl3.5-8b", label="InternVL3.5 8B",
-        hf_id="OpenGVLab/InternVL3_5-8B", family="internvl",
-        trust_remote_code=True,
-        notes="8B dense; Cascade-RL. Custom code (InternVLChatModel) -- "
-              "first remote load may need loader attention.",
-    ),
-    ModelSpec(
-        key="internvl3.5-14b", label="InternVL3.5 14B",
-        hf_id="OpenGVLab/InternVL3_5-14B", family="internvl",
-        trust_remote_code=True,
-        notes="14B dense; strongest dense InternVL under 20B. Custom code.",
-    ),
-    ModelSpec(
-        key="ovis2.5-9b", label="Ovis2.5 9B",
-        hf_id="ATH-MaaS/Ovis2.5-9B", family="ovis",
-        trust_remote_code=True,
-        notes="9B; native-resolution ViT. Repo moved from AIDC-AI to "
-              "ATH-MaaS. Custom code likely.",
-    ),
-    ModelSpec(
-        key="qwen3-vl-30b-a3b-thinking", label="Qwen3-VL 30B-A3B Thinking (QLoRA-only FT)",
-        hf_id="Qwen/Qwen3-VL-30B-A3B-Thinking", family="qwen", thinking=True,
-        notes="30B total / 3B active MoE; ~60GB bf16 weights.",
-    ),
-    ModelSpec(
-        key="gemma-4-26b-a4b", label="Gemma 4 26B-A4B (QLoRA-only FT)",
-        hf_id="google/gemma-4-26B-A4B-it", family="gemma",
+        key="gemma-4-e4b", label="Gemma 4 E4B",
+        hf_id="google/gemma-4-E4B-it", family="gemma",
         temperature=1.0, top_p=0.95, top_k=64,
-        notes="26B total / 4B active MoE; stays inside the Gemma harness.",
-    ),
-    ModelSpec(
-        key="internvl3.5-30b-a3b", label="InternVL3.5 30B-A3B (QLoRA-only FT)",
-        hf_id="OpenGVLab/InternVL3_5-30B-A3B", family="internvl",
-        trust_remote_code=True,
-        notes="30B total / 3B active MoE. Custom code.",
+        notes="4.5B effective dense; the model the harness was built on.",
     ),
 ]}
 
-DEFAULT_MODEL_KEY = "gemma-4-e4b"
+DEFAULT_MODEL_KEY = "gemma-4-12b"
 
 
 def spec_for(key: str) -> ModelSpec:
@@ -203,53 +108,10 @@ def spec_for(key: str) -> ModelSpec:
 
 # ========================================================== family adapters
 
-class ModelReply(str):
-    """The visible text of a model reply, as a plain ``str`` (so every
-    existing caller keeps working), plus the think-protocol metadata:
-
-    - ``raw``: the untouched decoded generation.
-    - ``thinking``: the stripped think-block text, or None.
-    - ``missing_think_close``: True when a thinking model never emitted its
-      close tag (FORMAT ERROR -- the full raw text was kept visible so an
-      intended move token is still accepted).
-    """
-
-    raw: str
-    thinking: str | None
-    missing_think_close: bool
-
-    def __new__(
-        cls, visible: str, raw: str, thinking: str | None,
-        missing_think_close: bool,
-    ) -> "ModelReply":
-        obj = super().__new__(cls, visible)
-        obj.raw = raw
-        obj.thinking = thinking
-        obj.missing_think_close = missing_think_close
-        return obj
-
-
 class FamilyAdapter:
-    """Per-family conventions: message normalization + think-tag protocol.
+    """Per-family conventions. Currently just message normalization; future
+    model families with different quirks get their own subclass here."""
 
-    ``always_thinks`` marks families whose chat template auto-opens the think
-    block inside the generation prompt (Qwen3 Thinking, GLM, Kimi, MiMo): the
-    open tag then never appears in the OUTPUT, and every reply is expected to
-    contain the close tag. Families with optional, explicitly-opened blocks
-    (Phi, Step) keep ``always_thinks=False``.
-    """
-
-    def __init__(
-        self,
-        think_open: str = "<think>",
-        think_close: str = "</think>",
-        always_thinks: bool = False,
-    ):
-        self.think_open = think_open
-        self.think_close = think_close
-        self.always_thinks = always_thinks
-
-    # ---------------------------------------------------------- messages
     @staticmethod
     def _resolve_image_url(url: str) -> str:
         """Allow ``url`` to be a local filesystem path; HF processors accept
@@ -277,67 +139,10 @@ class FamilyAdapter:
                 norm.append(m)
         return norm
 
-    # ------------------------------------------------------- think blocks
-    def split_thinking(
-        self, raw: str, thinking_model: bool
-    ) -> tuple[str, str | None, bool]:
-        """Split a decoded reply into ``(visible, thinking, missing_close)``.
 
-        Contract (see module docstring): tokens inside a think block never
-        count; a missing close tag keeps the FULL text visible (so an
-        intended move is still accepted) and flags a FORMAT ERROR -- except
-        when the reply provably never opened a block at all (optional
-        thinkers answering directly), which is a plain reply."""
-        if not thinking_model:
-            return raw, None, False
-        if self.think_close in raw:
-            thinking, _, visible = raw.partition(self.think_close)
-            thinking = thinking.replace(self.think_open, "", 1).strip()
-            return visible.strip(), thinking, False
-        if self.always_thinks or self.think_open in raw:
-            # A think block was (or must have been) opened and never closed.
-            return raw.strip(), None, True
-        return raw, None, False  # no block at all: a plain reply
-
-    def stop_region(self, generated_text: str) -> str | None:
-        """The slice of the generated-so-far text where stop patterns may
-        legitimately match, or None if stopping must wait (we are inside a
-        think block whose close tag has not arrived)."""
-        if self.think_close in generated_text:
-            return generated_text.split(self.think_close, 1)[1]
-        if self.always_thinks or self.think_open in generated_text:
-            return None
-        return generated_text
-
-
-class GlmAdapter(FamilyAdapter):
-    """GLM-4.1V wraps its final answer in <answer> tags; strip them from the
-    visible text so the harness parses clean prose."""
-
-    def split_thinking(
-        self, raw: str, thinking_model: bool
-    ) -> tuple[str, str | None, bool]:
-        visible, thinking, missing = super().split_thinking(raw, thinking_model)
-        for tag in ("<answer>", "</answer>"):
-            visible = visible.replace(tag, "")
-        return visible.strip(), thinking, missing
-
-
-#: One adapter instance per family. always_thinks per the family's template
-#: behavior (auto-opened think block -> close tag expected in every reply).
+#: One adapter instance per family.
 ADAPTERS: dict[str, FamilyAdapter] = {
     "gemma": FamilyAdapter(),
-    "qwen": FamilyAdapter(always_thinks=True),
-    "glm": GlmAdapter(always_thinks=True),
-    "step": FamilyAdapter(),
-    "phi": FamilyAdapter(),
-    "kimi": FamilyAdapter(
-        think_open="\u25c1think\u25b7", think_close="\u25c1/think\u25b7",
-        always_thinks=True,
-    ),
-    "mimo": FamilyAdapter(always_thinks=True),
-    "internvl": FamilyAdapter(),
-    "ovis": FamilyAdapter(),
 }
 
 
@@ -352,47 +157,22 @@ class RegexStopCriteria(StoppingCriteria):
     ``[SHOW`` would halt before the parameter is generated). This criteria
     decodes a window of the generated tokens each step and applies a regex,
     so generation halts right after the complete call.
-
-    THINK GATE. For thinking models pass ``gate`` (the family adapter): the
-    FULL generation is decoded each step and the patterns may only match in
-    the region the adapter allows -- after the think-close tag, or anywhere
-    if the reply provably has no think block. A move token inside an
-    unterminated think block therefore never stops generation; the reply runs
-    to its natural end and the missing-close salvage happens at parse time.
-
-    ``patterns`` may be one pattern or a list. Each is compiled SEPARATELY
-    and generation stops when any of them matches -- never spliced into one
-    alternation, because a pattern may legally begin with a global inline
-    flag like ``(?i)`` (SEARCH_TOOL_PATTERN does), which Python rejects
-    anywhere but position 0 of an expression.
     """
 
-    #: How many of the most recent generated tokens to decode per check (the
-    #: ungated path). Sized generously so a junk-padded call (e.g.
-    #: ``[SHOW: step 42 ]``) or a multi-word ``[SEARCH ...]`` query still fits
-    #: entirely in the window -- if the opening ``[SEARCH`` scrolled out of
-    #: the decoded tail before the closing ``]`` arrived, the pattern would
-    #: never match and generation would run on.
+    #: How many of the most recent generated tokens to decode per check.
+    #: Sized generously so a junk-padded call (e.g. ``[SHOW: step 42 ]``) or
+    #: a multi-word ``[SEARCH ...]`` query still fits entirely in the window
+    #: -- if the opening ``[SEARCH`` scrolled out of the decoded tail before
+    #: the closing ``]`` arrived, the pattern would never match and
+    #: generation would run on.
     TAIL_TOKENS = 48
 
     def __init__(
-        self,
-        patterns: str | re.Pattern | list,
-        tokenizer: Any,
-        prompt_len: int,
-        gate: FamilyAdapter | None = None,
+        self, pattern: str | re.Pattern, tokenizer: Any, prompt_len: int
     ):
-        if isinstance(patterns, (str, re.Pattern)):
-            patterns = [patterns]
-        self.patterns = [
-            re.compile(p) if isinstance(p, str) else p for p in patterns
-        ]
+        self.pattern = re.compile(pattern) if isinstance(pattern, str) else pattern
         self.tokenizer = tokenizer
         self.prompt_len = prompt_len
-        self.gate = gate
-
-    def _hit(self, text: str) -> bool:
-        return any(p.search(text) for p in self.patterns)
 
     def __call__(self, input_ids: torch.LongTensor, scores: Any, **kwargs: Any) -> bool:
         # Only consider generated tokens (not the prompt, which may legitimately
@@ -400,15 +180,9 @@ class RegexStopCriteria(StoppingCriteria):
         gen = input_ids[0][self.prompt_len:]
         if len(gen) == 0:
             return False
-        if self.gate is None:
-            tail = gen[-self.TAIL_TOKENS:]
-            text = self.tokenizer.decode(tail, skip_special_tokens=True)
-            return self._hit(text)
-        # Gated: the think-close tag may be arbitrarily far back, so decode
-        # the whole generation (bounded by max_new_tokens; fine at our scale).
-        text = self.tokenizer.decode(gen, skip_special_tokens=True)
-        region = self.gate.stop_region(text)
-        return region is not None and self._hit(region)
+        tail = gen[-self.TAIL_TOKENS:]
+        text = self.tokenizer.decode(tail, skip_special_tokens=True)
+        return self.pattern.search(text) is not None
 
 
 _DTYPE_MAP = {
@@ -522,20 +296,17 @@ class VLModel:
         max_new_tokens: int | None = None,
         stop_strings: list[str] | None = None,
         stop_regex: str | None = None,
-    ) -> ModelReply:
-        """Run one generation and return a :class:`ModelReply` (a ``str`` of
-        the VISIBLE text; think blocks stripped per the family protocol).
+    ) -> str:
+        """Run one generation and return the decoded reply text.
 
         If ``stop_strings`` is given, generation halts as soon as any of
         those strings is emitted; the stop string is included at the tail of
         the returned text. If ``stop_regex`` is given, generation halts as
         soon as the pattern matches the decoded generated text (see
         :class:`RegexStopCriteria`) -- use this for parameterized tokens like
-        ``[SHOW 42]`` that literal stop strings cannot capture. For thinking
-        models BOTH go through one think-gated regex criteria so a move
-        token inside a think block never halts generation. The model's native
-        end-of-turn/eos still terminates generation on its own, so a reply
-        that emits no stop token simply ends the turn."""
+        ``[SHOW 42]`` that literal stop strings cannot capture. The model's
+        native end-of-turn/eos still terminates generation on its own, so a
+        reply that emits no stop token simply ends the turn."""
         if not self._loaded:
             self.load()
         norm_messages = self.adapter.prepare_messages(messages)
@@ -564,47 +335,22 @@ class VLModel:
         }
         prompt_len = inputs["input_ids"].shape[-1]
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
-        if self.spec.thinking:
-            # Literal stop strings + the regex all go through ONE think-gated
-            # criteria (as separate patterns -- see RegexStopCriteria): nothing
-            # may stop generation from inside a think block.
-            parts = [re.escape(s) for s in (stop_strings or [])]
-            if stop_regex:
-                parts.append(stop_regex)
-            if parts:
-                gen_kwargs["stopping_criteria"] = StoppingCriteriaList([
-                    RegexStopCriteria(
-                        parts, tokenizer,
-                        prompt_len=prompt_len, gate=self.adapter,
-                    )
-                ])
-        else:
-            if stop_strings:
-                # StopStringCriteria requires the tokenizer to be passed to generate.
-                gen_kwargs["stop_strings"] = stop_strings
-                gen_kwargs["tokenizer"] = tokenizer
-            if stop_regex:
-                gen_kwargs["stopping_criteria"] = StoppingCriteriaList([
-                    RegexStopCriteria(stop_regex, tokenizer, prompt_len=prompt_len)
-                ])
+        if stop_strings:
+            # StopStringCriteria requires the tokenizer to be passed to generate.
+            gen_kwargs["stop_strings"] = stop_strings
+            gen_kwargs["tokenizer"] = tokenizer
+        if stop_regex:
+            gen_kwargs["stopping_criteria"] = StoppingCriteriaList([
+                RegexStopCriteria(stop_regex, tokenizer, prompt_len=prompt_len)
+            ])
 
-        reply: ModelReply | None = None
+        reply: str | None = None
         err: str | None = None
         try:
             with torch.inference_mode():
                 out = self.model.generate(**inputs, **gen_kwargs)
             gen = out[0][prompt_len:]
-            raw_out = self.processor.decode(gen, skip_special_tokens=True).strip()
-            visible, thinking, missing_close = self.adapter.split_thinking(
-                raw_out, self.spec.thinking
-            )
-            if missing_close:
-                logger.warning(
-                    "Model %s never closed its think block (%r missing) -- "
-                    "keeping the full text visible (FORMAT ERROR).",
-                    self.spec.key, self.adapter.think_close,
-                )
-            reply = ModelReply(visible, raw_out, thinking, missing_close)
+            reply = self.processor.decode(gen, skip_special_tokens=True).strip()
             return reply
         except Exception as exc:
             err = f"{type(exc).__name__}: {exc}"
@@ -632,11 +378,7 @@ class VLModel:
                     "stop_strings": stop_strings,
                     "stop_regex": stop_regex,
                 },
-                response=None if reply is None else {
-                    "raw": reply.raw,
-                    "thinking": reply.thinking,
-                    "missing_think_close": reply.missing_think_close,
-                },
+                response=None if reply is None else {"raw": reply},
                 error=err,
             )
 

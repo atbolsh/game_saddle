@@ -112,7 +112,7 @@ async def _cmd_dump(args: argparse.Namespace) -> int:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="agent.runner", description="Gemma 4 E4B game agent (NAMS-backed)")
+    p = argparse.ArgumentParser(prog="agent.runner", description="Gemma 4 game agent (NAMS-backed)")
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
 
