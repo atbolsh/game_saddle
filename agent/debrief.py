@@ -141,14 +141,21 @@ class DebriefSession:
             return self.select(self.play_session_id)
         return {"play_session_id": None, "debrief_session_id": None}
 
-    def switch_model(self, key: str, purge_others: bool = False) -> dict[str, Any]:
-        """Switch to registry model ``key`` (see ``agent.model.MODEL_REGISTRY``).
+    def switch_model(
+        self,
+        key: str,
+        purge_others: bool = False,
+        checkpoint: str | None = None,
+    ) -> dict[str, Any]:
+        """Switch to registry model ``key`` (see ``agent.model.MODEL_REGISTRY``),
+        optionally with a trained adapter ``checkpoint`` from
+        ``weights/<key>/`` (None = bare HuggingFace weights).
 
         With ``purge_others=True`` ("save only one set of weights at a
         time"), a fresh debrief thread is started first (over the same play
         conversation) and every other registry model's cached weights are
         deleted from disk before the new ones are downloaded."""
-        return switch_session_model(self, key, purge_others)
+        return switch_session_model(self, key, purge_others, checkpoint)
 
     def list_conversations(self) -> list[dict[str, Any]]:
         """All PLAY conversations (debriefs excluded), newest first, with

@@ -117,15 +117,22 @@ class InteractiveSession:
             "gold_remaining": game_io.gold_remaining(self.game),
         }
 
-    def switch_model(self, key: str, purge_others: bool = False) -> dict[str, Any]:
-        """Switch to registry model ``key`` (see ``agent.model.MODEL_REGISTRY``).
+    def switch_model(
+        self,
+        key: str,
+        purge_others: bool = False,
+        checkpoint: str | None = None,
+    ) -> dict[str, Any]:
+        """Switch to registry model ``key`` (see ``agent.model.MODEL_REGISTRY``),
+        optionally with a trained adapter ``checkpoint`` from
+        ``weights/<key>/`` (None = bare HuggingFace weights).
 
         With ``purge_others=True`` ("save only one set of weights at a
         time"), the conversation is restarted first and every other registry
         model's cached weights are deleted from disk before the new ones are
         downloaded. Without it, the conversation continues under the new
         model."""
-        return switch_session_model(self, key, purge_others)
+        return switch_session_model(self, key, purge_others, checkpoint)
 
     def current_frame_path(self) -> str:
         """Render the current game frame to disk (no DB write) and return its

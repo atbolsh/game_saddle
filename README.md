@@ -270,20 +270,24 @@ launch Jupyter from the repo root:
 jupyter notebook   # or: jupyter lab
 ```
 
-**Model dropdown.** The play, debrief, and interactive-self-eval notebooks
-all start their control panel with a shared model picker
-(`agent.notebook_ui.model_picker`): a dropdown over every
-`agent.model.MODEL_REGISTRY` entry in recommendation order (see
-`MODEL_CANDIDATES.md`), an explicit **Switch model** button (a misclick on
-the dropdown never starts a download), and a **"Save only one set of weights
-at a time"** checkbox. Unchecked (default), switching keeps the conversation
-and leaves other models' weights cached on disk; checked, a switch first
-restarts the conversation (debrief: a fresh thread over the same play
-conversation), then deletes every other registry model's cached HF weights
-before downloading the new ones — non-registry caches (GLiNER, spaCy,
-sentence-transformers) are never touched. The registry currently holds the
-two Gemma 4 variants (12B Unified, E4B); the wider 2026-07 candidate
-field, and why it lost, is recorded in `MODEL_CANDIDATES.md`.
+**Architecture + checkpoint dropdowns.** The play, debrief, and
+interactive-self-eval notebooks all start their control panel with a shared
+model picker (`agent.notebook_ui.model_picker`): an **Architecture** dropdown
+over every `agent.model.MODEL_REGISTRY` entry in recommendation order (see
+`MODEL_CANDIDATES.md`), a **Checkpoint** dropdown listing `[default]` (bare
+HuggingFace weights) plus every trained adapter found under
+`weights/<architecture>/` (newest first, rescanned when the architecture
+changes — see `TRAINING_OVERVIEW.md`), an explicit **Switch model** button (a
+misclick on a dropdown never starts a download), and a **"Save only one set
+of weights at a time"** checkbox. Unchecked (default), switching keeps the
+conversation and leaves other models' weights cached on disk; checked, a
+switch first restarts the conversation (debrief: a fresh thread over the same
+play conversation), then deletes every other registry model's cached HF
+weights before downloading the new ones — non-registry caches (GLiNER, spaCy,
+sentence-transformers) and trained checkpoints under `weights/` are never
+touched. The registry currently holds the two Gemma 4 variants (12B Unified,
+E4B); the wider 2026-07 candidate field, and why it lost, is recorded in
+`MODEL_CANDIDATES.md`.
 
 * **`notebooks/play.ipynb`** — interactive mode-1 play. It holds **one
   persistent game** and **one conversation thread**. Asking the agent to play
@@ -319,6 +323,35 @@ field, and why it lost, is recorded in `MODEL_CANDIDATES.md`.
 The play notebook's buttons do use `ipywidgets`; if they don't render, ensure
 `ipywidgets` is installed in the same environment as the Jupyter server
 (Notebook 7+ / JupyterLab 4+ ship the widget manager by default).
+
+## Training
+
+The self-training project has its own documentation set — start with
+[TRAINING_OVERVIEW.md](TRAINING_OVERVIEW.md) (roadmap, recipe, checkpoint
+convention), then [TRAINING_GAME_TRACES.md](TRAINING_GAME_TRACES.md) (how the
+self-eval loop becomes training data),
+[TRAINING_EXTRA_DATASETS.md](TRAINING_EXTRA_DATASETS.md) (replay mixing
+against forgetting; the early-warning suite), and
+[TRAINING_TRACE_EXTRAS.md](TRAINING_TRACE_EXTRAS.md) (planted-error data,
+prompt internalization).
+
+The entry point is `train.py` at the repo root: a source-agnostic QLoRA loop
+(weighted token cross-entropy over `TrainingExample`s from pluggable
+`DataSource`s — plain SFT and RL-style per-token quality vectors are the same
+code path):
+
+```bash
+python train.py --data batch1.jsonl batch2.jsonl:0.5 --label episode1
+```
+
+Checkpoints are **PEFT adapter folders** under
+`weights/<architecture>/<name>/` (git-ignored; the directory is created by
+`scripts/setup_env.sh`), saved periodically plus whenever training ends. Every
+entry point can load one on top of the HF base weights: set
+`MODEL_CHECKPOINT` in `.env`, pass `--checkpoint` to `agent.runner`, or use
+the checkpoint dropdown in the notebooks (`[default]` = bare HF weights).
+Training runs log to `logs/train_<label>_<stamp>/` and roll back to the best
+checkpoint (loudly) if a guarded eval metric regresses.
 
 ## Storing images in Neo4j: the approach used here
 
@@ -387,6 +420,8 @@ agent/
   interactive.py     # InteractiveSession: persistent-game mode-1 for notebooks
   run_logging.py     # per-run LLM-call + DB-retrieval logs (on by default)
   runner.py          # CLI
+train.py             # source-agnostic QLoRA training loop (see TRAINING_OVERVIEW.md)
+weights/             # trained adapter checkpoints, weights/<architecture>/<name>/ (git-ignored)
 notebooks/
   play.ipynb            # interactive mode-1 play (Ask + Restart conversation)
   visualize_memory.ipynb# pyvis interactive graph of the memory graph
@@ -402,5 +437,9 @@ README.md
 FUTURE_GOALS.md
 MODEL_CANDIDATES.md    # comparable multimodal models for the fine-tuning bake-off
 IMAGE_DECODER_GRAFT.md # how-to: graft an image decoder (visual imagination) onto the VLM
+TRAINING_OVERVIEW.md   # self-training roadmap + the train.py contract/recipe
+TRAINING_GAME_TRACES.md   # standard use of game traces (self-eval loop as data generator)
+TRAINING_EXTRA_DATASETS.md# replay mixing vs. forgetting; the early-warning suite
+TRAINING_TRACE_EXTRAS.md  # planted-error data; prompt internalization
 .env.example
 ```

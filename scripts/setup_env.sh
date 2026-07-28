@@ -84,7 +84,14 @@ GLiNER.from_pretrained(model_id)
 print("[setup-env] GLiNER weights cached.", flush=True)
 PY
 
-# --------------------------------------------------------------- 4. verify
+# ------------------------------------------------- 4. weights checkpoint dir
+# Trained LoRA adapter checkpoints live in weights/<architecture>/<name>/
+# (see TRAINING_OVERVIEW.md). -p tolerates an existing dir OR a symlink to
+# one (the owner's local box symlinks weights/ onto removable storage).
+log "ensuring checkpoint directory exists: ${REPO_ROOT}/weights"
+mkdir -p "${REPO_ROOT}/weights"
+
+# --------------------------------------------------------------- 5. verify
 log "verifying extractors import cleanly"
 python - "${SPACY_MODEL}" <<'PY'
 import sys

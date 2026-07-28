@@ -114,6 +114,13 @@ async def _cmd_dump(args: argparse.Namespace) -> int:
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="agent.runner", description="Gemma 4 game agent (NAMS-backed)")
     p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument(
+        "--checkpoint", default=None,
+        help="Trained adapter checkpoint to load on top of the HF base "
+             "weights: a folder name under weights/<MODEL_KEY>/ (see "
+             "TRAINING_OVERVIEW.md). Default: the MODEL_CHECKPOINT .env "
+             "var, else bare HF weights.",
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     p_seed = sub.add_parser("seed", help="Seed the NAMS long-term semantic model (run once).")
@@ -160,6 +167,11 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     _setup_logging(args.verbose)
+    if args.checkpoint is not None:
+        # Must run before the first get_model() call inside the command.
+        from .model import set_default_checkpoint
+
+        set_default_checkpoint(args.checkpoint)
     try:
         return asyncio.run(args.func(args))
     except KeyboardInterrupt:  # pragma: no cover

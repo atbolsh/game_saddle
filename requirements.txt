@@ -23,8 +23,13 @@ tokenizers>=0.15.0
 safetensors>=0.4.0
 accelerate>=1.0.0
 
-# Parameter-efficient fine-tuning
+# Parameter-efficient fine-tuning. peft provides LoRA (adapter checkpoints
+# under weights/ -- see TRAINING_OVERVIEW.md); bitsandbytes provides the
+# 4-bit NF4 quantization + paged 8-bit AdamW that train.py's QLoRA recipe
+# uses. bitsandbytes is CUDA-only in practice: like torch above, install it
+# on the GPU box.
 peft>=0.10.0
+bitsandbytes>=0.45.0
 
 # Game engine and graphics
 pygame>=2.5.0

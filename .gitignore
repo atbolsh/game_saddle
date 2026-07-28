@@ -13,6 +13,11 @@ neo4j_data/
 neo4j_logs/
 brain_checkpoints/
 
+# Trained LoRA adapter checkpoints (weights/<architecture>/<name>/); on the
+# local editing box "weights" is a symlink onto removable storage, so the
+# pattern has no trailing slash (a slash-pattern would not match the symlink).
+weights
+
 # Per-run logs: LLM-call logs, DB-retrieval logs, and .dump snapshots
 logs/
 *.dump

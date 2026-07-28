@@ -139,6 +139,19 @@ class AgentConfig:
     model_key: str = field(
         default_factory=lambda: _env("MODEL_KEY", "gemma-4-12b")
     )
+    # Optional trained checkpoint: the name of a folder under
+    # ``weights/<model_key>/`` holding a PEFT adapter produced by train.py.
+    # None/empty (the default) = bare HuggingFace weights -- what the
+    # notebooks show as "[default]" in their checkpoint dropdown.
+    model_checkpoint: str | None = field(
+        default_factory=lambda: os.environ.get("MODEL_CHECKPOINT") or None
+    )
+    # Root of the adapter-checkpoint tree (see TRAINING_OVERVIEW.md). On the
+    # owner's local box this is a symlink onto removable storage; everywhere
+    # else it is a plain directory created by scripts/setup_env.sh.
+    weights_dir: Path = field(
+        default_factory=lambda: Path(_env("WEIGHTS_DIR", "weights"))
+    )
     model_dtype: str = field(
         default_factory=lambda: _env_chain("MODEL_DTYPE", "GEMMA_DTYPE") or "bfloat16"
     )

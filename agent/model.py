@@ -23,6 +23,14 @@ drop in as one :class:`ModelSpec` (+ adapter, if a new family).
 FAMILY ADAPTERS. Per-family quirks live in ONE place each
 (:data:`ADAPTERS`): currently just message normalization.
 
+CHECKPOINTS. A checkpoint is a PEFT adapter folder produced by train.py,
+living at ``weights/<architecture-key>/<checkpoint-name>/`` (see
+TRAINING_OVERVIEW.md). Base weights always come from HuggingFace; loading a
+checkpoint stacks the adapter on top. ``checkpoint=None`` (everywhere) means
+bare HF weights -- the notebooks' "[default]". Selection paths: the
+MODEL_CHECKPOINT .env var, ``agent.runner --checkpoint``
+(:func:`set_default_checkpoint`), and the notebooks' checkpoint dropdown.
+
 The model is loaded once per process and shared across modes; switching
 models (:func:`switch_default`) unloads the old weights from the GPU first.
 """
@@ -32,6 +40,7 @@ from __future__ import annotations
 import gc
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import re
@@ -104,6 +113,35 @@ def spec_for(key: str) -> ModelSpec:
         raise KeyError(
             f"Unknown model key {key!r}. Known keys: {list(MODEL_REGISTRY)}"
         ) from None
+
+
+# ============================================================== checkpoints
+
+def checkpoint_dir(
+    architecture_key: str, checkpoint: str, cfg: AgentConfig | None = None
+) -> "Path":
+    """Filesystem location of one named checkpoint (no existence check)."""
+    cfg = cfg or CONFIG
+    return Path(cfg.weights_dir) / architecture_key / checkpoint
+
+
+def list_checkpoints(
+    architecture_key: str, cfg: AgentConfig | None = None
+) -> list[str]:
+    """Names of every saved adapter checkpoint for one architecture, newest
+    first (mtime order -- the natural order for a dropdown). A checkpoint is
+    any direct subfolder of ``weights/<key>/`` containing an
+    ``adapter_config.json``; anything else in the tree is ignored."""
+    cfg = cfg or CONFIG
+    root = Path(cfg.weights_dir) / architecture_key
+    if not root.is_dir():
+        return []
+    found = [
+        d for d in root.iterdir()
+        if d.is_dir() and (d / "adapter_config.json").is_file()
+    ]
+    found.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    return [d.name for d in found]
 
 
 # ========================================================== family adapters
@@ -199,12 +237,22 @@ _DTYPE_MAP = {
 # ================================================================== wrapper
 
 class VLModel:
-    """Thin sync wrapper around one registry model (spec-parameterized)."""
+    """Thin sync wrapper around one registry model (spec-parameterized).
 
-    def __init__(self, spec: ModelSpec, cfg: AgentConfig | None = None):
+    ``checkpoint`` (optional) names a trained PEFT adapter under
+    ``weights/<spec.key>/`` to stack on the HF base weights; None = bare HF.
+    """
+
+    def __init__(
+        self,
+        spec: ModelSpec,
+        cfg: AgentConfig | None = None,
+        checkpoint: str | None = None,
+    ):
         self.spec = spec
         self.adapter = ADAPTERS[spec.family]
         self.cfg = cfg or CONFIG
+        self.checkpoint = checkpoint or None
         self.model: Any = None
         self.processor: Any = None
         self._loaded = False
@@ -256,10 +304,41 @@ class VLModel:
                 f"Failed to load model {spec.key!r} ({spec.hf_id}): "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
+        if self.checkpoint:
+            self._apply_checkpoint()
         self.model.eval()
         self._loaded = True
-        logger.info("Model %s loaded.", spec.key)
+        logger.info(
+            "Model %s loaded%s.", spec.key,
+            f" with checkpoint {self.checkpoint!r}" if self.checkpoint else "",
+        )
         return self
+
+    def _apply_checkpoint(self) -> None:
+        """Stack the named PEFT adapter on the freshly loaded base. Missing
+        or malformed folders are hard errors (no-fuzzy-fallbacks): silently
+        running the bare base when a checkpoint was requested would poison
+        every conclusion drawn from the session."""
+        path = checkpoint_dir(self.spec.key, self.checkpoint, self.cfg)
+        if not (path / "adapter_config.json").is_file():
+            raise RuntimeError(
+                f"Checkpoint {self.checkpoint!r} for {self.spec.key!r} not "
+                f"found (no adapter_config.json under {path}). Known "
+                f"checkpoints: {list_checkpoints(self.spec.key, self.cfg)}"
+            )
+        from peft import PeftModel
+
+        logger.info("Applying checkpoint %s", path)
+        try:
+            self.model = PeftModel.from_pretrained(
+                self.model, str(path), is_trainable=False
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to apply checkpoint {self.checkpoint!r} "
+                f"({path}) onto {self.spec.key!r}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
 
     def unload(self) -> None:
         """Free the GPU: drop model + processor and empty the CUDA cache."""
@@ -387,44 +466,81 @@ class VLModel:
 
 _DEFAULT: VLModel | None = None
 
+#: Process-wide checkpoint override (set by ``agent.runner --checkpoint``
+#: BEFORE the first get_model call). Wins over cfg.model_checkpoint; the
+#: sentinel distinguishes "never set" from an explicit None (= bare HF).
+_CHECKPOINT_UNSET = object()
+_checkpoint_override: Any = _CHECKPOINT_UNSET
+
+
+def set_default_checkpoint(checkpoint: str | None) -> None:
+    """Force the checkpoint the process-wide model loads with, overriding
+    the MODEL_CHECKPOINT env var. Call before the first :func:`get_model`
+    (an already-loaded model is NOT reloaded -- use :func:`switch_default`)."""
+    global _checkpoint_override
+    _checkpoint_override = checkpoint or None
+
+
+def _default_checkpoint(cfg: AgentConfig) -> str | None:
+    if _checkpoint_override is not _CHECKPOINT_UNSET:
+        return _checkpoint_override
+    return cfg.model_checkpoint
+
 
 def get_model(cfg: AgentConfig | None = None) -> VLModel:
-    """The process-wide model (loads ``cfg.model_key`` on first call)."""
+    """The process-wide model (loads ``cfg.model_key`` on first call, with
+    the checkpoint from --checkpoint / MODEL_CHECKPOINT if any)."""
     global _DEFAULT
     if _DEFAULT is None:
         cfg = cfg or CONFIG
-        _DEFAULT = VLModel(spec_for(cfg.model_key), cfg).load()
+        _DEFAULT = VLModel(
+            spec_for(cfg.model_key), cfg, checkpoint=_default_checkpoint(cfg)
+        ).load()
     return _DEFAULT
 
 
-def switch_default(key: str, cfg: AgentConfig | None = None) -> VLModel:
+def switch_default(
+    key: str,
+    cfg: AgentConfig | None = None,
+    checkpoint: str | None = None,
+) -> VLModel:
     """Replace the process-wide model: unload the old weights from the GPU,
-    then load (downloading if needed) the registry model ``key``."""
+    then load (downloading if needed) the registry model ``key``, stacking
+    the named adapter ``checkpoint`` if given (None = bare HF)."""
     global _DEFAULT
     if _DEFAULT is not None:
         _DEFAULT.unload()
         _DEFAULT = None
-    _DEFAULT = VLModel(spec_for(key), cfg).load()
+    _DEFAULT = VLModel(spec_for(key), cfg, checkpoint=checkpoint).load()
     return _DEFAULT
 
 
 def switch_session_model(
-    session: Any, key: str, purge_others: bool = False
+    session: Any,
+    key: str,
+    purge_others: bool = False,
+    checkpoint: str | None = None,
 ) -> dict[str, Any]:
     """Shared implementation behind the sessions' ``switch_model`` methods.
 
     ``session`` is any object with ``model`` / ``cfg`` / ``restart()`` (both
-    ``InteractiveSession`` and ``DebriefSession`` qualify). Sequence:
+    ``InteractiveSession`` and ``DebriefSession`` qualify). ``checkpoint``
+    names a trained adapter under ``weights/<key>/`` (None = bare HF, the
+    notebooks' "[default]"). Sequence:
 
       1. If ``purge_others`` ("save only one set of weights at a time"):
          restart the conversation FIRST, so the old thread never mixes with
          the new model's output.
       2. Unload the current model from the GPU.
       3. If ``purge_others``: delete every OTHER registry model's cached
-         weights from disk (including the one just unloaded).
-      4. Load (downloading if needed) the new model and rebind it.
+         weights from disk (including the one just unloaded). Adapter
+         checkpoints under weights/ are never touched.
+      4. Load (downloading if needed) the new model + adapter and rebind it.
     """
-    info: dict[str, Any] = {"key": key, "restarted": False, "purge": None}
+    info: dict[str, Any] = {
+        "key": key, "checkpoint": checkpoint or None,
+        "restarted": False, "purge": None,
+    }
     if purge_others:
         info["restart"] = session.restart()
         info["restarted"] = True
@@ -432,7 +548,7 @@ def switch_session_model(
         session.model.unload()
     if purge_others:
         info["purge"] = purge_other_weights(key)
-    session.model = switch_default(key, session.cfg)
+    session.model = switch_default(key, session.cfg, checkpoint=checkpoint)
     info["hf_id"] = session.model.spec.hf_id
     info["label"] = session.model.spec.label
     return info
