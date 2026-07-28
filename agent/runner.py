@@ -118,8 +118,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--checkpoint", default=None,
         help="Trained adapter checkpoint to load on top of the HF base "
              "weights: a folder name under weights/<MODEL_KEY>/ (see "
-             "TRAINING_OVERVIEW.md). Default: the MODEL_CHECKPOINT .env "
-             "var, else bare HF weights.",
+             "training/TRAINING_OVERVIEW.md). Default: the MODEL_CHECKPOINT "
+             ".env var, else bare HF weights.",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 

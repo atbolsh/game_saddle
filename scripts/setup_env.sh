@@ -86,8 +86,9 @@ PY
 
 # ------------------------------------------------- 4. weights checkpoint dir
 # Trained LoRA adapter checkpoints live in weights/<architecture>/<name>/
-# (see TRAINING_OVERVIEW.md). -p tolerates an existing dir OR a symlink to
-# one (the owner's local box symlinks weights/ onto removable storage).
+# (see training/TRAINING_OVERVIEW.md). -p tolerates an existing dir OR a
+# symlink to one (the owner's local box symlinks weights/ onto removable
+# storage).
 log "ensuring checkpoint directory exists: ${REPO_ROOT}/weights"
 mkdir -p "${REPO_ROOT}/weights"
 

@@ -23,9 +23,10 @@ drop in as one :class:`ModelSpec` (+ adapter, if a new family).
 FAMILY ADAPTERS. Per-family quirks live in ONE place each
 (:data:`ADAPTERS`): currently just message normalization.
 
-CHECKPOINTS. A checkpoint is a PEFT adapter folder produced by train.py,
-living at ``weights/<architecture-key>/<checkpoint-name>/`` (see
-TRAINING_OVERVIEW.md). Base weights always come from HuggingFace; loading a
+CHECKPOINTS. A checkpoint is a PEFT adapter folder produced by
+training/train.py, living at ``weights/<architecture-key>/<checkpoint-name>/``
+(see training/TRAINING_OVERVIEW.md). Base weights always come from
+HuggingFace; loading a
 checkpoint stacks the adapter on top. ``checkpoint=None`` (everywhere) means
 bare HF weights -- the notebooks' "[default]". Selection paths: the
 MODEL_CHECKPOINT .env var, ``agent.runner --checkpoint``

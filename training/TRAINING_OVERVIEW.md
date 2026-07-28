@@ -1,8 +1,11 @@
 # Training overview — the self-training roadmap and the `train.py` contract
 
 This is the umbrella document for the self-training project: what the stages
-are, what `train.py` promises to every future data source, and the exact
-training recipe with its justifications. Companion documents:
+are, what `training/train.py` promises to every future data source, and the
+exact training recipe with its justifications. Everything training-related —
+this code and these docs — lives in `training/`; the remote-verification
+checklist for the current stage is [TO_TEST.md](TO_TEST.md). Companion
+documents:
 
 - [TRAINING_GAME_TRACES.md](TRAINING_GAME_TRACES.md) — the standard use of
   game traces (the self-eval loop as a data generator).
@@ -32,12 +35,22 @@ recorded here as a crutch to add only if training fails without it.
 | 2 | Concrete `DataSource`s: game traces from self-eval sessions (incl. image augmentation), planted-error generator | next |
 | 3 | Replay `DataSource`s (arithmetic, reasoning, general instruction, AV) + the early-warning probe suite wired into `train.py`'s eval hooks | after 2 |
 | 4 | First real training iteration: generate → grade → train → eval → repeat | after 3 |
-| 5+ | Possible: analyst training under a verified metric, prompt internalization, image-decoder graft (see [IMAGE_DECODER_GRAFT.md](IMAGE_DECODER_GRAFT.md)) | discussion |
+| 5+ | Possible: analyst training under a verified metric, prompt internalization, image-decoder graft (see [IMAGE_DECODER_GRAFT.md](../IMAGE_DECODER_GRAFT.md)) | discussion |
 
 ## The `train.py` contract
 
-`train.py` (repo root) is deliberately source-agnostic. Everything it knows
-about data comes through two small types:
+`training/train.py` is a **library, not a run**: the generic loop
+(`run_training(sources, config)`) plus a `TrainConfig` dataclass holding
+every knob, with the recipe below as its defaults. Each concrete training
+run is a short separate script that picks the data sources and the config
+deviations and calls the loop — copy
+[run_first_iteration.py](run_first_iteration.py) per run/iteration;
+`train.py` itself should not change between runs. A generic CLI front-end
+(`python -m training.train --data ...`, every flag mapping 1:1 onto a
+`TrainConfig` field) is kept for ad-hoc runs.
+
+The loop is deliberately source-agnostic. Everything it knows about data
+comes through two small types:
 
 - **`TrainingExample`** — chat `messages` (the same HF content-list format
   `agent/model.py` uses, text and image parts), a `target_text` string (the

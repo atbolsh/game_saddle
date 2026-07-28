@@ -67,14 +67,26 @@ passed via ``--projector-module`` -- must be verified on the remote box
 against ``model.named_modules()``; the code fails loudly with instructions
 when the name does not resolve.
 
-Usage::
+LIBRARY, NOT A RUN. This module is the reusable loop; it knows nothing about
+any specific training run. All knobs live in the :class:`TrainConfig`
+dataclass and each concrete run is a SHORT separate script that builds its
+``DataSource`` list + config and calls :func:`run_training` (copy
+``training/run_first_iteration.py`` per run)::
 
-    python train.py --data batch1.jsonl batch2.jsonl:0.5 \
+    from training.train import JsonlSource, TrainConfig, run_training
+    run_training([JsonlSource("batch1.jsonl")], TrainConfig(label="iter1"))
+
+A generic CLI front-end is kept for ad-hoc runs (from the repo root;
+``python training/train.py ...`` also works -- the module inserts the repo
+root into sys.path when run as a plain file)::
+
+    python -m training.train --data batch1.jsonl batch2.jsonl:0.5 \
         [--architecture gemma-4-12b] [--label episode1] \
         [--resume-checkpoint <name>] [--epochs 1] ...
 
 ``--data`` accepts ``path`` or ``path:weight`` (mixture weight, default 1.0;
-weight w resamples the source to ~w x its size per epoch).
+weight w resamples the source to ~w x its size per epoch); every other flag
+maps 1:1 onto a TrainConfig field.
 """
 
 from __future__ import annotations
@@ -92,6 +104,12 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
+
+# Support ``python training/train.py`` in addition to ``python -m
+# training.train``: run as a plain file, sys.path[0] is training/ and the
+# ``agent`` package would not import.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 logger = logging.getLogger("train")
 
@@ -188,6 +206,51 @@ def parse_data_arg(arg: str) -> JsonlSource:
         except ValueError:
             pass
     return JsonlSource(arg)
+
+
+# ========================================================= run configuration
+
+@dataclass
+class TrainConfig:
+    """Every knob of one training run (defaults = the TRAINING_OVERVIEW.md
+    recipe). Data sources are NOT part of the config -- they are live objects
+    passed to :func:`run_training` alongside it. Run scripts build one of
+    these directly; the CLI maps its flags onto the same fields 1:1."""
+
+    # run identity
+    label: str = "episode"          #: names the log dir and the checkpoints
+    architecture: str | None = None  #: MODEL_REGISTRY key; None = MODEL_KEY env
+    resume_checkpoint: str | None = None  #: name under weights/<architecture>/
+
+    # schedule
+    epochs: int = 1
+    max_steps: int | None = None    #: optimizer-step cap (None = epochs decide)
+    lr: float = 1e-4
+    scheduler: str = "cosine"       #: "cosine" (with floor) or "constant"
+    warmup_ratio: float = 0.03
+    lr_floor: float = 0.10          #: cosine decays to this fraction of peak
+    weight_decay: float = 0.0
+    grad_accum: int = 16
+
+    # LoRA / regularization
+    lora_r: int = 32
+    lora_alpha: int = 64
+    lora_dropout: float = 0.05
+    neftune_alpha: float = 5.0      #: 0 disables NEFTune embedding noise
+    #: module trained fully via modules_to_save; "none" = LoRA only.
+    #: VERIFY against model.named_modules() on the remote box.
+    projector_module: str = "multi_modal_projector"
+
+    # environment / reproducibility
+    seed: int = 17
+    device: str = "cuda:0"
+
+    # cadence + safety
+    log_steps: int = 10
+    save_steps: int = 200
+    holdout_fraction: float = 0.05
+    on_regression: str = "rollback"  #: "warn" | "rollback" | "abort"
+    regression_tolerance: float = 0.10  #: relative slack before regression
 
 
 # ================================================================= logging
@@ -424,7 +487,7 @@ def resolve_projector_modules(model: Any, projector_name: str) -> list[str]:
     return matches
 
 
-def build_model(spec: Any, args: argparse.Namespace, hf_token: str | None):
+def build_model(spec: Any, cfg: TrainConfig, hf_token: str | None):
     """Load the 4-bit base, prepare for k-bit training, wrap in LoRA."""
     import torch
     from transformers import AutoModelForMultimodalLM, AutoProcessor, BitsAndBytesConfig
@@ -454,7 +517,7 @@ def build_model(spec: Any, args: argparse.Namespace, hf_token: str | None):
         quantization_config=quant,
         dtype=torch.bfloat16,
         attn_implementation="sdpa",
-        device_map={"": args.device},
+        device_map={"": cfg.device},
         token=hf_token,
         trust_remote_code=spec.trust_remote_code,
     )
@@ -464,11 +527,11 @@ def build_model(spec: Any, args: argparse.Namespace, hf_token: str | None):
     )
 
     targets = discover_lora_targets(model)
-    projector = resolve_projector_modules(model, args.projector_module)
+    projector = resolve_projector_modules(model, cfg.projector_module)
     lora = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
+        r=cfg.lora_r,
+        lora_alpha=cfg.lora_alpha,
+        lora_dropout=cfg.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
         target_modules=targets,
@@ -651,30 +714,33 @@ def epoch_order(by_source: dict[str, list[TrainingExample]],
     return order
 
 
-def run_training(args: argparse.Namespace) -> int:
+def run_training(sources: list[DataSource], cfg: TrainConfig) -> int:
+    """The generic loop: train ``cfg.architecture`` on ``sources`` per
+    ``cfg``. This is the ONLY entry point -- the CLI and every run script
+    end up here."""
     import torch
     from agent.config import CONFIG
     from agent.model import ADAPTERS, spec_for
 
-    rng = random.Random(args.seed)
-    torch.manual_seed(args.seed)
+    rng = random.Random(cfg.seed)
+    torch.manual_seed(cfg.seed)
 
-    spec = spec_for(args.architecture)
-    tlog = TrainLogger(args.label)
+    architecture = cfg.architecture or CONFIG.model_key
+    spec = spec_for(architecture)
+    tlog = TrainLogger(cfg.label)
     logger.info("run dir: %s", tlog.run_dir)
 
     # ------------------------------------------------------------- data
-    sources = [parse_data_arg(a) for a in args.data]
     by_source = materialize(sources)
     src_weights = {s.name: s.weight for s in sources}
 
     # Held-out slice: a fixed fraction, drawn proportionally from every
     # source, removed from training entirely.
     holdout: list[TrainingExample] = []
-    if args.holdout_fraction > 0:
+    if cfg.holdout_fraction > 0:
         for name, exs in by_source.items():
             rng.shuffle(exs)
-            n_hold = max(1, int(len(exs) * args.holdout_fraction))
+            n_hold = max(1, int(len(exs) * cfg.holdout_fraction))
             holdout.extend(exs[:n_hold])
             by_source[name] = exs[n_hold:]
     n_train = sum(len(v) for v in by_source.values())
@@ -682,19 +748,19 @@ def run_training(args: argparse.Namespace) -> int:
 
     # ------------------------------------------------------------ model
     model, processor, lora_targets, projector = build_model(
-        spec, args, CONFIG.hf_token
+        spec, cfg, CONFIG.hf_token
     )
-    attach_neftune(model, args.neftune_alpha)
+    attach_neftune(model, cfg.neftune_alpha)
     tokenizer = getattr(processor, "tokenizer", processor)
     terminator = resolve_terminator_id(model, tokenizer)
     collator = Collator(
         processor, ADAPTERS[spec.family], terminator,
-        compute_dtype=torch.bfloat16, device=args.device,
+        compute_dtype=torch.bfloat16, device=cfg.device,
     )
 
     ckpt_root = Path(CONFIG.weights_dir) / spec.key
-    if args.resume_checkpoint:
-        resume_dir = ckpt_root / args.resume_checkpoint
+    if cfg.resume_checkpoint:
+        resume_dir = ckpt_root / cfg.resume_checkpoint
         load_adapter_state(model, resume_dir)
         tlog.event("resumed_from", path=str(resume_dir))
 
@@ -704,24 +770,24 @@ def run_training(args: argparse.Namespace) -> int:
 
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = bnb.optim.PagedAdamW8bit(
-        params, lr=args.lr, weight_decay=args.weight_decay
+        params, lr=cfg.lr, weight_decay=cfg.weight_decay
     )
     steps_per_epoch = math.ceil(
         sum(max(1, round(src_weights.get(n, 1.0) * len(v)))
-            for n, v in by_source.items()) / args.grad_accum
+            for n, v in by_source.items()) / cfg.grad_accum
     )
-    total_steps = args.max_steps or (args.epochs * steps_per_epoch)
-    if args.scheduler == "cosine":
+    total_steps = cfg.max_steps or (cfg.epochs * steps_per_epoch)
+    if cfg.scheduler == "cosine":
         scheduler = get_scheduler(
             "cosine_with_min_lr", optimizer,
-            num_warmup_steps=int(total_steps * args.warmup_ratio),
+            num_warmup_steps=int(total_steps * cfg.warmup_ratio),
             num_training_steps=total_steps,
-            scheduler_specific_kwargs={"min_lr_rate": args.lr_floor},
+            scheduler_specific_kwargs={"min_lr_rate": cfg.lr_floor},
         )
     else:
         scheduler = get_scheduler(
             "constant_with_warmup", optimizer,
-            num_warmup_steps=int(total_steps * args.warmup_ratio),
+            num_warmup_steps=int(total_steps * cfg.warmup_ratio),
         )
 
     # -------------------------------------------------------- hooks/guards
@@ -731,15 +797,17 @@ def run_training(args: argparse.Namespace) -> int:
     guards = {
         "heldout_loss": MetricGuard(
             "heldout_loss", higher_is_better=False,
-            rel_tolerance=args.regression_tolerance,
+            rel_tolerance=cfg.regression_tolerance,
         ),
     }
     best_metrics: dict[str, float] = {}
     best_ckpt: Path | None = None
 
     tlog.write_config({
-        **{k: getattr(args, k) for k in vars(args)},
+        **dataclasses.asdict(cfg),
+        "architecture_resolved": architecture,
         "architecture_hf_id": spec.hf_id,
+        "sources": {s.name: s.weight for s in sources},
         "git_rev": _git_rev(),
         "n_train": n_train,
         "n_holdout": len(holdout),
@@ -752,7 +820,7 @@ def run_training(args: argparse.Namespace) -> int:
 
     def run_hooks_and_guard(step: int, epoch: int) -> None:
         """After each save: run every probe, track bests, react to
-        regressions per --on-regression."""
+        regressions per cfg.on_regression."""
         nonlocal best_ckpt
         for hook in eval_hooks:
             metrics = hook(model)
@@ -768,20 +836,20 @@ def run_training(args: argparse.Namespace) -> int:
                 elif best is not None and guard.is_regression(value, best):
                     tlog.event(
                         "REGRESSION", metric=mname, value=value, best=best,
-                        action=args.on_regression,
+                        action=cfg.on_regression,
                     )
                     logger.error(
                         "REGRESSION on %s: %.5g (best %.5g, tolerance %.0f%%)"
                         " -- action: %s",
                         mname, value, best,
-                        guard.rel_tolerance * 100, args.on_regression,
+                        guard.rel_tolerance * 100, cfg.on_regression,
                     )
-                    if args.on_regression == "abort":
+                    if cfg.on_regression == "abort":
                         raise SystemExit(
                             f"aborted: {mname} regressed ({value:.5g} vs best "
                             f"{best:.5g}); best checkpoint: {best_ckpt}"
                         )
-                    if args.on_regression == "rollback":
+                    if cfg.on_regression == "rollback":
                         if best_ckpt is None:
                             logger.error(
                                 "rollback requested but no best checkpoint "
@@ -799,7 +867,7 @@ def run_training(args: argparse.Namespace) -> int:
     src_loss_n: dict[str, int] = {}
     done = False
 
-    for epoch in range(args.epochs):
+    for epoch in range(cfg.epochs):
         if done:
             break
         order = epoch_order(by_source, src_weights, rng)
@@ -807,19 +875,19 @@ def run_training(args: argparse.Namespace) -> int:
         for i, ex in enumerate(order):
             built = collator.build(ex)
             loss = weighted_loss(model, built["model_inputs"], built["weights"])
-            (loss / args.grad_accum).backward()
+            (loss / cfg.grad_accum).backward()
             lv = float(loss.detach())
             src_loss_sum[ex.source] = src_loss_sum.get(ex.source, 0.0) + lv
             src_loss_n[ex.source] = src_loss_n.get(ex.source, 0) + 1
 
-            if (i + 1) % args.grad_accum == 0 or i == len(order) - 1:
+            if (i + 1) % cfg.grad_accum == 0 or i == len(order) - 1:
                 grad_norm = float(torch.nn.utils.clip_grad_norm_(params, 1.0))
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 step += 1
 
-                if step % args.log_steps == 0:
+                if step % cfg.log_steps == 0:
                     per_src = {
                         n: round(src_loss_sum[n] / src_loss_n[n], 4)
                         for n in src_loss_sum
@@ -835,9 +903,9 @@ def run_training(args: argparse.Namespace) -> int:
                     src_loss_sum.clear()
                     src_loss_n.clear()
 
-                if step % args.save_steps == 0:
+                if step % cfg.save_steps == 0:
                     last_ckpt = save_checkpoint(
-                        model, ckpt_root / f"{args.label}_step{step}",
+                        model, ckpt_root / f"{cfg.label}_step{step}",
                         {"step": step, "epoch": epoch, "git_rev": _git_rev(),
                          "sources": {n: len(v) for n, v in by_source.items()},
                          "best_metrics": best_metrics},
@@ -845,20 +913,20 @@ def run_training(args: argparse.Namespace) -> int:
                     )
                     run_hooks_and_guard(step, epoch)
 
-                if args.max_steps and step >= args.max_steps:
+                if cfg.max_steps and step >= cfg.max_steps:
                     done = True
                     break
 
     # Final save (skip if the loop happened to save on the very last step).
     if last_ckpt is None or not str(last_ckpt).endswith(f"step{step}"):
         last_ckpt = save_checkpoint(
-            model, ckpt_root / f"{args.label}_step{step}",
-            {"step": step, "epoch": args.epochs, "git_rev": _git_rev(),
+            model, ckpt_root / f"{cfg.label}_step{step}",
+            {"step": step, "epoch": cfg.epochs, "git_rev": _git_rev(),
              "sources": {n: len(v) for n, v in by_source.items()},
              "best_metrics": best_metrics, "final": True},
             tlog,
         )
-        run_hooks_and_guard(step, args.epochs)
+        run_hooks_and_guard(step, cfg.epochs)
 
     tlog.event("done", steps=step, final_checkpoint=str(last_ckpt),
                best_checkpoint=str(best_ckpt), best_metrics=best_metrics)
@@ -869,64 +937,78 @@ def run_training(args: argparse.Namespace) -> int:
 
 # ==================================================================== CLI
 
+def configure_logging() -> None:
+    """Console logging for training entry points (CLI and run scripts)."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
+    """Generic CLI front-end: --data builds JsonlSources, every other flag
+    maps 1:1 onto a TrainConfig field (defaults read FROM TrainConfig, so
+    the dataclass stays the single source of truth)."""
+    d = TrainConfig()
     p = argparse.ArgumentParser(
-        prog="train.py",
-        description="Source-agnostic QLoRA training (see TRAINING_OVERVIEW.md)",
+        prog="python -m training.train",
+        description="Source-agnostic QLoRA training "
+                    "(see training/TRAINING_OVERVIEW.md)",
     )
     p.add_argument("--data", nargs="+", required=True,
                    help="jsonl file(s), each 'path' or 'path:weight'")
-    p.add_argument("--architecture", default=None,
+    p.add_argument("--architecture", default=d.architecture,
                    help="MODEL_REGISTRY key (default: MODEL_KEY from .env)")
-    p.add_argument("--label", default="episode",
+    p.add_argument("--label", default=d.label,
                    help="run label; names the log dir and checkpoints")
-    p.add_argument("--resume-checkpoint", default=None,
+    p.add_argument("--resume-checkpoint", default=d.resume_checkpoint,
                    help="checkpoint name under weights/<architecture>/ to "
                         "resume the adapter from")
-    # recipe knobs (defaults per TRAINING_OVERVIEW.md)
-    p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--max-steps", type=int, default=None)
-    p.add_argument("--lr", type=float, default=1e-4)
+    # recipe knobs (defaults per TRAINING_OVERVIEW.md, via TrainConfig)
+    p.add_argument("--epochs", type=int, default=d.epochs)
+    p.add_argument("--max-steps", type=int, default=d.max_steps)
+    p.add_argument("--lr", type=float, default=d.lr)
     p.add_argument("--scheduler", choices=("cosine", "constant"),
-                   default="cosine")
-    p.add_argument("--warmup-ratio", type=float, default=0.03)
-    p.add_argument("--lr-floor", type=float, default=0.10,
+                   default=d.scheduler)
+    p.add_argument("--warmup-ratio", type=float, default=d.warmup_ratio)
+    p.add_argument("--lr-floor", type=float, default=d.lr_floor,
                    help="cosine decays to this fraction of peak LR")
-    p.add_argument("--weight-decay", type=float, default=0.0)
-    p.add_argument("--grad-accum", type=int, default=16)
-    p.add_argument("--lora-r", type=int, default=32)
-    p.add_argument("--lora-alpha", type=int, default=64)
-    p.add_argument("--lora-dropout", type=float, default=0.05)
-    p.add_argument("--neftune-alpha", type=float, default=5.0,
+    p.add_argument("--weight-decay", type=float, default=d.weight_decay)
+    p.add_argument("--grad-accum", type=int, default=d.grad_accum)
+    p.add_argument("--lora-r", type=int, default=d.lora_r)
+    p.add_argument("--lora-alpha", type=int, default=d.lora_alpha)
+    p.add_argument("--lora-dropout", type=float, default=d.lora_dropout)
+    p.add_argument("--neftune-alpha", type=float, default=d.neftune_alpha,
                    help="0 disables NEFTune embedding noise")
-    p.add_argument("--projector-module", default="multi_modal_projector",
+    p.add_argument("--projector-module", default=d.projector_module,
                    help="module name trained fully via modules_to_save; "
                         "'none' to train LoRA only. VERIFY against "
                         "model.named_modules() on the remote box.")
-    p.add_argument("--seed", type=int, default=17)
-    p.add_argument("--device", default="cuda:0")
+    p.add_argument("--seed", type=int, default=d.seed)
+    p.add_argument("--device", default=d.device)
     # cadence + safety
-    p.add_argument("--log-steps", type=int, default=10)
-    p.add_argument("--save-steps", type=int, default=200)
-    p.add_argument("--holdout-fraction", type=float, default=0.05)
+    p.add_argument("--log-steps", type=int, default=d.log_steps)
+    p.add_argument("--save-steps", type=int, default=d.save_steps)
+    p.add_argument("--holdout-fraction", type=float,
+                   default=d.holdout_fraction)
     p.add_argument("--on-regression", choices=("warn", "rollback", "abort"),
-                   default="rollback")
-    p.add_argument("--regression-tolerance", type=float, default=0.10,
+                   default=d.on_regression)
+    p.add_argument("--regression-tolerance", type=float,
+                   default=d.regression_tolerance,
                    help="relative tolerance before a guarded metric counts "
                         "as regressed")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    configure_logging()
     args = build_parser().parse_args(argv)
-    if args.architecture is None:
-        from agent.config import CONFIG
-        args.architecture = CONFIG.model_key
-    return run_training(args)
+    sources: list[DataSource] = [parse_data_arg(a) for a in args.data]
+    cfg = TrainConfig(**{
+        f.name: getattr(args, f.name)
+        for f in dataclasses.fields(TrainConfig)
+    })
+    return run_training(sources, cfg)
 
 
 if __name__ == "__main__":

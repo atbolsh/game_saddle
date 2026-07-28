@@ -9,7 +9,8 @@
   the top of every notebook, wired to the session's ``switch_model``. The
   checkpoint dropdown starts at "[default]" (bare HuggingFace weights) and
   lists every trained adapter found under ``weights/<architecture>/`` (see
-  TRAINING_OVERVIEW.md), rescanned whenever the architecture changes.
+  training/TRAINING_OVERVIEW.md), rescanned whenever the architecture
+  changes.
 """
 
 from __future__ import annotations
@@ -71,7 +72,7 @@ def model_picker(
     by every trained adapter under ``weights/<architecture>/`` (newest
     first); the list is rescanned from disk whenever the architecture
     selection changes and after every switch, so checkpoints saved by a
-    train.py run appear without re-running the cell. Switching is an
+    training/train.py run appear without re-running the cell. Switching is an
     explicit button press (a dropdown misclick must never start a multi-GB
     download). The checkbox implements "save only one set of weights at a
     time": when checked, a switch first restarts the conversation, then

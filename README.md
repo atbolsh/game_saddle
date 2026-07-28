@@ -277,7 +277,8 @@ over every `agent.model.MODEL_REGISTRY` entry in recommendation order (see
 `MODEL_CANDIDATES.md`), a **Checkpoint** dropdown listing `[default]` (bare
 HuggingFace weights) plus every trained adapter found under
 `weights/<architecture>/` (newest first, rescanned when the architecture
-changes — see `TRAINING_OVERVIEW.md`), an explicit **Switch model** button (a
+changes — see `training/TRAINING_OVERVIEW.md`), an explicit **Switch model**
+button (a
 misclick on a dropdown never starts a download), and a **"Save only one set
 of weights at a time"** checkbox. Unchecked (default), switching keeps the
 conversation and leaves other models' weights cached on disk; checked, a
@@ -326,22 +327,28 @@ The play notebook's buttons do use `ipywidgets`; if they don't render, ensure
 
 ## Training
 
-The self-training project has its own documentation set — start with
-[TRAINING_OVERVIEW.md](TRAINING_OVERVIEW.md) (roadmap, recipe, checkpoint
-convention), then [TRAINING_GAME_TRACES.md](TRAINING_GAME_TRACES.md) (how the
+Everything training-related lives in `training/` — code, design docs, and
+the remote-test checklist ([training/TO_TEST.md](training/TO_TEST.md)). Start
+with [training/TRAINING_OVERVIEW.md](training/TRAINING_OVERVIEW.md) (roadmap,
+recipe, checkpoint convention), then
+[training/TRAINING_GAME_TRACES.md](training/TRAINING_GAME_TRACES.md) (how the
 self-eval loop becomes training data),
-[TRAINING_EXTRA_DATASETS.md](TRAINING_EXTRA_DATASETS.md) (replay mixing
-against forgetting; the early-warning suite), and
-[TRAINING_TRACE_EXTRAS.md](TRAINING_TRACE_EXTRAS.md) (planted-error data,
-prompt internalization).
+[training/TRAINING_EXTRA_DATASETS.md](training/TRAINING_EXTRA_DATASETS.md)
+(replay mixing against forgetting; the early-warning suite), and
+[training/TRAINING_TRACE_EXTRAS.md](training/TRAINING_TRACE_EXTRAS.md)
+(planted-error data, prompt internalization).
 
-The entry point is `train.py` at the repo root: a source-agnostic QLoRA loop
-(weighted token cross-entropy over `TrainingExample`s from pluggable
-`DataSource`s — plain SFT and RL-style per-token quality vectors are the same
-code path):
+The loop lives in `training/train.py` as a **library**: a source-agnostic
+QLoRA loop (weighted token cross-entropy over `TrainingExample`s from
+pluggable `DataSource`s — plain SFT and RL-style per-token quality vectors
+are the same code path) driven entirely by a `TrainConfig` dataclass. Each
+concrete run is a short script that picks sources + config and calls
+`run_training` — copy `training/run_first_iteration.py` per run. A generic
+CLI front-end also exists for ad-hoc runs:
 
 ```bash
-python train.py --data batch1.jsonl batch2.jsonl:0.5 --label episode1
+python -m training.run_first_iteration        # a configured run script
+python -m training.train --data batch1.jsonl batch2.jsonl:0.5 --label ad-hoc
 ```
 
 Checkpoints are **PEFT adapter folders** under
@@ -420,7 +427,14 @@ agent/
   interactive.py     # InteractiveSession: persistent-game mode-1 for notebooks
   run_logging.py     # per-run LLM-call + DB-retrieval logs (on by default)
   runner.py          # CLI
-train.py             # source-agnostic QLoRA training loop (see TRAINING_OVERVIEW.md)
+training/
+  train.py           # the training LIBRARY: TrainConfig + run_training + generic CLI
+  run_first_iteration.py    # run script template: sources + config -> run_training
+  TRAINING_OVERVIEW.md      # self-training roadmap + the train.py contract/recipe
+  TRAINING_GAME_TRACES.md   # standard use of game traces (self-eval loop as data generator)
+  TRAINING_EXTRA_DATASETS.md# replay mixing vs. forgetting; the early-warning suite
+  TRAINING_TRACE_EXTRAS.md  # planted-error data; prompt internalization
+  TO_TEST.md         # remote-box verification checklist for the current stage
 weights/             # trained adapter checkpoints, weights/<architecture>/<name>/ (git-ignored)
 notebooks/
   play.ipynb            # interactive mode-1 play (Ask + Restart conversation)
@@ -437,9 +451,5 @@ README.md
 FUTURE_GOALS.md
 MODEL_CANDIDATES.md    # comparable multimodal models for the fine-tuning bake-off
 IMAGE_DECODER_GRAFT.md # how-to: graft an image decoder (visual imagination) onto the VLM
-TRAINING_OVERVIEW.md   # self-training roadmap + the train.py contract/recipe
-TRAINING_GAME_TRACES.md   # standard use of game traces (self-eval loop as data generator)
-TRAINING_EXTRA_DATASETS.md# replay mixing vs. forgetting; the early-warning suite
-TRAINING_TRACE_EXTRAS.md  # planted-error data; prompt internalization
 .env.example
 ```
