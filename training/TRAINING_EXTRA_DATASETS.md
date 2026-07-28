@@ -28,39 +28,92 @@ Every training iteration mixes replay `DataSource`s alongside the game-trace
 source, at a combined **~20–50% of each batch** (engineering judgment; the
 LoRA-forgetting literature consistently shows even ~10–30% replay largely
 preserves held-out capabilities, and LoRA itself — base weights frozen — is
-already the strongest single protection). Suggested starting split of the
-replay share: arithmetic/math ~40%, general multimodal ~30%, general
-instruction ~20%, AV ~10%; retune from the early-warning suite, not from
-taste.
+already the strongest single protection). Retune the split from the
+early-warning suite, not from taste.
 
-Candidate public datasets (verify exact HF ids on the remote box before
-wiring them in — the no-fuzzy-fallbacks rule applies to dataset names too):
+### The manifest (implemented — phase 2)
 
-| Capability | Candidates | Notes |
-|---|---|---|
-| Arithmetic / math | GSM8K (`openai/gsm8k`), MetaMathQA, orca-math-word-problems | Short, verifiable, cheap to mix; the analyst-drift compensator |
-| Reasoning | OpenThoughts / OpenR1-style distilled reasoning sets | Prefer sets distilled from models at or above Gemma 4's level |
-| General multimodal | The Cauldron (`HuggingFaceM4/the_cauldron`), LLaVA-OneVision data | Broad VQA/captioning/document mixtures; keeps non-game vision alive |
-| General instruction | A SlimOrca-class instruction set | Keeps English/agentic tone intact |
-| Video / audio | ShareGPT4Video-class captions; audio QA sets | Only if the deployed checkpoint actually exercises AV; otherwise probe-only |
+The single source of truth is **[datasets.json](datasets.json)**: both
+`scripts/setup_env.sh` (via `python -m training.download_external`) and the
+run scripts (via `training.external_data.sources_from_manifest()`) read it.
+Each entry's `examples_per_epoch` is an ABSOLUTE per-epoch quota (the
+`ExternalSource` weight is `examples_per_epoch / n_materialized`), so the
+mixture never shifts when a cap changes. `enabled: false` turns a dataset
+off everywhere at once. All HF ids verified 2026-07; per-row schemas are a
+remote TO_TEST item.
 
-### Self-distillation replay (recorded option, recommended default)
+| Dataset | HF id / generator | Cap (rows) | Per epoch | Loss | Probe | Role |
+|---|---|---|---|---|---|---|
+| `gsm8k` | `openai/gsm8k` (main) | all 7.5k | 200 | CE | 100 test items, exact-match | Arithmetic — the analyst-drift compensator |
+| `metamathqa` | `meta-math/MetaMathQA` | 20k | 200 | CE | — | Augmented math word problems |
+| `orca_math` | `microsoft/orca-math-word-problems-200k` | 20k | 200 | CE | — | More arithmetic breadth |
+| `numinamath_cot` | `AI-MO/NuminaMath-CoT` | 20k | 150 | CE | — | Competition-style CoT depth |
+| `navigation` | `training/synth_navigation.py` (local, seeded) | 10k | 300 | CE | 100 items, exact-match | Clock/compass/bearing/shortest-rotation in THIS repo's conventions — the geometry failure modes, directly |
+| `openthoughts` | `open-thoughts/OpenThoughts-114k` | 8k | 200 | KD | — | General reasoning retention |
+| `slimorca` | `Open-Orca/SlimOrca` | 20k | 150 | KD | — | Instruction following / English tone |
+| `cauldron_vqav2` | `HuggingFaceM4/the_cauldron` (vqav2) | 6k | 250 | KD | — | Broad non-game VQA |
+| `cauldron_cocoqa` | `HuggingFaceM4/the_cauldron` (cocoqa) | 6k | 200 | KD | — | Non-game vision |
+| `cauldron_ai2d` | `HuggingFaceM4/the_cauldron` (ai2d) | all 2.4k | 150 | KD | — | Diagram QA — closest proxy to board-like images |
+| `sharegpt4video` | placeholder, `enabled: false` | — | 0 | KD | — | Video replay: enable only if the checkpoint exercises video |
+| `audio_qa` | placeholder, `enabled: false` | — | 0 | KD | — | Audio replay: same rule |
 
-Instead of training on a public dataset's *own* targets (whose style may
-differ from Gemma 4's and thus cause needless drift), sample prompts from
-the public sets and have the **base model generate the targets**, then train
-on those. The replay data is then exactly "what the base model already
-does", which is the thing being protected. Costs one generation pass per
-replay batch; can be produced on the same box between iterations. Use plain
-targets first if simplicity wins; switch to self-distilled targets if the
-early-warning suite shows style/capability drift that replay mixing alone
-does not stop.
+Replay volume with these counts: **~2,000 replay examples/epoch, of which
+arithmetic + navigation = 1,050 (~52% of replay)** — arithmetic-heavy on
+purpose (see above). When the ~2.5k-example game source joins, replay is
+~45% of a batch, inside the 20–50% band. Coverage note: LLaVA-OneVision
+data from the original candidate list is deliberately substituted by the
+Cauldron configs — same purpose (broad non-game VQA), one clean download
+code path instead of a multi-repo layout.
+
+**CE vs KD, the rule:** CE ("strengthen") trains on the dataset's own
+targets and is used exactly where we WANT the model to move — arithmetic and
+navigation, the analyst-drift compensators. KD ("preserve") ignores the
+dataset's authorship style and instead matches the student's logits to the
+**untrained base model** over the same target tokens (soft cross-entropy,
+target positions only; the teacher is the same process via PEFT
+`disable_adapter()`, no second copy of the weights) — used everywhere the
+goal is *don't drift*, because "what the base already does" is precisely the
+thing being protected. Per-line `loss` lives in the materialized jsonl, so
+one file can mix kinds if ever needed.
+
+### Self-distillation replay (implemented alternative to KD)
+
+The generation-based variant of the same idea: have the **base model answer
+the replay prompts itself**, then train on those outputs with plain CE —
+"keep producing exactly what you would have produced" expressed as ordinary
+SFT data instead of a logit-matching loss.
+`python -m training.generate_self_distill --dataset <name>` writes
+`data_selfdistill.jsonl` beside a materialized dataset (originals never
+touched); swap it in with a plain `JsonlSource`. The utility forces
+`set_default_checkpoint(None)`, so the generating model is the pristine
+base even when `MODEL_CHECKPOINT` is set in `.env`.
+
+The trade-off, and the decision rule: KD costs nothing to prepare but is
+rigid at train time (it pins the student's distribution at every position
+of *someone else's* text, and needs two forwards per example);
+self-distillation costs one offline generation pass per dataset plus the
+extra jsonl on disk, after which training is a single ordinary CE forward
+on text in the base model's own voice. **Run with KD first.** Switch a
+dataset to self-distilled targets only on evidence from the early-warning
+suite: KD sources still drifting, OOMs on long examples (TO_TEST item 15),
+or a broken `disable_adapter()` teacher path (TO_TEST item 14).
+
+### Download strategy and disk
+
+`setup_env.sh` measures free disk at the repo root ONCE and writes
+`data_external/settings.json`: `download_mode: "full"` by default (whole
+datasets land in the HF cache and stay there — no network dependence
+afterwards), `"stream"` when less than **60 GB** is free (only the consumed
+shards ever hit disk). Both modes produce byte-identical materialized
+output under `data_external/<name>/`. Approximate figures: **materialized
+data ~2–2.5 GB with the default caps; full-mode HF cache ~20 GB across the
+manifest (vqav2 alone is ~13.5 GB)** — see the README's disk-budget
+paragraph for the box-level totals.
 
 ## The early-warning suite
 
 A fixed battery of probes, run by `train.py`'s eval-hook interface after
-every checkpoint save (mechanism shipped in stage 1 with a placeholder
-held-out-loss hook; the real probes land in stage 3). Design rules:
+every checkpoint save. Design rules:
 
 - **Fixed** — the same items every run, never regenerated, so scores are
   comparable across iterations and across weeks.
@@ -68,21 +121,34 @@ held-out-loss hook; the real probes land in stage 3). Design rules:
 - **Per-capability** — one score per protected capability, not one blended
   number that can hide a collapse.
 
-Probe set (initial):
+What is implemented now (phase 2):
+
+- **Per-source held-out loss** — the held-out slice is reported and GUARDED
+  per dataset (`heldout_loss/<name>`), each example scored with its own
+  loss kind; for KD sources the held-out KD loss *is* the drift-from-base
+  measure.
+- **Exact-match probes** ([probes.py](probes.py), built by
+  `download_external.py`): `exact_match/gsm8k` (100 fixed test items) and
+  `exact_match/navigation` (100 fixed synthetic items — the direct
+  instrument for the clock/compass failure modes). Greedy generation,
+  ~3–5 min per save on an A100; guarded higher-is-better.
+- **Per-task eval history** — every evaluation appends one FLAT row to the
+  run's `eval_log.jsonl` with every metric as its own key, so any metric's
+  trajectory graphs in one line (`pandas.read_json(..., lines=True)`).
+
+Probe set (planned additions, next stages):
 
 | Probe | Measures | Source |
 |---|---|---|
 | Held-out game boards: move accuracy + OBS format compliance | The skill being trained | Fixed set of ~100 boards with known-good moves, frozen at suite creation |
 | Planted-error analyst miss rate | Analyst quality / sycophancy drift | The planted-error generator of [TRAINING_TRACE_EXTRAS.md](TRAINING_TRACE_EXTRAS.md) |
-| Arithmetic slice (~100 GSM8K-class items) | Reasoning/arithmetic retention | Public eval split, fixed subset |
-| Non-game VQA slice (~100 items) | General vision retention | Public eval split, fixed subset |
 | Instruction-following slice | General English/agentic retention | Small fixed prompt set, scored by exact-match/format checks where possible |
 
-Each guarded metric carries a threshold (e.g. "no more than 3 points below
-the best checkpoint's score"); a breach triggers `train.py`'s regression
-path — ERROR-level logging and, by default, rollback to the best checkpoint
-(`--on-regression warn|rollback|abort`). The analyst miss-rate probe is the
-designated tripwire for the shared-network drift risk accepted in
+Each guarded metric carries a threshold (relative, default 10%); a breach
+triggers `train.py`'s regression path — ERROR-level logging and, by
+default, rollback to the best checkpoint (`--on-regression
+warn|rollback|abort`). The analyst miss-rate probe is the designated
+tripwire for the shared-network drift risk accepted in
 [TRAINING_GAME_TRACES.md](TRAINING_GAME_TRACES.md).
 
 ## Memory (NAMS) hygiene during training epochs

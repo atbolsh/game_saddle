@@ -357,8 +357,28 @@ Checkpoints are **PEFT adapter folders** under
 entry point can load one on top of the HF base weights: set
 `MODEL_CHECKPOINT` in `.env`, pass `--checkpoint` to `agent.runner`, or use
 the checkpoint dropdown in the notebooks (`[default]` = bare HF weights).
-Training runs log to `logs/train_<label>_<stamp>/` and roll back to the best
-checkpoint (loudly) if a guarded eval metric regresses.
+Training runs log to `logs/train_<label>_<stamp>/` (including a flat
+`eval_log.jsonl` with every per-task eval metric per row, for graphing) and
+roll back to the best checkpoint (loudly) if a guarded eval metric regresses.
+
+**External replay datasets** live in `data_external/` (git-ignored;
+`scripts/setup_env.sh` creates it and runs
+`python -m training.download_external`, which materializes every enabled
+entry of the tracked manifest `training/datasets.json` — HF sets plus the
+locally generated navigation set — and the fixed probe files). Layout:
+`data_external/<name>/data.jsonl` (+ `images/`, `meta.json`) and
+`data_external/probes/<name>_probe.jsonl`. Dataset roles, per-epoch quotas,
+and the CE-vs-KD loss rationale are documented in
+[training/TRAINING_EXTRA_DATASETS.md](training/TRAINING_EXTRA_DATASETS.md).
+
+**Disk budget.** Materialized replay data is ~2–2.5 GB with the default
+caps (budget 3–5 GB). The default `full` download mode additionally keeps
+~20 GB of HF *dataset* cache (vqav2 alone is ~13.5 GB); `setup_env.sh`
+switches to `stream` mode automatically when less than 60 GB is free
+(recorded in `data_external/settings.json`), which skips that cache
+entirely. On top of that: ~24 GB HF *model* cache for Gemma 4 12B, and
+~0.3–1 GB per adapter checkpoint under `weights/`. Recommend **≥ 75 GB
+free for the default full-download setup, ≥ 40 GB in stream mode**.
 
 ## Storing images in Neo4j: the approach used here
 
@@ -430,12 +450,19 @@ agent/
 training/
   train.py           # the training LIBRARY: TrainConfig + run_training + generic CLI
   run_first_iteration.py    # run script template: sources + config -> run_training
+  datasets.json      # tracked manifest of external replay datasets (ids, caps, loss kind)
+  external_data.py   # manifest loader, per-dataset converters, ExternalSource
+  download_external.py      # materializes data_external/ from the manifest (setup_env.sh runs it)
+  synth_navigation.py       # seeded generator: clock/compass/bearing problems + probe
+  probes.py          # exact-match capability probes (GSM8K, navigation) + guards
+  generate_self_distill.py  # optional: regenerate replay targets with the base model
   TRAINING_OVERVIEW.md      # self-training roadmap + the train.py contract/recipe
   TRAINING_GAME_TRACES.md   # standard use of game traces (self-eval loop as data generator)
   TRAINING_EXTRA_DATASETS.md# replay mixing vs. forgetting; the early-warning suite
   TRAINING_TRACE_EXTRAS.md  # planted-error data; prompt internalization
   TO_TEST.md         # remote-box verification checklist for the current stage
 weights/             # trained adapter checkpoints, weights/<architecture>/<name>/ (git-ignored)
+data_external/       # materialized replay datasets + probes (git-ignored; setup_env.sh)
 notebooks/
   play.ipynb            # interactive mode-1 play (Ask + Restart conversation)
   visualize_memory.ipynb# pyvis interactive graph of the memory graph

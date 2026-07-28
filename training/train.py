@@ -18,6 +18,17 @@ are the same code path. Per-example loss is normalized by the sum of
 ABSOLUTE token weights so annotated and plain examples mix at comparable
 gradient scale.
 
+TWO LOSS KINDS. ``TrainingExample.loss`` selects "ce" (above -- teach the
+dataset's targets; used where we want to STRENGTHEN, e.g. arithmetic replay)
+or "kd" (knowledge distillation to the base model -- soft cross-entropy
+against the frozen base's distribution over the same target positions; used
+where we want to PRESERVE, e.g. general reasoning/instruction/VQA replay,
+see TRAINING_EXTRA_DATASETS.md). KD needs no stored teacher:
+``model.disable_adapter()`` gives the base forward in the same process, and
+teacher/student softmaxes are computed over the TARGET POSITIONS ONLY
+(a full-sequence float softmax at a 262k vocab would be GBs). Both kinds
+use the same span weights and the same normalization.
+
 SEQUENCE = EXACTLY WHAT INFERENCE PRODUCES. Trained ids are
 ``prompt_ids + content_ids + [end-of-turn]`` where ``prompt_ids`` come from
 ``apply_chat_template(..., add_generation_prompt=True)`` -- byte-identical to
@@ -49,16 +60,23 @@ CHECKPOINTS. Periodic PEFT-adapter saves to
 checkpoint is an adapter, never a full model copy; the notebooks/scripts load
 it on top of the HF base via the [default]/checkpoint dropdowns.
 
-ROLLBACK. After every save, registered eval hooks run (stage 1 ships one:
-held-out loss on a reserved slice). A guarded metric regressing past its
+ROLLBACK. After every save, registered eval hooks run: held-out loss on a
+reserved slice, reported PER SOURCE (each source gets its own guard -- for
+KD sources held-out KD loss IS the drift-from-base early-warning metric),
+plus any ``extra_hooks`` the run script attaches (e.g. the exact-match
+probes from ``training/probes.py``). A guarded metric regressing past its
 threshold logs at ERROR and -- per ``--on-regression warn|rollback|abort``
 (default rollback) -- restores the best adapter state and continues, or
-aborts the run.
+aborts the run. Hooks are callables ``hook(ctx: TrainContext) -> dict`` so
+they can generate, not just score.
 
 LOGGING. ``logs/train_<label>_<stamp>/``: config.json (resolved config +
 seed + git rev + discovered LoRA target modules), train_log.jsonl + .txt
 (per-step loss, per-source loss, LR, grad norm), events.jsonl (saves, evals,
-rollbacks).
+rollbacks), and eval_log.jsonl -- ONE FLAT ROW PER EVALUATION with every
+metric (each source's held-out loss, each probe accuracy) as its own key,
+so plotting any metric over training is a one-liner
+(``pandas.read_json(..., lines=True)``).
 
 NOTE (remote-environment rule): this file cannot be executed on the local
 editing box (no torch/transformers/GPU). Anything that depends on the exact
@@ -116,16 +134,24 @@ logger = logging.getLogger("train")
 
 # ============================================================== data model
 
+#: Loss kinds a TrainingExample may carry: "ce" = weighted token
+#: cross-entropy on the target text (strengthen); "kd" = soft cross-entropy
+#: against the frozen base model's distribution (preserve).
+VALID_LOSSES = ("ce", "kd")
+
+
 @dataclass
 class TrainingExample:
     """One trainable unit. ``messages`` is the HF chat content-list format
     (see agent/model.py); ``target_text`` is the assistant reply to train on;
     ``span_weights`` are (char_start, char_end, weight) triples over
-    ``target_text`` -- absent means plain SFT (every target token weighs 1)."""
+    ``target_text`` -- absent means plain SFT (every target token weighs 1);
+    ``loss`` picks the loss kind (see VALID_LOSSES)."""
 
     messages: list[dict]
     target_text: str
     span_weights: list[tuple[int, int, float]] | None = None
+    loss: str = "ce"
     source: str = "unknown"
     meta: dict = field(default_factory=dict)
 
@@ -156,15 +182,20 @@ class DataSource(ABC):
 class JsonlSource(DataSource):
     """Reference DataSource: one JSON object per line with keys
     ``messages`` (required), ``target_text`` (required), ``span_weights``
-    (optional, list of [start, end, weight]), ``meta`` (optional).
+    (optional, list of [start, end, weight]), ``loss`` (optional "ce"|"kd",
+    default = the constructor's ``default_loss``), ``meta`` (optional).
 
     Malformed lines are hard errors with the line number -- a training set
     that silently drops examples is worse than one that refuses to load."""
 
-    def __init__(self, path: str | Path, weight: float = 1.0):
+    def __init__(self, path: str | Path, weight: float = 1.0,
+                 default_loss: str = "ce"):
         self.path = Path(path)
         self.name = self.path.stem
         self.weight = weight
+        if default_loss not in VALID_LOSSES:
+            raise ValueError(f"JsonlSource: bad default_loss {default_loss!r}")
+        self.default_loss = default_loss
         if not self.path.is_file():
             raise FileNotFoundError(f"JsonlSource: no such file: {self.path}")
 
@@ -186,10 +217,17 @@ class JsonlSource(DataSource):
                 spans = obj.get("span_weights")
                 if spans is not None:
                     spans = [(int(s), int(e), float(w)) for s, e, w in spans]
+                loss = obj.get("loss", self.default_loss)
+                if loss not in VALID_LOSSES:
+                    raise ValueError(
+                        f"{self.path}:{lineno}: bad loss kind {loss!r} "
+                        f"(expected one of {VALID_LOSSES})"
+                    )
                 yield TrainingExample(
                     messages=messages,
                     target_text=target_text,
                     span_weights=spans,
+                    loss=loss,
                     source=self.name,
                     meta=obj.get("meta", {}),
                 )
@@ -257,9 +295,10 @@ class TrainConfig:
 
 class TrainLogger:
     """One run directory under logs/: config.json, train_log.{jsonl,txt},
-    events.jsonl. Same spirit as agent.run_logging: machine-readable +
-    human-readable, and logging failures must never kill a run that is
-    burning GPU-hours (they degrade to a one-time console warning)."""
+    events.jsonl, eval_log.jsonl. Same spirit as agent.run_logging:
+    machine-readable + human-readable, and logging failures must never kill
+    a run that is burning GPU-hours (they degrade to a one-time console
+    warning)."""
 
     def __init__(self, label: str, base_dir: str | Path = "logs"):
         stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -268,6 +307,7 @@ class TrainLogger:
         self.jsonl = self.run_dir / "train_log.jsonl"
         self.txt = self.run_dir / "train_log.txt"
         self.events = self.run_dir / "events.jsonl"
+        self.eval_jsonl = self.run_dir / "eval_log.jsonl"
         self._warned = False
 
     def _append(self, path: Path, text: str) -> None:
@@ -299,6 +339,15 @@ class TrainLogger:
         if "source_loss" in record:
             parts.append("per-source " + json.dumps(record["source_loss"]))
         self._append(self.txt, "  ".join(parts) + "\n")
+
+    def eval_row(self, step: int, epoch: int, metrics: dict[str, float]) -> None:
+        """One FLAT row per evaluation -- every metric (each source's
+        held-out loss, each probe accuracy) is its own key, so any metric's
+        history over training plots in one line:
+        ``pandas.read_json('eval_log.jsonl', lines=True).plot(x='step', y=...)``."""
+        row = {"ts": datetime.datetime.now().isoformat(timespec="seconds"),
+               "step": step, "epoch": epoch, **metrics}
+        self._append(self.eval_jsonl, json.dumps(row, default=str) + "\n")
 
     def event(self, kind: str, **fields: Any) -> None:
         record = {"ts": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -569,29 +618,85 @@ def attach_neftune(model: Any, alpha: float) -> None:
 
 # ================================================================== loss
 
-def weighted_loss(model: Any, model_inputs: dict, weights: Any):
-    """Weighted token cross-entropy, normalized by the sum of ABSOLUTE
-    weights (so plain-SFT and annotated/negative-weight examples arrive at
-    comparable gradient scale, and long examples don't dominate)."""
+def _base_model_logits(model: Any, model_inputs: dict) -> Any:
+    """Teacher forward for KD: the frozen base model's logits on the same
+    inputs, via PEFT's ``disable_adapter()`` (bypasses BOTH the LoRA deltas
+    and the modules_to_save projector copy -- VERIFY the projector part on
+    the remote box, see TO_TEST.md). Forced to eval mode for the duration so
+    the NEFTune hook and dropout cannot perturb the teacher."""
+    import torch
+
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad(), model.disable_adapter():
+            out = model(**model_inputs)
+    finally:
+        if was_training:
+            model.train()
+    return out.logits
+
+
+def weighted_loss(model: Any, model_inputs: dict, weights: Any,
+                  loss_kind: str = "ce"):
+    """Per-token weighted loss, normalized by the sum of ABSOLUTE weights
+    (so plain-SFT and annotated/negative-weight examples arrive at
+    comparable gradient scale, and long examples don't dominate).
+
+    ``loss_kind="ce"``: token cross-entropy against the example's targets.
+    ``loss_kind="kd"``: soft cross-entropy against the frozen BASE model's
+    distribution on the same inputs (self-distillation replay -- preserve,
+    don't teach). Teacher and student softmaxes are computed over the
+    weighted target positions only: at a 262k vocab, a full-sequence float
+    softmax pair would cost GBs of activation memory for nothing."""
     import torch
     import torch.nn.functional as F
+
+    if loss_kind not in VALID_LOSSES:
+        raise ValueError(f"weighted_loss: bad loss_kind {loss_kind!r}")
 
     out = model(**model_inputs)
     logits = out.logits  # [1, L, V]
     shift_logits = logits[:, :-1, :]
     shift_labels = model_inputs["input_ids"][:, 1:]
-    shift_w = weights[:, 1:]
-    token_ce = F.cross_entropy(
-        shift_logits.reshape(-1, shift_logits.shape[-1]).float(),
-        shift_labels.reshape(-1),
-        reduction="none",
-    )
-    w = shift_w.reshape(-1)
+    w = weights[:, 1:].reshape(-1)
     denom = w.abs().sum().clamp(min=1e-8)
-    return (token_ce * w).sum() / denom
+
+    if loss_kind == "ce":
+        token_ce = F.cross_entropy(
+            shift_logits.reshape(-1, shift_logits.shape[-1]).float(),
+            shift_labels.reshape(-1),
+            reduction="none",
+        )
+        return (token_ce * w).sum() / denom
+
+    # kd: slice the target positions BEFORE any float32 softmax
+    mask = w != 0
+    student = shift_logits.reshape(-1, shift_logits.shape[-1])[mask].float()
+    teacher_logits = _base_model_logits(model, model_inputs)
+    teacher = teacher_logits[:, :-1, :].reshape(
+        -1, teacher_logits.shape[-1]
+    )[mask].float()
+    token_kd = -(F.softmax(teacher, dim=-1)
+                 * F.log_softmax(student, dim=-1)).sum(dim=-1)
+    return (token_kd * w[mask]).sum() / denom
 
 
 # ============================================================== eval hooks
+
+@dataclass
+class TrainContext:
+    """What an eval hook gets to work with: enough to score held-out loss
+    (model + collator) AND to generate (model + processor + adapter), so
+    exact-match probes (training/probes.py) plug in with the same
+    ``hook(ctx) -> dict[str, float]`` signature."""
+
+    model: Any
+    processor: Any
+    adapter: Any        #: agent.model FamilyAdapter for this architecture
+    collator: Collator
+    device: str
+
 
 @dataclass
 class MetricGuard:
@@ -614,35 +719,46 @@ class MetricGuard:
 
 
 class HeldOutLossHook:
-    """Stage-1 placeholder probe: mean per-example normalized loss on a
-    reserved slice of the training data. The real early-warning suite
-    (fixed boards, planted-error miss rate, replay slices -- see
-    TRAINING_EXTRA_DATASETS.md) plugs in beside it in stage 3 as more
-    callables with the same signature."""
+    """Mean per-example normalized loss on a reserved slice of the training
+    data, reported overall AND per source (``heldout_loss/<source>``) so
+    every dataset is tracked -- and guarded -- individually. Each example is
+    scored with ITS OWN loss kind, so for KD sources the held-out KD loss is
+    exactly the drift-from-base early-warning metric. Task-level probes
+    (exact-match accuracy etc., training/probes.py) plug in beside it as
+    more callables with the same signature."""
 
     name = "heldout_loss"
 
-    def __init__(self, examples: list[TrainingExample], collator: Collator):
+    def __init__(self, examples: list[TrainingExample]):
         self.examples = examples
-        self.collator = collator
 
-    def __call__(self, model: Any) -> dict[str, float]:
+    def __call__(self, ctx: TrainContext) -> dict[str, float]:
         import torch
 
         if not self.examples:
             return {}
+        model = ctx.model
         was_training = model.training
         model.eval()
-        total = 0.0
+        per_src_sum: dict[str, float] = {}
+        per_src_n: dict[str, int] = {}
         with torch.no_grad():
             for ex in self.examples:
-                built = self.collator.build(ex)
-                total += float(
-                    weighted_loss(model, built["model_inputs"], built["weights"])
-                )
+                built = ctx.collator.build(ex)
+                lv = float(weighted_loss(
+                    model, built["model_inputs"], built["weights"],
+                    loss_kind=ex.loss,
+                ))
+                per_src_sum[ex.source] = per_src_sum.get(ex.source, 0.0) + lv
+                per_src_n[ex.source] = per_src_n.get(ex.source, 0) + 1
         if was_training:
             model.train()
-        return {self.name: total / len(self.examples)}
+        metrics = {
+            self.name: sum(per_src_sum.values()) / len(self.examples),
+        }
+        for src in sorted(per_src_sum):
+            metrics[f"{self.name}/{src}"] = per_src_sum[src] / per_src_n[src]
+        return metrics
 
 
 # ============================================================ checkpointing
@@ -714,10 +830,18 @@ def epoch_order(by_source: dict[str, list[TrainingExample]],
     return order
 
 
-def run_training(sources: list[DataSource], cfg: TrainConfig) -> int:
+def run_training(
+    sources: list[DataSource],
+    cfg: TrainConfig,
+    extra_hooks: list[Callable[[TrainContext], dict[str, float]]] | None = None,
+    extra_guards: dict[str, MetricGuard] | None = None,
+) -> int:
     """The generic loop: train ``cfg.architecture`` on ``sources`` per
     ``cfg``. This is the ONLY entry point -- the CLI and every run script
-    end up here."""
+    end up here. ``extra_hooks`` run beside the built-in held-out-loss hook
+    after every save (see :class:`TrainContext`); ``extra_guards`` map
+    metric names to :class:`MetricGuard` for the regression machinery
+    (probes from training/probes.py arrive through these two)."""
     import torch
     from agent.config import CONFIG
     from agent.model import ADAPTERS, spec_for
@@ -791,15 +915,30 @@ def run_training(sources: list[DataSource], cfg: TrainConfig) -> int:
         )
 
     # -------------------------------------------------------- hooks/guards
-    eval_hooks: list[Callable[[Any], dict[str, float]]] = []
+    ctx = TrainContext(
+        model=model, processor=processor, adapter=ADAPTERS[spec.family],
+        collator=collator, device=cfg.device,
+    )
+    eval_hooks: list[Callable[[TrainContext], dict[str, float]]] = []
     if holdout:
-        eval_hooks.append(HeldOutLossHook(holdout, collator))
+        eval_hooks.append(HeldOutLossHook(holdout))
+    eval_hooks.extend(extra_hooks or [])
+    # Overall held-out loss + one guard PER SOURCE (for KD sources the
+    # per-source held-out KD loss is the drift-from-base measure), then any
+    # run-script guards (probes) on top.
     guards = {
         "heldout_loss": MetricGuard(
             "heldout_loss", higher_is_better=False,
             rel_tolerance=cfg.regression_tolerance,
         ),
     }
+    for src_name in by_source:
+        metric = f"heldout_loss/{src_name}"
+        guards[metric] = MetricGuard(
+            metric, higher_is_better=False,
+            rel_tolerance=cfg.regression_tolerance,
+        )
+    guards.update(extra_guards or {})
     best_metrics: dict[str, float] = {}
     best_ckpt: Path | None = None
 
@@ -819,45 +958,48 @@ def run_training(sources: list[DataSource], cfg: TrainConfig) -> int:
     })
 
     def run_hooks_and_guard(step: int, epoch: int) -> None:
-        """After each save: run every probe, track bests, react to
-        regressions per cfg.on_regression."""
+        """After each save: run every probe, log one flat eval row, track
+        bests, react to regressions per cfg.on_regression."""
         nonlocal best_ckpt
+        all_metrics: dict[str, float] = {}
         for hook in eval_hooks:
-            metrics = hook(model)
-            tlog.event("eval", step=step, **metrics)
-            for mname, value in metrics.items():
-                guard = guards.get(mname)
-                if guard is None:
-                    continue
-                best = best_metrics.get(mname)
-                if guard.is_improvement(value, best):
-                    best_metrics[mname] = value
-                    best_ckpt = last_ckpt
-                elif best is not None and guard.is_regression(value, best):
-                    tlog.event(
-                        "REGRESSION", metric=mname, value=value, best=best,
-                        action=cfg.on_regression,
+            all_metrics.update(hook(ctx))
+        if all_metrics:
+            tlog.event("eval", step=step, **all_metrics)
+            tlog.eval_row(step, epoch, all_metrics)
+        for mname, value in all_metrics.items():
+            guard = guards.get(mname)
+            if guard is None:
+                continue
+            best = best_metrics.get(mname)
+            if guard.is_improvement(value, best):
+                best_metrics[mname] = value
+                best_ckpt = last_ckpt
+            elif best is not None and guard.is_regression(value, best):
+                tlog.event(
+                    "REGRESSION", metric=mname, value=value, best=best,
+                    action=cfg.on_regression,
+                )
+                logger.error(
+                    "REGRESSION on %s: %.5g (best %.5g, tolerance %.0f%%)"
+                    " -- action: %s",
+                    mname, value, best,
+                    guard.rel_tolerance * 100, cfg.on_regression,
+                )
+                if cfg.on_regression == "abort":
+                    raise SystemExit(
+                        f"aborted: {mname} regressed ({value:.5g} vs best "
+                        f"{best:.5g}); best checkpoint: {best_ckpt}"
                     )
-                    logger.error(
-                        "REGRESSION on %s: %.5g (best %.5g, tolerance %.0f%%)"
-                        " -- action: %s",
-                        mname, value, best,
-                        guard.rel_tolerance * 100, cfg.on_regression,
-                    )
-                    if cfg.on_regression == "abort":
-                        raise SystemExit(
-                            f"aborted: {mname} regressed ({value:.5g} vs best "
-                            f"{best:.5g}); best checkpoint: {best_ckpt}"
+                if cfg.on_regression == "rollback":
+                    if best_ckpt is None:
+                        logger.error(
+                            "rollback requested but no best checkpoint "
+                            "exists yet; continuing WITHOUT rollback"
                         )
-                    if cfg.on_regression == "rollback":
-                        if best_ckpt is None:
-                            logger.error(
-                                "rollback requested but no best checkpoint "
-                                "exists yet; continuing WITHOUT rollback"
-                            )
-                        else:
-                            load_adapter_state(model, best_ckpt)
-                            tlog.event("rolled_back", to=str(best_ckpt))
+                    else:
+                        load_adapter_state(model, best_ckpt)
+                        tlog.event("rolled_back", to=str(best_ckpt))
 
     # ------------------------------------------------------------- loop
     model.train()
@@ -874,7 +1016,8 @@ def run_training(sources: list[DataSource], cfg: TrainConfig) -> int:
         optimizer.zero_grad(set_to_none=True)
         for i, ex in enumerate(order):
             built = collator.build(ex)
-            loss = weighted_loss(model, built["model_inputs"], built["weights"])
+            loss = weighted_loss(model, built["model_inputs"],
+                                 built["weights"], loss_kind=ex.loss)
             (loss / cfg.grad_accum).backward()
             lv = float(loss.detach())
             src_loss_sum[ex.source] = src_loss_sum.get(ex.source, 0.0) + lv

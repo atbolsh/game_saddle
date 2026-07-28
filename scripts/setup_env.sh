@@ -92,7 +92,39 @@ PY
 log "ensuring checkpoint directory exists: ${REPO_ROOT}/weights"
 mkdir -p "${REPO_ROOT}/weights"
 
-# --------------------------------------------------------------- 5. verify
+# ------------------------------------------------ 5. external replay datasets
+# Materialize the replay datasets described in training/datasets.json into
+# data_external/ (gitignored; on the owner's local box it is a symlink onto
+# removable storage). Download mode is decided ONCE from free disk space and
+# persisted in data_external/settings.json: "full" (default -- whole datasets
+# stay in the HF cache, no network dependence afterwards) or "stream" (below
+# the threshold -- only the consumed shards ever hit disk). An existing
+# settings file is preserved so a manual choice survives re-runs.
+DATA_EXTERNAL="${REPO_ROOT}/data_external"
+log "ensuring external-data directory exists: ${DATA_EXTERNAL}"
+mkdir -p "${DATA_EXTERNAL}"
+
+SETTINGS_FILE="${DATA_EXTERNAL}/settings.json"
+if [ -f "${SETTINGS_FILE}" ]; then
+  log "keeping existing ${SETTINGS_FILE}: $(cat "${SETTINGS_FILE}")"
+else
+  FREE_GB="$(df -BG --output=avail "${REPO_ROOT}" | tail -1 | tr -dc '0-9')"
+  DOWNLOAD_MODE="full"
+  if [ "${FREE_GB}" -lt 60 ]; then
+    DOWNLOAD_MODE="stream"
+    log "only ${FREE_GB} GB free (< 60 GB): using streaming downloads"
+  else
+    log "${FREE_GB} GB free: using full downloads (HF cache keeps the datasets)"
+  fi
+  printf '{"download_mode": "%s", "free_gb_at_setup": %s}\n' \
+    "${DOWNLOAD_MODE}" "${FREE_GB}" > "${SETTINGS_FILE}"
+  log "wrote ${SETTINGS_FILE}"
+fi
+
+log "materializing external datasets (idempotent; HF token from .env)"
+(cd "${REPO_ROOT}" && python -m training.download_external)
+
+# --------------------------------------------------------------- 6. verify
 log "verifying extractors import cleanly"
 python - "${SPACY_MODEL}" <<'PY'
 import sys

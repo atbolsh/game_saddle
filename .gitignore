@@ -18,6 +18,11 @@ brain_checkpoints/
 # pattern has no trailing slash (a slash-pattern would not match the symlink).
 weights
 
+# Materialized external replay datasets (training/datasets.json describes
+# them; scripts/setup_env.sh downloads them). Same no-trailing-slash reason
+# as weights: locally this is a symlink onto removable storage.
+data_external
+
 # Per-run logs: LLM-call logs, DB-retrieval logs, and .dump snapshots
 logs/
 *.dump
