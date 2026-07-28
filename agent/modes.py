@@ -1315,6 +1315,28 @@ def parse_wrong_spans(analysis: str, source_text: str) -> dict[str, list[str]]:
     return {"verified": verified, "unverified": unverified}
 
 
+# The final verdict line requested by _BLOCK_RATING ("RATING: <number>").
+# Tolerates markdown bold around the label -- both "**RATING**: x" and
+# "**RATING:** x" -- and an optional sign; the number itself must be a plain
+# decimal, anything else is a parse failure, not a guess
+# (no-fuzzy-fallbacks).
+RATING_RE = re.compile(
+    r"(?im)^[^\S\n]*\**[^\S\n]*RATING[^\S\n]*\**[^\S\n]*:[^\S\n]*\**[^\S\n]*"
+    r"(?P<value>[-+]?\d+(?:\.\d+)?)"
+)
+
+
+def parse_rating(analysis: str) -> float | None:
+    """Extract the analyst's final ``RATING: <number>`` from ``analysis``,
+    clamped to [-1.0, 1.0]. The LAST match wins (the closing verdict; earlier
+    matches are quotes or revisions). Returns None when no rating line is
+    present -- callers decide how loudly to fail; never guess a number."""
+    matches = RATING_RE.findall(analysis)
+    if not matches:
+        return None
+    return max(-1.0, min(1.0, float(matches[-1])))
+
+
 def _clean_search_query(query: str) -> str:
     """Normalize a captured [SEARCH] query: models often quote it (e.g.
     [SEARCH "Message 24"]), and the capture regex's trailing ``\\W*`` eats the

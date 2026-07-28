@@ -92,6 +92,12 @@ PY
 log "ensuring checkpoint directory exists: ${REPO_ROOT}/weights"
 mkdir -p "${REPO_ROOT}/weights"
 
+# Generated self-eval game traces (training/generate_game_traces.py) live in
+# data_game/<label>/; gitignored, symlinked onto removable storage on the
+# owner's local box.
+log "ensuring game-trace directory exists: ${REPO_ROOT}/data_game"
+mkdir -p "${REPO_ROOT}/data_game"
+
 # ------------------------------------------------ 5. external replay datasets
 # Materialize the replay datasets described in training/datasets.json into
 # data_external/ (gitignored; on the owner's local box it is a symlink onto

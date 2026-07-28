@@ -23,6 +23,11 @@ weights
 # as weights: locally this is a symlink onto removable storage.
 data_external
 
+# Generated self-eval game traces (training/generate_game_traces.py writes
+# them). Same no-trailing-slash reason: locally a symlink onto removable
+# storage.
+data_game
+
 # Per-run logs: LLM-call logs, DB-retrieval logs, and .dump snapshots
 logs/
 *.dump

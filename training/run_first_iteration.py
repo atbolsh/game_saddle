@@ -7,14 +7,10 @@ pick the config, call :func:`run_training`. Copy this file per run/iteration
 (``run_iter2.py``, ``run_replay_ablation.py``, ...); train.py itself should
 not change between runs.
 
-STATUS: template. The external replay sources and probes (phase 2) are live;
-the game-trace ``DataSource`` and the graded jsonl batches it produces
-arrive in the next stage -- until then the game line below stays commented
-out, and the script as-is runs a REPLAY-ONLY smoke pass (useful for
-verifying the phase-2 plumbing end to end on the remote box).
+Prerequisites (both on the remote box):
 
-Prerequisite: ``python -m training.download_external`` (or a full
-``bash scripts/setup_env.sh``) so data_external/ is materialized.
+    python -m training.download_external          # or bash scripts/setup_env.sh
+    python -m training.generate_game_traces --label iter1
 
 Run from the repo root::
 
@@ -30,6 +26,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from training.external_data import sources_from_manifest  # noqa: E402
+from training.game_traces import GameTraceSource  # noqa: E402
 from training.probes import build_probe_hooks  # noqa: E402
 from training.train import (  # noqa: E402
     DataSource,
@@ -39,16 +36,13 @@ from training.train import (  # noqa: E402
 )
 
 # --------------------------------------------------------------- the data
-# Replay: every enabled dataset from training/datasets.json, each weighted
-# so it contributes exactly its manifest examples_per_epoch
+# The graded self-eval game traces are the POINT of the iteration (reward
+# scheme + volume rationale: TRAINING_GAME_TRACES.md); the manifest replay
+# sources ride along to keep general capabilities from washing out
 # (TRAINING_EXTRA_DATASETS.md documents each dataset's role and loss kind).
 SOURCES: list[DataSource] = [
+    GameTraceSource("data_game/iter1/traces.jsonl"),
     *sources_from_manifest(),
-    # Graded player generations from the self-eval loop (next stage;
-    # TRAINING_GAME_TRACES.md has the volume rationale: 1-5k generations
-    # per iteration, roughly half surviving grading). Uncomment when the
-    # game-trace DataSource exists:
-    # JsonlSource("data/game_traces_iter1.jsonl"),
 ]
 
 # ------------------------------------------------------------ the probes

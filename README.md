@@ -361,6 +361,23 @@ Training runs log to `logs/train_<label>_<stamp>/` (including a flat
 `eval_log.jsonl` with every per-task eval metric per row, for graphing) and
 roll back to the best checkpoint (loudly) if a guarded eval metric regresses.
 
+**Game-trace data generation** is
+`python -m training.generate_game_traces --label iterN [--checkpoint ...]`:
+the interactive self-eval loop run headlessly (player move, one analyst
+exchange, round end; a game = gold eaten or 200 rounds) with mild label-safe
+image noise at inference and a NAMS episodic reset every ~100 games (tips
+survive). It writes `data_game/<label>/traces.jsonl` + stable frame copies
+under `data_game/<label>/images/` (git-ignored; `setup_env.sh` creates
+`data_game/`). Each record stores the exact player prompt, the raw reply
+(the only trainable tokens — analyst text never enters records), and raw
+annotations (rating, verified `WRONG:` spans, outcome). At training time
+`GameTraceSource` turns those into per-token weights — **single-sample
+offline REINFORCE with a shaped per-token advantage (reward-weighted
+regression)**: the analyst rating as the reply-wide base, -1.0 on verified
+`WRONG:` spans, and a discounted `0.2 * 0.9^d` win boost added uniformly on
+won games — and re-noises the frames per run. Details and knobs in
+[training/TRAINING_GAME_TRACES.md](training/TRAINING_GAME_TRACES.md).
+
 **External replay datasets** live in `data_external/` (git-ignored;
 `scripts/setup_env.sh` creates it and runs
 `python -m training.download_external`, which materializes every enabled
@@ -456,6 +473,9 @@ training/
   synth_navigation.py       # seeded generator: clock/compass/bearing problems + probe
   probes.py          # exact-match capability probes (GSM8K, navigation) + guards
   generate_self_distill.py  # optional: regenerate replay targets with the base model
+  generate_game_traces.py   # headless self-eval datagen -> data_game/<label>/
+  game_traces.py     # GameTraceSource: traces -> REINFORCE-weighted examples
+  image_noise.py     # label-safe frame degradation (inference + training)
   TRAINING_OVERVIEW.md      # self-training roadmap + the train.py contract/recipe
   TRAINING_GAME_TRACES.md   # standard use of game traces (self-eval loop as data generator)
   TRAINING_EXTRA_DATASETS.md# replay mixing vs. forgetting; the early-warning suite
@@ -463,6 +483,7 @@ training/
   TO_TEST.md         # remote-box verification checklist for the current stage
 weights/             # trained adapter checkpoints, weights/<architecture>/<name>/ (git-ignored)
 data_external/       # materialized replay datasets + probes (git-ignored; setup_env.sh)
+data_game/           # generated self-eval game traces + frames (git-ignored; setup_env.sh)
 notebooks/
   play.ipynb            # interactive mode-1 play (Ask + Restart conversation)
   visualize_memory.ipynb# pyvis interactive graph of the memory graph

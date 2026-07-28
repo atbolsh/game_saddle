@@ -105,6 +105,17 @@ class InteractiveSelfEvalSession(InteractiveSession):
 
     def __init__(self, *args: Any, log_label: str | None = None, **kwargs: Any):
         super().__init__(*args, log_label=log_label or "self_eval", **kwargs)
+        #: Optional in-place PNG post-processor (path -> None) applied to
+        #: every snapshot right after it is stored, BEFORE anyone (player,
+        #: analyst, NAMS links, training copies) sees it. The datagen loop
+        #: installs the image-noise regularizer here; the notebook leaves it
+        #: None. Applying at the stored file keeps one invariant: every
+        #: consumer of a frame sees the SAME bytes.
+        self.image_filter: Callable[[str], None] | None = None
+
+    def _apply_image_filter(self, path: str | None) -> None:
+        if path and self.image_filter is not None:
+            self.image_filter(path)
 
     # ------------------------------------------------------------------ state
     def restart(self) -> dict[str, Any]:
@@ -178,6 +189,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
                 settings_before, cfg=self.cfg, label="before",
             )
         )
+        self._apply_image_filter(before_path)
 
         # 2. Memory context, exactly as in play mode (settings scrubbed).
         query = modes._retrieval_query(
@@ -297,6 +309,10 @@ class InteractiveSelfEvalSession(InteractiveSession):
             "bare_move": bare_move,
             "before_path": before_path,
             "searches": searches,
+            # The EXACT prompt of the accepted generation (system prompt,
+            # memory context, accumulated search notes, image part) -- what
+            # the training data must reproduce byte for byte.
+            "messages": messages,
             "phase": self.phase,
         }
 
@@ -407,12 +423,17 @@ class InteractiveSelfEvalSession(InteractiveSession):
         # Harness-verified error spans: exact substring match against the
         # recorded player reply. Unverified spans are surfaced, never kept.
         wrong_spans = modes.parse_wrong_spans(analysis, pending["raw"])
+        # The closing "RATING: <number>" verdict; None (never a guess) when
+        # the analyst forgot the line -- the datagen loop drops such records
+        # loudly.
+        rating = modes.parse_rating(analysis)
 
         logger.info(
             "analyst exchange %d done (%d verified / %d unverified WRONG "
-            "spans); round still open.",
+            "spans; rating=%s); round still open.",
             pending["n_analyses"],
             len(wrong_spans["verified"]), len(wrong_spans["unverified"]),
+            "missing" if rating is None else f"{rating:+.2f}",
         )
         return {
             "session_id": self.session_id,
@@ -420,6 +441,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
             "analysis": analysis,
             "replies": replies,
             "wrong_spans": wrong_spans,
+            "rating": rating,
             "player_raw": pending["raw"],
             "n_analyses": pending["n_analyses"],
             "phase": self.phase,
@@ -453,6 +475,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
                     extra={"action": action, "gold_collected": gold_collected},
                 )
             )
+            self._apply_image_filter(after_path)
             self._run(
                 image_store.link_snapshot_to_message(
                     self.client, pending["assistant_msg_id"], snapshot_after_id,

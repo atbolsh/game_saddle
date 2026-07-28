@@ -70,9 +70,46 @@ PEFT internals still needs the remote box:
     per evaluation with `heldout_loss/<source>` per dataset and both
     `exact_match/*` keys; loads with `pandas.read_json(..., lines=True)`.
 18. **Replay-only smoke run**: `python -m training.run_first_iteration`
-    (game line still commented out) completes a few hundred steps with
-    mixed CE + KD sources, per-source losses all finite in
-    `train_log.jsonl`.
+    (with the `GameTraceSource` line temporarily removed, or a smoke trace
+    file in place) completes a few hundred steps with mixed CE + KD sources,
+    per-source losses all finite in `train_log.jsonl`.
 19. **Self-distill utility** (optional path):
     `python -m training.generate_self_distill --dataset slimorca --limit 20`
     writes 20 non-empty regenerated targets.
+
+# To test on the remote box (phase 3: the self-eval datagen loop)
+
+The reward mapping (`build_span_weights`) and the record plumbing are pure
+python, but the loop itself needs GPU + NAMS:
+
+20. **Datagen smoke run**: `python -m training.generate_game_traces --label
+    smoke --games 2 --max-moves 5` completes; `data_game/smoke/traces.jsonl`
+    has one record per player generation, `generation_stats.json` matches,
+    and every `meta.rating` present in the analyst logs parsed (compare a
+    few analyses by hand — bold `**RATING:**` variants must parse too).
+21. **Stored frames byte-identical**: for a few records, the copy under
+    `data_game/smoke/images/` is byte-identical (`cmp`) to the
+    `memory_images/` snapshot the player saw, and — with noise on — the
+    image is visibly degraded but clearly readable (agent, gold, walls
+    distinguishable at strength 0.5). If not readable, lower
+    `INFERENCE_STRENGTH`.
+22. **Exact-context invariant**: for one record, re-render the player
+    prompt from the live session (`player["messages"]`) and diff against
+    the record's `messages` (modulo the rewritten image url) — no drift, no
+    truncation, search notes included.
+23. **No analyst text anywhere**: grep `traces.jsonl` for a distinctive
+    phrase from a few analyst analyses in the run's logs — zero hits (the
+    tripwire checks current-session analyses automatically; this manual
+    check also covers cross-session leakage through NAMS retrieval).
+24. **NAMS reset cadence**: with `--reset-every 1 --games 3`, node counts
+    between games drop back to the seeded semantic model while `Preference`
+    (tip) nodes survive; datagen continues cleanly after each reset.
+25. **GameTraceSource end-to-end**: `run_first_iteration.py` pointed at the
+    smoke traces trains — negative-weight spans (WRONG marks) train without
+    error, records with `rating: null` are dropped with the WARNING count,
+    and the per-run noised frame copies land in the temp dir (check one
+    visually).
+26. **Win stamping**: play until a win happens (or shrink the board via
+    config); the winning game's records carry `game_won: true` and
+    `moves_from_end` counting down to 0, and `build_span_weights` on the
+    winning move yields base `r + 0.2` (clamped) / WRONG spans `-1.0 + 0.2`.

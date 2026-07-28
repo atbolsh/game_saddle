@@ -33,11 +33,84 @@ failure signal that would justify revisiting it. See
    principle: in the environments this repo is meant to grow into, no oracle
    engine will be available, so the loop must not learn to depend on one.
 
-The exact mapping from analyst verdict to per-token weights (e.g. rating as
-a global scale, `WRONG:` spans down-weighted or negative, move token
-up-weighted) is a stage-2 decision — it belongs to the game-trace
-`DataSource`, not to `train.py`, which only sees `(char_start, char_end,
-weight)` spans.
+The exact mapping from analyst verdict to per-token weights lives in the
+game-trace `DataSource` ([game_traces.py](game_traces.py)), not in
+`train.py`, which only sees `(char_start, char_end, weight)` spans. The
+implemented mapping is in "The reward scheme" below.
+
+## The implemented loop
+
+`python -m training.generate_game_traces --label iterN [--checkpoint ...]`
+drives the EXACT self-eval machinery of the interactive notebook
+(`InteractiveSelfEvalSession`, default player and analyst questions, same
+prompts, same memory screening) headlessly: per round it asks the player,
+asks the analyst once, then ends the round so the move propagates. **A game
+is formally: the gold eaten, or 200 player rounds** (`--max-moves`),
+whichever comes first.
+
+One record per player generation lands in `data_game/<label>/traces.jsonl`:
+
+- `messages` — the EXACT prompt of the accepted player generation (system
+  prompt, screened NAMS context, accumulated search notes, frame), with the
+  frame's url rewritten to a stable copy in `data_game/<label>/images/`
+  (byte-identical to what the player saw; the live `memory_images/` copy
+  does not survive NAMS resets);
+- `target_text` — the raw player reply, the ONLY trainable tokens;
+- `meta` — RAW annotations only: analyst rating, harness-verified `WRONG:`
+  spans, action, game/move indices, `game_won`, `moves_from_end`. Rewards
+  are computed at TRAINING time from these, so every ratio below stays
+  tunable without regenerating data.
+
+Housekeeping baked into the generator:
+
+- **NAMS reset every ~100 games** (`--reset-every`): episodic memory is
+  wiped back to the seeded semantic model; tips are `Preference` nodes and
+  survive. Prevents unbounded memory growth and keeps retrieved context
+  representative of a fresh box.
+- **Inference-time image noise** (`--no-noise` to disable): every stored
+  snapshot is degraded in place (strength 0.5, see below) BEFORE the player,
+  the analyst, NAMS, or the training copy sees it — one invariant, one set
+  of bytes.
+- **Analyst-leak tripwire:** every analysis generated in the current session
+  is matched against each record's serialized player context; a hit aborts
+  the run. The load-side screening (`exclude_analyst` + `exclude_session`)
+  should make a hit impossible — the tripwire is there for the day that
+  regresses.
+- Records whose analyst forgot the `RATING:` line are written with
+  `rating: null` and counted; `GameTraceSource` DROPS them loudly at load
+  time (never train on a guessed reward).
+
+## The reward scheme
+
+**The algorithm, by name: single-sample offline REINFORCE with a shaped
+per-token advantage — equivalently, reward-weighted regression.** The
+weighted-CE loss of [TRAINING_OVERVIEW.md](TRAINING_OVERVIEW.md) *is* the
+REINFORCE surrogate `-w * log p(token)` with the per-token weight playing
+the role of the advantage; there is no critic, no importance ratio, no
+clipping — which is also why each batch is trained for a SINGLE epoch
+(after one gradient step the data is off-policy and this estimator has no
+correction for that).
+
+Per token of the player reply, `GameTraceSource` builds the weight as:
+
+1. **base = analyst rating** `r ∈ [-1, 1]` over the whole reply — every
+   token of a reply is the same "move", so they share its reward;
+2. **verified `WRONG:` spans override the base with -1.0** — the one
+   token-level signal the analyst gives; unverified spans never reach
+   training;
+3. **win boost, won games only:** `b = 0.2 * 0.9^d` (`d` = rounds from the
+   winning move) is added UNIFORMLY to every token of the message —
+   including WRONG spans (they become `-1.0 + b`). The win is the loop's one
+   ground-truth signal; on a won trajectory even flagged text gets its
+   penalty softened rather than trusted less. Magnitudes: the boost peaks at
+   0.2 on the winning move and fades with ~10-round half-life, so analyst
+   grades (|r| up to 1.0) stay the dominant signal and long wandering
+   prefixes of a lucky game get almost nothing;
+4. **clamp to [-1, 1]**, then multiply still-negative weights by
+   `negative_scale` — the committed default is **1.0 (symmetric REINFORCE,
+   negatives unlearn at full strength)**; `0.5` is the gentler first knob if
+   training destabilizes, `0.0` is filtered behavior cloning (strictly
+   positive rewards, maximally stable, learns nothing from mistakes).
 
 ### Disagree and commit: separate LoRA adapters per role
 
@@ -124,18 +197,21 @@ Recorded from the planning discussion; provenance and reasoning in
 
 ## Visual generalization — regularize the images
 
-Worry, recorded as a requirement on the stage-2 game-trace `DataSource`:
-image-interpretation skills learned on this one renderer (one palette, one
-agent sprite, one board style) may not generalize. The data source that
-feeds frames into training must therefore apply **label-safe image
-regularization** — augmentations sampled per example at load time:
+Worry: image-interpretation skills learned on this one renderer (one
+palette, one agent sprite, one board style) may not generalize. Implemented
+in [image_noise.py](image_noise.py) and applied at BOTH ends — at datagen
+inference (strength 0.5, in place on the stored snapshot, so player /
+analyst / training all see the same bytes) and again at training time
+(strength 1.0, fresh per-run noised copies made by `GameTraceSource`) —
+**label-safe image regularization**, sampled per image:
 
 - Gaussian pixel noise;
-- blur (mild);
+- mild blur OR JPEG compression artifacts (one of the two);
 - brightness / contrast / color jitter;
-- JPEG compression artifacts;
-- slight random crops / rescales (small enough not to cut off the agent or
-  the gold).
+- 2–6 small discolored patches (semi-transparent tints, a few percent of
+  the image side each — mild local discoloration, not dropout);
+- slight random crops / rescales (≤4% per edge — small enough not to cut
+  off the agent or the gold).
 
 **NOT label-safe here, do not use naively:** horizontal/vertical flips and
 rotations. They invert or shift the clock/bearing semantics that the OBS
