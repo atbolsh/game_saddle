@@ -81,8 +81,11 @@ class ExactMatchHook:
     """Eval hook (``hook(ctx) -> dict``): greedy-generate on every probe
     item, report exact-match accuracy under ``metric``."""
 
+    # 192 tokens is generous for "work briefly, then ANSWER: <value>";
+    # ramblers that hit the cap lose their answer and score wrong, which is
+    # itself a regression signal.
     def __init__(self, metric: str, probe_path: str | Path,
-                 max_new_tokens: int = 256):
+                 max_new_tokens: int = 192):
         self.metric = metric
         self.probe_path = Path(probe_path)
         self.max_new_tokens = max_new_tokens

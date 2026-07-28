@@ -196,6 +196,12 @@ class RegexStopCriteria(StoppingCriteria):
     ``[SHOW`` would halt before the parameter is generated). This criteria
     decodes a window of the generated tokens each step and applies a regex,
     so generation halts right after the complete call.
+
+    Per-row aware: returns a bool tensor of shape ``[batch]``, so in a
+    batched generate each row halts individually on its own match while the
+    others continue (transformers ORs per-row criteria into its
+    unfinished-sequences mask). With LEFT padding all prompts end at the
+    same index, so a single ``prompt_len`` is correct for every row.
     """
 
     #: How many of the most recent generated tokens to decode per check.
@@ -213,15 +219,21 @@ class RegexStopCriteria(StoppingCriteria):
         self.tokenizer = tokenizer
         self.prompt_len = prompt_len
 
-    def __call__(self, input_ids: torch.LongTensor, scores: Any, **kwargs: Any) -> bool:
-        # Only consider generated tokens (not the prompt, which may legitimately
-        # contain tool-call examples).
-        gen = input_ids[0][self.prompt_len:]
-        if len(gen) == 0:
-            return False
-        tail = gen[-self.TAIL_TOKENS:]
-        text = self.tokenizer.decode(tail, skip_special_tokens=True)
-        return self.pattern.search(text) is not None
+    def __call__(
+        self, input_ids: torch.LongTensor, scores: Any, **kwargs: Any
+    ) -> torch.Tensor:
+        done = torch.zeros(
+            input_ids.shape[0], dtype=torch.bool, device=input_ids.device
+        )
+        # Only consider generated tokens (not the prompt, which may
+        # legitimately contain tool-call examples).
+        if input_ids.shape[1] <= self.prompt_len:
+            return done
+        for i in range(input_ids.shape[0]):
+            tail = input_ids[i][self.prompt_len:][-self.TAIL_TOKENS:]
+            text = self.tokenizer.decode(tail, skip_special_tokens=True)
+            done[i] = self.pattern.search(text) is not None
+        return done
 
 
 _DTYPE_MAP = {
@@ -461,6 +473,125 @@ class VLModel:
                 response=None if reply is None else {"raw": reply},
                 error=err,
             )
+
+    # ------------------------------------------------------ batched generate
+    def generate_batch(
+        self,
+        batch: list[dict],
+        max_new_tokens: int | None = None,
+        stop_strings: list[str] | None = None,
+        stop_regex: str | None = None,
+    ) -> list[str]:
+        """One batched generation over several prompts (the parallel-datagen
+        fast path: decode is memory-bandwidth-bound, so a batch of N costs
+        barely more than a batch of 1).
+
+        ``batch`` is a list of ``{"messages": [...]}`` dicts. The stopping
+        knobs are BATCH-WIDE by contract -- a per-row stop set would let one
+        row halt on ANOTHER row's stop string (an analyst quoting
+        ``[FORWARD]`` mid-analysis would be truncated), so the dispatcher
+        (agent/parallel_gen.py) groups requests by identical stop signature
+        and this method refuses mixed image counts, which processors pad
+        inconsistently. Prompts are LEFT-padded, so every row's generation
+        starts at the same index; rows finish individually (per-row stop
+        strings / regex / eos)."""
+        if not batch:
+            return []
+        if len(batch) == 1:
+            return [self.generate(
+                batch[0]["messages"], max_new_tokens=max_new_tokens,
+                stop_strings=stop_strings, stop_regex=stop_regex,
+            )]
+        if not self._loaded:
+            self.load()
+
+        def _n_images(messages: list[dict]) -> int:
+            return sum(
+                1
+                for m in messages
+                for part in (m.get("content") or [])
+                if isinstance(part, dict) and part.get("type") == "image"
+            )
+
+        image_counts = {_n_images(r["messages"]) for r in batch}
+        if len(image_counts) > 1:
+            raise ValueError(
+                "generate_batch: mixed image counts in one batch "
+                f"({sorted(image_counts)}) -- group requests by image count "
+                "(see agent/parallel_gen.py)"
+            )
+
+        norm = [self.adapter.prepare_messages(r["messages"]) for r in batch]
+        tokenizer = getattr(self.processor, "tokenizer", self.processor)
+        prev_side = getattr(tokenizer, "padding_side", "right")
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
+        try:
+            inputs = self.processor.apply_chat_template(
+                norm,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+                padding=True,
+            )
+        finally:
+            tokenizer.padding_side = prev_side
+        target_device = next(self.model.parameters()).device
+        inputs = inputs.to(target_device)
+        model_dtype = next(self.model.parameters()).dtype
+        for k, v in list(inputs.items()):
+            if isinstance(v, torch.Tensor) and v.dtype.is_floating_point:
+                inputs[k] = v.to(model_dtype)
+
+        gen_kwargs: dict[str, Any] = {
+            "max_new_tokens": max_new_tokens or self.cfg.max_new_tokens,
+            **self._sampling_kwargs(),
+        }
+        prompt_len = inputs["input_ids"].shape[-1]
+        if stop_strings:
+            gen_kwargs["stop_strings"] = stop_strings
+            gen_kwargs["tokenizer"] = tokenizer
+        if stop_regex:
+            gen_kwargs["stopping_criteria"] = StoppingCriteriaList([
+                RegexStopCriteria(stop_regex, tokenizer, prompt_len=prompt_len)
+            ])
+
+        replies: list[str] | None = None
+        err: str | None = None
+        try:
+            with torch.inference_mode():
+                out = self.model.generate(**inputs, **gen_kwargs)
+            replies = [
+                self.processor.decode(
+                    out[i][prompt_len:], skip_special_tokens=True
+                ).strip()
+                for i in range(len(batch))
+            ]
+            return replies
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            for i, r in enumerate(batch):
+                run_logging.log_llm_call(
+                    model=f"{self.spec.key} ({self.spec.hf_id})",
+                    kind="generate_batch",
+                    request={"messages": r["messages"],
+                             "batch_size": len(batch), "batch_index": i},
+                    params={
+                        "max_new_tokens": gen_kwargs.get("max_new_tokens"),
+                        "do_sample": gen_kwargs.get("do_sample"),
+                        "temperature": gen_kwargs.get("temperature"),
+                        "top_p": gen_kwargs.get("top_p"),
+                        "top_k": gen_kwargs.get("top_k"),
+                        "stop_strings": stop_strings,
+                        "stop_regex": stop_regex,
+                    },
+                    response=None if replies is None else {"raw": replies[i]},
+                    error=err,
+                )
 
 
 # ======================================================= process singleton

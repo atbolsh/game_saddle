@@ -1,0 +1,782 @@
+"""The formal test suite: numbered stages, one command each, PASS/FAIL lines.
+
+Run on the REMOTE box (GPU + NAMS), in order, as soon as setup_env.sh has
+finished::
+
+    python -m training.selftest t0     # seconds   env + imports
+    python -m training.selftest t1     # seconds   pure-python units
+    python -m training.selftest t2     # seconds   materialized data + manifest
+    python -m training.selftest t3     # minutes   4-bit load, forward/backward
+    python -m training.selftest t4     # ~15-30m   batch parity + smoke train + rollback
+    python -m training.selftest t5     # ~10-20m   datagen 2 games, --parallel 2
+    python -m training.selftest t6     # minutes   batched-vs-solo generation A/B
+    python -m training.selftest t7     # minutes   t5 traces -> real train steps
+
+or everything in order with ``python -m training.selftest all``. Every stage
+prints exactly one line ``TEST <id> PASS/FAIL: <evidence>`` (paste those
+lines back for review); failures also print the traceback to stderr. Later
+stages assume earlier ones passed (t7 consumes t5's output). No pytest, no
+new dependencies -- plain asserts.
+
+Stage map (rationale in the Intermission plan):
+
+  * t0-env      imports + versions + CUDA + bitsandbytes
+  * t1-pure     parse_rating, build_span_weights, image noise, tripwire,
+                _rewrite_image_urls, GameTraceSource on a fabricated dir,
+                epoch_batches bucketing
+  * t2-data     manifest loads, per-source counts vs meta.json, probes exist
+  * t3-model    4-bit QLoRA load, terminator, CE/KD forward+backward
+                (image example included), teacher-path sanity
+  * t4-train    batch-4 vs batch-1 loss parity, CLI smoke train (CE + KD +
+                negative span + image), forced-rollback variant
+  * t5-datagen  2 games x 5 moves at --parallel 2: traces, images, stats,
+                plots, tripwire silent
+  * t6-ab       generate_batch vs generate equivalence, greedy
+  * t7-e2e      GameTraceSource over t5's output through real train steps
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import traceback
+from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+# ================================================================ fixtures
+
+def _tiny_png(path: Path, seed: int = 0, size: int = 96) -> Path:
+    """A small deterministic board-like image (colored cells on a grid)."""
+    import random
+
+    from PIL import Image, ImageDraw
+
+    rng = random.Random(seed)
+    img = Image.new("RGB", (size, size), (235, 235, 235))
+    draw = ImageDraw.Draw(img)
+    cell = size // 6
+    for gx in range(6):
+        for gy in range(6):
+            if rng.random() < 0.25:
+                color = rng.choice(
+                    [(200, 40, 40), (40, 160, 40), (220, 180, 30), (60, 60, 200)]
+                )
+                draw.rectangle(
+                    [gx * cell, gy * cell, (gx + 1) * cell - 1,
+                     (gy + 1) * cell - 1],
+                    fill=color,
+                )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(path)
+    return path
+
+
+def _text_example(text_in: str, text_out: str, **extra) -> dict:
+    return {
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": text_in}]},
+        ],
+        "target_text": text_out,
+        **extra,
+    }
+
+
+def _image_example(img_path: Path, text_in: str, text_out: str,
+                   **extra) -> dict:
+    return {
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "image", "url": str(img_path)},
+                {"type": "text", "text": text_in},
+            ]},
+        ],
+        "target_text": text_out,
+        **extra,
+    }
+
+
+def _write_smoke_jsonl(dir_: Path) -> Path:
+    """The t4 smoke set: CE text, CE image, KD, negative-span -- two of each
+    so micro-batching has something to bucket."""
+    img_a = _tiny_png(dir_ / "img_a.png", seed=1)
+    img_b = _tiny_png(dir_ / "img_b.png", seed=2)
+    rows = [
+        _text_example("What is 2 + 3? Reply with the number.", "5"),
+        _text_example("Name the color of a clear daytime sky.",
+                      "The sky is blue."),
+        _image_example(img_a, "Describe this board in one short sentence.",
+                       "A small grid with a few colored cells."),
+        _image_example(img_b, "Is anything drawn on this board?",
+                       "Yes, several colored cells on a light grid."),
+        _text_example("Say the word 'hello'.", "hello", loss="kd"),
+        _text_example("Count from 1 to 3.", "1, 2, 3", loss="kd"),
+        _text_example(
+            "Where is the gold?",
+            "The gold is at 3 o'clock. WRONG: it is at 9 o'clock.",
+            span_weights=[[0, 27, 0.5], [28, 58, -1.0]],
+        ),
+        _text_example(
+            "Which way is the wall?",
+            "The wall is ahead. Actually behind.",
+            span_weights=[[0, 18, 0.6], [19, 35, -0.5]],
+        ),
+    ]
+    path = dir_ / "smoke.jsonl"
+    with open(path, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    return path
+
+
+def _run_cli(argv: list[str], timeout: int = 3600) -> subprocess.CompletedProcess:
+    """Run a repo CLI as a subprocess, capturing output for the evidence."""
+    return subprocess.run(
+        [sys.executable, "-m", *argv],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=timeout,
+    )
+
+
+def _newest(pattern: str, base: Path = REPO_ROOT) -> Path:
+    matches = sorted(base.glob(pattern), key=lambda p: p.stat().st_mtime)
+    if not matches:
+        raise AssertionError(f"nothing matches {base / pattern}")
+    return matches[-1]
+
+
+def _free_cuda(*objs) -> None:
+    import gc
+
+    import torch
+
+    for o in objs:
+        del o
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+# ================================================================== stages
+
+def t0_env() -> str:
+    """Imports, versions, CUDA."""
+    import platform
+
+    import torch
+    import transformers
+    from packaging.version import Version
+
+    assert Version(transformers.__version__) >= Version("5.10"), (
+        f"transformers {transformers.__version__} < 5.10 (the registry "
+        "models need it)"
+    )
+    assert torch.cuda.is_available(), "CUDA not visible from torch"
+    import bitsandbytes  # noqa: F401  (import is the test)
+    import peft
+    import matplotlib
+    from PIL import Image  # noqa: F401
+
+    gpu = torch.cuda.get_device_name(0)
+    vram = torch.cuda.get_device_properties(0).total_memory / 2**30
+    return (
+        f"python {platform.python_version()}, torch {torch.__version__}, "
+        f"transformers {transformers.__version__}, peft {peft.__version__}, "
+        f"bitsandbytes {bitsandbytes.__version__}, "
+        f"matplotlib {matplotlib.__version__}; {gpu} ({vram:.0f} GiB)"
+    )
+
+
+def t1_pure() -> str:
+    """The pure-python units -- no GPU, no NAMS, no downloads."""
+    import io
+    import random
+
+    from PIL import Image
+
+    from agent.modes import parse_rating
+    from training.game_traces import GameTraceSource, build_span_weights
+    from training.generate_game_traces import (
+        _assert_no_analyst_leak,
+        _rewrite_image_urls,
+    )
+    from training.image_noise import make_image_filter, noise_image
+    from training.train import TrainingExample, epoch_batches
+
+    checks = 0
+
+    # ---- parse_rating: plain, bold variants, last-wins, clamp, absent
+    for text, expected in [
+        ("...verdict.\nRATING: 0.5", 0.5),
+        ("**RATING:** -0.25", -0.25),
+        ("**RATING**: 1", 1.0),
+        ("RATING: 0.1\nrethinking...\nRATING: -0.9", -0.9),
+        ("RATING: 7", 1.0),          # clamped
+        ("no verdict here", None),
+    ]:
+        got = parse_rating(text)
+        assert got == expected, f"parse_rating({text!r}) = {got}, want {expected}"
+        checks += 1
+
+    # ---- build_span_weights: base, WRONG override, win boost, neg scale
+    tgt = "go left WRONG: gold is right done"
+    spans = build_span_weights(tgt, rating=0.5, wrong_spans=["WRONG: gold is right"],
+                               game_won=False, moves_from_end=None)
+    assert spans[0] == (0, len(tgt), 0.5), spans[0]
+    assert spans[1][2] == -1.0 and tgt[spans[1][0]:spans[1][1]].startswith("WRONG"), spans[1]
+    win = build_span_weights(tgt, rating=0.9, wrong_spans=["WRONG: gold is right"],
+                             game_won=True, moves_from_end=0)
+    assert abs(win[0][2] - 1.0) < 1e-9, win[0]     # clamp(0.9 + 0.2)
+    assert abs(win[1][2] - (-0.8)) < 1e-9, win[1]  # clamp(-1.0 + 0.2)
+    gentle = build_span_weights(tgt, rating=-0.5, wrong_spans=[],
+                                game_won=False, moves_from_end=None,
+                                negative_scale=0.5)
+    assert abs(gentle[0][2] - (-0.25)) < 1e-9, gentle[0]
+    checks += 4
+
+    # ---- image noise: deterministic per seed, identity at strength 0
+    base_img = Image.new("RGB", (64, 64), (120, 40, 40))
+    def png_bytes(img):
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    a = png_bytes(noise_image(base_img, random.Random(3), 1.0))
+    b = png_bytes(noise_image(base_img, random.Random(3), 1.0))
+    assert a == b, "noise_image not deterministic under a fixed seed"
+    assert a != png_bytes(base_img), "noise_image(strength=1) changed nothing"
+    ident = png_bytes(noise_image(base_img, random.Random(3), 0.0))
+    assert ident == png_bytes(base_img.convert("RGB")), "strength 0 not identity"
+    checks += 3
+
+    with tempfile.TemporaryDirectory(prefix="selftest_t1_") as tmp:
+        tmp_dir = Path(tmp)
+        # ---- make_image_filter: in-place, successive frames differ
+        f1 = _tiny_png(tmp_dir / "f1.png", seed=5)
+        f2 = _tiny_png(tmp_dir / "f2.png", seed=5)
+        raw = f1.read_bytes()
+        filt = make_image_filter(seed=11)
+        filt(str(f1))
+        filt(str(f2))
+        assert f1.read_bytes() != raw, "image_filter did not modify the file"
+        assert f1.read_bytes() != f2.read_bytes(), (
+            "identical inputs noised identically along one stream"
+        )
+        checks += 2
+
+        # ---- _rewrite_image_urls
+        msgs = [
+            {"role": "user", "content": [
+                {"type": "image", "url": "/live/frame.png"},
+                {"type": "text", "text": "hi"},
+            ]},
+        ]
+        n = _rewrite_image_urls(msgs, {"/live/frame.png": "images/g0.png"})
+        assert n == 1 and msgs[0]["content"][0]["url"] == "images/g0.png"
+        checks += 1
+
+        # ---- tripwire: fires on a leak (incl. multi-line), silent when clean
+        analysis = "The move was poor.\nThe agent ignored the wall at 9."
+        leaky = {
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "context: " + analysis + " more"},
+            ]}],
+            "target_text": "[FORWARD]",
+        }
+        clean = {
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "an innocent player context"},
+            ]}],
+            "target_text": "[FORWARD]",
+        }
+        fired = False
+        try:
+            _assert_no_analyst_leak(leaky, [analysis])
+        except RuntimeError:
+            fired = True
+        assert fired, "tripwire did not fire on an embedded analysis"
+        _assert_no_analyst_leak(clean, [analysis])  # must not raise
+        checks += 2
+
+        # ---- GameTraceSource on a fabricated trace dir
+        trace_dir = tmp_dir / "traces_fab"
+        img = _tiny_png(trace_dir / "images" / "g0.png", seed=7)
+        records = [
+            {
+                "messages": [{"role": "user", "content": [
+                    {"type": "image", "url": "images/g0.png"},
+                    {"type": "text", "text": "move?"},
+                ]}],
+                "target_text": "thinking WRONG bit [FORWARD]",
+                "meta": {"rating": 0.5, "wrong_spans": ["WRONG bit"],
+                         "game_won": True, "moves_from_end": 0},
+            },
+            {   # analyst forgot the rating -> must be dropped
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "move?"},
+                ]}],
+                "target_text": "[LEFT]",
+                "meta": {"rating": None, "wrong_spans": []},
+            },
+        ]
+        with open(trace_dir / "traces.jsonl", "w", encoding="utf-8") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+        src = GameTraceSource(trace_dir / "traces.jsonl", noise_strength=0.0)
+        exs = list(src.examples())
+        assert len(exs) == 1, f"expected 1 example (1 dropped), got {len(exs)}"
+        ex = exs[0]
+        assert ex.loss == "ce" and ex.span_weights, ex
+        assert ex.messages[0]["content"][0]["url"] == str(img), (
+            "image url not resolved against the trace dir"
+        )
+        base_w = ex.span_weights[0][2]
+        assert abs(base_w - 0.7) < 1e-9, f"win boost wrong: {base_w}"
+        checks += 4
+
+    # ---- epoch_batches: bucketing separates loss kinds / image counts,
+    #      batch sizes bounded, nothing lost
+    exs = (
+        [TrainingExample([{"role": "user", "content": [
+            {"type": "text", "text": "q" * 50}]}], "a", loss="ce")] * 5
+        + [TrainingExample([{"role": "user", "content": [
+            {"type": "text", "text": "q" * 50}]}], "a", loss="kd")] * 3
+        + [TrainingExample([{"role": "user", "content": [
+            {"type": "image", "url": "x.png"},
+            {"type": "text", "text": "q" * 50}]}], "a", loss="ce")] * 2
+    )
+    batches = epoch_batches(exs, micro_batch=4, rng=random.Random(0))
+    assert sum(len(b) for b in batches) == len(exs), "examples lost in batching"
+    for b in batches:
+        assert len(b) <= 4
+        assert len({x.loss for x in b}) == 1, "mixed loss kinds in a batch"
+        assert len({x.declares_image() for x in b}) == 1, (
+            "image and text examples share a batch"
+        )
+    checks += 1
+
+    return f"{checks} unit groups passed (ratings, rewards, noise, tripwire, source, batching)"
+
+
+def t2_data() -> str:
+    """Materialized external data vs the manifest -- run AFTER
+    ``python -m training.download_external`` (setup_env.sh does it)."""
+    from training.external_data import load_manifest, sources_from_manifest
+
+    entries = [e for e in load_manifest() if e.enabled]
+    assert entries, "manifest has no enabled entries"
+    parts = []
+    for entry in entries:
+        meta_path = entry.data_dir / "meta.json"
+        assert meta_path.is_file(), (
+            f"{entry.name}: not materialized -- run python -m "
+            "training.download_external"
+        )
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        data_path = entry.data_dir / "data.jsonl"
+        n_lines = sum(
+            1 for line in open(data_path, encoding="utf-8") if line.strip()
+        )
+        assert n_lines == int(meta["examples"]), (
+            f"{entry.name}: data.jsonl has {n_lines} rows but meta.json "
+            f"says {meta['examples']}"
+        )
+        if entry.probe:
+            assert entry.probe_path.is_file(), (
+                f"{entry.name}: probe file missing: {entry.probe_path}"
+            )
+        parts.append(f"{entry.name}={n_lines}")
+    sources = sources_from_manifest()
+    assert all(s.weight > 0 for s in sources)
+    return f"{len(entries)} source(s) verified: " + ", ".join(parts)
+
+
+def t3_model() -> str:
+    """4-bit QLoRA load + one collated forward/backward per loss kind
+    (image example included) + teacher-path sanity. GPU required."""
+    import torch
+
+    from agent.config import CONFIG
+    from agent.model import ADAPTERS, spec_for
+    from training.train import (
+        Collator,
+        JsonlSource,
+        TrainConfig,
+        build_model,
+        resolve_terminator_id,
+        weighted_loss,
+    )
+
+    cfg = TrainConfig(label="selftest_t3")
+    spec = spec_for(cfg.architecture or CONFIG.model_key)
+    model, processor, lora_targets, projector = build_model(
+        spec, cfg, CONFIG.hf_token
+    )
+    try:
+        tokenizer = getattr(processor, "tokenizer", processor)
+        terminator = resolve_terminator_id(model, tokenizer)
+        collator = Collator(processor, ADAPTERS[spec.family], terminator,
+                            compute_dtype=torch.bfloat16, device=cfg.device)
+
+        with tempfile.TemporaryDirectory(prefix="selftest_t3_") as tmp:
+            smoke = _write_smoke_jsonl(Path(tmp))
+            exs = list(JsonlSource(smoke).examples())
+        by_kind = {
+            "ce_text": next(e for e in exs
+                            if e.loss == "ce" and not e.declares_image()
+                            and not e.span_weights),
+            "ce_image": next(e for e in exs if e.declares_image()),
+            "kd": next(e for e in exs if e.loss == "kd"),
+            "neg_span": next(e for e in exs if e.span_weights),
+        }
+        losses = {}
+        model.train()
+        for kind, ex in by_kind.items():
+            built = collator.build(ex)
+            if kind == "ce_image":
+                assert any(
+                    v.dtype.is_floating_point
+                    for v in built["model_inputs"].values()
+                    if isinstance(v, torch.Tensor)
+                ), "image example collated without pixel values"
+            loss = weighted_loss(model, built["model_inputs"],
+                                 built["weights"], loss_kind=ex.loss)
+            loss.backward()
+            model.zero_grad(set_to_none=True)
+            lv = float(loss.detach())
+            assert lv == lv and abs(lv) < 1e4, f"{kind}: bad loss {lv}"
+            losses[kind] = lv
+
+        # Teacher-path sanity: with a FRESH (identity) adapter, student ==
+        # teacher, so the KD soft-CE must equal the teacher's own entropy --
+        # i.e. the smallest value it can take. A mismatch means
+        # disable_adapter() is not returning the base distribution.
+        import torch.nn.functional as F
+
+        from training.train import _base_model_logits
+
+        ex = by_kind["kd"]
+        built = collator.build(ex)
+        kd_loss = float(weighted_loss(model, built["model_inputs"],
+                                      built["weights"], loss_kind="kd").detach())
+        with torch.no_grad():
+            t_logits = _base_model_logits(model, built["model_inputs"])
+            w = built["weights"][:, 1:].reshape(-1)
+            mask = w != 0
+            t = t_logits[:, :-1, :].reshape(-1, t_logits.shape[-1])[mask].float()
+            entropy = float(
+                (-(F.softmax(t, -1) * F.log_softmax(t, -1)).sum(-1) * w[mask]).sum()
+                / w[mask].abs().sum()
+            )
+        assert abs(kd_loss - entropy) < 0.05, (
+            f"fresh-adapter KD loss {kd_loss:.4f} != teacher entropy "
+            f"{entropy:.4f} -- disable_adapter() may not bypass the adapter"
+        )
+        peak = torch.cuda.max_memory_allocated() / 2**30
+        return (
+            f"{len(lora_targets)} LoRA targets, {len(projector)} projector "
+            f"module(s), terminator {terminator}; losses "
+            + ", ".join(f"{k}={v:.3f}" for k, v in losses.items())
+            + f"; KD==teacher-entropy ok; peak {peak:.1f} GiB"
+        )
+    finally:
+        _free_cuda(model)
+
+
+def t4_train() -> str:
+    """Micro-batch parity + CLI smoke train + forced rollback."""
+    import torch
+
+    from agent.config import CONFIG
+    from agent.model import ADAPTERS, spec_for
+    from training.train import (
+        Collator,
+        JsonlSource,
+        TrainConfig,
+        build_model,
+        epoch_batches,
+        resolve_terminator_id,
+        weighted_loss,
+    )
+
+    smoke_dir = REPO_ROOT / "logs" / "selftest_smoke"
+    if smoke_dir.exists():
+        shutil.rmtree(smoke_dir)
+    smoke_dir.mkdir(parents=True)
+    smoke = _write_smoke_jsonl(smoke_dir)
+
+    # ---- (a) batch-4 vs batch-1 loss parity on the mixed smoke set
+    cfg = TrainConfig(label="selftest_t4")
+    spec = spec_for(cfg.architecture or CONFIG.model_key)
+    model, processor, _, _ = build_model(spec, cfg, CONFIG.hf_token)
+    try:
+        tokenizer = getattr(processor, "tokenizer", processor)
+        terminator = resolve_terminator_id(model, tokenizer)
+        collator = Collator(processor, ADAPTERS[spec.family], terminator,
+                            compute_dtype=torch.bfloat16, device=cfg.device)
+        exs = list(JsonlSource(smoke).examples())
+        model.eval()  # dropout off -- parity must be exact-deterministic
+        solo: dict[int, float] = {}
+        with torch.no_grad():
+            for i, ex in enumerate(exs):
+                built = collator.build(ex)
+                solo[id(ex)] = float(weighted_loss(
+                    model, built["model_inputs"], built["weights"],
+                    loss_kind=ex.loss,
+                ))
+            import random as _random
+            worst = 0.0
+            for batch in epoch_batches(exs, 4, _random.Random(0)):
+                built = collator.build_batch(batch)
+                _, per_ex = weighted_loss(
+                    model, built["model_inputs"], built["weights"],
+                    loss_kind=batch[0].loss, return_per_example=True,
+                )
+                for ex, lv in zip(batch, per_ex.tolist()):
+                    ref = solo[id(ex)]
+                    rel = abs(lv - ref) / max(abs(ref), 1e-6)
+                    worst = max(worst, rel)
+        # bf16 kernels differ between padded/unpadded shapes; a few percent
+        # is numerical, order-of-magnitude gaps are a padding/masking bug.
+        assert worst < 0.05, (
+            f"batch-4 per-example loss deviates {worst:.1%} from batch-1"
+        )
+    finally:
+        _free_cuda(model)
+
+    # ---- (b) CLI smoke train: mixed sources, checkpoint + eval row land
+    r = _run_cli([
+        "training.train", "--data", str(smoke),
+        "--label", "selftest_t4", "--epochs", "2",
+        "--micro-batch", "2", "--grad-accum", "2",
+        "--save-steps", "2", "--max-steps", "4",
+        "--holdout-fraction", "0.2",
+    ], timeout=5400)
+    assert r.returncode == 0, (
+        f"smoke train failed (rc {r.returncode}): ...{r.stderr[-800:]}"
+    )
+    ckpt = _newest(f"weights/{spec.key}/selftest_t4_step*")
+    assert (ckpt / "adapter_model.safetensors").is_file(), f"no adapter in {ckpt}"
+    run_dir = _newest("logs/train_selftest_t4_*")
+    eval_rows = [
+        json.loads(line)
+        for line in (run_dir / "eval_log.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    assert eval_rows and any("heldout_loss" in row for row in eval_rows), (
+        "no heldout_loss eval row in eval_log.jsonl"
+    )
+
+    # ---- (c) forced rollback: a destructive LR regresses the holdout fast
+    r2 = _run_cli([
+        "training.train", "--data", str(smoke),
+        "--label", "selftest_t4rb", "--epochs", "8",
+        "--lr", "0.05", "--micro-batch", "2", "--grad-accum", "1",
+        "--save-steps", "2", "--max-steps", "10",
+        "--holdout-fraction", "0.2", "--regression-tolerance", "0",
+        "--on-regression", "rollback", "--max-rollbacks", "0",
+    ], timeout=5400)
+    assert r2.returncode == 0, (
+        f"rollback run crashed (rc {r2.returncode}): ...{r2.stderr[-800:]}"
+    )
+    rb_dir = _newest("logs/train_selftest_t4rb_*")
+    events = [
+        json.loads(line)
+        for line in (rb_dir / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    rolled = [e for e in events if e["kind"] == "rolled_back"]
+    assert rolled, (
+        "no rolled_back event despite lr=0.05 + tolerance 0 -- rollback "
+        "path untested (rerun; if it persists, inspect events.jsonl: "
+        f"{rb_dir})"
+    )
+    return (
+        f"parity worst dev {worst:.2%}; smoke ckpt {ckpt.name} + "
+        f"{len(eval_rows)} eval row(s); rollback fired {len(rolled)}x"
+    )
+
+
+def t5_datagen() -> str:
+    """Tiny parallel datagen run. GPU + NAMS required."""
+    label = "selftest_t5"
+    out_dir = REPO_ROOT / "data_game" / label
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    r = _run_cli([
+        "training.generate_game_traces", "--label", label,
+        "--games", "2", "--max-moves", "5", "--parallel", "2",
+        "--seed", "7",
+    ], timeout=7200)
+    assert r.returncode == 0, (
+        f"datagen failed (rc {r.returncode}) -- tripwire or crash: "
+        f"...{r.stderr[-800:]}"
+    )
+    traces = out_dir / "traces.jsonl"
+    records = [
+        json.loads(line)
+        for line in traces.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert records, "no trace records written"
+    for rec in records:
+        assert rec["messages"] and rec["target_text"] is not None
+        urls = [
+            part["url"]
+            for m in rec["messages"]
+            for part in (m.get("content") or [])
+            if isinstance(part, dict) and part.get("type") == "image"
+        ]
+        assert urls, "record without an image part"
+        for u in urls:
+            assert (out_dir / u).is_file(), f"referenced frame missing: {u}"
+    stats = json.loads((out_dir / "generation_stats.json").read_text())
+    assert stats["games"] == 2, stats
+    assert stats["generations"] == len(records), (
+        f'{stats["generations"]} generations vs {len(records)} records'
+    )
+    n_images = len(list((out_dir / "images").glob("*.png")))
+    assert n_images == len(records), (
+        f"{n_images} stored frames vs {len(records)} records"
+    )
+    rated = sum(1 for rec in records if rec["meta"].get("rating") is not None)
+    plots = _newest(f"logs/datagen_stats_{label}_*")
+    assert (plots / "summary.png").is_file(), f"no summary.png under {plots}"
+    return (
+        f"{len(records)} records / {stats['games']} games, {rated} rated, "
+        f"{n_images} frames, plots at {plots.name}"
+    )
+
+
+def t6_ab() -> str:
+    """Batched vs solo generation, greedy: identical prompts must produce
+    identical replies (multimodal left-padding is where bugs hide)."""
+    from agent.model import get_model
+
+    model = get_model()
+    with tempfile.TemporaryDirectory(prefix="selftest_t6_") as tmp:
+        img = _tiny_png(Path(tmp) / "board.png", seed=9)
+        prompts = [
+            [{"role": "user", "content": [
+                {"type": "image", "url": str(img)},
+                {"type": "text", "text": q},
+            ]}]
+            for q in (
+                "In one short sentence, what colors do you see?",
+                "Answer briefly: is the grid mostly empty? Explain in one "
+                "sentence why you think so.",
+                "Reply with a single word: light or dark background?",
+            )
+        ]
+        # Force greedy for the comparison (instance attr shadows the method).
+        original = model._sampling_kwargs
+        model._sampling_kwargs = lambda: {"do_sample": False}
+        try:
+            solo = [model.generate(p, max_new_tokens=48) for p in prompts]
+            batched = model.generate_batch(
+                [{"messages": p} for p in prompts], max_new_tokens=48,
+            )
+        finally:
+            model._sampling_kwargs = original
+    mismatches = [
+        (i, s, b) for i, (s, b) in enumerate(zip(solo, batched)) if s != b
+    ]
+    assert not mismatches, (
+        "greedy batched != solo on rows "
+        + "; ".join(f"[{i}] solo={s!r} batched={b!r}" for i, s, b in mismatches)
+    )
+    return (
+        f"3/3 greedy replies identical batched vs solo; "
+        f"e.g. row0={solo[0][:60]!r}"
+    )
+
+
+def t7_e2e() -> str:
+    """t5's traces through real train steps via GameTraceSource."""
+    from training.game_traces import GameTraceSource
+    from training.train import TrainConfig, run_training
+
+    traces = REPO_ROOT / "data_game" / "selftest_t5" / "traces.jsonl"
+    assert traces.is_file(), "run t5 first (its output is this stage's input)"
+    src = GameTraceSource(traces, noise_seed=1)
+    cfg = TrainConfig(
+        label="selftest_t7", epochs=1, max_steps=3, save_steps=999,
+        micro_batch=2, grad_accum=1, holdout_fraction=0.0,
+        log_steps=1,
+    )
+    rc = run_training([src], cfg)
+    assert rc == 0, f"run_training returned {rc}"
+    run_dir = _newest("logs/train_selftest_t7_*")
+    rows = [
+        json.loads(line)
+        for line in (run_dir / "train_log.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    losses = [row["loss"] for row in rows if "loss" in row]
+    assert losses and all(l == l for l in losses), (
+        f"no finite losses logged in {run_dir}"
+    )
+    return (
+        f"{len(losses)} step(s) on {src.name}, losses "
+        + ", ".join(f"{l:.3f}" for l in losses[:4])
+    )
+
+
+# ================================================================== runner
+
+STAGES: list[tuple[str, str, "callable"]] = [
+    ("t0-env", "imports, versions, CUDA", t0_env),
+    ("t1-pure", "pure-python units", t1_pure),
+    ("t2-data", "materialized data vs manifest", t2_data),
+    ("t3-model", "4-bit load + forward/backward", t3_model),
+    ("t4-train", "batch parity + smoke train + rollback", t4_train),
+    ("t5-datagen", "parallel datagen smoke", t5_datagen),
+    ("t6-ab", "batched vs solo generation", t6_ab),
+    ("t7-e2e", "traces -> train steps", t7_e2e),
+]
+
+
+def _resolve(arg: str) -> list[tuple[str, str, "callable"]]:
+    if arg == "all":
+        return STAGES
+    picked = [s for s in STAGES if s[0] == arg or s[0].split("-")[0] == arg]
+    if not picked:
+        raise SystemExit(
+            f"unknown stage {arg!r}; stages: "
+            + ", ".join(s[0] for s in STAGES) + ", all"
+        )
+    return picked
+
+
+def main(argv: list[str] | None = None) -> int:
+    import logging
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    args = argv if argv is not None else sys.argv[1:]
+    if len(args) != 1:
+        print(__doc__)
+        return 2
+    os.chdir(REPO_ROOT)  # relative paths (logs/, weights/, data_*) anchor here
+    failures = 0
+    for stage_id, _desc, fn in _resolve(args[0]):
+        try:
+            evidence = fn()
+            print(f"TEST {stage_id} PASS: {evidence}", flush=True)
+        except BaseException as exc:
+            failures += 1
+            traceback.print_exc()
+            first_line = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+            print(f"TEST {stage_id} FAIL: {first_line}", flush=True)
+    return failures
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

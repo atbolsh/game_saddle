@@ -105,9 +105,17 @@ the language-model LoRA (via PEFT `modules_to_save`, so it rides inside the
 adapter checkpoint). That is the standard low-risk lever for improving visual
 grounding without destabilizing the encoder.
 
-Micro-batch size is fixed at 1 (variable-size multimodal batches are a
-padding/collation swamp for zero benefit at this scale); the effective batch
-comes from gradient accumulation.
+Micro-batching (Intermission): the default is `micro_batch=4` with
+`grad_accum=4`, so the **effective batch stays 16** (`micro_batch x
+grad_accum`); both remain independent knobs. Batches are formed inside
+buckets keyed by `(loss kind, image count, length bin)` — loss kind because
+KD needs the extra teacher forward, image count because pixel tensors must
+stack, length bin to bound padding waste — then the batch list is shuffled
+so sources still interleave. The collator right-pads (training never
+generates), padded positions carry weight 0, and `weighted_loss` normalizes
+each example by its OWN absolute-weight sum before averaging the batch, so
+a micro-batch of 4 is exactly 4 batch-1 passes averaged (selftest t4
+asserts the parity). `--micro-batch 1` restores the old behavior.
 
 ## The recipe, with justifications
 
@@ -125,7 +133,7 @@ activations at our sequence lengths):
 | Schedule | cosine decay to ~10% of peak, ~3% warmup | Boring and robust; `--scheduler constant` kept as the ablation alternative |
 | Weight decay | 0.0 on LoRA params | QLoRA convention — decay fights the low-rank update; exposed as a flag for ablation |
 | Grad clip | max-norm 1.0 | Standard stabilization, matters with negative-weight tokens |
-| Effective batch | ~16 (micro-batch 1 x grad-accum 16) | Small-data SFT regime; smaller effective batches track the fresh on-policy data better |
+| Effective batch | ~16 (micro-batch 4 x grad-accum 4) | Small-data SFT regime; smaller effective batches track the fresh on-policy data better; micro-batch 4 buys the GPU-utilization win without changing the math (bucketed padding, per-example normalization) |
 | Epochs per iteration | 1–2 | Self-generated data is only on-policy the first pass; re-epoching amplifies the model's own quirks; instruction-tuning literature sees memorization at 3+ |
 | NEFTune noise | alpha ~5, on by default | Jain et al. 2023: uniform embedding noise consistently improves small-data SFT; doubles as a mild regularizer against overfitting one visual domain |
 | Seed | fixed, logged | Reproducibility; every run logs config + seed + git rev |
@@ -179,10 +187,22 @@ it runs each registered probe (stage 1 ships one placeholder — held-out loss
 on a reserved slice of the training data) and compares guarded metrics
 against the best value seen. On regression past the threshold it logs at
 ERROR and, per `--on-regression {warn,rollback,abort}` (default `rollback`),
-restores the best adapter and continues, or aborts the run. The real probe
-suite — per-capability benchmarks, planted-error analyst miss rate — is
-specified in [TRAINING_EXTRA_DATASETS.md](TRAINING_EXTRA_DATASETS.md) and
-lands in stage 3.
+restores the best adapter and continues, or aborts the run. Rollbacks are
+capped by `--max-rollbacks` (default 3): rollback restores weights but not
+the schedule position, so a persistently regressing run would otherwise
+oscillate silently — past the cap the run aborts naming the best
+checkpoint. The real probe suite — per-capability benchmarks, planted-error
+analyst miss rate — is specified in
+[TRAINING_EXTRA_DATASETS.md](TRAINING_EXTRA_DATASETS.md) and lands in
+stage 3.
+
+Eval cost is capped (Intermission): the held-out slice takes
+`--holdout-fraction` of each source but at most `--holdout-cap` examples
+per source (default 100 — the fraction alone would make every eval a
+~6k-forward, hour-long affair on the full manifest), the held-out pass runs
+micro-batched, and the exact-match probes generate at most 192 tokens per
+item (answers are short; ramblers that hit the cap score wrong, which is
+itself signal).
 
 ## Logging
 

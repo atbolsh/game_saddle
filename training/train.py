@@ -268,7 +268,10 @@ class TrainConfig:
     warmup_ratio: float = 0.03
     lr_floor: float = 0.10          #: cosine decays to this fraction of peak
     weight_decay: float = 0.0
-    grad_accum: int = 16
+    #: examples per forward pass (length-bucketed padding; see epoch_batches).
+    #: Effective batch = micro_batch * grad_accum = 16 at the defaults.
+    micro_batch: int = 4
+    grad_accum: int = 4
 
     # LoRA / regularization
     lora_r: int = 32
@@ -283,12 +286,27 @@ class TrainConfig:
     seed: int = 17
     device: str = "cuda:0"
 
+    # data hygiene
+    #: drop (LOUDLY, per-source counts) any example whose total text exceeds
+    #: this many chars (~4 chars/token, so 16k chars ~ 4k tokens): bounds the
+    #: per-sequence activation/logit memory without silent truncation.
+    max_example_chars: int = 16000
+
     # cadence + safety
     log_steps: int = 10
     save_steps: int = 200
     holdout_fraction: float = 0.05
+    #: held-out examples PER SOURCE are capped here -- the fraction is taken
+    #: of the MATERIALIZED pool (~120k examples for the default manifest),
+    #: which would otherwise make every eval a ~6k-forward, hour-long affair.
+    holdout_cap: int = 100
     on_regression: str = "rollback"  #: "warn" | "rollback" | "abort"
     regression_tolerance: float = 0.10  #: relative slack before regression
+    #: rollbacks allowed per run before aborting: rollback restores the best
+    #: adapter but keeps training on the same schedule, so a persistently
+    #: regressing run would otherwise oscillate (roll back, re-regress, ...)
+    #: and burn the GPU weekend silently.
+    max_rollbacks: int = 3
 
 
 # ================================================================= logging
@@ -455,6 +473,68 @@ class Collator:
             1, n_total, dtype=torch.long, device=self.device
         )
         return {"model_inputs": batch, "weights": weights.to(self.device)}
+
+    def build_batch(self, exs: list[TrainingExample]) -> dict[str, Any]:
+        """Micro-batch of examples -> one padded model input.
+
+        RIGHT padding (training never generates, so right pad + zeroed
+        attention mask is correct); padded positions carry weight 0, so they
+        vanish from weighted_loss's numerator and denominator. Callers batch
+        via :func:`epoch_batches`, whose buckets guarantee what this method
+        asserts: same loss kind and same image count (pixel tensors must
+        stack; a text row cannot share a batch with an image row)."""
+        import torch
+
+        builds = [self.build(ex) for ex in exs]
+        if len(builds) == 1:
+            return builds[0]
+
+        key_sets = {tuple(sorted(b["model_inputs"])) for b in builds}
+        if len(key_sets) > 1:
+            raise ValueError(
+                "build_batch: examples produced different model-input keys "
+                f"({sorted(key_sets)}) -- the bucketing (epoch_batches) must "
+                "keep image and text examples apart"
+            )
+        max_len = max(b["model_inputs"]["input_ids"].shape[1] for b in builds)
+        pad_id = getattr(self.tokenizer, "pad_token_id", None) or 0
+
+        def pad_to(t: Any, fill: Any) -> Any:  # [1, L] -> [1, max_len]
+            if t.shape[1] == max_len:
+                return t
+            pad = torch.full((1, max_len - t.shape[1]), fill,
+                             dtype=t.dtype, device=t.device)
+            return torch.cat([t, pad], dim=1)
+
+        batch: dict[str, Any] = {
+            "input_ids": torch.cat(
+                [pad_to(b["model_inputs"]["input_ids"], pad_id)
+                 for b in builds]
+            ),
+            "attention_mask": torch.cat(
+                [pad_to(b["model_inputs"]["attention_mask"], 0)
+                 for b in builds]
+            ),
+        }
+        for key in builds[0]["model_inputs"]:
+            if key in batch:
+                continue
+            vals = [b["model_inputs"][key] for b in builds]
+            if (not vals[0].dtype.is_floating_point and vals[0].dim() == 2):
+                # id-shaped per-token tensor: pad like input_ids, fill 0.
+                batch[key] = torch.cat([pad_to(v, 0) for v in vals])
+            elif vals[0].dtype.is_floating_point:
+                # pixel tensors: stack images in example order (the model
+                # consumes them in image-token order, which is row-major
+                # over the batch).
+                batch[key] = torch.cat(vals, dim=0)
+            else:
+                raise ValueError(
+                    f"build_batch: don't know how to batch key {key!r} "
+                    f"(shape {tuple(vals[0].shape)}, dtype {vals[0].dtype})"
+                )
+        weights = torch.cat([pad_to(b["weights"], 0.0) for b in builds])
+        return {"model_inputs": batch, "weights": weights}
 
 
 def resolve_terminator_id(model: Any, tokenizer: Any) -> int:
@@ -638,17 +718,27 @@ def _base_model_logits(model: Any, model_inputs: dict) -> Any:
 
 
 def weighted_loss(model: Any, model_inputs: dict, weights: Any,
-                  loss_kind: str = "ce"):
-    """Per-token weighted loss, normalized by the sum of ABSOLUTE weights
-    (so plain-SFT and annotated/negative-weight examples arrive at
-    comparable gradient scale, and long examples don't dominate).
+                  loss_kind: str = "ce", return_per_example: bool = False):
+    """Per-token weighted loss: each example is normalized by ITS OWN sum of
+    ABSOLUTE weights (so plain-SFT and annotated/negative-weight examples
+    arrive at comparable gradient scale, and long examples don't dominate),
+    then the batch is the mean over examples -- a micro-batch of B is
+    EXACTLY equivalent to B batch-1 passes averaged, padding positions
+    carry weight 0 and vanish entirely.
 
     ``loss_kind="ce"``: token cross-entropy against the example's targets.
     ``loss_kind="kd"``: soft cross-entropy against the frozen BASE model's
     distribution on the same inputs (self-distillation replay -- preserve,
-    don't teach). Teacher and student softmaxes are computed over the
-    weighted target positions only: at a 262k vocab, a full-sequence float
-    softmax pair would cost GBs of activation memory for nothing."""
+    don't teach).
+
+    BOTH paths slice the weighted target positions out of the logits BEFORE
+    any float32 cast: at a 262k vocab a full-sequence fp32 logit copy costs
+    ~1 GB per 1k tokens, all of it spent on prompt positions whose weight is
+    zero.
+
+    With ``return_per_example=True`` returns ``(loss, per_example)`` where
+    ``per_example`` is the detached [B] tensor of per-example normalized
+    losses (exact per-source logging from mixed-source batches)."""
     import torch
     import torch.nn.functional as F
 
@@ -656,30 +746,39 @@ def weighted_loss(model: Any, model_inputs: dict, weights: Any,
         raise ValueError(f"weighted_loss: bad loss_kind {loss_kind!r}")
 
     out = model(**model_inputs)
-    logits = out.logits  # [1, L, V]
+    logits = out.logits  # [B, L, V]
     shift_logits = logits[:, :-1, :]
     shift_labels = model_inputs["input_ids"][:, 1:]
+    n_rows, n_pos = shift_labels.shape
     w = weights[:, 1:].reshape(-1)
-    denom = w.abs().sum().clamp(min=1e-8)
+
+    # Slice the weighted positions BEFORE any float32 cast.
+    mask = w != 0
+    row_of = mask.nonzero(as_tuple=True)[0] // n_pos  # owning example per pos
+    student = shift_logits.reshape(-1, shift_logits.shape[-1])[mask].float()
 
     if loss_kind == "ce":
-        token_ce = F.cross_entropy(
-            shift_logits.reshape(-1, shift_logits.shape[-1]).float(),
-            shift_labels.reshape(-1),
-            reduction="none",
+        token_loss = F.cross_entropy(
+            student, shift_labels.reshape(-1)[mask], reduction="none",
         )
-        return (token_ce * w).sum() / denom
+    else:
+        teacher_logits = _base_model_logits(model, model_inputs)
+        teacher = teacher_logits[:, :-1, :].reshape(
+            -1, teacher_logits.shape[-1]
+        )[mask].float()
+        token_loss = -(F.softmax(teacher, dim=-1)
+                       * F.log_softmax(student, dim=-1)).sum(dim=-1)
 
-    # kd: slice the target positions BEFORE any float32 softmax
-    mask = w != 0
-    student = shift_logits.reshape(-1, shift_logits.shape[-1])[mask].float()
-    teacher_logits = _base_model_logits(model, model_inputs)
-    teacher = teacher_logits[:, :-1, :].reshape(
-        -1, teacher_logits.shape[-1]
-    )[mask].float()
-    token_kd = -(F.softmax(teacher, dim=-1)
-                 * F.log_softmax(student, dim=-1)).sum(dim=-1)
-    return (token_kd * w[mask]).sum() / denom
+    zeros = torch.zeros(n_rows, dtype=token_loss.dtype,
+                        device=token_loss.device)
+    # out-of-place index_add keeps the autograd path to token_loss clean
+    numer = zeros.index_add(0, row_of, token_loss * w[mask])
+    denom = zeros.index_add(0, row_of, w[mask].abs())
+    per_example = numer / denom.clamp(min=1e-8)
+    loss = per_example.mean()
+    if return_per_example:
+        return loss, per_example.detach()
+    return loss
 
 
 # ============================================================== eval hooks
@@ -729,8 +828,10 @@ class HeldOutLossHook:
 
     name = "heldout_loss"
 
-    def __init__(self, examples: list[TrainingExample]):
+    def __init__(self, examples: list[TrainingExample],
+                 micro_batch: int = 1):
         self.examples = examples
+        self.micro_batch = max(1, micro_batch)
 
     def __call__(self, ctx: TrainContext) -> dict[str, float]:
         import torch
@@ -742,15 +843,21 @@ class HeldOutLossHook:
         model.eval()
         per_src_sum: dict[str, float] = {}
         per_src_n: dict[str, int] = {}
+        # Same bucketed batching as training (weighted_loss normalizes each
+        # row by its own |w| sum, so batching changes NO per-example value);
+        # the fixed rng only orders the batches, which we don't care about.
+        batches = epoch_batches(self.examples, self.micro_batch,
+                                random.Random(0))
         with torch.no_grad():
-            for ex in self.examples:
-                built = ctx.collator.build(ex)
-                lv = float(weighted_loss(
+            for exs in batches:
+                built = ctx.collator.build_batch(exs)
+                _, per_example = weighted_loss(
                     model, built["model_inputs"], built["weights"],
-                    loss_kind=ex.loss,
-                ))
-                per_src_sum[ex.source] = per_src_sum.get(ex.source, 0.0) + lv
-                per_src_n[ex.source] = per_src_n.get(ex.source, 0) + 1
+                    loss_kind=exs[0].loss, return_per_example=True,
+                )
+                for ex, lv in zip(exs, per_example.tolist()):
+                    per_src_sum[ex.source] = per_src_sum.get(ex.source, 0.0) + lv
+                    per_src_n[ex.source] = per_src_n.get(ex.source, 0) + 1
         if was_training:
             model.train()
         metrics = {
@@ -800,10 +907,41 @@ def load_adapter_state(model: Any, ckpt_dir: Path) -> None:
 
 # ============================================================== the trainer
 
-def materialize(sources: list[DataSource]) -> dict[str, list[TrainingExample]]:
+def _example_chars(ex: TrainingExample) -> int:
+    """Total text size of an example (all message text parts + target):
+    the cheap stand-in for token count (~4 chars/token) used by the
+    overlong-example guard."""
+    n = len(ex.target_text)
+    for m in ex.messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    n += len(part.get("text") or "")
+    return n
+
+
+def materialize(sources: list[DataSource],
+                max_example_chars: int = 0,
+                ) -> dict[str, list[TrainingExample]]:
+    """Load every source into memory. With ``max_example_chars > 0``,
+    oversized examples (mostly long OpenThoughts KD rows) are dropped with a
+    per-source WARNING count -- bounding per-sequence activation/logit
+    memory without ever silently truncating anyone's text."""
     by_source: dict[str, list[TrainingExample]] = {}
     for src in sources:
         exs = list(src.examples())
+        if max_example_chars > 0:
+            kept = [ex for ex in exs
+                    if _example_chars(ex) <= max_example_chars]
+            if len(kept) < len(exs):
+                logger.warning(
+                    "source %s: DROPPED %d/%d example(s) over "
+                    "max_example_chars=%d",
+                    src.name, len(exs) - len(kept), len(exs),
+                    max_example_chars,
+                )
+            exs = kept
         if not exs:
             raise ValueError(f"data source {src.name!r} yielded no examples")
         by_source[src.name] = exs
@@ -828,6 +966,50 @@ def epoch_order(by_source: dict[str, list[TrainingExample]],
             order.extend(rng.choices(exs, k=n))
     rng.shuffle(order)
     return order
+
+
+def _batch_bucket_key(ex: TrainingExample) -> tuple:
+    """Examples may share a micro-batch iff these match: loss kind (KD needs
+    the extra teacher forward), image count (pixel tensors must stack), and
+    a coarse length bin (padding waste stays bounded; chars ~ 4x tokens is
+    plenty accurate for binning)."""
+    n_images = sum(
+        1
+        for m in ex.messages
+        for part in (m.get("content") or [])
+        if isinstance(part, dict) and part.get("type") == "image"
+    )
+    chars = _example_chars(ex)
+    length_bin, edge = 0, 512
+    while chars > edge:
+        edge = int(edge * 1.5)
+        length_bin += 1
+    return (ex.loss, n_images, length_bin)
+
+
+def epoch_batches(order: list[TrainingExample], micro_batch: int,
+                  rng: random.Random) -> list[list[TrainingExample]]:
+    """Group an epoch's example order into micro-batches: fill buckets
+    (:func:`_batch_bucket_key`) in order, emit a batch whenever one fills,
+    flush remainders as short batches, then shuffle the batch list so
+    sources and buckets interleave. Bucket remainders make the batch count
+    slightly larger than ``ceil(len(order) / micro_batch)`` -- the scheduler
+    estimate tolerates that (a few trailing steps at the LR floor)."""
+    if micro_batch <= 1:
+        return [[ex] for ex in order]
+    buckets: dict[tuple, list[TrainingExample]] = {}
+    batches: list[list[TrainingExample]] = []
+    for ex in order:
+        bucket = buckets.setdefault(_batch_bucket_key(ex), [])
+        bucket.append(ex)
+        if len(bucket) >= micro_batch:
+            batches.append(bucket.copy())
+            bucket.clear()
+    for bucket in buckets.values():
+        if bucket:
+            batches.append(bucket.copy())
+    rng.shuffle(batches)
+    return batches
 
 
 def run_training(
@@ -855,16 +1037,20 @@ def run_training(
     logger.info("run dir: %s", tlog.run_dir)
 
     # ------------------------------------------------------------- data
-    by_source = materialize(sources)
+    by_source = materialize(sources, max_example_chars=cfg.max_example_chars)
     src_weights = {s.name: s.weight for s in sources}
 
     # Held-out slice: a fixed fraction, drawn proportionally from every
-    # source, removed from training entirely.
+    # source, removed from training entirely -- capped per source, because
+    # the fraction is of the materialized pool and every held-out example is
+    # a full forward pass at each save.
     holdout: list[TrainingExample] = []
     if cfg.holdout_fraction > 0:
         for name, exs in by_source.items():
             rng.shuffle(exs)
             n_hold = max(1, int(len(exs) * cfg.holdout_fraction))
+            if cfg.holdout_cap > 0:
+                n_hold = min(n_hold, cfg.holdout_cap)
             holdout.extend(exs[:n_hold])
             by_source[name] = exs[n_hold:]
     n_train = sum(len(v) for v in by_source.values())
@@ -896,9 +1082,14 @@ def run_training(
     optimizer = bnb.optim.PagedAdamW8bit(
         params, lr=cfg.lr, weight_decay=cfg.weight_decay
     )
+    # Estimate: bucket remainders in epoch_batches add a few extra batches
+    # per epoch beyond ceil(n / micro_batch) (at most one per bucket), so
+    # the cosine schedule may end a handful of steps early -- those trailing
+    # steps just run at the LR floor.
+    contributions = sum(max(1, round(src_weights.get(n, 1.0) * len(v)))
+                        for n, v in by_source.items())
     steps_per_epoch = math.ceil(
-        sum(max(1, round(src_weights.get(n, 1.0) * len(v)))
-            for n, v in by_source.items()) / cfg.grad_accum
+        math.ceil(contributions / max(1, cfg.micro_batch)) / cfg.grad_accum
     )
     total_steps = cfg.max_steps or (cfg.epochs * steps_per_epoch)
     if cfg.scheduler == "cosine":
@@ -921,7 +1112,8 @@ def run_training(
     )
     eval_hooks: list[Callable[[TrainContext], dict[str, float]]] = []
     if holdout:
-        eval_hooks.append(HeldOutLossHook(holdout))
+        eval_hooks.append(HeldOutLossHook(holdout,
+                                          micro_batch=cfg.micro_batch))
     eval_hooks.extend(extra_hooks or [])
     # Overall held-out loss + one guard PER SOURCE (for KD sources the
     # per-source held-out KD loss is the drift-from-base measure), then any
@@ -957,10 +1149,12 @@ def run_training(
         "projector_modules": projector,
     })
 
+    n_rollbacks = 0
+
     def run_hooks_and_guard(step: int, epoch: int) -> None:
         """After each save: run every probe, log one flat eval row, track
         bests, react to regressions per cfg.on_regression."""
-        nonlocal best_ckpt
+        nonlocal best_ckpt, n_rollbacks
         all_metrics: dict[str, float] = {}
         for hook in eval_hooks:
             all_metrics.update(hook(ctx))
@@ -998,8 +1192,25 @@ def run_training(
                             "exists yet; continuing WITHOUT rollback"
                         )
                     else:
+                        n_rollbacks += 1
+                        # Rollback restores the weights but not the data or
+                        # LR position, so a persistently regressing run
+                        # oscillates (roll back, re-regress, ...) forever;
+                        # cap it and hand back the best checkpoint instead.
+                        if (cfg.max_rollbacks > 0
+                                and n_rollbacks > cfg.max_rollbacks):
+                            tlog.event("rollback_limit",
+                                       n_rollbacks=n_rollbacks,
+                                       best_checkpoint=str(best_ckpt))
+                            raise SystemExit(
+                                f"aborted: {n_rollbacks} rollbacks exceed "
+                                f"max_rollbacks={cfg.max_rollbacks} -- the "
+                                "run is oscillating, not converging. Best "
+                                f"checkpoint: {best_ckpt}"
+                            )
                         load_adapter_state(model, best_ckpt)
-                        tlog.event("rolled_back", to=str(best_ckpt))
+                        tlog.event("rolled_back", to=str(best_ckpt),
+                                   n_rollbacks=n_rollbacks)
 
     # ------------------------------------------------------------- loop
     model.train()
@@ -1013,17 +1224,24 @@ def run_training(
         if done:
             break
         order = epoch_order(by_source, src_weights, rng)
+        batches = epoch_batches(order, cfg.micro_batch, rng)
         optimizer.zero_grad(set_to_none=True)
-        for i, ex in enumerate(order):
-            built = collator.build(ex)
-            loss = weighted_loss(model, built["model_inputs"],
-                                 built["weights"], loss_kind=ex.loss)
+        for i, exs in enumerate(batches):
+            built = collator.build_batch(exs)
+            # weighted_loss means over the batch's per-example normalized
+            # losses, so each example's gradient contribution is
+            # 1/(micro_batch * grad_accum) -- identical to batch-1 training
+            # at the same effective batch.
+            loss, per_example = weighted_loss(
+                model, built["model_inputs"], built["weights"],
+                loss_kind=exs[0].loss, return_per_example=True,
+            )
             (loss / cfg.grad_accum).backward()
-            lv = float(loss.detach())
-            src_loss_sum[ex.source] = src_loss_sum.get(ex.source, 0.0) + lv
-            src_loss_n[ex.source] = src_loss_n.get(ex.source, 0) + 1
+            for ex, lv in zip(exs, per_example.tolist()):
+                src_loss_sum[ex.source] = src_loss_sum.get(ex.source, 0.0) + lv
+                src_loss_n[ex.source] = src_loss_n.get(ex.source, 0) + 1
 
-            if (i + 1) % cfg.grad_accum == 0 or i == len(order) - 1:
+            if (i + 1) % cfg.grad_accum == 0 or i == len(batches) - 1:
                 grad_norm = float(torch.nn.utils.clip_grad_norm_(params, 1.0))
                 optimizer.step()
                 scheduler.step()
@@ -1117,6 +1335,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lr-floor", type=float, default=d.lr_floor,
                    help="cosine decays to this fraction of peak LR")
     p.add_argument("--weight-decay", type=float, default=d.weight_decay)
+    p.add_argument("--micro-batch", type=int, default=d.micro_batch,
+                   help="examples per forward pass (length-bucketed); "
+                        "effective batch = micro_batch * grad_accum")
     p.add_argument("--grad-accum", type=int, default=d.grad_accum)
     p.add_argument("--lora-r", type=int, default=d.lora_r)
     p.add_argument("--lora-alpha", type=int, default=d.lora_alpha)
@@ -1129,17 +1350,25 @@ def build_parser() -> argparse.ArgumentParser:
                         "model.named_modules() on the remote box.")
     p.add_argument("--seed", type=int, default=d.seed)
     p.add_argument("--device", default=d.device)
+    # data hygiene
+    p.add_argument("--max-example-chars", type=int, default=d.max_example_chars,
+                   help="drop (loudly) examples whose total text exceeds "
+                        "this many chars; 0 disables")
     # cadence + safety
     p.add_argument("--log-steps", type=int, default=d.log_steps)
     p.add_argument("--save-steps", type=int, default=d.save_steps)
     p.add_argument("--holdout-fraction", type=float,
                    default=d.holdout_fraction)
+    p.add_argument("--holdout-cap", type=int, default=d.holdout_cap,
+                   help="max held-out examples per source; 0 = uncapped")
     p.add_argument("--on-regression", choices=("warn", "rollback", "abort"),
                    default=d.on_regression)
     p.add_argument("--regression-tolerance", type=float,
                    default=d.regression_tolerance,
                    help="relative tolerance before a guarded metric counts "
                         "as regressed")
+    p.add_argument("--max-rollbacks", type=int, default=d.max_rollbacks,
+                   help="abort after this many rollbacks in one run")
     return p
 
 

@@ -45,8 +45,10 @@ drives the EXACT self-eval machinery of the interactive notebook
 (`InteractiveSelfEvalSession`, default player and analyst questions, same
 prompts, same memory screening) headlessly: per round it asks the player,
 asks the analyst once, then ends the round so the move propagates. **A game
-is formally: the gold eaten, or 200 player rounds** (`--max-moves`),
-whichever comes first.
+is formally: the gold eaten, or `--max-moves` player rounds** (default 50),
+whichever comes first -- each round costs two generations, and early
+wandering traces carry little signal per round, so short games are the
+cheap default; raise the cap as the player gets good enough to need it.
 
 One record per player generation lands in `data_game/<label>/traces.jsonl`:
 
@@ -63,10 +65,23 @@ One record per player generation lands in `data_game/<label>/traces.jsonl`:
 
 Housekeeping baked into the generator:
 
+- **Parallel sessions** (`--parallel`, default 3): N sessions play N games
+  concurrently, one worker thread each, sharing the ONE loaded model
+  through `agent/parallel_gen.py` — concurrent generations merge into
+  batched decode calls (batch-1 decode is memory-bandwidth-bound, so a
+  batch of 3 costs barely more than a batch of 1; expected ~2–2.5x on the
+  datagen wall-clock). Requests batch only with identical stop signatures,
+  so player-phase and analyst-phase generations never truncate each other.
+  A concurrent session's analyst text is exactly as visible to another
+  player as a PAST session's (the intended cross-game learning channel);
+  current-session screening is untouched. `--parallel 1` restores the
+  sequential loop.
 - **NAMS reset every ~100 games** (`--reset-every`): episodic memory is
   wiped back to the seeded semantic model; tips are `Preference` nodes and
   survive. Prevents unbounded memory growth and keeps retrieved context
-  representative of a fresh box.
+  representative of a fresh box. With parallel workers the reset happens at
+  block boundaries: all workers drain their current games, one resets, all
+  restart — no game ever loses its memory mid-flight.
 - **Inference-time image noise** (`--no-noise` to disable): every stored
   snapshot is degraded in place (strength 0.5, see below) BEFORE the player,
   the analyst, NAMS, or the training copy sees it — one invariant, one set
@@ -79,6 +94,14 @@ Housekeeping baked into the generator:
 - Records whose analyst forgot the `RATING:` line are written with
   `rating: null` and counted; `GameTraceSource` DROPS them loudly at load
   time (never train on a guessed reward).
+- **End-of-run stats + plots:** counters land in
+  `data_game/<label>/generation_stats.json` and, via
+  `training/datagen_plots.py`, as figures in
+  `logs/datagen_stats_<label>_<stamp>/` — rating histogram, rolling mean
+  rating, rounds per game with wins marked, verified-`WRONG:`-span rate.
+  Read the rating histogram BEFORE training: grades compressed into a
+  narrow positive band with rare WRONG spans mean a nearly uniform reward,
+  i.e. the batch will train like plain self-SFT.
 
 ## The reward scheme
 

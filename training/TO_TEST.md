@@ -1,115 +1,74 @@
-# To test on the remote box (stage 1)
+# The remote verification protocol
 
-Nothing here has run yet — the local box cannot execute this code (see
-`.cursor/rules/remote-environment.mdc`). Checklist before trusting train.py:
+Nothing in `training/` has run on this box until you run it — the local
+machine only edits code (`.cursor/rules/remote-environment.mdc`). The test
+suite is `training/selftest.py`: numbered stages, one command each, each
+printing exactly one `TEST <id> PASS/FAIL: <evidence>` line. Run the
+commands below **in order** (later stages consume earlier stages' output)
+as soon as `scripts/setup_env.sh` has finished, and paste the `TEST ...`
+lines back for review. On a FAIL, also paste the traceback that precedes it.
 
-1. **`pip install bitsandbytes`** installs and imports cleanly next to
-   torch/CUDA on the GPU box.
-2. **4-bit load of gemma-4-12b**: `AutoModelForMultimodalLM.from_pretrained`
-   accepts `quantization_config=BitsAndBytesConfig(...)` +
-   `prepare_model_for_kbit_training` on the unified architecture.
-3. **`--projector-module`**: the default `multi_modal_projector` must match a
-   real module in `model.named_modules()`. On mismatch train.py fails loudly
-   and prints the top-level submodules — pass the right name (or `none`).
-4. **LoRA target discovery**: check `lora_targets` in the run's
-   `config.json` — language-model linears only, no vision/audio modules,
-   non-empty.
-5. **Terminator id**: `resolve_terminator_id` should pick `<end_of_turn>`
-   (logged in config.json as `terminator_id`).
-6. **Scheduler name**: `get_scheduler("cosine_with_min_lr", ...,
-   scheduler_specific_kwargs={"min_lr_rate": ...})` under transformers 5.x.
-7. **End-to-end smoke run**: tiny hand-written jsonl (a few examples, at
-   least one with an image part) → loss decreases, `pixel_values` present
-   (the image assert must NOT fire), checkpoint lands in
-   `weights/gemma-4-12b/<label>_step<K>/` with `adapter_config.json` +
-   `train_meta.json`. Exercise both entry points: the CLI
-   (`python -m training.train --data ...`) and a run script (point
-   `run_first_iteration.py`'s SOURCES at the smoke jsonl).
-8. **Rollback path**: rerun with `--regression-tolerance 0 --save-steps 1`
-   to force a regression; expect the ERROR log + `rolled_back` event.
-9. **Checkpoint loading**: the smoke checkpoint appears in the notebooks'
-   Checkpoint dropdown, loads (and generates) via the picker, via
-   `MODEL_CHECKPOINT` in `.env`, and via `python -m agent.runner
-   --checkpoint <name> game ...`; `[default]` still loads bare HF weights.
-10. **Span weights**: an example with `span_weights` (incl. a negative one)
-    trains without error; spot-check the per-token mapping by logging one
-    collated example.
+| # | Command | Cost | What it proves |
+|---|---------|------|----------------|
+| 0 | `python -m training.selftest t0` | seconds | imports; transformers >= 5.10; CUDA visible; bitsandbytes loads |
+| 1 | `python -m training.selftest t1` | seconds | pure units: `parse_rating` (incl. bold variants), `build_span_weights` (WRONG override, win boost, negative scale), image-noise determinism/identity, analyst-leak tripwire (incl. multi-line), `_rewrite_image_urls`, `GameTraceSource` on a fabricated trace dir, micro-batch bucketing |
+| 2 | `python -m training.selftest t2` | seconds | every enabled manifest entry materialized; `data.jsonl` row counts match `meta.json`; probe files present |
+| 3 | `python -m training.selftest t3` | minutes | 4-bit QLoRA load; LoRA target discovery + projector resolution; terminator id; one collated forward+backward per loss kind (image example included); fresh-adapter KD loss equals teacher entropy (the `disable_adapter()` teacher path) |
+| 4 | `python -m training.selftest t4` | ~15–30 min | batch-4 vs batch-1 per-example loss parity (mixed CE/KD/image/negative-span buckets); CLI smoke train lands a checkpoint + `eval_log.jsonl` rows; destructive-LR variant fires the rollback path |
+| 5 | `python -m training.selftest t5` | ~10–20 min | datagen 2 games x 5 moves at `--parallel 2`: traces + stored frames + stats + plots written, one record per generation, tripwire silent, ratings parsed |
+| 6 | `python -m training.selftest t6` | minutes | `generate_batch` vs solo `generate` on identical prompts, greedy: replies must be identical (multimodal LEFT-padding is where per-model bugs hide) |
+| 7 | `python -m training.selftest t7` | minutes | t5's traces through `GameTraceSource` and real train steps (RL weights, per-run noised frames, finite losses) |
 
-# To test on the remote box (phase 2: external datasets)
+(`python -m training.selftest all` runs everything in order; the exit code
+is the number of failures.)
 
-The synthetic-navigation path (generator → materialize → probe →
-`ExternalSource` → per-line loss) and every converter (on fabricated rows)
-were smoke-tested locally; everything touching HF downloads, the GPU, or
-PEFT internals still needs the remote box:
+Stage 6 note: greedy equality is the strict criterion. If it fails only on
+a near-tie token deep into a reply (both outputs sane, divergence late),
+that is bf16 batched-matmul nondeterminism, not necessarily a padding bug —
+paste both replies and we judge. Early divergence or garbled batched output
+means the left-padding/pixel-routing is wrong.
 
-11. **Manifest ids resolve**: `python -m training.download_external` (run by
-    `setup_env.sh`) materializes every enabled entry. Watch for per-row
-    schema mismatches — the converters assume `question/answer` (gsm8k),
-    `query/response` (metamathqa), `problem/solution` (numinamath),
-    ShareGPT `conversations` (openthoughts/slimorca), `images/texts`
-    (cauldron) — a wrong field name fails loudly with the row number.
-12. **Streaming respects caps**: `--force --mode stream --only cauldron_vqav2`
-    must stop after `max_rows` source rows without pulling the full 13.5 GB,
-    and produce output identical to full mode (compare `meta.json` counts).
-13. **settings.json**: `setup_env.sh` writes `download_mode` correctly for
-    the box's free disk, and preserves an existing file on re-run.
-14. **KD teacher path**: `model.disable_adapter()` on the PEFT-wrapped
-    4-bit model bypasses BOTH the LoRA deltas and the `modules_to_save`
-    projector copy (compare a teacher logit slice against the bare base
-    model on one input). This is the linchpin of the KD loss.
-15. **KD memory**: a long OpenThoughts example (thousands of target tokens)
-    fits — the target-position slicing bounds the float32 softmax pair, but
-    the two full forwards (student + teacher) still cost activation memory.
-    If it OOMs, cap target length in the converter or drop
-    `openthoughts` per-epoch count.
-16. **Probe runtime + parsing**: `exact_match/gsm8k` and
-    `exact_match/navigation` run in the promised ~3–5 min combined per save
-    and the base model actually emits parseable `ANSWER:` lines (accuracy
-    well above 0 before any training).
-17. **eval_log.jsonl**: after a smoke run with probes attached, one flat row
-    per evaluation with `heldout_loss/<source>` per dataset and both
-    `exact_match/*` keys; loads with `pandas.read_json(..., lines=True)`.
-18. **Replay-only smoke run**: `python -m training.run_first_iteration`
-    (with the `GameTraceSource` line temporarily removed, or a smoke trace
-    file in place) completes a few hundred steps with mixed CE + KD sources,
-    per-source losses all finite in `train_log.jsonl`.
-19. **Self-distill utility** (optional path):
-    `python -m training.generate_self_distill --dataset slimorca --limit 20`
-    writes 20 non-empty regenerated targets.
+Stage 4 note: the rollback variant relies on `--lr 0.05` wrecking the
+adapter between saves, which is near-certain but stochastic; if no
+`rolled_back` event fires, rerun once before treating it as a bug.
 
-# To test on the remote box (phase 3: the self-eval datagen loop)
+## Manual appendix (not automatable)
 
-The reward mapping (`build_span_weights`) and the record plumbing are pure
-python, but the loop itself needs GPU + NAMS:
+These need eyes or box-level state; check them once per box / after big
+changes rather than every run:
 
-20. **Datagen smoke run**: `python -m training.generate_game_traces --label
-    smoke --games 2 --max-moves 5` completes; `data_game/smoke/traces.jsonl`
-    has one record per player generation, `generation_stats.json` matches,
-    and every `meta.rating` present in the analyst logs parsed (compare a
-    few analyses by hand — bold `**RATING:**` variants must parse too).
-21. **Stored frames byte-identical**: for a few records, the copy under
-    `data_game/smoke/images/` is byte-identical (`cmp`) to the
-    `memory_images/` snapshot the player saw, and — with noise on — the
-    image is visibly degraded but clearly readable (agent, gold, walls
-    distinguishable at strength 0.5). If not readable, lower
-    `INFERENCE_STRENGTH`.
-22. **Exact-context invariant**: for one record, re-render the player
-    prompt from the live session (`player["messages"]`) and diff against
-    the record's `messages` (modulo the rewritten image url) — no drift, no
-    truncation, search notes included.
-23. **No analyst text anywhere**: grep `traces.jsonl` for a distinctive
-    phrase from a few analyst analyses in the run's logs — zero hits (the
-    tripwire checks current-session analyses automatically; this manual
-    check also covers cross-session leakage through NAMS retrieval).
-24. **NAMS reset cadence**: with `--reset-every 1 --games 3`, node counts
-    between games drop back to the seeded semantic model while `Preference`
-    (tip) nodes survive; datagen continues cleanly after each reset.
-25. **GameTraceSource end-to-end**: `run_first_iteration.py` pointed at the
-    smoke traces trains — negative-weight spans (WRONG marks) train without
-    error, records with `rating: null` are dropped with the WARNING count,
-    and the per-run noised frame copies land in the temp dir (check one
-    visually).
-26. **Win stamping**: play until a win happens (or shrink the board via
-    config); the winning game's records carry `game_won: true` and
-    `moves_from_end` counting down to 0, and `build_span_weights` on the
-    winning move yields base `r + 0.2` (clamped) / WRONG spans `-1.0 + 0.2`.
+1. **Checkpoint dropdowns** — the smoke checkpoint from t4 appears in the
+   notebooks' Checkpoint dropdown, loads and generates via the picker, via
+   `MODEL_CHECKPOINT` in `.env`, and via
+   `python -m agent.runner --checkpoint <name> game ...`; `[default]` still
+   loads bare HF weights.
+2. **Disk-mode settings** — `scripts/setup_env.sh` writes
+   `data_external/settings.json` (`download_mode`) correctly for the box's
+   free disk and preserves an existing file on re-run. On a disk-tight box:
+   `python -m training.download_external --force --mode stream --only
+   cauldron_vqav2` stops after `max_rows` without pulling the full 13.5 GB,
+   and `meta.json` counts match full mode.
+3. **Noised frames readable** — open a few `data_game/<label>/images/`
+   frames from t5 (noise on by default): visibly degraded but agent, gold,
+   and walls clearly distinguishable. If not, lower `INFERENCE_STRENGTH`
+   in `training/image_noise.py`. Also spot one per-run training copy from
+   t7's temp dir (path in the run log) at `TRAINING_STRENGTH`.
+4. **Cross-session leak grep** — the tripwire covers current-session leaks
+   automatically; once per big prompt/memory change, also grep
+   `data_game/<label>/traces.jsonl` for distinctive phrases from analyst
+   analyses in the datagen run logs (`logs/datagen_*/llm_calls.txt`) to
+   confirm nothing arrives through NAMS retrieval either.
+5. **NAMS reset cadence** — with `--reset-every 1 --games 3`, node counts
+   between games drop back to the seeded semantic model while `Preference`
+   (tip) nodes survive; datagen continues cleanly after each reset.
+6. **Win stamping** — when a game is actually won (shrink the board via
+   config if needed), its records carry `game_won: true` and
+   `moves_from_end` counting down to 0.
+7. **Probe sanity before training** — `exact_match/gsm8k` and
+   `exact_match/navigation` accuracies from t4's eval rows are well above 0
+   on the base model (the model emits parseable `ANSWER:` lines), and the
+   probe pass stays within ~3–5 min per save.
+8. **Datagen stats plots** — open `logs/datagen_stats_<label>_*/summary.png`
+   after every real datagen run: a rating histogram compressed into a
+   narrow positive band with rare WRONG spans means a weak reward signal —
+   reconsider before spending the training hours.

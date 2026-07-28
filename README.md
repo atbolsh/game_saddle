@@ -364,7 +364,8 @@ roll back to the best checkpoint (loudly) if a guarded eval metric regresses.
 **Game-trace data generation** is
 `python -m training.generate_game_traces --label iterN [--checkpoint ...]`:
 the interactive self-eval loop run headlessly (player move, one analyst
-exchange, round end; a game = gold eaten or 200 rounds) with mild label-safe
+exchange, round end; a game = gold eaten or `--max-moves` rounds, default
+50) with mild label-safe
 image noise at inference and a NAMS episodic reset every ~100 games (tips
 survive). It writes `data_game/<label>/traces.jsonl` + stable frame copies
 under `data_game/<label>/images/` (git-ignored; `setup_env.sh` creates
@@ -377,6 +378,20 @@ regression)**: the analyst rating as the reply-wide base, -1.0 on verified
 `WRONG:` spans, and a discounted `0.2 * 0.9^d` win boost added uniformly on
 won games — and re-noises the frames per run. Details and knobs in
 [training/TRAINING_GAME_TRACES.md](training/TRAINING_GAME_TRACES.md).
+
+**Intermission optimizations** (between phase 3 and the first real run):
+datagen runs `--parallel 3` game sessions by default, merged into batched
+decode calls on the one shared model (`agent/parallel_gen.py` — decode is
+bandwidth-bound, so a batch of 3 costs barely more than a batch of 1), and
+finishes by writing signal-check plots to `logs/datagen_stats_<label>_*/`
+(look at the rating histogram before spending training hours). Training
+runs micro-batched (`micro_batch=4` x `grad_accum=4` = the same effective
+batch 16), caps held-out eval at 100 examples per source, drops overlong
+examples loudly (`max_example_chars`), and aborts after `--max-rollbacks`
+(default 3) rollbacks instead of oscillating. The formal verification
+protocol is `python -m training.selftest <t0..t7|all>` — ordered stages
+printing `TEST <id> PASS/FAIL` lines; see
+[training/TO_TEST.md](training/TO_TEST.md).
 
 **External replay datasets** live in `data_external/` (git-ignored;
 `scripts/setup_env.sh` creates it and runs
@@ -456,7 +471,8 @@ has the high-res frame on disk for re-feeding into the model.
 agent/
   __init__.py
   config.py          # env-driven AgentConfig
-  model.py           # model registry + family adapters + VLModel wrapper
+  model.py           # model registry + family adapters + VLModel wrapper (incl. generate_batch)
+  parallel_gen.py    # cross-thread generation batching (dispatcher + session proxy)
   game_io.py         # bare level gen, Settings <-> dict, render to PNG, apply_action
   image_store.py     # disk PNG + 64x64 thumbnail b64 + GameSnapshot node + linking
   memory.py          # NAMS MemoryClient factory; context stripping; semantic-model seed; DB dump
@@ -476,6 +492,8 @@ training/
   generate_game_traces.py   # headless self-eval datagen -> data_game/<label>/
   game_traces.py     # GameTraceSource: traces -> REINFORCE-weighted examples
   image_noise.py     # label-safe frame degradation (inference + training)
+  datagen_plots.py   # end-of-datagen signal-check plots -> logs/datagen_stats_*/
+  selftest.py        # the formal test suite (stages t0-t7, TEST id PASS/FAIL lines)
   TRAINING_OVERVIEW.md      # self-training roadmap + the train.py contract/recipe
   TRAINING_GAME_TRACES.md   # standard use of game traces (self-eval loop as data generator)
   TRAINING_EXTRA_DATASETS.md# replay mixing vs. forgetting; the early-warning suite

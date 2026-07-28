@@ -10,8 +10,9 @@ human in the loop:
                 -> ask_analyst(DEFAULT_ANALYST_QUESTION)   (one exchange)
                 -> end_round()                             (move propagates)
 
-**A game is formally: the gold eaten, OR --max-moves (default 200) player
-rounds**, whichever comes first. Records buffer per game and are written at
+**A game is formally: the gold eaten, OR --max-moves player rounds**
+(default 50 -- early wandering traces carry little signal per round),
+whichever comes first. Records buffer per game and are written at
 game close, each stamped with ``meta.game_won`` and ``meta.moves_from_end``
 (0 = the round whose move ate the gold) -- the discounted win boost is
 computed from these at TRAINING time by ``GameTraceSource``, not here; this
@@ -40,6 +41,18 @@ Housekeeping per the committed plan: frames are noised at inference
 memory is reset to the seeded semantic model (tips are ``Preference`` nodes
 and survive) every ``--reset-every`` games.
 
+**Parallelism** (``--parallel``, default 3): N sessions play N games
+concurrently, one worker thread each, sharing ONE model through
+``agent.parallel_gen`` -- concurrent generations merge into batched decode
+calls (batch-1 decode is bandwidth-bound, so a batch of 3 costs barely more
+than a batch of 1). NAMS resets happen at BLOCK boundaries: games run in
+sequential blocks of ``--reset-every``, all workers drain between blocks,
+one session resets, all restart. Each concurrent session is invisible to
+the others' players exactly as PAST sessions are (current-session
+screening is per session; cross-session analyst memories are the intended
+learning mechanism), so the leak tripwire stays session-scoped. At the end
+of the run, summary plots land in ``logs/datagen_stats_<label>_<stamp>/``.
+
 GPU + NAMS required; run on the remote box, typically once per training
 iteration with the current checkpoint::
 
@@ -55,6 +68,7 @@ import json
 import logging
 import shutil
 import sys
+import threading
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -134,10 +148,151 @@ def _assert_no_analyst_leak(record: dict, analyses: list[str]) -> None:
             )
 
 
+class _Shared:
+    """Everything the worker threads touch together: the trace file, the
+    counters, and the generation budget. One lock covers it all -- these are
+    microsecond operations next to multi-second generations."""
+
+    def __init__(self, out: Any, images_dir: Path, max_generations: int):
+        self.lock = threading.Lock()
+        self.out = out
+        self.images_dir = images_dir
+        self.max_generations = max_generations
+        self.stats: Counter = Counter()
+        self.rating_hist: Counter = Counter()
+        self.records: list[dict] = []  #: in order written (for the plots)
+
+    def take_generation(self) -> bool:
+        """Reserve one generation slot; False once the budget is spent."""
+        with self.lock:
+            if self.stats["generations"] >= self.max_generations:
+                return False
+            self.stats["generations"] += 1
+            return True
+
+    def budget_spent(self) -> bool:
+        with self.lock:
+            return self.stats["generations"] >= self.max_generations
+
+
+def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
+               shared: _Shared, session_analyses: list[str]) -> None:
+    """One full game on ``session``: rounds until the gold is eaten, the
+    move cap is hit, or the run-wide generation budget runs out. Buffers the
+    game's records, stamps the outcome, writes them under the shared lock."""
+    game_records: list[dict] = []
+    won = False
+    for move_idx in range(args.max_moves):
+        if not shared.take_generation():
+            break
+        player = session.ask_player(session.DEFAULT_PLAYER_QUESTION)
+
+        # Stable image copy FIRST (before anything else can touch the live
+        # file): byte-identical to the (possibly noised) frame the player
+        # just saw. The uuid in the snapshot filename keeps copies unique
+        # across workers and across --append runs.
+        before_path = player["before_path"]
+        img_name = f"g{game_idx:04d}_m{move_idx:03d}_{Path(before_path).name}"
+        shutil.copy2(before_path, shared.images_dir / img_name)
+
+        analyst = session.ask_analyst(session.DEFAULT_ANALYST_QUESTION)
+        session_analyses.append(analyst["analysis"])
+        outcome = session.end_round()
+
+        record = {
+            "messages": player["messages"],
+            "target_text": player["raw"],
+            "meta": {
+                "rating": analyst["rating"],
+                "wrong_spans": analyst["wrong_spans"]["verified"],
+                "unverified_spans": analyst["wrong_spans"]["unverified"],
+                "action": player["action"],
+                "bare_move": player["bare_move"],
+                "searches": [
+                    {"query": s["query"], "thought": s["thought"]}
+                    for s in player["searches"]
+                ],
+                "gold_collected": outcome["gold_collected"],
+                "game_index": game_idx,
+                "move_index": move_idx,
+                "session_id": player["session_id"],
+            },
+        }
+        n_imgs = _rewrite_image_urls(
+            record["messages"], {before_path: f"images/{img_name}"}
+        )
+        if n_imgs == 0:
+            raise RuntimeError(
+                "player context contains no image part -- the player "
+                "answered blind; refusing to record"
+            )
+        # Session-scoped by design: a CONCURRENT session's analyses are as
+        # visible-by-retrieval as a past game's, which is the intended
+        # cross-game learning; only current-session screening is invariant.
+        _assert_no_analyst_leak(record, session_analyses)
+        game_records.append(record)
+
+        with shared.lock:
+            if analyst["rating"] is None:
+                shared.stats["rating_missing"] += 1
+            else:
+                shared.rating_hist[f"{analyst['rating']:+.1f}"] += 1
+            shared.stats["wrong_spans"] += len(analyst["wrong_spans"]["verified"])
+            if player["action"]:
+                shared.stats["moves"] += 1
+
+        if outcome["gold_remaining"] == 0:
+            won = True
+            break
+
+    # Stamp the outcome and flush the game (one writer at a time).
+    last = len(game_records) - 1
+    with shared.lock:
+        for i, record in enumerate(game_records):
+            record["meta"]["game_won"] = won
+            record["meta"]["moves_from_end"] = (last - i) if won else None
+            shared.out.write(json.dumps(record, ensure_ascii=False) + "\n")
+            shared.records.append(record)
+        shared.out.flush()
+        shared.stats["games"] += 1
+        shared.stats["games_won" if won else "games_lost"] += 1
+        n_gen = shared.stats["generations"]
+    logger.info(
+        "game %d done: %s in %d round(s) (total generations: %d)",
+        game_idx, "WON" if won else "lost", len(game_records), n_gen,
+    )
+
+
+def _worker(worker_id: int, session: Any, block: list[int], shared: _Shared,
+            args: argparse.Namespace, session_analyses: list[str],
+            fresh: list[bool], errors: list[BaseException]) -> None:
+    """Pull game indices off the shared block queue until it drains, the
+    budget runs out, or any worker errored (fail the whole run, never
+    silently continue with fewer workers)."""
+    try:
+        while True:
+            with shared.lock:
+                if errors or not block:
+                    return
+                game_idx = block.pop(0)
+            if shared.budget_spent():
+                return
+            if fresh[worker_id]:
+                fresh[worker_id] = False  # restart() already dealt the board
+            else:
+                session.reset_game()
+            _play_game(session, game_idx, args, shared, session_analyses)
+    except BaseException as exc:
+        logger.exception("datagen worker %d failed", worker_id)
+        with shared.lock:
+            errors.append(exc)
+
+
 def run_generation(args: argparse.Namespace) -> dict[str, Any]:
     """The loop. Split from main() so a run script / notebook cell can call
     it with a Namespace built by hand."""
-    from agent.model import set_default_checkpoint
+    from agent.model import get_model, set_default_checkpoint
+    from agent.parallel_gen import BatchingProxy, GenerationDispatcher
     from agent.self_eval_session import InteractiveSelfEvalSession
 
     set_default_checkpoint(args.checkpoint)
@@ -152,132 +307,98 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
         )
     images_dir.mkdir(parents=True, exist_ok=True)
 
-    stats: Counter = Counter()
-    rating_hist: Counter = Counter()
-
-    session = InteractiveSelfEvalSession(log_label=f"datagen_{args.label}")
+    n_workers = max(1, args.parallel)
+    sessions = [
+        InteractiveSelfEvalSession(log_label=f"datagen_{args.label}_w{i}")
+        for i in range(n_workers)
+    ]
+    dispatcher: GenerationDispatcher | None = None
+    if n_workers > 1:
+        # One model, batched decode across the workers (see
+        # agent/parallel_gen.py); the sessions themselves never know.
+        dispatcher = GenerationDispatcher(get_model(), max_batch=n_workers)
+        for s in sessions:
+            s.model = BatchingProxy(dispatcher)
     if args.noise:
-        session.image_filter = make_image_filter(
-            args.seed, strength=INFERENCE_STRENGTH
-        )
-    try:
-        session.restart()
-        # Analyses produced in the CURRENT session (cleared on memory reset
-        # + restart) -- the tripwire corpus.
-        session_analyses: list[str] = []
+        for i, s in enumerate(sessions):
+            s.image_filter = make_image_filter(
+                args.seed + i, strength=INFERENCE_STRENGTH
+            )
 
+    try:
         with open(traces_path, "a", encoding="utf-8") as out:
-            for game_idx in range(args.games):
-                if stats["generations"] >= args.max_generations:
+            shared = _Shared(out, images_dir, args.max_generations)
+            # Per-session tripwire corpora (cleared on memory reset).
+            analyses: list[list[str]] = [[] for _ in range(n_workers)]
+            for s in sessions:
+                s.restart()
+            fresh = [True] * n_workers
+
+            # Games run in sequential BLOCKS of --reset-every: workers drain
+            # between blocks, so the global memory reset never yanks another
+            # worker's episodic memory mid-game.
+            for block_start in range(0, args.games, args.reset_every):
+                if shared.budget_spent():
                     logger.info("--max-generations reached; stopping.")
                     break
-                if game_idx > 0 and game_idx % args.reset_every == 0:
+                if block_start > 0:
                     logger.info(
                         "NAMS hygiene: resetting episodic memory to the "
-                        "seeded semantic model (game %d).", game_idx,
+                        "seeded semantic model (game %d).", block_start,
                     )
-                    session.reset_memory_to_seed()
-                    session.restart()
-                    session_analyses = []
-                elif game_idx > 0:
-                    session.reset_game()
-
-                game_records: list[dict] = []
-                won = False
-                for move_idx in range(args.max_moves):
-                    player = session.ask_player(
-                        session.DEFAULT_PLAYER_QUESTION
+                    sessions[0].reset_memory_to_seed()
+                    for i, s in enumerate(sessions):
+                        s.restart()
+                        analyses[i].clear()
+                        fresh[i] = True
+                block = list(range(
+                    block_start, min(block_start + args.reset_every, args.games)
+                ))
+                errors: list[BaseException] = []
+                threads = [
+                    threading.Thread(
+                        target=_worker, name=f"datagen-w{i}",
+                        args=(i, sessions[i], block, shared, args,
+                              analyses[i], fresh, errors),
                     )
-                    stats["generations"] += 1
-
-                    # Stable image copy FIRST (before anything else can
-                    # touch the live file): byte-identical to the (possibly
-                    # noised) frame the player just saw.
-                    before_path = player["before_path"]
-                    img_name = f"g{game_idx:04d}_m{move_idx:03d}_{Path(before_path).name}"
-                    shutil.copy2(before_path, images_dir / img_name)
-
-                    analyst = session.ask_analyst(
-                        session.DEFAULT_ANALYST_QUESTION
-                    )
-                    session_analyses.append(analyst["analysis"])
-                    outcome = session.end_round()
-
-                    record = {
-                        "messages": player["messages"],
-                        "target_text": player["raw"],
-                        "meta": {
-                            "rating": analyst["rating"],
-                            "wrong_spans": analyst["wrong_spans"]["verified"],
-                            "unverified_spans": analyst["wrong_spans"]["unverified"],
-                            "action": player["action"],
-                            "bare_move": player["bare_move"],
-                            "searches": [
-                                {"query": s["query"], "thought": s["thought"]}
-                                for s in player["searches"]
-                            ],
-                            "gold_collected": outcome["gold_collected"],
-                            "game_index": game_idx,
-                            "move_index": move_idx,
-                            "session_id": player["session_id"],
-                        },
-                    }
-                    n_imgs = _rewrite_image_urls(
-                        record["messages"], {before_path: f"images/{img_name}"}
-                    )
-                    if n_imgs == 0:
-                        raise RuntimeError(
-                            "player context contains no image part -- the "
-                            "player answered blind; refusing to record"
-                        )
-                    _assert_no_analyst_leak(record, session_analyses)
-                    game_records.append(record)
-
-                    if analyst["rating"] is None:
-                        stats["rating_missing"] += 1
-                    else:
-                        rating_hist[f"{analyst['rating']:+.1f}"] += 1
-                    stats["wrong_spans"] += len(analyst["wrong_spans"]["verified"])
-                    if player["action"]:
-                        stats["moves"] += 1
-
-                    if outcome["gold_remaining"] == 0:
-                        won = True
-                        break
-                    if stats["generations"] >= args.max_generations:
-                        break
-
-                # Stamp the outcome and flush the game.
-                last = len(game_records) - 1
-                for i, record in enumerate(game_records):
-                    record["meta"]["game_won"] = won
-                    record["meta"]["moves_from_end"] = (last - i) if won else None
-                    out.write(json.dumps(record, ensure_ascii=False) + "\n")
-                out.flush()
-                stats["games"] += 1
-                stats["games_won" if won else "games_lost"] += 1
-                logger.info(
-                    "game %d done: %s in %d round(s) (total generations: %d)",
-                    game_idx, "WON" if won else "lost", len(game_records),
-                    stats["generations"],
-                )
+                    for i in range(n_workers)
+                ]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+                if errors:
+                    raise errors[0]
     finally:
-        session.close()
+        if dispatcher is not None:
+            dispatcher.close()
+        for s in sessions:
+            s.close()
 
     summary = {
-        **{k: stats[k] for k in sorted(stats)},
-        "rating_histogram": dict(sorted(rating_hist.items())),
+        **{k: shared.stats[k] for k in sorted(shared.stats)},
+        "rating_histogram": dict(sorted(shared.rating_hist.items())),
         "traces": str(traces_path),
+        "parallel": n_workers,
     }
     (out_dir / "generation_stats.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
     )
     logger.info("done: %s", json.dumps(summary, indent=2))
-    if stats["rating_missing"]:
+    if shared.stats["rating_missing"]:
         logger.warning(
             "%d record(s) have no parseable RATING and will be DROPPED by "
-            "GameTraceSource at load time.", stats["rating_missing"],
+            "GameTraceSource at load time.", shared.stats["rating_missing"],
         )
+    try:
+        from training.datagen_plots import write_datagen_plots
+        plot_dir = write_datagen_plots(args.label, summary, shared.records)
+        summary["plots"] = str(plot_dir)
+        logger.info("stats plots: %s", plot_dir)
+    except Exception:
+        # Plots are a convenience, never worth losing a finished run over --
+        # but say so loudly.
+        logger.exception("stats plotting failed (traces are safe on disk)")
     return summary
 
 
@@ -291,11 +412,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--games", type=int, default=60,
                    help="games to play (default 60; volume rationale in "
                         "TRAINING_GAME_TRACES.md)")
-    p.add_argument("--max-moves", type=int, default=200,
-                   help="rounds per game before it counts as lost "
-                        "(the formal game definition; default 200)")
+    p.add_argument("--max-moves", type=int, default=50,
+                   help="rounds per game before it counts as lost (the "
+                        "formal game definition: gold eaten or this cap; "
+                        "default 50 -- early wandering traces carry little "
+                        "signal per round, and each round costs two "
+                        "generations)")
     p.add_argument("--max-generations", type=int, default=3000,
                    help="hard cap on player generations for the whole run")
+    p.add_argument("--parallel", type=int, default=3,
+                   help="concurrent game sessions sharing one model via "
+                        "batched decode (agent/parallel_gen.py); 1 = the "
+                        "plain sequential loop")
     p.add_argument("--reset-every", type=int, default=100,
                    help="reset NAMS episodic memory (tips survive) every N "
                         "games (default 100 per TRAINING_EXTRA_DATASETS.md)")
