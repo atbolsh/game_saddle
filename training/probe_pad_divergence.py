@@ -69,7 +69,7 @@ def _last_logits(model: Any, enc: dict[str, Any]) -> Any:
     inputs["position_ids"] = (mask.long().cumsum(-1) - 1).clamp(min=0)
     with torch.inference_mode():
         out = model.model(**inputs)
-    return out.logits[0, -1].float().cpu()
+    return out.logits[:, -1].float().cpu()
 
 
 def _describe(tok: Any, logits: Any, k: int = 5) -> str:
@@ -107,13 +107,13 @@ def run_probe() -> int:
         suspicious = False
         for name, messages in cases.items():
             enc = model.encode_messages(messages)
-            solo = _last_logits(model, enc)
+            solo = _last_logits(model, enc)[0]
             print(f"\n=== {name} (prompt {enc['input_ids'].shape[1]} tok) ===")
             print(f"solo   top5: {_describe(tok, solo)}")
             for pad_len in (8, 64, 256):
                 padded = _last_logits(
                     model, _left_pad_row(enc, pad_len, pad_id)
-                )
+                )[0]
                 delta = (padded - solo).abs()
                 flipped = int(padded.argmax()) != int(solo.argmax())
                 print(
@@ -125,12 +125,61 @@ def run_probe() -> int:
                     suspicious = True
                     print(f"         top5: {_describe(tok, padded)}")
 
+        # ---- the t6 configuration: padded row inside a REAL batch of 2.
+        # Batch-1 padding above showed only bounded wobble; if THIS row
+        # diverges hard (t6 flipped its first token to 'a', far below the
+        # solo top-5), the defect is in the batched multimodal path
+        # (e.g. image-feature scatter with left-padded rows), not padding
+        # per se.
+        import torch
+
+        q_short = "In one short sentence, what colors do you see?"
+        q_long = ("Answer briefly: is the grid mostly empty? Explain in "
+                  "one sentence why you think so.")
+        encs = {}
+        for label, q in (("short", q_short), ("long", q_long)):
+            encs[label] = model.encode_messages(
+                [{"role": "user", "content": [
+                    {"type": "image", "url": str(img)},
+                    {"type": "text", "text": q},
+                ]}]
+            )
+        len_s = encs["short"]["input_ids"].shape[1]
+        len_l = encs["long"]["input_ids"].shape[1]
+        assert len_l > len_s, (len_s, len_l)
+        solo_s = _last_logits(model, encs["short"])[0]
+        solo_l = _last_logits(model, encs["long"])[0]
+        padded_s = _left_pad_row(encs["short"], len_l - len_s, pad_id)
+        stacked = {
+            k: torch.cat([padded_s[k], encs["long"][k]], dim=0)
+            for k in padded_s
+            if isinstance(padded_s[k], torch.Tensor)
+        }
+        both = _last_logits(model, stacked)
+        print(f"\n=== batch of 2 (short {len_s} tok left-padded to {len_l}, "
+              "long unpadded) ===")
+        for label, solo, row in (("short/padded", solo_s, both[0]),
+                                 ("long/control", solo_l, both[1])):
+            delta = (row - solo).abs()
+            flipped = int(row.argmax()) != int(solo.argmax())
+            print(
+                f"{label:<13s} max|dLogit|={float(delta.max()):.4f} "
+                f"mean={float(delta.mean()):.5f} argmax_flipped={flipped}"
+            )
+            if flipped or float(delta.max()) > 0.5:
+                suspicious = True
+                print(f"    solo  top5: {_describe(tok, solo)}")
+                print(f"    batch top5: {_describe(tok, row)}")
+
     print(
         "\nVERDICT GUIDE: max|dLogit| ~1e-2 flat across pad lengths and no "
         "argmax flips => bf16 kernel noise. Deltas >~0.5, growing with pad "
         "length, or flips toward caption-style tokens ('a', 'an') => real "
-        "mask/position defect in the padded prefill (report upstream; "
-        "equal-length-only batching stays mandatory either way)."
+        "mask/position defect. If batch-1 padding is tame but the "
+        "batch-of-2 padded row diverges hard, the bug is in the batched "
+        "multimodal path (image-feature scatter / mask across rows) -- "
+        "report upstream; equal-length-only batching stays mandatory "
+        "either way."
     )
     return 1 if suspicious else 0
 
