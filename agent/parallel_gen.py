@@ -121,6 +121,11 @@ class GenerationDispatcher:
                          if r.signature() == sig][: self.max_batch]
                 for r in group:
                     self._pending.remove(r)
+                left_behind = len(self._pending)
+            logger.info(
+                "dispatch: group of %d (%d incompatible request(s) left "
+                "for the next window)", len(group), left_behind,
+            )
             try:
                 replies = self.model.generate_batch(
                     [{"messages": r.messages} for r in group],

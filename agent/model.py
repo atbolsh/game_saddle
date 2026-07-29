@@ -674,12 +674,14 @@ class VLModel:
         for i, enc in enumerate(rows):
             by_len.setdefault(int(enc["input_ids"].shape[1]), []).append(i)
 
-        if len(by_len) > 1:
-            logger.info(
-                "generate_batch: %d length cohort(s) %s (Gemma 4: no "
-                "left-pad decode; equal-length cohorts stay batched)",
-                len(by_len), sorted(by_len),
-            )
+        # Always log the cohort structure: this is THE datagen-throughput
+        # signal (cohorts of 1 mean the parallel sessions decode serially).
+        logger.info(
+            "generate_batch: %d rows -> %d equal-length cohort(s) %s "
+            "(no left-pad decode on Gemma 4)",
+            len(batch), len(by_len),
+            {length: len(idx) for length, idx in sorted(by_len.items())},
+        )
 
         replies: list[str | None] = [None] * len(batch)
         err: str | None = None
