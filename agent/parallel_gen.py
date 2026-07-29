@@ -12,11 +12,14 @@ The pieces:
   * :class:`GenerationDispatcher` -- owns the (process-singleton) model.
     Worker threads submit requests and block; the dispatcher waits a short
     window for peers to arrive, groups compatible requests, and runs one
-    batched call. Compatibility = identical stop signature and image count:
-    stop knobs are batch-wide in ``generate_batch`` (a per-row mix would let
+    batched call. Compatibility = identical stop signature and image count.
+    Stop knobs are batch-wide in ``generate_batch`` (a per-row mix would let
     an analyst quoting "[FORWARD]" be truncated by a player row's stop
-    string), so player-phase and analyst-phase requests batch among
-    themselves and never with each other.
+    string). Prompt length is deliberately NOT part of the signature:
+    ``generate_batch`` itself splits a group into exact-token-length cohorts
+    (Gemma 4 Unified cannot left-pad decode), and only the exact token
+    count decides who batches -- any cheaper proxy (e.g. char buckets)
+    would split same-length peers that could have shared a batch.
   * :class:`BatchingProxy` -- duck-types ``VLModel`` for a session: same
     ``generate(...)`` signature, everything else forwarded to the real
     model. Installed as ``session.model``, so the session code does not know

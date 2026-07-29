@@ -11,12 +11,12 @@ lines back for review. On a FAIL, also paste the traceback that precedes it.
 | # | Command | Cost | What it proves |
 |---|---------|------|----------------|
 | 0 | `python -m training.selftest t0` | seconds | imports; transformers >= 5.10; CUDA visible; bitsandbytes loads |
-| 1 | `python -m training.selftest t1` | seconds | pure units: `parse_rating` (incl. bold variants), `build_span_weights` (WRONG override, win boost, negative scale), image-noise determinism/identity, analyst-leak tripwire (incl. multi-line), `_rewrite_image_urls`, `GameTraceSource` on a fabricated trace dir, micro-batch bucketing, planted-error scrambler (seed determinism, all three move-token modes, clock-shift tolerance labeling, direction swap incl. the "right move" guard, inert-text fallthrough), perception-question sampling (rate honored, groups and mirrored variants balanced), `AnalystTraceSource` on a fabricated file (KD loss kind, rating-null kept, unverified-span record dropped, quota weight), `left_pad_collate` (pad on left, `mm_token_type_ids` suffix preserved) |
+| 1 | `python -m training.selftest t1` | seconds | pure units: `parse_rating` (incl. bold variants), `build_span_weights` (WRONG override, win boost, negative scale), image-noise determinism/identity, analyst-leak tripwire (incl. multi-line), `_rewrite_image_urls`, `GameTraceSource` on a fabricated trace dir, micro-batch bucketing, planted-error scrambler (seed determinism, all three move-token modes, clock-shift tolerance labeling, direction swap incl. the "right move" guard, inert-text fallthrough), perception-question sampling (rate honored, groups and mirrored variants balanced), `AnalystTraceSource` on a fabricated file (KD loss kind, rating-null kept, unverified-span record dropped, quota weight), `stack_equal_length` (equal-length rows stack, mixed lengths hard-error) |
 | 2 | `python -m training.selftest t2` | seconds | every enabled manifest entry materialized; `data.jsonl` row counts match `meta.json`; probe files present |
 | 3 | `python -m training.selftest t3` | minutes | 4-bit QLoRA load; LoRA target discovery + projector resolution; terminator id; one collated forward+backward per loss kind (image example included); fresh-adapter KD loss equals teacher entropy (the `disable_adapter()` teacher path) |
 | 4 | `python -m training.selftest t4` | ~15–30 min | batch-4 vs batch-1 per-example loss parity (mixed CE/KD/image/negative-span buckets); CLI smoke train lands a checkpoint + `eval_log.jsonl` rows; destructive-LR variant fires the rollback path |
 | 5 | `python -m training.selftest t5` | ~10–20 min | datagen 2 games x 5 moves at `--parallel 2`: traces + stored frames + stats + plots written, one record per generation, tripwire silent, ratings parsed; `analyst_traces.jsonl` has one record per round (minus counted truncated-search skips), analyses nonempty, frames shared with player records |
-| 6 | `python -m training.selftest t6` | minutes | left-pad tensor parity (solo encodings vs collated batch, incl. `mm_token_type_ids`) then `generate_batch` vs solo `generate` greedy identity |
+| 6 | `python -m training.selftest t6` | minutes | equal-length identical-prompt true GPU batch vs solo; variable-length via length cohorts vs solo (Gemma 4: no left-pad decode) |
 | 7 | `python -m training.selftest t7` | minutes | t5's traces through `GameTraceSource` + `AnalystTraceSource` and real train steps (RL weights + KD-vs-base analyst anchor, mixed CE/KD buckets, per-run noised frames, finite losses; the tiny epoch is drained so the KD bucket is guaranteed to train) |
 
 (`python -m training.selftest all` runs everything in order; the exit code
@@ -34,12 +34,12 @@ PID holding VRAM.
 
 Stage 6 note: greedy equality is the strict criterion. If it fails only on
 a near-tie token deep into a reply (both outputs sane, divergence late),
-that is bf16 batched-matmul nondeterminism, not necessarily a padding bug —
-paste both replies and we judge. Early divergence or garbled batched output
-means padding/mm-token routing is wrong. `generate_batch` left-pads from
-per-row encodings (same path as solo `generate`) rather than trusting
-processor-native batched padding — t6 asserts tensor suffix parity
-(including `mm_token_type_ids`) before the greedy decode A/B.
+that is bf16 batched-matmul nondeterminism — paste both replies and we
+judge. Gemma 4 Unified: left-padded variable-length multimodal decode
+diverges from solo (KV-shared layers + SDPA) even with every aux tensor
+hand-collated in lockstep, so `generate_batch` runs one true GPU batch per
+distinct prompt length (zero pad); rows whose length is unique decode
+alone. Equal-length early divergence is a true-batch bug.
 
 Stage 4 note: the rollback variant relies on `--lr 0.05` wrecking the
 adapter between saves, which is near-certain but stochastic; if no

@@ -100,8 +100,13 @@ Housekeeping baked into the generator:
   concurrently, one worker thread each, sharing the ONE loaded model
   through `agent/parallel_gen.py` — concurrent generations merge into
   batched decode calls (batch-1 decode is memory-bandwidth-bound, so a
-  batch of 3 costs barely more than a batch of 1; expected ~2–2.5x on the
-  datagen wall-clock). Requests batch only with identical stop signatures,
+  batch of 3 costs barely more than a batch of 1). Caveat for Gemma 4
+  Unified: left-padded decode diverges from solo, so `generate_batch` only
+  true-batches rows whose prompt token lengths are exactly equal; grouped
+  requests with unique lengths decode sequentially inside the call. The
+  realized speedup therefore depends on how often concurrent sessions'
+  prompt lengths coincide — measure the datagen wall-clock before counting
+  on ~2–2.5x. Requests batch only with identical stop signatures,
   so player-phase and analyst-phase generations never truncate each other.
   A concurrent session's analyst text is exactly as visible to another
   player as a PAST session's (the intended cross-game learning channel);

@@ -23,7 +23,7 @@ Stage map (rationale in the Intermission plan):
   * t0-env      imports + versions + CUDA + bitsandbytes
   * t1-pure     parse_rating, build_span_weights, image noise, tripwire,
                 _rewrite_image_urls, GameTraceSource on a fabricated dir,
-                epoch_batches bucketing, left_pad_collate
+                epoch_batches bucketing, stack_equal_length
   * t2-data     manifest loads, per-source counts vs meta.json, probes exist
   * t3-model    4-bit QLoRA load, terminator, CE/KD forward+backward
                 (image example included), teacher-path sanity
@@ -506,38 +506,43 @@ def t1_pure() -> str:
     assert max(totals) < 1.1 * min(totals), f"unbalanced groups: {totals}"
     checks += 1
 
-    # ---- left_pad_collate: pad on the LEFT; every sequence-aligned tensor
-    #      keeps its solo suffix (the generate_batch invariant)
+    # ---- stack_equal_length: the generate_batch collation (Gemma 4 cannot
+    #      left-pad decode, so only equal-length rows may share a batch and
+    #      mixed lengths must be a hard error, not a silent pad)
     import torch
 
-    from agent.model import left_pad_collate
+    from agent.model import stack_equal_length
 
-    short = {
-        "input_ids": torch.tensor([[10, 11, 12]]),
+    a = {
+        "input_ids": torch.tensor([[1, 2, 3]]),
         "attention_mask": torch.tensor([[1, 1, 1]]),
-        "mm_token_type_ids": torch.tensor([[0, 1, 0]]),
-        "pixel_values": torch.zeros(1, 4, 3),
+        "pixel_values": torch.zeros(1, 2, 2),
     }
-    long = {
-        "input_ids": torch.tensor([[20, 21, 22, 23, 24]]),
-        "attention_mask": torch.tensor([[1, 1, 1, 1, 1]]),
-        "mm_token_type_ids": torch.tensor([[0, 1, 1, 1, 0]]),
-        "pixel_values": torch.ones(1, 4, 3),
+    b = {
+        "input_ids": torch.tensor([[4, 5, 6]]),
+        "attention_mask": torch.tensor([[1, 1, 1]]),
+        "pixel_values": torch.ones(1, 2, 2),
     }
-    collated = left_pad_collate([short, long], pad_token_id=0)
-    assert collated["input_ids"].shape == (2, 5)
-    assert collated["input_ids"][0].tolist() == [0, 0, 10, 11, 12]
-    assert collated["attention_mask"][0].tolist() == [0, 0, 1, 1, 1]
-    assert collated["mm_token_type_ids"][0].tolist() == [0, 0, 0, 1, 0]
-    assert collated["input_ids"][1].tolist() == [20, 21, 22, 23, 24]
-    assert collated["mm_token_type_ids"][1].tolist() == [0, 1, 1, 1, 0]
-    assert collated["pixel_values"].shape == (2, 4, 3)
-    assert torch.all(collated["attention_mask"][:, -1] == 1)
+    stacked = stack_equal_length([a, b])
+    assert stacked["input_ids"].tolist() == [[1, 2, 3], [4, 5, 6]]
+    assert stacked["attention_mask"].shape == (2, 3)
+    assert stacked["pixel_values"].shape == (2, 2, 2)
+    assert torch.equal(stacked["pixel_values"][1], b["pixel_values"][0])
+    longer = {
+        "input_ids": torch.tensor([[7, 8, 9, 10]]),
+        "attention_mask": torch.tensor([[1, 1, 1, 1]]),
+        "pixel_values": torch.ones(1, 2, 2),
+    }
+    try:
+        stack_equal_length([a, longer])
+        raise AssertionError("stack_equal_length accepted mixed lengths")
+    except ValueError:
+        pass
     checks += 1
 
     return (
         f"{checks} unit groups passed (ratings, rewards, noise, tripwire, "
-        "source, batching, scrambler, questions, left-pad)"
+        "source, batching, scrambler, questions, stack-eq)"
     )
 
 
@@ -886,17 +891,26 @@ def t5_datagen() -> str:
 
 
 def t6_ab() -> str:
-    """Batched vs solo generation, greedy: identical prompts must produce
-    identical replies. Checks left-pad tensor parity BEFORE generate so a
-    padding/mm_token bug fails with a structural message, not garbled text."""
-    import torch
+    """Batched vs solo generation A/B (Gemma 4: equal-length cohorts only).
 
-    from agent.model import get_model, left_pad_collate
+      (1) identical prompts x3 -- true GPU batch (no pad); must match solo.
+      (2) variable-length prompts -- generate_batch splits into length
+          cohorts (still must match solo; may be B=1 per cohort).
+    """
+    from agent.model import get_model, stack_equal_length
 
     model = get_model()
     with tempfile.TemporaryDirectory(prefix="selftest_t6_") as tmp:
         img = _tiny_png(Path(tmp) / "board.png", seed=9)
-        prompts = [
+        q_same = "In one short sentence, what colors do you see?"
+        same_prompts = [
+            [{"role": "user", "content": [
+                {"type": "image", "url": str(img)},
+                {"type": "text", "text": q_same},
+            ]}]
+            for _ in range(3)
+        ]
+        var_prompts = [
             [{"role": "user", "content": [
                 {"type": "image", "url": str(img)},
                 {"type": "text", "text": q},
@@ -908,96 +922,61 @@ def t6_ab() -> str:
                 "Reply with a single word: light or dark background?",
             )
         ]
-        tokenizer = getattr(model.processor, "tokenizer", model.processor)
-        pad_id = int(tokenizer.pad_token_id
-                     if tokenizer.pad_token_id is not None
-                     else tokenizer.eos_token_id)
 
-        # (a) Structural: our left_pad_collate reproduces each solo encoding
-        #     as a right-aligned suffix, pads on the left, and keeps every
-        #     sequence-aligned aux tensor (esp. mm_token_type_ids) in sync.
-        solos = [model.encode_messages(p) for p in prompts]
-        collated = left_pad_collate(solos, pad_token_id=pad_id)
-        max_len = collated["input_ids"].shape[1]
-        assert torch.all(collated["attention_mask"][:, -1] == 1), (
-            "collated batch is not left-padded "
-            f"(mask tail={collated['attention_mask'][:, -1].tolist()})"
-        )
-        seq_keys = [
-            k for k, v in solos[0].items()
-            if isinstance(v, torch.Tensor) and v.dim() == 2
-            and v.shape[1] == solos[0]["input_ids"].shape[1]
-        ]
-        for i, solo in enumerate(solos):
-            sl = solo["input_ids"].shape[1]
-            pad_len = max_len - sl
-            if pad_len:
-                assert torch.all(
-                    collated["attention_mask"][i, :pad_len] == 0
-                ), f"row {i}: pad region attention_mask not zero"
-                assert torch.all(
-                    collated["input_ids"][i, :pad_len] == pad_id
-                ), f"row {i}: pad region input_ids not pad_id"
-            for key in seq_keys:
-                assert torch.equal(
-                    collated[key][i, -sl:], solo[key][0]
-                ), (
-                    f"row {i} key {key!r}: collated suffix != solo encoding "
-                    f"(solo_len={sl}, batch_len={max_len})"
-                )
+        same_enc = [model.encode_messages(p) for p in same_prompts]
+        same_lens = {int(e["input_ids"].shape[1]) for e in same_enc}
+        assert len(same_lens) == 1, same_lens
+        stacked = stack_equal_length(same_enc)
+        assert stacked["input_ids"].shape[0] == 3
 
-        # (b) Optional diagnostic: processor-native batched padding often
-        #     breaks mm_token_type_ids even when attention_mask looks fine.
-        #     Record the mismatch; our generate_batch must NOT use that path.
-        try:
-            native = model.processor.apply_chat_template(
-                [model.adapter.prepare_messages(p) for p in prompts],
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=True,
-                return_tensors="pt",
-                processor_kwargs={"padding": True, "padding_side": "left"},
-            )
-            native_mm_ok = True
-            if "mm_token_type_ids" in native and "mm_token_type_ids" in solos[0]:
-                for i, solo in enumerate(solos):
-                    sl = solo["input_ids"].shape[1]
-                    if not torch.equal(
-                        native["mm_token_type_ids"][i, -sl:],
-                        solo["mm_token_type_ids"][0],
-                    ):
-                        native_mm_ok = False
-                        break
-            native_note = (
-                "processor-native mm_token_type_ids ok"
-                if native_mm_ok
-                else "processor-native mm_token_type_ids MISALIGNED "
-                     "(generate_batch correctly bypasses this path)"
-            )
-        except Exception as exc:
-            native_note = f"processor-native pad probe skipped ({type(exc).__name__})"
+        var_lens = {
+            int(model.encode_messages(p)["input_ids"].shape[1])
+            for p in var_prompts
+        }
+        assert len(var_lens) > 1, f"var probe not variable: {sorted(var_lens)}"
 
-        # (c) Greedy decode A/B
         original = model._sampling_kwargs
         model._sampling_kwargs = lambda: {"do_sample": False}
         try:
-            solo = [model.generate(p, max_new_tokens=48) for p in prompts]
-            batched = model.generate_batch(
-                [{"messages": p} for p in prompts], max_new_tokens=48,
+            solo_same = [
+                model.generate(p, max_new_tokens=48) for p in same_prompts
+            ]
+            batched_same = model.generate_batch(
+                [{"messages": p} for p in same_prompts], max_new_tokens=48,
+            )
+            solo_var = [
+                model.generate(p, max_new_tokens=48) for p in var_prompts
+            ]
+            batched_var = model.generate_batch(
+                [{"messages": p} for p in var_prompts], max_new_tokens=48,
             )
         finally:
             model._sampling_kwargs = original
-    mismatches = [
-        (i, s, b) for i, (s, b) in enumerate(zip(solo, batched)) if s != b
+
+    mism_same = [
+        (i, s, b) for i, (s, b) in enumerate(zip(solo_same, batched_same))
+        if s != b
     ]
-    assert not mismatches, (
-        "greedy batched != solo on rows "
-        + "; ".join(f"[{i}] solo={s!r} batched={b!r}" for i, s, b in mismatches)
-        + f" ({native_note})"
+    mism_var = [
+        (i, s, b) for i, (s, b) in enumerate(zip(solo_var, batched_var))
+        if s != b
+    ]
+    assert not mism_same, (
+        "equal-length true batch != solo: "
+        + "; ".join(
+            f"[{i}] solo={s!r} batched={b!r}" for i, s, b in mism_same
+        )
+    )
+    assert not mism_var, (
+        "variable-length (length-cohort) batch != solo: "
+        + "; ".join(
+            f"[{i}] solo={s!r} batched={b!r}" for i, s, b in mism_var
+        )
     )
     return (
-        f"3/3 greedy identical; left-pad tensor parity ok; {native_note}; "
-        f"e.g. row0={solo[0][:60]!r}"
+        f"equal-len 3/3 identical (true batch); var-len 3/3 identical "
+        f"via length cohorts {sorted(var_lens)}; "
+        f"e.g. same0={solo_same[0][:50]!r}"
     )
 
 

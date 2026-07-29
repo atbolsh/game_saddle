@@ -394,7 +394,9 @@ token is the model's default behavior — staged plan in
 **Intermission optimizations** (between phase 3 and the first real run):
 datagen runs `--parallel 3` game sessions by default, merged into batched
 decode calls on the one shared model (`agent/parallel_gen.py` — decode is
-bandwidth-bound, so a batch of 3 costs barely more than a batch of 1), and
+bandwidth-bound, so a batch of 3 costs barely more than a batch of 1;
+Gemma 4 Unified only true-batches equal-token-length prompts, see
+TRAINING_GAME_TRACES.md), and
 finishes by writing signal-check plots to `logs/datagen_stats_<label>_*/`
 (look at the rating histogram before spending training hours). Training
 runs micro-batched (`micro_batch=4` x `grad_accum=4` = the same effective

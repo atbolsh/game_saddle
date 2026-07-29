@@ -229,114 +229,52 @@ ADAPTERS: dict[str, FamilyAdapter] = {
 
 # ====================================================== generate batching
 
-def left_pad_collate(
+def stack_equal_length(
     rows: list[dict[str, Any]],
-    *,
-    pad_token_id: int,
 ) -> dict[str, Any]:
-    """Left-pad single-example processor outputs into one generate batch.
+    """Stack per-row encodings that already share one sequence length.
 
-    Do NOT trust ``processor.apply_chat_template([...], padding=True)`` for
-    multimodal batches: transformers v5 can left-pad ``input_ids`` /
-    ``attention_mask`` while leaving ``mm_token_type_ids`` (and friends)
-    misaligned, which makes shorter rows silently diverge from solo
-    ``generate``. Collating from per-row encodings keeps every
-    sequence-aligned tensor in lockstep with ``input_ids``.
-
-    Each row is batch-dim 1 (``return_tensors="pt"`` shape). Sequence-aligned
-    int tensors pad on the LEFT; other leading-singleton tensors
-    (``pixel_values``, ``image_position_ids``, ...) stack on dim 0.
+    Gemma 4 Unified (KV-shared layers + SDPA) matches solo generate on
+    zero-pad batches and diverges on left-padded shorter rows even when
+    every sequence-aligned tensor (``mm_token_type_ids`` included) is padded
+    in lockstep with ``input_ids`` -- we verified that by hand-collating and
+    it still diverged. So ``generate_batch`` only stacks equal-length rows;
+    it never left-pads for decode, and mixed lengths here are a hard error.
     """
     if not rows:
         return {}
-    row_dicts: list[dict[str, Any]] = []
-    for r in rows:
-        d = {k: v for k, v in r.items()
-             if isinstance(v, torch.Tensor)}
-        if "input_ids" not in d or "attention_mask" not in d:
-            raise ValueError(
-                "left_pad_collate: each row needs input_ids and "
-                f"attention_mask; got {sorted(d)}"
-            )
-        if d["input_ids"].shape[0] != 1:
-            raise ValueError(
-                "left_pad_collate: expected per-row batch dim 1, "
-                f"got input_ids shape {tuple(d['input_ids'].shape)}"
-            )
-        row_dicts.append(d)
+    row_dicts = [
+        {k: v for k, v in r.items() if isinstance(v, torch.Tensor)}
+        for r in rows
+    ]
+    seq_lens = {int(d["input_ids"].shape[1]) for d in row_dicts}
+    if len(seq_lens) != 1:
+        raise ValueError(
+            f"stack_equal_length: mixed lengths {sorted(seq_lens)}"
+        )
     if len(row_dicts) == 1:
         return dict(row_dicts[0])
-
     key_sets = {frozenset(d) for d in row_dicts}
     if len(key_sets) > 1:
         raise ValueError(
-            "left_pad_collate: rows produced different keys "
-            f"({sorted(key_sets)}) -- mixed image/text in one batch?"
+            f"stack_equal_length: mixed keys {sorted(key_sets)}"
         )
-
-    max_len = max(d["input_ids"].shape[1] for d in row_dicts)
-
-    def _left_pad(t: Any, fill: int | float) -> Any:
-        if t.shape[1] == max_len:
-            return t
-        pad = t.new_full((t.shape[0], max_len - t.shape[1]), fill)
-        return torch.cat([pad, t], dim=1)
-
-    batch: dict[str, Any] = {
-        "input_ids": torch.cat(
-            [_left_pad(d["input_ids"], pad_token_id) for d in row_dicts]
-        ),
-        "attention_mask": torch.cat(
-            [_left_pad(d["attention_mask"], 0) for d in row_dicts]
-        ),
-    }
-    seq_lens = [d["input_ids"].shape[1] for d in row_dicts]
+    batch: dict[str, Any] = {}
     for key in row_dicts[0]:
-        if key in batch:
-            continue
         vals = [d[key] for d in row_dicts]
-        # Per-token id tensors aligned with the sequence (mm_token_type_ids,
-        # token_type_ids, ...): left-pad exactly like input_ids.
-        if (not vals[0].dtype.is_floating_point
-                and vals[0].dim() == 2
-                and all(v.shape[1] == sl
-                        for v, sl in zip(vals, seq_lens))):
-            batch[key] = torch.cat([_left_pad(v, 0) for v in vals])
-            continue
-        # Vision / aux with leading singleton batch dim -- stack.
-        if all(v.dim() >= 1 and v.shape[0] == 1 for v in vals):
+        if all(v.shape[0] == 1 for v in vals):
             trailing = {tuple(v.shape[1:]) for v in vals}
             if len(trailing) > 1:
                 raise ValueError(
-                    f"left_pad_collate: key {key!r} has mismatched trailing "
-                    f"shapes {sorted(trailing)}"
+                    f"stack_equal_length: key {key!r} trailing mismatch "
+                    f"{sorted(trailing)}"
                 )
             batch[key] = torch.cat(vals, dim=0)
             continue
         raise ValueError(
-            f"left_pad_collate: don't know how to batch key {key!r} "
-            f"(shape {tuple(vals[0].shape)}, dtype {vals[0].dtype})"
+            f"stack_equal_length: don't know how to stack {key!r} "
+            f"shape {tuple(vals[0].shape)}"
         )
-
-    # Structural checks -- fail loud, never decode a misaligned batch.
-    if not torch.all(batch["attention_mask"][:, -1] == 1):
-        raise RuntimeError(
-            "left_pad_collate: attention_mask[:, -1] has zeros; "
-            f"tail={batch['attention_mask'][:, -1].tolist()}"
-        )
-    for i, (d, sl) in enumerate(zip(row_dicts, seq_lens)):
-        if not torch.equal(batch["input_ids"][i, -sl:], d["input_ids"][0]):
-            raise RuntimeError(
-                f"left_pad_collate: row {i} input_ids suffix != solo encoding"
-            )
-        for key, v in d.items():
-            if key in ("input_ids", "attention_mask"):
-                continue
-            if v.dim() == 2 and v.shape[1] == sl:
-                if not torch.equal(batch[key][i, -sl:], v[0]):
-                    raise RuntimeError(
-                        f"left_pad_collate: row {i} {key} suffix != solo"
-                    )
     return batch
 
 
@@ -355,8 +293,8 @@ class RegexStopCriteria(StoppingCriteria):
     Per-row aware: returns a bool tensor of shape ``[batch]``, so in a
     batched generate each row halts individually on its own match while the
     others continue (transformers ORs per-row criteria into its
-    unfinished-sequences mask). With LEFT padding all prompts end at the
-    same index, so a single ``prompt_len`` is correct for every row.
+    unfinished-sequences mask). Batches are equal-length (no padding), so a
+    single ``prompt_len`` is correct for every row.
     """
 
     #: How many of the most recent generated tokens to decode per check.
@@ -553,6 +491,9 @@ class VLModel:
         if not self._loaded:
             self.load()
         norm = self.adapter.prepare_messages(messages)
+        # NOTE: keep this call in lockstep with training's Collator.build
+        # (training/train.py) -- the trained prompt must stay byte-identical
+        # to this one. Any new template kwarg goes in BOTH places.
         return self.processor.apply_chat_template(
             norm,
             tokenize=True,
@@ -649,6 +590,38 @@ class VLModel:
             )
 
     # ------------------------------------------------------ batched generate
+    def _generate_equal_length_batch(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        max_new_tokens: int | None,
+        stop_strings: list[str] | None,
+        stop_regex: str | None,
+    ) -> list[str]:
+        """True GPU batch over encodings that already share one seq length."""
+        tokenizer = getattr(self.processor, "tokenizer", self.processor)
+        inputs = self._move_inputs_to_model(stack_equal_length(rows))
+        gen_kwargs: dict[str, Any] = {
+            "max_new_tokens": max_new_tokens or self.cfg.max_new_tokens,
+            **self._sampling_kwargs(),
+        }
+        prompt_len = inputs["input_ids"].shape[-1]
+        if stop_strings:
+            gen_kwargs["stop_strings"] = stop_strings
+            gen_kwargs["tokenizer"] = tokenizer
+        if stop_regex:
+            gen_kwargs["stopping_criteria"] = StoppingCriteriaList([
+                RegexStopCriteria(stop_regex, tokenizer, prompt_len=prompt_len)
+            ])
+        with torch.inference_mode():
+            out = self.model.generate(**inputs, **gen_kwargs)
+        return [
+            self.processor.decode(
+                out[i][prompt_len:], skip_special_tokens=True
+            ).strip()
+            for i in range(len(rows))
+        ]
+
     def generate_batch(
         self,
         batch: list[dict],
@@ -656,19 +629,20 @@ class VLModel:
         stop_strings: list[str] | None = None,
         stop_regex: str | None = None,
     ) -> list[str]:
-        """One batched generation over several prompts (the parallel-datagen
-        fast path: decode is memory-bandwidth-bound, so a batch of N costs
-        barely more than a batch of 1).
+        """Batched generation for parallel datagen.
 
-        ``batch`` is a list of ``{"messages": [...]}`` dicts. The stopping
-        knobs are BATCH-WIDE by contract -- a per-row stop set would let one
-        row halt on ANOTHER row's stop string (an analyst quoting
-        ``[FORWARD]`` mid-analysis would be truncated), so the dispatcher
-        (agent/parallel_gen.py) groups requests by identical stop signature
-        and this method refuses mixed image counts, which processors pad
-        inconsistently. Prompts are LEFT-padded, so every row's generation
-        starts at the same index; rows finish individually (per-row stop
-        strings / regex / eos)."""
+        ``batch`` is a list of ``{"messages": [...]}`` dicts. Stopping knobs
+        are BATCH-WIDE (dispatcher groups by identical stop signature). Mixed
+        image counts are refused.
+
+        Gemma 4 Unified: left-padded variable-length multimodal batches
+        diverge from solo ``generate`` on shorter rows (KV-shared layers +
+        SDPA; same finding as other Gemma 4 batch servers -- zero-pad /
+        equal-length batches match serial). So we encode each row, then run
+        one true GPU batch **per distinct prompt length** (no left-pad on
+        the decode path). Same-length peers amortize weight reads; rows
+        whose length is unique in the batch decode alone.
+        """
         if not batch:
             return []
         if len(batch) == 1:
@@ -695,43 +669,33 @@ class VLModel:
                 "(see agent/parallel_gen.py)"
             )
 
-        # Encode each row with the SAME path as generate(), then left-pad
-        # ourselves. Processor-native batched padding has been observed to
-        # leave mm_token_type_ids misaligned with input_ids on Gemma 4 even
-        # when attention_mask looks left-padded (selftest t6).
-        tokenizer = getattr(self.processor, "tokenizer", self.processor)
-        if tokenizer.pad_token_id is None:
-            tokenizer.pad_token = tokenizer.eos_token
         rows = [self.encode_messages(r["messages"]) for r in batch]
-        inputs = self._move_inputs_to_model(
-            left_pad_collate(rows, pad_token_id=int(tokenizer.pad_token_id))
-        )
+        by_len: dict[int, list[int]] = {}
+        for i, enc in enumerate(rows):
+            by_len.setdefault(int(enc["input_ids"].shape[1]), []).append(i)
 
-        gen_kwargs: dict[str, Any] = {
-            "max_new_tokens": max_new_tokens or self.cfg.max_new_tokens,
-            **self._sampling_kwargs(),
-        }
-        prompt_len = inputs["input_ids"].shape[-1]
-        if stop_strings:
-            gen_kwargs["stop_strings"] = stop_strings
-            gen_kwargs["tokenizer"] = tokenizer
-        if stop_regex:
-            gen_kwargs["stopping_criteria"] = StoppingCriteriaList([
-                RegexStopCriteria(stop_regex, tokenizer, prompt_len=prompt_len)
-            ])
+        if len(by_len) > 1:
+            logger.info(
+                "generate_batch: %d length cohort(s) %s (Gemma 4: no "
+                "left-pad decode; equal-length cohorts stay batched)",
+                len(by_len), sorted(by_len),
+            )
 
-        replies: list[str] | None = None
+        replies: list[str | None] = [None] * len(batch)
         err: str | None = None
         try:
-            with torch.inference_mode():
-                out = self.model.generate(**inputs, **gen_kwargs)
-            replies = [
-                self.processor.decode(
-                    out[i][prompt_len:], skip_special_tokens=True
-                ).strip()
-                for i in range(len(batch))
-            ]
-            return replies
+            for _length, indices in by_len.items():
+                sub_rows = [rows[i] for i in indices]
+                sub_replies = self._generate_equal_length_batch(
+                    sub_rows,
+                    max_new_tokens=max_new_tokens,
+                    stop_strings=stop_strings,
+                    stop_regex=stop_regex,
+                )
+                for i, reply in zip(indices, sub_replies):
+                    replies[i] = reply
+            assert all(r is not None for r in replies)
+            return list(replies)  # type: ignore[arg-type]
         except Exception as exc:
             err = f"{type(exc).__name__}: {exc}"
             raise
@@ -743,15 +707,16 @@ class VLModel:
                     request={"messages": r["messages"],
                              "batch_size": len(batch), "batch_index": i},
                     params={
-                        "max_new_tokens": gen_kwargs.get("max_new_tokens"),
-                        "do_sample": gen_kwargs.get("do_sample"),
-                        "temperature": gen_kwargs.get("temperature"),
-                        "top_p": gen_kwargs.get("top_p"),
-                        "top_k": gen_kwargs.get("top_k"),
+                        "max_new_tokens": max_new_tokens or self.cfg.max_new_tokens,
+                        "do_sample": self._sampling_kwargs().get("do_sample"),
                         "stop_strings": stop_strings,
                         "stop_regex": stop_regex,
+                        "seq_len": int(rows[i]["input_ids"].shape[1]),
+                        "length_cohorts": {
+                            str(k): len(v) for k, v in by_len.items()
+                        },
                     },
-                    response=None if replies is None else {"raw": replies[i]},
+                    response=None if replies[i] is None else {"raw": replies[i]},
                     error=err,
                 )
 
