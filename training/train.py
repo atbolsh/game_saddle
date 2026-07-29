@@ -626,6 +626,38 @@ def resolve_projector_modules(model: Any, projector_name: str) -> list[str]:
     return matches
 
 
+def _assert_modules_float(model: Any, module_names: list[str]) -> None:
+    """Hard-fail if any ``modules_to_save`` target still holds quantized
+    (non-float) parameters -- PEFT cannot ``requires_grad`` those, and a
+    silent skip-list mismatch is exactly how that happens."""
+    if not module_names:
+        return
+    import bitsandbytes as bnb
+
+    bad: list[str] = []
+    for full_name, module in model.named_modules():
+        if not any(
+            full_name == n or full_name.startswith(n + ".")
+            for n in module_names
+        ):
+            continue
+        if isinstance(module, (bnb.nn.Linear4bit, bnb.nn.Linear8bitLt)):
+            bad.append(full_name)
+            continue
+        for pname, param in module.named_parameters(recurse=False):
+            if not param.is_floating_point():
+                bad.append(f"{full_name}.{pname} dtype={param.dtype}")
+    if bad:
+        raise RuntimeError(
+            "modules_to_save targets still contain quantized / non-float "
+            "params (PEFT will crash with 'only Tensors of floating point "
+            "dtype can require gradients'). The BitsAndBytes skip list did "
+            "not protect these modules -- check that skip keys are FULL "
+            "prefixes like 'model.embed_vision', not bare leaf names. "
+            f"Offenders: {bad[:20]}"
+        )
+
+
 def build_model(spec: Any, cfg: TrainConfig, hf_token: str | None):
     """Load the 4-bit base, prepare for k-bit training, wrap in LoRA."""
     import torch
@@ -643,13 +675,16 @@ def build_model(spec: Any, cfg: TrainConfig, hf_token: str | None):
 
     # Keep multimodal embedders / towers + lm_head in bf16. modules_to_save
     # needs floating-point params (PEFT set_requires_grad fails on Linear4bit
-    # packed weights -- "only Tensors of floating point dtype can require
-    # gradients"). Passing a custom skip list also CLEARS transformers'
-    # default lm_head skip, so lm_head is listed explicitly.
+    # packed weights). transformers' should_convert_module only treats a skip
+    # key as a PREFIX at the START of the full module name (or an exact
+    # suffix), so bare "embed_vision" does NOT protect
+    # "model.embed_vision.patch_dense" -- the path must be "model.embed_vision".
+    # A custom skip list also CLEARS the default lm_head skip, so lm_head is
+    # listed explicitly.
     skip_modules = [
         "lm_head",
-        "embed_vision", "embed_audio",
-        "vision_tower", "audio_tower",
+        "model.embed_vision", "model.embed_audio",
+        "model.vision_tower", "model.audio_tower",
     ]
     quant = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -681,6 +716,7 @@ def build_model(spec: Any, cfg: TrainConfig, hf_token: str | None):
 
     targets = discover_lora_targets(model)
     projector = resolve_projector_modules(model, cfg.projector_module)
+    _assert_modules_float(model, projector)
     lora = LoraConfig(
         r=cfg.lora_r,
         lora_alpha=cfg.lora_alpha,

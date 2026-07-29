@@ -108,9 +108,11 @@ On Gemma 4 / Gemma 4 Unified that module is `embed_vision`
 Unified architecture this embedder *is* the whole vision path (encoder-free
 patch→LM projection), which is the intended trainable lever. Under 4-bit
 QLoRA the embedder/towers + `lm_head` are kept in bf16 via
-`BitsAndBytesConfig.llm_int8_skip_modules` — PEFT cannot `requires_grad` on
-quantized packed weights, so quantizing `embed_vision` and then listing it
-in `modules_to_save` fails loudly.
+`BitsAndBytesConfig.llm_int8_skip_modules` with **full path prefixes**
+(`model.embed_vision`, not bare `embed_vision` — transformers only matches
+a skip key as a prefix at the start of the module name). PEFT cannot
+`requires_grad` on quantized packed weights; a post-load assertion fails
+loudly if the skip list missed anything under the `modules_to_save` target.
 
 Micro-batching (Intermission): the default is `micro_batch=4` with
 `grad_accum=4`, so the **effective batch stays 16** (`micro_batch x
