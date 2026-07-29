@@ -33,11 +33,20 @@ One record per player generation, in ``data_game/<label>/traces.jsonl``:
     records whose question differs from the default move request).
 
 Analyst text is stored to NAMS exactly as in the notebook and never enters
-any record's ``messages``/``target_text`` -- it exists in training only as
-annotation. As a TRIPWIRE against a screening regression, every analyst
-analysis generated in the current session is checked against each record's
-serialized player context; a hit aborts the run (a silently poisoned
-dataset is the worst outcome).
+any PLAYER record's ``messages``/``target_text`` -- it exists in player
+training only as annotation. As a TRIPWIRE against a screening regression,
+every analyst analysis generated in the current session is checked against
+each player record's serialized player context; a hit aborts the run (a
+silently poisoned dataset is the worst outcome).
+
+A SECOND file, ``data_game/<label>/analyst_traces.jsonl``, records each
+analyst exchange itself -- the exact analyst prompt (privileged: settings,
+unscrubbed context) plus the analysis it produced, referencing the same
+stable frame copies. It feeds ``AnalystTraceSource`` (training/
+game_traces.py): a KD-vs-frozen-base replay anchor that keeps analyst
+behavior from drifting while the shared weights train on player data. The
+strict player/analyst separation is structural: the two files are never
+read by the same source.
 
 Housekeeping per the committed plan: frames are noised at inference
 (mild label-safe degradation, ``--no-noise`` to disable) and NAMS episodic
@@ -202,9 +211,11 @@ class _Shared:
     counters, and the generation budget. One lock covers it all -- these are
     microsecond operations next to multi-second generations."""
 
-    def __init__(self, out: Any, images_dir: Path, max_generations: int):
+    def __init__(self, out: Any, analyst_out: Any, images_dir: Path,
+                 max_generations: int):
         self.lock = threading.Lock()
         self.out = out
+        self.analyst_out = analyst_out
         self.images_dir = images_dir
         self.max_generations = max_generations
         self.stats: Counter = Counter()
@@ -237,6 +248,7 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
     move token; a mistakenly emitted token still propagates, exactly as the
     game contract promises, and the analyst grades it as unrequested)."""
     game_records: list[dict] = []
+    analyst_records: list[dict] = []
     won = False
     for move_idx in range(args.max_moves):
         if not shared.take_generation():
@@ -293,6 +305,44 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
         _assert_no_analyst_leak(record, session_analyses)
         game_records.append(record)
 
+        # Analyst record for the KD anchor (AnalystTraceSource): the exact
+        # analyst prompt + the analysis it produced, referencing the SAME
+        # stable image copy as the player record. Kept in a SEPARATE file so
+        # no loader can ever mix analyst text into player training data.
+        # The leak tripwire does NOT apply here -- these records contain
+        # analyses by construction. Skipped (and counted) when the accepted
+        # generation was a truncated search call (budget exhausted
+        # mid-search): never anchor on a cut-off tool call.
+        truncated_search = analyst["replies"][-1]["search_query"] is not None
+        if truncated_search:
+            with shared.lock:
+                shared.stats["analyst_skipped_search"] += 1
+        else:
+            analyst_record = {
+                "messages": analyst["messages"],
+                "target_text": analyst["analysis"],
+                "meta": {
+                    "rating": analyst["rating"],
+                    "wrong_spans": analyst["wrong_spans"]["verified"],
+                    "unverified_spans": analyst["wrong_spans"]["unverified"],
+                    "question": analyst["question"],
+                    "player_question": question,
+                    "n_search_calls": analyst["n_search_calls"],
+                    "game_index": game_idx,
+                    "move_index": move_idx,
+                    "session_id": player["session_id"],
+                },
+            }
+            n_imgs = _rewrite_image_urls(
+                analyst_record["messages"], {before_path: f"images/{img_name}"}
+            )
+            if n_imgs == 0:
+                raise RuntimeError(
+                    "analyst context contains no image part -- the analyst "
+                    "reviewed blind; refusing to record"
+                )
+            analyst_records.append(analyst_record)
+
         with shared.lock:
             if analyst["rating"] is None:
                 shared.stats["rating_missing"] += 1
@@ -317,6 +367,12 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
             shared.out.write(json.dumps(record, ensure_ascii=False) + "\n")
             shared.records.append(record)
         shared.out.flush()
+        for record in analyst_records:
+            shared.analyst_out.write(
+                json.dumps(record, ensure_ascii=False) + "\n"
+            )
+        shared.analyst_out.flush()
+        shared.stats["analyst_records"] += len(analyst_records)
         shared.stats["games"] += 1
         shared.stats["games_won" if won else "games_lost"] += 1
         n_gen = shared.stats["generations"]
@@ -364,6 +420,7 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
     out_dir = DATA_GAME_DIR / args.label
     images_dir = out_dir / "images"
     traces_path = out_dir / "traces.jsonl"
+    analyst_path = out_dir / "analyst_traces.jsonl"
     if traces_path.exists() and not args.append:
         raise SystemExit(
             f"{traces_path} already exists; pass --append to add to it or "
@@ -390,8 +447,10 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
             )
 
     try:
-        with open(traces_path, "a", encoding="utf-8") as out:
-            shared = _Shared(out, images_dir, args.max_generations)
+        with open(traces_path, "a", encoding="utf-8") as out, \
+                open(analyst_path, "a", encoding="utf-8") as analyst_out:
+            shared = _Shared(out, analyst_out, images_dir,
+                             args.max_generations)
             # Per-session tripwire corpora (cleared on memory reset).
             analyses: list[list[str]] = [[] for _ in range(n_workers)]
             # Per-worker question rng, persistent across blocks so no two
@@ -447,6 +506,7 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
         **{k: shared.stats[k] for k in sorted(shared.stats)},
         "rating_histogram": dict(sorted(shared.rating_hist.items())),
         "traces": str(traces_path),
+        "analyst_traces": str(analyst_path),
         "parallel": n_workers,
     }
     (out_dir / "generation_stats.json").write_text(

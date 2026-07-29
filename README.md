@@ -371,8 +371,13 @@ survive). A `--question-rate` fraction of rounds (default 0.2) asks a
 direction-balanced perception question ("Is the gold to your left?")
 instead of a move — gradeable pressure on the known perception weak point. It writes `data_game/<label>/traces.jsonl` + stable frame copies
 under `data_game/<label>/images/` (git-ignored; `setup_env.sh` creates
-`data_game/`). Each record stores the exact player prompt, the raw reply
-(the only trainable tokens — analyst text never enters records), and raw
+`data_game/`), plus `analyst_traces.jsonl` — the analyst's exact contexts
+and analyses, which train as a KD-vs-frozen-base anchor
+(`AnalystTraceSource`) so analyst behavior cannot silently drift while the
+shared weights learn to play. Each player record stores the exact player
+prompt, the raw reply
+(the only trainable tokens — analyst text never enters player records),
+and raw
 annotations (rating, verified `WRONG:` spans, outcome). At training time
 `GameTraceSource` turns those into per-token weights — **single-sample
 offline REINFORCE with a shaped per-token advantage (reward-weighted
@@ -497,7 +502,7 @@ training/
   probes.py          # exact-match capability probes (GSM8K, navigation) + guards
   generate_self_distill.py  # optional: regenerate replay targets with the base model
   generate_game_traces.py   # headless self-eval datagen -> data_game/<label>/
-  game_traces.py     # GameTraceSource: traces -> REINFORCE-weighted examples
+  game_traces.py     # GameTraceSource (traces -> REINFORCE-weighted examples) + AnalystTraceSource (KD anchor)
   planted_errors.py  # planted-error scrambler (labeled corruptions; not hooked up)
   image_noise.py     # label-safe frame degradation (inference + training)
   datagen_plots.py   # end-of-datagen signal-check plots -> logs/datagen_stats_*/

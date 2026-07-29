@@ -41,7 +41,11 @@ uses, in order of commitment:
    tripwire in the early-warning suite
    ([TRAINING_EXTRA_DATASETS.md](TRAINING_EXTRA_DATASETS.md)) — it works
    even though the analyst is never trained, because the *shared* network
-   underneath it is.
+   underneath it is. Datagen now records every analyst exchange's exact
+   context to `analyst_traces.jsonl` (it feeds the analyst KD anchor of
+   TRAINING_EXTRA_DATASETS.md), which is also the prerequisite for this
+   probe — corrupted replies slot into recorded analyst prompts — and for
+   any future analyst training.
 2. **Analyst backprop under a different metric (open).** If the analyst is
    ever trained, planted-error catches are the natural training signal:
    the label is programmatic (no engine query at inference, no human), and

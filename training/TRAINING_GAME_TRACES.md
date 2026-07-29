@@ -82,6 +82,18 @@ One record per player generation lands in `data_game/<label>/traces.jsonl`:
   `moves_from_end`. Rewards are computed at TRAINING time from these, so
   every ratio below stays tunable without regenerating data.
 
+A second file, `data_game/<label>/analyst_traces.jsonl`, records the
+analyst side of every round: the EXACT analyst prompt (`messages`,
+privileged — settings, unscrubbed context — with the frame url pointing at
+the SAME stable copy as the player record) and the analysis as
+`target_text`, plus `meta` (rating, verified/unverified spans, questions,
+indices, search-call count). It feeds `AnalystTraceSource`, the KD-vs-base
+analyst anchor documented in
+[TRAINING_EXTRA_DATASETS.md](TRAINING_EXTRA_DATASETS.md). Rounds whose
+accepted analyst generation was a truncated search call are skipped and
+counted (`analyst_skipped_search`). The player/analyst separation is
+structural — no loader reads both files.
+
 Housekeeping baked into the generator:
 
 - **Parallel sessions** (`--parallel`, default 3): N sessions play N games

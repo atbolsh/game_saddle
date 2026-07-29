@@ -445,6 +445,13 @@ class InteractiveSelfEvalSession(InteractiveSession):
             "player_raw": pending["raw"],
             "n_analyses": pending["n_analyses"],
             "phase": self.phase,
+            # The EXACT prompt of the accepted analyst generation (scene
+            # blocks, unscrubbed recent context, accumulated search notes,
+            # frame) -- mirrors ask_player's contract for the same reason:
+            # training data derived from this exchange must reproduce the
+            # context byte for byte.
+            "messages": messages,
+            "n_search_calls": n_searches,
         }
 
     def end_round(self) -> dict[str, Any]:

@@ -202,7 +202,11 @@ def t1_pure() -> str:
     from PIL import Image
 
     from agent.modes import parse_rating
-    from training.game_traces import GameTraceSource, build_span_weights
+    from training.game_traces import (
+        AnalystTraceSource,
+        GameTraceSource,
+        build_span_weights,
+    )
     from training.generate_game_traces import (
         PERCEPTION_QUESTION_GROUPS,
         _assert_no_analyst_leak,
@@ -347,6 +351,53 @@ def t1_pure() -> str:
         base_w = ex.span_weights[0][2]
         assert abs(base_w - 0.7) < 1e-9, f"win boost wrong: {base_w}"
         checks += 4
+
+        # ---- AnalystTraceSource: KD anchor semantics on a fabricated file
+        analyst_fixtures = [
+            {   # usable
+                "messages": [{"role": "user", "content": [
+                    {"type": "image", "url": "images/g0.png"},
+                    {"type": "text", "text": "review this"},
+                ]}],
+                "target_text": "Solid move. RATING: 0.5",
+                "meta": {"rating": 0.5, "wrong_spans": [],
+                         "unverified_spans": []},
+            },
+            {   # rating missing -> KEPT (a KD anchor needs no reward)
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "review this"},
+                ]}],
+                "target_text": "Forgot the verdict line.",
+                "meta": {"rating": None, "wrong_spans": [],
+                         "unverified_spans": []},
+            },
+            {   # hallucinated WRONG quote -> DROPPED by default
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "review this"},
+                ]}],
+                "target_text": "WRONG: never said this. RATING: -0.5",
+                "meta": {"rating": -0.5, "wrong_spans": [],
+                         "unverified_spans": ["never said this"]},
+            },
+        ]
+        with open(trace_dir / "analyst_traces.jsonl", "w",
+                  encoding="utf-8") as f:
+            for r in analyst_fixtures:
+                f.write(json.dumps(r) + "\n")
+        asrc = AnalystTraceSource(trace_dir / "analyst_traces.jsonl",
+                                  examples_per_epoch=100, noise_strength=0.0)
+        aexs = list(asrc.examples())
+        assert len(aexs) == 2, (
+            f"expected 2 analyst examples (1 dropped), got {len(aexs)}"
+        )
+        assert all(x.loss == "kd" and x.span_weights is None for x in aexs)
+        assert aexs[0].messages[0]["content"][0]["url"] == str(img), (
+            "analyst image url not resolved against the trace dir"
+        )
+        assert abs(asrc.weight - 100 / 2) < 1e-9, (
+            f"quota weight wrong: {asrc.weight}"
+        )
+        checks += 1
 
     # ---- epoch_batches: bucketing separates loss kinds / image counts,
     #      batch sizes bounded, nothing lost
@@ -743,11 +794,41 @@ def t5_datagen() -> str:
         f"{n_images} stored frames vs {len(records)} records"
     )
     rated = sum(1 for rec in records if rec["meta"].get("rating") is not None)
+
+    # Analyst KD-anchor file: one record per round minus the (counted)
+    # truncated-search skips, same stable frames, analyses nonempty.
+    analyst_path = out_dir / "analyst_traces.jsonl"
+    assert analyst_path.is_file(), "no analyst_traces.jsonl written"
+    analyst_records = [
+        json.loads(line)
+        for line in analyst_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    n_expected = len(records) - stats.get("analyst_skipped_search", 0)
+    assert len(analyst_records) == n_expected, (
+        f"{len(analyst_records)} analyst records vs {n_expected} expected "
+        f"({len(records)} rounds - "
+        f"{stats.get('analyst_skipped_search', 0)} skipped)"
+    )
+    assert stats.get("analyst_records", 0) == len(analyst_records), stats
+    for rec in analyst_records:
+        assert rec["target_text"], "analyst record with empty analysis"
+        urls = [
+            part["url"]
+            for m in rec["messages"]
+            for part in (m.get("content") or [])
+            if isinstance(part, dict) and part.get("type") == "image"
+        ]
+        assert urls, "analyst record without an image part"
+        for u in urls:
+            assert (out_dir / u).is_file(), f"analyst frame missing: {u}"
+
     plots = _newest(f"logs/datagen_stats_{label}_*")
     assert (plots / "summary.png").is_file(), f"no summary.png under {plots}"
     return (
         f"{len(records)} records / {stats['games']} games, {rated} rated, "
-        f"{n_images} frames, plots at {plots.name}"
+        f"{len(analyst_records)} analyst records, {n_images} frames, "
+        f"plots at {plots.name}"
     )
 
 
@@ -795,19 +876,26 @@ def t6_ab() -> str:
 
 
 def t7_e2e() -> str:
-    """t5's traces through real train steps via GameTraceSource."""
-    from training.game_traces import GameTraceSource
+    """t5's traces through real train steps: GameTraceSource (weighted CE)
+    plus AnalystTraceSource (KD vs the frozen base), mixed buckets."""
+    from training.game_traces import AnalystTraceSource, GameTraceSource
     from training.train import TrainConfig, run_training
 
     traces = REPO_ROOT / "data_game" / "selftest_t5" / "traces.jsonl"
     assert traces.is_file(), "run t5 first (its output is this stage's input)"
     src = GameTraceSource(traces, noise_seed=1)
+    asrc = AnalystTraceSource(
+        traces.parent / "analyst_traces.jsonl",
+        examples_per_epoch=4, noise_seed=1,
+    )
+    # No step cap: the tiny t5 corpus is a handful of batches, and draining
+    # the epoch guarantees the KD (analyst) bucket actually trains.
     cfg = TrainConfig(
-        label="selftest_t7", epochs=1, max_steps=3, save_steps=999,
+        label="selftest_t7", epochs=1, max_steps=None, save_steps=999,
         micro_batch=2, grad_accum=1, holdout_fraction=0.0,
         log_steps=1,
     )
-    rc = run_training([src], cfg)
+    rc = run_training([src, asrc], cfg)
     assert rc == 0, f"run_training returned {rc}"
     run_dir = _newest("logs/train_selftest_t7_*")
     rows = [
@@ -820,7 +908,7 @@ def t7_e2e() -> str:
         f"no finite losses logged in {run_dir}"
     )
     return (
-        f"{len(losses)} step(s) on {src.name}, losses "
+        f"{len(losses)} step(s) on {src.name}+{asrc.name}, losses "
         + ", ".join(f"{l:.3f}" for l in losses[:4])
     )
 

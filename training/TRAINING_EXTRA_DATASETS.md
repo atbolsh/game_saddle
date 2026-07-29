@@ -98,6 +98,50 @@ dataset to self-distilled targets only on evidence from the early-warning
 suite: KD sources still drifting, OOMs on long examples (TO_TEST item 15),
 or a broken `disable_adapter()` teacher path (TO_TEST item 14).
 
+### The analyst KD anchor (implemented — in-domain replay)
+
+The manifest sets anchor *generic* chat/reasoning/vision behavior, but the
+analyst task — privileged frame + settings + grading a player reply — is
+far from all of those distributions, and it is the one shared-weight
+capability the plan protects without ever training it. The analyst anchor
+is the in-domain replay set that closes that gap: datagen records every
+analyst exchange (the EXACT analyst prompt + the analysis it produced) to
+`data_game/<label>/analyst_traces.jsonl`, and `AnalystTraceSource`
+([game_traces.py](game_traces.py)) feeds those contexts back as
+uniform-weight **KD examples** — soft cross-entropy against the **frozen
+base** model on the analyst's own contexts.
+
+Design decisions, recorded:
+
+- **The teacher is always the frozen base** (`disable_adapter()`),
+  regardless of which checkpoint generated the trace — so the anchor pins
+  analyst behavior to Gemma-as-shipped and never chases its own drift,
+  even when later iterations' traces come from trained checkpoints. This
+  is why KD, not CE-on-recorded-text, is the loss: CE would anchor to one
+  sampled (possibly drifted) trajectory; KD needs no stored teacher at
+  all, only contexts.
+- **No reward enters.** It is an anchor, not RL: records with
+  `rating: null` are kept. Records whose analysis quoted *unverified*
+  (hallucinated) `WRONG:` spans are dropped loudly by default — the one
+  analyst failure the harness detects for free is not worth anchoring on.
+  Truncated search-call generations are never recorded at all (counted as
+  `analyst_skipped_search` in the datagen stats).
+- **Quota, not proportion:** `examples_per_epoch` (default 150, the same
+  convention as the manifest sets) — the per-epoch mix stays fixed while
+  the trace corpus grows across datagen runs.
+- **The gate is the standard one:** `run_training` auto-guards
+  `heldout_loss/analyst_<label>`, and for a KD source that held-out loss
+  *is* drift-from-base on analyst contexts — an analyst-drift meter logged
+  to `eval_log.jsonl` at every save alongside the other per-source
+  metrics, with the usual rollback on a >10% relative regression.
+- **Relation to the planted-error probe** ([TRAINING_TRACE_EXTRAS.md](TRAINING_TRACE_EXTRAS.md)):
+  the probe is *measurement*, this anchor is *prevention*; the probe's
+  corrupted replies must never enter training, or the tripwire stops
+  being evidence.
+- **Player/analyst separation stays structural:** `analyst_traces.jsonl`
+  and `traces.jsonl` are never read by the same source, and the datagen
+  leak tripwire continues to guard player records only.
+
 ### Download strategy and disk
 
 `setup_env.sh` measures free disk at the repo root ONCE and writes
