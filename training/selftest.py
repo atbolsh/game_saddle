@@ -572,67 +572,74 @@ def t3_model() -> str:
         collator = Collator(processor, ADAPTERS[spec.family], terminator,
                             compute_dtype=torch.bfloat16, device=cfg.device)
 
+        # Keep the temp dir alive for the WHOLE stage: image examples hold
+        # absolute paths into it, and the processor hard-fails (misleading
+        # "Incorrect padding" / base64 error) if the file is already gone.
         with tempfile.TemporaryDirectory(prefix="selftest_t3_") as tmp:
             smoke = _write_smoke_jsonl(Path(tmp))
             exs = list(JsonlSource(smoke).examples())
-        by_kind = {
-            "ce_text": next(e for e in exs
-                            if e.loss == "ce" and not e.declares_image()
-                            and not e.span_weights),
-            "ce_image": next(e for e in exs if e.declares_image()),
-            "kd": next(e for e in exs if e.loss == "kd"),
-            "neg_span": next(e for e in exs if e.span_weights),
-        }
-        losses = {}
-        model.train()
-        for kind, ex in by_kind.items():
+            by_kind = {
+                "ce_text": next(e for e in exs
+                                if e.loss == "ce" and not e.declares_image()
+                                and not e.span_weights),
+                "ce_image": next(e for e in exs if e.declares_image()),
+                "kd": next(e for e in exs if e.loss == "kd"),
+                "neg_span": next(e for e in exs if e.span_weights),
+            }
+            losses = {}
+            model.train()
+            for kind, ex in by_kind.items():
+                built = collator.build(ex)
+                if kind == "ce_image":
+                    assert any(
+                        v.dtype.is_floating_point
+                        for v in built["model_inputs"].values()
+                        if isinstance(v, torch.Tensor)
+                    ), "image example collated without pixel values"
+                loss = weighted_loss(model, built["model_inputs"],
+                                     built["weights"], loss_kind=ex.loss)
+                loss.backward()
+                model.zero_grad(set_to_none=True)
+                lv = float(loss.detach())
+                assert lv == lv and abs(lv) < 1e4, f"{kind}: bad loss {lv}"
+                losses[kind] = lv
+
+            # Teacher-path sanity: with a FRESH (identity) adapter, student ==
+            # teacher, so the KD soft-CE must equal the teacher's own entropy --
+            # i.e. the smallest value it can take. A mismatch means
+            # disable_adapter() is not returning the base distribution.
+            import torch.nn.functional as F
+
+            from training.train import _base_model_logits
+
+            ex = by_kind["kd"]
             built = collator.build(ex)
-            if kind == "ce_image":
-                assert any(
-                    v.dtype.is_floating_point
-                    for v in built["model_inputs"].values()
-                    if isinstance(v, torch.Tensor)
-                ), "image example collated without pixel values"
-            loss = weighted_loss(model, built["model_inputs"],
-                                 built["weights"], loss_kind=ex.loss)
-            loss.backward()
-            model.zero_grad(set_to_none=True)
-            lv = float(loss.detach())
-            assert lv == lv and abs(lv) < 1e4, f"{kind}: bad loss {lv}"
-            losses[kind] = lv
-
-        # Teacher-path sanity: with a FRESH (identity) adapter, student ==
-        # teacher, so the KD soft-CE must equal the teacher's own entropy --
-        # i.e. the smallest value it can take. A mismatch means
-        # disable_adapter() is not returning the base distribution.
-        import torch.nn.functional as F
-
-        from training.train import _base_model_logits
-
-        ex = by_kind["kd"]
-        built = collator.build(ex)
-        kd_loss = float(weighted_loss(model, built["model_inputs"],
-                                      built["weights"], loss_kind="kd").detach())
-        with torch.no_grad():
-            t_logits = _base_model_logits(model, built["model_inputs"])
-            w = built["weights"][:, 1:].reshape(-1)
-            mask = w != 0
-            t = t_logits[:, :-1, :].reshape(-1, t_logits.shape[-1])[mask].float()
-            entropy = float(
-                (-(F.softmax(t, -1) * F.log_softmax(t, -1)).sum(-1) * w[mask]).sum()
-                / w[mask].abs().sum()
+            kd_loss = float(weighted_loss(
+                model, built["model_inputs"], built["weights"], loss_kind="kd"
+            ).detach())
+            with torch.no_grad():
+                t_logits = _base_model_logits(model, built["model_inputs"])
+                w = built["weights"][:, 1:].reshape(-1)
+                mask = w != 0
+                t = t_logits[:, :-1, :].reshape(
+                    -1, t_logits.shape[-1]
+                )[mask].float()
+                entropy = float(
+                    (-(F.softmax(t, -1) * F.log_softmax(t, -1)).sum(-1)
+                     * w[mask]).sum()
+                    / w[mask].abs().sum()
+                )
+            assert abs(kd_loss - entropy) < 0.05, (
+                f"fresh-adapter KD loss {kd_loss:.4f} != teacher entropy "
+                f"{entropy:.4f} -- disable_adapter() may not bypass the adapter"
             )
-        assert abs(kd_loss - entropy) < 0.05, (
-            f"fresh-adapter KD loss {kd_loss:.4f} != teacher entropy "
-            f"{entropy:.4f} -- disable_adapter() may not bypass the adapter"
-        )
-        peak = torch.cuda.max_memory_allocated() / 2**30
-        return (
-            f"{len(lora_targets)} LoRA targets, {len(projector)} projector "
-            f"module(s), terminator {terminator}; losses "
-            + ", ".join(f"{k}={v:.3f}" for k, v in losses.items())
-            + f"; KD==teacher-entropy ok; peak {peak:.1f} GiB"
-        )
+            peak = torch.cuda.max_memory_allocated() / 2**30
+            return (
+                f"{len(lora_targets)} LoRA targets, {len(projector)} projector "
+                f"module(s), terminator {terminator}; losses "
+                + ", ".join(f"{k}={v:.3f}" for k, v in losses.items())
+                + f"; KD==teacher-entropy ok; peak {peak:.1f} GiB"
+            )
     finally:
         _free_cuda(model)
 

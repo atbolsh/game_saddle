@@ -19,7 +19,8 @@ cd "${REPO_ROOT}"
 echo "Cleaning selftest artifacts under ${REPO_ROOT} ..."
 
 rm -rf data_game/selftest_t5
-rm -rf logs/train_selftest_* logs/datagen_stats_selftest_*
+rm -rf logs/train_selftest_* logs/datagen_stats_selftest_* logs/selftest_smoke
+
 # Glob may expand to nothing; nullglob-safe via a loop.
 shopt -s nullglob
 for d in weights/*/selftest_t4* weights/*/selftest_t4rb* weights/*/selftest_t7*; do

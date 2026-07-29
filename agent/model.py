@@ -152,18 +152,60 @@ class FamilyAdapter:
     model families with different quirks get their own subclass here."""
 
     @staticmethod
-    def _resolve_image_url(url: str) -> str:
-        """Allow ``url`` to be a local filesystem path; HF processors accept
-        paths directly. We also tolerate a ``file://`` prefix."""
-        if url.startswith("file://"):
-            return url[len("file://"):]
-        return url
+    def _materialize_image_part(part: dict) -> dict:
+        """Normalize one ``type=image`` content part for the HF processor.
+
+        ``apply_chat_template`` pulls values from keys
+        ``image`` / ``url`` / ``path`` / ``base64`` and passes them to
+        ``load_image_as_tensor``, which accepts http(s) URLs, local paths
+        (via ``os.path.isfile``), base64, or a PIL image. We materialize
+        *local* paths to PIL ourselves under the ``image`` key (and drop
+        ``url``/``path`` so the extractor does not also enqueue the string
+        and double-count the frame). Reasons:
+
+        * A missing/deleted path otherwise falls through to the base64
+          branch and raises the misleading ``Incorrect padding`` error.
+        * Passing PIL is the format HF's own processor tests use and is
+          immune to cwd / temp-dir lifetime surprises between record and
+          collate time.
+        """
+        from PIL import Image
+
+        # Already a loaded image / tensor -- leave alone (strip string keys
+        # so we don't also enqueue a path/url for the same part).
+        if part.get("image") is not None and not isinstance(part["image"], str):
+            return {k: v for k, v in part.items()
+                    if k not in ("url", "path", "base64")}
+
+        src = part.get("url") or part.get("path") or part.get("image")
+        if src is None and part.get("base64"):
+            return part  # let the processor decode
+        if not isinstance(src, str):
+            raise TypeError(
+                f"image content part has no usable source "
+                f"(keys={sorted(part)}); expected url/path/image/base64"
+            )
+        if src.startswith("file://"):
+            src = src[len("file://"):]
+        if (src.startswith("http://") or src.startswith("https://")
+                or src.startswith("data:")):
+            return {**part, "url": src}
+
+        path = Path(src)
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"image url/path is not an existing local file: {src!r}"
+            )
+        with Image.open(path) as im:
+            pil = im.convert("RGB").copy()
+        # Only the PIL object -- no url/path, or the chat extractor would
+        # collect BOTH and ask the processor for two images.
+        return {"type": "image", "image": pil}
 
     def prepare_messages(self, messages: list[dict]) -> list[dict]:
-        """Normalize messages for this family. Default: resolve image URLs
-        (paths) in content lists; the standard HF chat format needs nothing
-        else. Override per family only if a processor rejects the
-        ``{"type": "image", "url": ...}`` content format."""
+        """Normalize messages for this family: materialize local image paths
+        to PIL (see :meth:`_materialize_image_part`). Override per family
+        only if a processor rejects the standard HF content format."""
         norm: list[dict] = []
         for m in messages:
             content = m.get("content")
@@ -171,7 +213,7 @@ class FamilyAdapter:
                 new_content = []
                 for part in content:
                     if isinstance(part, dict) and part.get("type") == "image":
-                        part = {**part, "url": self._resolve_image_url(part["url"])}
+                        part = self._materialize_image_part(part)
                     new_content.append(part)
                 norm.append({**m, "content": new_content})
             else:
