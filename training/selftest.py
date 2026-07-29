@@ -197,16 +197,25 @@ def t1_pure() -> str:
     """The pure-python units -- no GPU, no NAMS, no downloads."""
     import io
     import random
+    from collections import Counter
 
     from PIL import Image
 
     from agent.modes import parse_rating
     from training.game_traces import GameTraceSource, build_span_weights
     from training.generate_game_traces import (
+        PERCEPTION_QUESTION_GROUPS,
         _assert_no_analyst_leak,
         _rewrite_image_urls,
+        _sample_perception_question,
     )
     from training.image_noise import make_image_filter, noise_image
+    from training.planted_errors import (
+        scramble_clock,
+        scramble_directions,
+        scramble_move_token,
+        scramble_player_reply,
+    )
     from training.train import TrainingExample, epoch_batches
 
     checks = 0
@@ -360,7 +369,96 @@ def t1_pure() -> str:
         )
     checks += 1
 
-    return f"{checks} unit groups passed (ratings, rewards, noise, tripwire, source, batching)"
+    # ---- planted-error scrambler: deterministic, one labeled change,
+    #      span points at the new text
+    reply = (
+        "OBS: my eye points toward 12 o'clock; the gold is at the top "
+        "right, toward 1 o'clock of me.\n"
+        "REASON: the gold is slightly to the right of my facing.\n[CLOCK]"
+    )
+    r1 = scramble_player_reply(reply, random.Random(5))
+    assert r1 == scramble_player_reply(reply, random.Random(5)), (
+        "scramble_player_reply not deterministic under a fixed seed"
+    )
+    text1, changes1 = r1
+    assert len(changes1) == 1 and text1 != reply, (text1, changes1)
+    ch = changes1[0]
+    assert {"kind", "span", "old", "new", "within_tolerance"} <= set(ch), ch
+    assert text1[ch["span"][0]:ch["span"][1]] == ch["new"], ch
+    checks += 1
+
+    # ---- move token: all three corruption modes reachable, each well-formed
+    kinds_seen = set()
+    for s in range(40):
+        t, chs = scramble_move_token(reply, random.Random(s))
+        (c,) = chs
+        kinds_seen.add(c["kind"])
+        assert c["old"] == "[CLOCK]", c
+        if c["kind"] == "move_token_replace":
+            assert c["new"] in ("[ANTICLOCK]", "[FORWARD]"), c
+        elif c["kind"] == "move_token_strip":
+            assert c["new"] == "CLOCK" and t.endswith("CLOCK") and "[CLOCK]" not in t, (t, c)
+        else:
+            assert c["kind"] == "move_token_delete" and c["new"] == "" and "[CLOCK]" not in t, (t, c)
+    assert kinds_seen == {
+        "move_token_replace", "move_token_strip", "move_token_delete"
+    }, kinds_seen
+    checks += 1
+
+    # ---- clock: hour always changes; tolerance label = circular shift <= 2
+    for s in range(40):
+        t, chs = scramble_clock("the gold sits toward 4 o'clock of me",
+                                random.Random(s))
+        (c,) = chs
+        new_hour = int(c["new"].split()[0])
+        assert 1 <= new_hour <= 12 and new_hour != 4, c
+        shift = min((new_hour - 4) % 12, (4 - new_hour) % 12)
+        assert c["shift_hours"] == shift, c
+        assert c["within_tolerance"] == (shift <= 2), c
+    checks += 1
+
+    # ---- directions: case-preserving swap; the "right = correct" guard;
+    #      unchanged-text fallthrough
+    t, chs = scramble_directions("Left of me sits the wall.", random.Random(0))
+    assert t == "Right of me sits the wall." and chs[0]["new"] == "Right", (t, chs)
+    guarded = "That was the right move."
+    assert scramble_directions(guarded, random.Random(0)) == (guarded, []), (
+        "semantic 'right' was swapped"
+    )
+    plain = "nothing scrambleable here."
+    assert scramble_player_reply(plain, random.Random(0)) == (plain, []), (
+        "scramble fabricated a change on inert text"
+    )
+    checks += 1
+
+    # ---- perception questions: rate honored; groups equiprobable; mirrored
+    #      variants within a group near-equal (the direction-balance promise)
+    qrng = random.Random(1)
+    n_rate = 20_000
+    n_q = sum(
+        _sample_perception_question(qrng, 0.2) is not None
+        for _ in range(n_rate)
+    )
+    assert abs(n_q / n_rate - 0.2) < 0.02, f"question rate off: {n_q / n_rate}"
+    counts: Counter = Counter(
+        _sample_perception_question(qrng, 1.0) for _ in range(60_000)
+    )
+    assert None not in counts, "rate-1.0 draw returned the default question"
+    totals = []
+    for group in PERCEPTION_QUESTION_GROUPS:
+        assert all(isinstance(q, str) and q.strip() for q in group), group
+        got = [counts[q] for q in group]
+        assert min(got) > 0 and max(got) < 1.15 * min(got), (
+            f"unbalanced variants: {dict(zip(group, got))}"
+        )
+        totals.append(sum(got))
+    assert max(totals) < 1.1 * min(totals), f"unbalanced groups: {totals}"
+    checks += 1
+
+    return (
+        f"{checks} unit groups passed (ratings, rewards, noise, tripwire, "
+        "source, batching, scrambler, questions)"
+    )
 
 
 def t2_data() -> str:

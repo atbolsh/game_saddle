@@ -1177,7 +1177,9 @@ def build_scene_analyst_messages(
         scene.append(
             f"The reply ends in the move token [{pending_action}]. That move "
             "has NOT been applied yet -- judge the decision on the frame "
-            "below."
+            "below. Check the user's question first: if it asked for "
+            "information rather than a move, this move token was NOT "
+            "requested -- that is itself a format mistake to call out."
         )
     else:
         bare = game_io.find_bare_move(player_reply)

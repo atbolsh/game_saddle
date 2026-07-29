@@ -6,7 +6,8 @@ Drives the EXACT machinery of the interactive self-eval notebook --
 player and analyst questions, same prompts, same memory screening -- with no
 human in the loop:
 
-    per round:  ask_player(DEFAULT_PLAYER_QUESTION)
+    per round:  ask_player(DEFAULT_PLAYER_QUESTION,
+                           or a perception question at --question-rate)
                 -> ask_analyst(DEFAULT_ANALYST_QUESTION)   (one exchange)
                 -> end_round()                             (move propagates)
 
@@ -27,7 +28,9 @@ One record per player generation, in ``data_game/<label>/traces.jsonl``:
     ``data_game/<label>/images/`` (byte-identical to what the player saw --
     the live ``memory_images/`` copy does not survive NAMS resets);
   * ``target_text`` -- the raw player reply (the ONLY trainable tokens);
-  * ``meta``      -- rating, wrong spans, action, game/move indices, outcome.
+  * ``meta``      -- rating, wrong spans, action, game/move indices, outcome,
+    and the exact ``question`` the round asked (perception rounds are the
+    records whose question differs from the default move request).
 
 Analyst text is stored to NAMS exactly as in the notebook and never enters
 any record's ``messages``/``target_text`` -- it exists in training only as
@@ -66,6 +69,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import random
 import shutil
 import sys
 import threading
@@ -88,6 +92,51 @@ DATA_GAME_DIR = Path(__file__).resolve().parent.parent / "data_game"
 #: Long enough to never fire on a coincidental phrase, short enough to catch
 #: a truncated leak.
 _TRIPWIRE_PREFIX_LEN = 100
+
+#: Perception-question rounds: with probability --question-rate a round asks
+#: one of these instead of the default move request. The player must answer
+#: in prose with NO move token (the scene-play prompt says so explicitly);
+#: the analyst grades the answer against the exact settings it already
+#: receives, and an unrequested move token is itself a graded mistake.
+#:
+#: DIRECTION BALANCE: the pool is a list of GROUPS of mirrored variants --
+#: sampling picks a group uniformly, then a variant uniformly within it, so
+#: "is the gold to your left?" and "... to your right?" (and above/below)
+#: are asked with exactly the same probability, and the data never teaches a
+#: directional prior. Questions drawn from the real interactive logs and the
+#: scene-play prompt's own examples.
+PERCEPTION_QUESTION_GROUPS: list[list[str]] = [
+    ["Are you facing the gold?"],
+    [
+        "Is the gold to your left?",
+        "Is the gold to your right?",
+        "Is the gold above you?",
+        "Is the gold below you?",
+    ],
+    [
+        "Disregard the gold. Are you facing generally to the left or right "
+        "of the screen?",
+        "Disregard the gold. Are you facing generally toward the top or the "
+        "bottom of the screen?",
+    ],
+    ["Which way is your eye pointing, in clock terms?"],
+    [
+        "Is the gold closer to the top or the bottom of the board?",
+        "Is the gold closer to the left or the right edge of the board?",
+    ],
+    ["Are you close to any wall right now?"],
+]
+
+
+def _sample_perception_question(rng: random.Random,
+                                question_rate: float) -> str | None:
+    """One draw of the round's question: a perception question with
+    probability ``question_rate`` (group-uniform, then variant-uniform --
+    see PERCEPTION_QUESTION_GROUPS), else None (= the default move
+    request)."""
+    if rng.random() >= question_rate:
+        return None
+    return rng.choice(rng.choice(PERCEPTION_QUESTION_GROUPS))
 
 
 def _rewrite_image_urls(messages: list[dict], mapping: dict[str, str]) -> int:
@@ -176,16 +225,27 @@ class _Shared:
 
 
 def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
-               shared: _Shared, session_analyses: list[str]) -> None:
+               shared: _Shared, session_analyses: list[str],
+               qrng: random.Random) -> None:
     """One full game on ``session``: rounds until the gold is eaten, the
     move cap is hit, or the run-wide generation budget runs out. Buffers the
-    game's records, stamps the outcome, writes them under the shared lock."""
+    game's records, stamps the outcome, writes them under the shared lock.
+
+    Each round asks either the default move request or (with probability
+    ``--question-rate``, drawn from ``qrng``) a perception question --
+    those rounds do not advance the game (a correct answer is prose with no
+    move token; a mistakenly emitted token still propagates, exactly as the
+    game contract promises, and the analyst grades it as unrequested)."""
     game_records: list[dict] = []
     won = False
     for move_idx in range(args.max_moves):
         if not shared.take_generation():
             break
-        player = session.ask_player(session.DEFAULT_PLAYER_QUESTION)
+        question = _sample_perception_question(qrng, args.question_rate)
+        is_perception = question is not None
+        if question is None:
+            question = session.DEFAULT_PLAYER_QUESTION
+        player = session.ask_player(question)
 
         # Stable image copy FIRST (before anything else can touch the live
         # file): byte-identical to the (possibly noised) frame the player
@@ -216,6 +276,7 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
                 "game_index": game_idx,
                 "move_index": move_idx,
                 "session_id": player["session_id"],
+                "question": question,
             },
         }
         n_imgs = _rewrite_image_urls(
@@ -240,6 +301,8 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
             shared.stats["wrong_spans"] += len(analyst["wrong_spans"]["verified"])
             if player["action"]:
                 shared.stats["moves"] += 1
+            if is_perception:
+                shared.stats["perception_rounds"] += 1
 
         if outcome["gold_remaining"] == 0:
             won = True
@@ -265,7 +328,8 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
 
 def _worker(worker_id: int, session: Any, block: list[int], shared: _Shared,
             args: argparse.Namespace, session_analyses: list[str],
-            fresh: list[bool], errors: list[BaseException]) -> None:
+            fresh: list[bool], errors: list[BaseException],
+            qrng: random.Random) -> None:
     """Pull game indices off the shared block queue until it drains, the
     budget runs out, or any worker errored (fail the whole run, never
     silently continue with fewer workers)."""
@@ -281,7 +345,7 @@ def _worker(worker_id: int, session: Any, block: list[int], shared: _Shared,
                 fresh[worker_id] = False  # restart() already dealt the board
             else:
                 session.reset_game()
-            _play_game(session, game_idx, args, shared, session_analyses)
+            _play_game(session, game_idx, args, shared, session_analyses, qrng)
     except BaseException as exc:
         logger.exception("datagen worker %d failed", worker_id)
         with shared.lock:
@@ -330,6 +394,10 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
             shared = _Shared(out, images_dir, args.max_generations)
             # Per-session tripwire corpora (cleared on memory reset).
             analyses: list[list[str]] = [[] for _ in range(n_workers)]
+            # Per-worker question rng, persistent across blocks so no two
+            # blocks (or workers) repeat the same question sequence.
+            qrngs = [random.Random(args.seed * 1000 + i)
+                     for i in range(n_workers)]
             for s in sessions:
                 s.restart()
             fresh = [True] * n_workers
@@ -359,7 +427,7 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
                     threading.Thread(
                         target=_worker, name=f"datagen-w{i}",
                         args=(i, sessions[i], block, shared, args,
-                              analyses[i], fresh, errors),
+                              analyses[i], fresh, errors, qrngs[i]),
                     )
                     for i in range(n_workers)
                 ]
@@ -427,8 +495,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reset-every", type=int, default=100,
                    help="reset NAMS episodic memory (tips survive) every N "
                         "games (default 100 per TRAINING_EXTRA_DATASETS.md)")
+    p.add_argument("--question-rate", type=float, default=0.2,
+                   help="probability that a round asks a perception "
+                        "question (direction-balanced pool, see "
+                        "PERCEPTION_QUESTION_GROUPS) instead of the default "
+                        "move request (default 0.2)")
     p.add_argument("--seed", type=int, default=17,
-                   help="seed for the inference-time image noise stream")
+                   help="seed for the inference-time image noise stream and "
+                        "the question sampler")
     p.add_argument("--noise", dest="noise", action="store_true", default=True)
     p.add_argument("--no-noise", dest="noise", action="store_false",
                    help="disable inference-time frame degradation")

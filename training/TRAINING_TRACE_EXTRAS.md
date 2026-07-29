@@ -8,23 +8,31 @@ standard pipeline is [TRAINING_GAME_TRACES.md](TRAINING_GAME_TRACES.md).
 
 Take a player reply that is **correct** (as graded, or hand-picked) and
 programmatically corrupt it, producing a reply with a known, labeled
-mistake. Committed generation techniques — deliberately cheap:
+mistake. **The generator is implemented:** [planted_errors.py](planted_errors.py)
+(`scramble_player_reply(text, rng)` plants exactly ONE corruption per reply
+and returns the change log; nothing imports it yet — usage stays deferred as
+below). The generation techniques — deliberately cheap:
 
 - **Clock-word shift:** grep the reply for clock words (`N o'clock`,
-  matching the compass/clock convention the prompts use) and randomly shift
-  the hour by 1–5 — with the shift size recorded in the label, since a
-  1–2 hour shift is *within* the grading tolerance and must be labeled
-  "acceptable", not "error". Direction words ("upper left", "clockwise")
-  are a second, optional target for swaps.
+  matching the compass/clock convention the prompts use) and replace one
+  chosen hour with a random different hour 1–12 — with the circular shift
+  size recorded in the label, since a 1–2 hour shift is *within* the
+  grading tolerance and must be labeled "acceptable", not "error".
+- **Direction-word swap:** swap one direction word with its opposite
+  (left/right, up/down, upper/lower, top/bottom, above/below,
+  clockwise/counter-clockwise), case-preserving; compounds ("upper left")
+  fall out of the word-level swap. A narrow guard skips `right` when it
+  means "correct" ("the right move", "all right") — every swap lands in
+  the change log, so residual misfires stay auditable.
 - **Move-token scramble:** replace the final move token with another of the
   three, strip its brackets (the known bare-word format error), or delete
   it outright when a move was requested.
 
 Each corrupted reply carries machine-readable ground truth: what was
 changed, where (char span), and whether it is inside or outside grading
-tolerance. The generator is a stage-2 deliverable alongside the game-trace
-`DataSource`; exact usage is decided later. The two candidate uses, in
-order of commitment:
+tolerance; an unchanged return means no target was found and the caller
+must skip that reply. Exact usage is decided later. The two candidate
+uses, in order of commitment:
 
 1. **Measure analyst quality (committed).** Feed corrupted replies through
    the analyst phase and score: miss rate (planted error not flagged),

@@ -11,7 +11,7 @@ lines back for review. On a FAIL, also paste the traceback that precedes it.
 | # | Command | Cost | What it proves |
 |---|---------|------|----------------|
 | 0 | `python -m training.selftest t0` | seconds | imports; transformers >= 5.10; CUDA visible; bitsandbytes loads |
-| 1 | `python -m training.selftest t1` | seconds | pure units: `parse_rating` (incl. bold variants), `build_span_weights` (WRONG override, win boost, negative scale), image-noise determinism/identity, analyst-leak tripwire (incl. multi-line), `_rewrite_image_urls`, `GameTraceSource` on a fabricated trace dir, micro-batch bucketing |
+| 1 | `python -m training.selftest t1` | seconds | pure units: `parse_rating` (incl. bold variants), `build_span_weights` (WRONG override, win boost, negative scale), image-noise determinism/identity, analyst-leak tripwire (incl. multi-line), `_rewrite_image_urls`, `GameTraceSource` on a fabricated trace dir, micro-batch bucketing, planted-error scrambler (seed determinism, all three move-token modes, clock-shift tolerance labeling, direction swap incl. the "right move" guard, inert-text fallthrough), perception-question sampling (rate honored, groups and mirrored variants balanced) |
 | 2 | `python -m training.selftest t2` | seconds | every enabled manifest entry materialized; `data.jsonl` row counts match `meta.json`; probe files present |
 | 3 | `python -m training.selftest t3` | minutes | 4-bit QLoRA load; LoRA target discovery + projector resolution; terminator id; one collated forward+backward per loss kind (image example included); fresh-adapter KD loss equals teacher entropy (the `disable_adapter()` teacher path) |
 | 4 | `python -m training.selftest t4` | ~15–30 min | batch-4 vs batch-1 per-example loss parity (mixed CE/KD/image/negative-span buckets); CLI smoke train lands a checkpoint + `eval_log.jsonl` rows; destructive-LR variant fires the rollback path |
@@ -72,3 +72,9 @@ changes rather than every run:
    after every real datagen run: a rating histogram compressed into a
    narrow positive band with rare WRONG spans means a weak reward signal —
    reconsider before spending the training hours.
+9. **Question-round analyses** — from a t5 (or real) datagen run, pull a
+   few records whose `meta.question` is a perception question and read the
+   analyst analyses in the run log: prose answers with no move token are
+   graded on correctness (not punished for the missing token), and a reply
+   that DID emit a move token on a question round gets the unrequested
+   token called out.

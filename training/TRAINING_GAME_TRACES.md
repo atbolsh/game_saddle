@@ -50,6 +50,25 @@ whichever comes first -- each round costs two generations, and early
 wandering traces carry little signal per round, so short games are the
 cheap default; raise the cap as the player gets good enough to need it.
 
+**Perception-question rounds** (`--question-rate`, default 0.2): with this
+probability a round asks a perception question ("Are you facing the gold?",
+"Is the gold to your left?", ...) instead of the default move request —
+targeted pressure on the identified weak point (reading the frame), with
+fully gradeable ground truth since the analyst checks the answer against
+the exact settings it already receives. The pool
+(`PERCEPTION_QUESTION_GROUPS` in the generator) is **direction-balanced**:
+questions are grouped with their mirrored variants and sampling is
+group-uniform then variant-uniform, so "to your left?" and "to your right?"
+(and above/below, top/bottom) are asked with identical probability and the
+data never teaches a directional prior. A correct answer is prose with NO
+move token; a mistakenly emitted token still propagates (the game contract:
+an emitted token is executed) and the analyst prompt explicitly calls an
+unrequested move token a format mistake. Question rounds don't advance the
+game, so at rate q a `--max-moves` cap yields ~q fewer move rounds per
+game. `meta.question` stores the exact question asked, which is how
+perception records are distinguished downstream; the run summary counts
+them as `perception_rounds`.
+
 One record per player generation lands in `data_game/<label>/traces.jsonl`:
 
 - `messages` — the EXACT prompt of the accepted player generation (system
@@ -59,9 +78,9 @@ One record per player generation lands in `data_game/<label>/traces.jsonl`:
   does not survive NAMS resets);
 - `target_text` — the raw player reply, the ONLY trainable tokens;
 - `meta` — RAW annotations only: analyst rating, harness-verified `WRONG:`
-  spans, action, game/move indices, `game_won`, `moves_from_end`. Rewards
-  are computed at TRAINING time from these, so every ratio below stays
-  tunable without regenerating data.
+  spans, action, game/move indices, the round's `question`, `game_won`,
+  `moves_from_end`. Rewards are computed at TRAINING time from these, so
+  every ratio below stays tunable without regenerating data.
 
 Housekeeping baked into the generator:
 
