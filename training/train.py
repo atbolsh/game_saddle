@@ -641,13 +641,27 @@ def build_model(spec: Any, cfg: TrainConfig, hf_token: str | None):
                 f"{transformers.__version__} installed."
             )
 
+    # Keep multimodal embedders / towers + lm_head in bf16. modules_to_save
+    # needs floating-point params (PEFT set_requires_grad fails on Linear4bit
+    # packed weights -- "only Tensors of floating point dtype can require
+    # gradients"). Passing a custom skip list also CLEARS transformers'
+    # default lm_head skip, so lm_head is listed explicitly.
+    skip_modules = [
+        "lm_head",
+        "embed_vision", "embed_audio",
+        "vision_tower", "audio_tower",
+    ]
     quant = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_use_double_quant=True,
         bnb_4bit_compute_dtype=torch.bfloat16,
+        llm_int8_skip_modules=skip_modules,
     )
-    logger.info("Loading %s (%s) in 4-bit NF4 ...", spec.key, spec.hf_id)
+    logger.info(
+        "Loading %s (%s) in 4-bit NF4 (skip quant: %s) ...",
+        spec.key, spec.hf_id, skip_modules,
+    )
     processor = AutoProcessor.from_pretrained(
         spec.hf_id, token=hf_token, trust_remote_code=spec.trust_remote_code,
     )

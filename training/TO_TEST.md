@@ -22,6 +22,16 @@ lines back for review. On a FAIL, also paste the traceback that precedes it.
 (`python -m training.selftest all` runs everything in order; the exit code
 is the number of failures.)
 
+To wipe selftest leftovers (failed / Ctrl-C mid-run) and re-start cleanly::
+
+    bash scripts/clean_selftest.sh
+    python -m training.selftest all   # or resume from the failed stage
+
+That script only removes `selftest_*` paths under `data_game/`, `logs/`,
+`weights/`, and `/tmp`; it never touches `data_external/` or Neo4j. If a
+GPU stage was interrupted, also check `nvidia-smi` for a leftover python
+PID holding VRAM.
+
 Stage 6 note: greedy equality is the strict criterion. If it fails only on
 a near-tie token deep into a reply (both outputs sane, divergence late),
 that is bf16 batched-matmul nondeterminism, not necessarily a padding bug —

@@ -106,7 +106,11 @@ LoRA via PEFT `modules_to_save` (so it rides inside the adapter checkpoint).
 On Gemma 4 / Gemma 4 Unified that module is `embed_vision`
 (`model.embed_vision`) — there is no `multi_modal_projector`. For the 12B
 Unified architecture this embedder *is* the whole vision path (encoder-free
-patch→LM projection), which is the intended trainable lever.
+patch→LM projection), which is the intended trainable lever. Under 4-bit
+QLoRA the embedder/towers + `lm_head` are kept in bf16 via
+`BitsAndBytesConfig.llm_int8_skip_modules` — PEFT cannot `requires_grad` on
+quantized packed weights, so quantizing `embed_vision` and then listing it
+in `modules_to_save` fails loudly.
 
 Micro-batching (Intermission): the default is `micro_batch=4` with
 `grad_accum=4`, so the **effective batch stays 16** (`micro_batch x
