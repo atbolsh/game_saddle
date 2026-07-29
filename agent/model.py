@@ -346,10 +346,14 @@ class VLModel:
         if self.cfg.hf_token:
             kwargs["token"] = self.cfg.hf_token
         try:
+            # padding_side=left is required for batched decoder-only generate
+            # (HF Gemma 4 docs); training builds its own processor and
+            # right-pads manually in Collator.
             self.processor = AutoProcessor.from_pretrained(
                 spec.hf_id,
                 token=self.cfg.hf_token or None,
                 trust_remote_code=spec.trust_remote_code,
+                padding_side="left",
             )
             self.model = AutoModelForMultimodalLM.from_pretrained(spec.hf_id, **kwargs)
         except Exception as exc:
@@ -359,6 +363,11 @@ class VLModel:
                 f"Failed to load model {spec.key!r} ({spec.hf_id}): "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
+        # Belt-and-suspenders: some processor builds only honor the tokenizer
+        # attribute, not the from_pretrained kwarg.
+        tok = getattr(self.processor, "tokenizer", self.processor)
+        if hasattr(tok, "padding_side"):
+            tok.padding_side = "left"
         if self.checkpoint:
             self._apply_checkpoint()
         self.model.eval()
@@ -565,21 +574,30 @@ class VLModel:
 
         norm = [self.adapter.prepare_messages(r["messages"]) for r in batch]
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
-        prev_side = getattr(tokenizer, "padding_side", "right")
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = "left"
-        try:
-            inputs = self.processor.apply_chat_template(
-                norm,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=True,
-                return_tensors="pt",
-                padding=True,
+        # Transformers v5+: padding/padding_side must go in processor_kwargs
+        # (top-level kwargs warn and can miss the tokenizer's padding_side).
+        inputs = self.processor.apply_chat_template(
+            norm,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+            processor_kwargs={"padding": True, "padding_side": "left"},
+        )
+        # Left-pad invariant: every row's last prompt token is real content,
+        # so a single prompt_len is correct for decode + RegexStopCriteria.
+        # Right-padded batches look "fine" then silently diverge from solo
+        # generate (exactly what selftest t6 catches).
+        mask = inputs.get("attention_mask")
+        if mask is None or not torch.all(mask[:, -1] == 1):
+            raise RuntimeError(
+                "generate_batch: prompts are not left-padded "
+                "(attention_mask[:, -1] has zeros or mask missing); "
+                "refusing to decode a divergent batch. "
+                f"mask_tail={None if mask is None else mask[:, -1].tolist()}"
             )
-        finally:
-            tokenizer.padding_side = prev_side
         target_device = next(self.model.parameters()).device
         inputs = inputs.to(target_device)
         model_dtype = next(self.model.parameters()).dtype

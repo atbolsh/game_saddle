@@ -36,7 +36,10 @@ Stage 6 note: greedy equality is the strict criterion. If it fails only on
 a near-tie token deep into a reply (both outputs sane, divergence late),
 that is bf16 batched-matmul nondeterminism, not necessarily a padding bug —
 paste both replies and we judge. Early divergence or garbled batched output
-means the left-padding/pixel-routing is wrong.
+means the left-padding/pixel-routing is wrong. Transformers v5 wants
+`processor_kwargs={"padding": True, "padding_side": "left"}` on
+`apply_chat_template`; a top-level `padding=True` only warns and can leave
+the batch right-padded.
 
 Stage 4 note: the rollback variant relies on `--lr 0.05` wrecking the
 adapter between saves, which is near-certain but stochastic; if no
