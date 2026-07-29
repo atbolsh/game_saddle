@@ -82,6 +82,7 @@ import random
 import shutil
 import sys
 import threading
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -415,6 +416,7 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
     from agent.parallel_gen import BatchingProxy, GenerationDispatcher
     from agent.self_eval_session import InteractiveSelfEvalSession
 
+    t_start = time.perf_counter()
     set_default_checkpoint(args.checkpoint)
 
     out_dir = DATA_GAME_DIR / args.label
@@ -502,12 +504,18 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
         for s in sessions:
             s.close()
 
+    wall_s = time.perf_counter() - t_start
+    n_gen = shared.stats.get("generations", 0)
     summary = {
         **{k: shared.stats[k] for k in sorted(shared.stats)},
         "rating_histogram": dict(sorted(shared.rating_hist.items())),
         "traces": str(traces_path),
         "analyst_traces": str(analyst_path),
         "parallel": n_workers,
+        # THE number to compare across --parallel settings (model load
+        # included; identical either way, so it cancels in the comparison).
+        "wall_seconds": round(wall_s, 1),
+        "seconds_per_generation": round(wall_s / n_gen, 2) if n_gen else None,
     }
     (out_dir / "generation_stats.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
