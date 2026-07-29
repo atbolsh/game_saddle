@@ -39,8 +39,9 @@ weights). No train/inference template mismatch.
 IMAGES ARE FIRST-CLASS. The model's own AutoProcessor runs over the full
 messages, so batches carry pixel tensors and the forward pass is the
 multimodal forward. An example that declares an image but produces no pixel
-tensor is a hard error (no silent text-only degradation). Vision tower
-frozen; the multimodal projector trains via PEFT ``modules_to_save`` and so
+tensor is a hard error (no silent text-only degradation). Vision/audio
+towers stay frozen (name-excluded from LoRA); the vision embedder
+(``embed_vision`` on Gemma 4) trains via PEFT ``modules_to_save`` and so
 rides inside the adapter checkpoint. Micro-batch is fixed at 1 (variable-size
 multimodal padding is a swamp; effective batch comes from grad accumulation).
 
@@ -79,11 +80,11 @@ so plotting any metric over training is a one-liner
 (``pandas.read_json(..., lines=True)``).
 
 NOTE (remote-environment rule): this file cannot be executed on the local
-editing box (no torch/transformers/GPU). Anything that depends on the exact
-Gemma4Unified module tree -- most importantly the projector module name
-passed via ``--projector-module`` -- must be verified on the remote box
-against ``model.named_modules()``; the code fails loudly with instructions
-when the name does not resolve.
+editing box (no torch/transformers/GPU). The default ``--projector-module``
+(``embed_vision``) matches Gemma 4 / Gemma 4 Unified in transformers >= 5.10
+(``model.embed_vision``; there is no ``multi_modal_projector``). An
+unresolvable name still fails loudly with candidate module names from
+``model.named_modules()``.
 
 LIBRARY, NOT A RUN. This module is the reusable loop; it knows nothing about
 any specific training run. All knobs live in the :class:`TrainConfig`
@@ -278,9 +279,10 @@ class TrainConfig:
     lora_alpha: int = 64
     lora_dropout: float = 0.05
     neftune_alpha: float = 5.0      #: 0 disables NEFTune embedding noise
-    #: module trained fully via modules_to_save; "none" = LoRA only.
-    #: VERIFY against model.named_modules() on the remote box.
-    projector_module: str = "multi_modal_projector"
+    #: Module trained fully via modules_to_save; "none" = LoRA only.
+    #: Gemma 4 / Gemma 4 Unified: ``embed_vision`` (resolves to
+    #: ``model.embed_vision``). There is no ``multi_modal_projector``.
+    projector_module: str = "embed_vision"
 
     # environment / reproducibility
     seed: int = 17
@@ -597,8 +599,9 @@ def discover_lora_targets(model: Any) -> list[str]:
 def resolve_projector_modules(model: Any, projector_name: str) -> list[str]:
     """Full names of modules matching --projector-module (trained fully via
     modules_to_save). 'none' disables; an unresolvable name is a hard error
-    listing the model's top-level children so the right flag is one look
-    away (per the remote-environment rule: never guess the module tree)."""
+    listing top-level children plus candidate names containing
+    embed/project/vision so the right flag is one look away (never guess
+    the module tree)."""
     if projector_name.lower() == "none":
         return []
     matches = [
@@ -607,11 +610,18 @@ def resolve_projector_modules(model: Any, projector_name: str) -> list[str]:
     ]
     if not matches:
         top_level = [name for name, _ in model.named_children()]
+        candidates = [
+            name for name, _ in model.named_modules()
+            if name and any(
+                k in name.lower() for k in ("embed", "project", "vision")
+            )
+        ][:40]
         raise RuntimeError(
             f"--projector-module {projector_name!r} matches no module in "
-            f"this model. Top-level submodules: {top_level}. Inspect "
-            "model.named_modules() on the remote box and pass the right "
-            "name, or '--projector-module none' to train LoRA only."
+            f"this model. Top-level submodules: {top_level}. Candidate "
+            f"names (embed/project/vision): {candidates}. For Gemma 4 use "
+            "'embed_vision' (resolves to model.embed_vision), or "
+            "'--projector-module none' to train LoRA only."
         )
     return matches
 
@@ -1345,9 +1355,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--neftune-alpha", type=float, default=d.neftune_alpha,
                    help="0 disables NEFTune embedding noise")
     p.add_argument("--projector-module", default=d.projector_module,
-                   help="module name trained fully via modules_to_save; "
-                        "'none' to train LoRA only. VERIFY against "
-                        "model.named_modules() on the remote box.")
+                   help="module name trained fully via modules_to_save "
+                        "(default embed_vision for Gemma 4); "
+                        "'none' to train LoRA only")
     p.add_argument("--seed", type=int, default=d.seed)
     p.add_argument("--device", default=d.device)
     # data hygiene

@@ -100,10 +100,13 @@ image part but produces no pixel tensor is a hard error, never a silent
 text-only fallback — understanding the frame is most of the point of this
 training.
 
-The vision tower stays frozen; the **multimodal projector trains** alongside
-the language-model LoRA (via PEFT `modules_to_save`, so it rides inside the
-adapter checkpoint). That is the standard low-risk lever for improving visual
-grounding without destabilizing the encoder.
+Any dedicated vision/audio **tower** stays frozen (excluded from LoRA by
+name); the **multimodal vision embedder** trains alongside the language-model
+LoRA via PEFT `modules_to_save` (so it rides inside the adapter checkpoint).
+On Gemma 4 / Gemma 4 Unified that module is `embed_vision`
+(`model.embed_vision`) — there is no `multi_modal_projector`. For the 12B
+Unified architecture this embedder *is* the whole vision path (encoder-free
+patch→LM projection), which is the intended trainable lever.
 
 Micro-batching (Intermission): the default is `micro_batch=4` with
 `grad_accum=4`, so the **effective batch stays 16** (`micro_batch x
