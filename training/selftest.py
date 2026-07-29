@@ -23,7 +23,7 @@ Stage map (rationale in the Intermission plan):
   * t0-env      imports + versions + CUDA + bitsandbytes
   * t1-pure     parse_rating, build_span_weights, image noise, tripwire,
                 _rewrite_image_urls, GameTraceSource on a fabricated dir,
-                epoch_batches bucketing
+                epoch_batches bucketing, left_pad_collate
   * t2-data     manifest loads, per-source counts vs meta.json, probes exist
   * t3-model    4-bit QLoRA load, terminator, CE/KD forward+backward
                 (image example included), teacher-path sanity
@@ -506,9 +506,38 @@ def t1_pure() -> str:
     assert max(totals) < 1.1 * min(totals), f"unbalanced groups: {totals}"
     checks += 1
 
+    # ---- left_pad_collate: pad on the LEFT; every sequence-aligned tensor
+    #      keeps its solo suffix (the generate_batch invariant)
+    import torch
+
+    from agent.model import left_pad_collate
+
+    short = {
+        "input_ids": torch.tensor([[10, 11, 12]]),
+        "attention_mask": torch.tensor([[1, 1, 1]]),
+        "mm_token_type_ids": torch.tensor([[0, 1, 0]]),
+        "pixel_values": torch.zeros(1, 4, 3),
+    }
+    long = {
+        "input_ids": torch.tensor([[20, 21, 22, 23, 24]]),
+        "attention_mask": torch.tensor([[1, 1, 1, 1, 1]]),
+        "mm_token_type_ids": torch.tensor([[0, 1, 1, 1, 0]]),
+        "pixel_values": torch.ones(1, 4, 3),
+    }
+    collated = left_pad_collate([short, long], pad_token_id=0)
+    assert collated["input_ids"].shape == (2, 5)
+    assert collated["input_ids"][0].tolist() == [0, 0, 10, 11, 12]
+    assert collated["attention_mask"][0].tolist() == [0, 0, 1, 1, 1]
+    assert collated["mm_token_type_ids"][0].tolist() == [0, 0, 0, 1, 0]
+    assert collated["input_ids"][1].tolist() == [20, 21, 22, 23, 24]
+    assert collated["mm_token_type_ids"][1].tolist() == [0, 1, 1, 1, 0]
+    assert collated["pixel_values"].shape == (2, 4, 3)
+    assert torch.all(collated["attention_mask"][:, -1] == 1)
+    checks += 1
+
     return (
         f"{checks} unit groups passed (ratings, rewards, noise, tripwire, "
-        "source, batching, scrambler, questions)"
+        "source, batching, scrambler, questions, left-pad)"
     )
 
 
@@ -858,8 +887,11 @@ def t5_datagen() -> str:
 
 def t6_ab() -> str:
     """Batched vs solo generation, greedy: identical prompts must produce
-    identical replies (multimodal left-padding is where bugs hide)."""
-    from agent.model import get_model
+    identical replies. Checks left-pad tensor parity BEFORE generate so a
+    padding/mm_token bug fails with a structural message, not garbled text."""
+    import torch
+
+    from agent.model import get_model, left_pad_collate
 
     model = get_model()
     with tempfile.TemporaryDirectory(prefix="selftest_t6_") as tmp:
@@ -876,7 +908,76 @@ def t6_ab() -> str:
                 "Reply with a single word: light or dark background?",
             )
         ]
-        # Force greedy for the comparison (instance attr shadows the method).
+        tokenizer = getattr(model.processor, "tokenizer", model.processor)
+        pad_id = int(tokenizer.pad_token_id
+                     if tokenizer.pad_token_id is not None
+                     else tokenizer.eos_token_id)
+
+        # (a) Structural: our left_pad_collate reproduces each solo encoding
+        #     as a right-aligned suffix, pads on the left, and keeps every
+        #     sequence-aligned aux tensor (esp. mm_token_type_ids) in sync.
+        solos = [model.encode_messages(p) for p in prompts]
+        collated = left_pad_collate(solos, pad_token_id=pad_id)
+        max_len = collated["input_ids"].shape[1]
+        assert torch.all(collated["attention_mask"][:, -1] == 1), (
+            "collated batch is not left-padded "
+            f"(mask tail={collated['attention_mask'][:, -1].tolist()})"
+        )
+        seq_keys = [
+            k for k, v in solos[0].items()
+            if isinstance(v, torch.Tensor) and v.dim() == 2
+            and v.shape[1] == solos[0]["input_ids"].shape[1]
+        ]
+        for i, solo in enumerate(solos):
+            sl = solo["input_ids"].shape[1]
+            pad_len = max_len - sl
+            if pad_len:
+                assert torch.all(
+                    collated["attention_mask"][i, :pad_len] == 0
+                ), f"row {i}: pad region attention_mask not zero"
+                assert torch.all(
+                    collated["input_ids"][i, :pad_len] == pad_id
+                ), f"row {i}: pad region input_ids not pad_id"
+            for key in seq_keys:
+                assert torch.equal(
+                    collated[key][i, -sl:], solo[key][0]
+                ), (
+                    f"row {i} key {key!r}: collated suffix != solo encoding "
+                    f"(solo_len={sl}, batch_len={max_len})"
+                )
+
+        # (b) Optional diagnostic: processor-native batched padding often
+        #     breaks mm_token_type_ids even when attention_mask looks fine.
+        #     Record the mismatch; our generate_batch must NOT use that path.
+        try:
+            native = model.processor.apply_chat_template(
+                [model.adapter.prepare_messages(p) for p in prompts],
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+                processor_kwargs={"padding": True, "padding_side": "left"},
+            )
+            native_mm_ok = True
+            if "mm_token_type_ids" in native and "mm_token_type_ids" in solos[0]:
+                for i, solo in enumerate(solos):
+                    sl = solo["input_ids"].shape[1]
+                    if not torch.equal(
+                        native["mm_token_type_ids"][i, -sl:],
+                        solo["mm_token_type_ids"][0],
+                    ):
+                        native_mm_ok = False
+                        break
+            native_note = (
+                "processor-native mm_token_type_ids ok"
+                if native_mm_ok
+                else "processor-native mm_token_type_ids MISALIGNED "
+                     "(generate_batch correctly bypasses this path)"
+            )
+        except Exception as exc:
+            native_note = f"processor-native pad probe skipped ({type(exc).__name__})"
+
+        # (c) Greedy decode A/B
         original = model._sampling_kwargs
         model._sampling_kwargs = lambda: {"do_sample": False}
         try:
@@ -892,9 +993,10 @@ def t6_ab() -> str:
     assert not mismatches, (
         "greedy batched != solo on rows "
         + "; ".join(f"[{i}] solo={s!r} batched={b!r}" for i, s, b in mismatches)
+        + f" ({native_note})"
     )
     return (
-        f"3/3 greedy replies identical batched vs solo; "
+        f"3/3 greedy identical; left-pad tensor parity ok; {native_note}; "
         f"e.g. row0={solo[0][:60]!r}"
     )
 

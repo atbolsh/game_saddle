@@ -227,6 +227,119 @@ ADAPTERS: dict[str, FamilyAdapter] = {
 }
 
 
+# ====================================================== generate batching
+
+def left_pad_collate(
+    rows: list[dict[str, Any]],
+    *,
+    pad_token_id: int,
+) -> dict[str, Any]:
+    """Left-pad single-example processor outputs into one generate batch.
+
+    Do NOT trust ``processor.apply_chat_template([...], padding=True)`` for
+    multimodal batches: transformers v5 can left-pad ``input_ids`` /
+    ``attention_mask`` while leaving ``mm_token_type_ids`` (and friends)
+    misaligned, which makes shorter rows silently diverge from solo
+    ``generate``. Collating from per-row encodings keeps every
+    sequence-aligned tensor in lockstep with ``input_ids``.
+
+    Each row is batch-dim 1 (``return_tensors="pt"`` shape). Sequence-aligned
+    int tensors pad on the LEFT; other leading-singleton tensors
+    (``pixel_values``, ``image_position_ids``, ...) stack on dim 0.
+    """
+    if not rows:
+        return {}
+    row_dicts: list[dict[str, Any]] = []
+    for r in rows:
+        d = {k: v for k, v in r.items()
+             if isinstance(v, torch.Tensor)}
+        if "input_ids" not in d or "attention_mask" not in d:
+            raise ValueError(
+                "left_pad_collate: each row needs input_ids and "
+                f"attention_mask; got {sorted(d)}"
+            )
+        if d["input_ids"].shape[0] != 1:
+            raise ValueError(
+                "left_pad_collate: expected per-row batch dim 1, "
+                f"got input_ids shape {tuple(d['input_ids'].shape)}"
+            )
+        row_dicts.append(d)
+    if len(row_dicts) == 1:
+        return dict(row_dicts[0])
+
+    key_sets = {frozenset(d) for d in row_dicts}
+    if len(key_sets) > 1:
+        raise ValueError(
+            "left_pad_collate: rows produced different keys "
+            f"({sorted(key_sets)}) -- mixed image/text in one batch?"
+        )
+
+    max_len = max(d["input_ids"].shape[1] for d in row_dicts)
+
+    def _left_pad(t: Any, fill: int | float) -> Any:
+        if t.shape[1] == max_len:
+            return t
+        pad = t.new_full((t.shape[0], max_len - t.shape[1]), fill)
+        return torch.cat([pad, t], dim=1)
+
+    batch: dict[str, Any] = {
+        "input_ids": torch.cat(
+            [_left_pad(d["input_ids"], pad_token_id) for d in row_dicts]
+        ),
+        "attention_mask": torch.cat(
+            [_left_pad(d["attention_mask"], 0) for d in row_dicts]
+        ),
+    }
+    seq_lens = [d["input_ids"].shape[1] for d in row_dicts]
+    for key in row_dicts[0]:
+        if key in batch:
+            continue
+        vals = [d[key] for d in row_dicts]
+        # Per-token id tensors aligned with the sequence (mm_token_type_ids,
+        # token_type_ids, ...): left-pad exactly like input_ids.
+        if (not vals[0].dtype.is_floating_point
+                and vals[0].dim() == 2
+                and all(v.shape[1] == sl
+                        for v, sl in zip(vals, seq_lens))):
+            batch[key] = torch.cat([_left_pad(v, 0) for v in vals])
+            continue
+        # Vision / aux with leading singleton batch dim -- stack.
+        if all(v.dim() >= 1 and v.shape[0] == 1 for v in vals):
+            trailing = {tuple(v.shape[1:]) for v in vals}
+            if len(trailing) > 1:
+                raise ValueError(
+                    f"left_pad_collate: key {key!r} has mismatched trailing "
+                    f"shapes {sorted(trailing)}"
+                )
+            batch[key] = torch.cat(vals, dim=0)
+            continue
+        raise ValueError(
+            f"left_pad_collate: don't know how to batch key {key!r} "
+            f"(shape {tuple(vals[0].shape)}, dtype {vals[0].dtype})"
+        )
+
+    # Structural checks -- fail loud, never decode a misaligned batch.
+    if not torch.all(batch["attention_mask"][:, -1] == 1):
+        raise RuntimeError(
+            "left_pad_collate: attention_mask[:, -1] has zeros; "
+            f"tail={batch['attention_mask'][:, -1].tolist()}"
+        )
+    for i, (d, sl) in enumerate(zip(row_dicts, seq_lens)):
+        if not torch.equal(batch["input_ids"][i, -sl:], d["input_ids"][0]):
+            raise RuntimeError(
+                f"left_pad_collate: row {i} input_ids suffix != solo encoding"
+            )
+        for key, v in d.items():
+            if key in ("input_ids", "attention_mask"):
+                continue
+            if v.dim() == 2 and v.shape[1] == sl:
+                if not torch.equal(batch[key][i, -sl:], v[0]):
+                    raise RuntimeError(
+                        f"left_pad_collate: row {i} {key} suffix != solo"
+                    )
+    return batch
+
+
 # ============================================================ stop criteria
 
 class RegexStopCriteria(StoppingCriteria):
@@ -432,6 +545,35 @@ class VLModel:
                 out[name] = val
         return out
 
+    # ---------------------------------------------------- encode / device
+    def encode_messages(self, messages: list[dict]) -> dict[str, Any]:
+        """One prompt -> processor tensors (batch dim 1), same path as
+        :meth:`generate`. Used by :meth:`generate_batch` so batched rows are
+        byte-identical to solo encodings before left-pad collate."""
+        if not self._loaded:
+            self.load()
+        norm = self.adapter.prepare_messages(messages)
+        return self.processor.apply_chat_template(
+            norm,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+
+    def _move_inputs_to_model(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        target_device = next(self.model.parameters()).device
+        model_dtype = next(self.model.parameters()).dtype
+        out: dict[str, Any] = {}
+        for k, v in inputs.items():
+            if not isinstance(v, torch.Tensor):
+                continue
+            v = v.to(target_device)
+            if v.dtype.is_floating_point:
+                v = v.to(model_dtype)
+            out[k] = v
+        return out
+
     # ---------------------------------------------------------- generate
     def generate(
         self,
@@ -452,26 +594,7 @@ class VLModel:
         reply that emits no stop token simply ends the turn."""
         if not self._loaded:
             self.load()
-        norm_messages = self.adapter.prepare_messages(messages)
-        inputs = self.processor.apply_chat_template(
-            norm_messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
-        )
-        # Move to model device/dtype.
-        target_device = next(self.model.parameters()).device
-        inputs = inputs.to(target_device)
-        # Pixel values / image inputs should be cast to model dtype for the
-        # vision encoder; text inputs keep long.
-        try:
-            model_dtype = next(self.model.parameters()).dtype
-            for k, v in list(inputs.items()):
-                if v.dtype.is_floating_point:
-                    inputs[k] = v.to(model_dtype)
-        except StopIteration:
-            pass
+        inputs = self._move_inputs_to_model(self.encode_messages(messages))
         gen_kwargs: dict[str, Any] = {
             "max_new_tokens": max_new_tokens or self.cfg.max_new_tokens,
             **self._sampling_kwargs(),
@@ -572,38 +695,17 @@ class VLModel:
                 "(see agent/parallel_gen.py)"
             )
 
-        norm = [self.adapter.prepare_messages(r["messages"]) for r in batch]
+        # Encode each row with the SAME path as generate(), then left-pad
+        # ourselves. Processor-native batched padding has been observed to
+        # leave mm_token_type_ids misaligned with input_ids on Gemma 4 even
+        # when attention_mask looks left-padded (selftest t6).
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
-        # Transformers v5+: padding/padding_side must go in processor_kwargs
-        # (top-level kwargs warn and can miss the tokenizer's padding_side).
-        inputs = self.processor.apply_chat_template(
-            norm,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
-            processor_kwargs={"padding": True, "padding_side": "left"},
+        rows = [self.encode_messages(r["messages"]) for r in batch]
+        inputs = self._move_inputs_to_model(
+            left_pad_collate(rows, pad_token_id=int(tokenizer.pad_token_id))
         )
-        # Left-pad invariant: every row's last prompt token is real content,
-        # so a single prompt_len is correct for decode + RegexStopCriteria.
-        # Right-padded batches look "fine" then silently diverge from solo
-        # generate (exactly what selftest t6 catches).
-        mask = inputs.get("attention_mask")
-        if mask is None or not torch.all(mask[:, -1] == 1):
-            raise RuntimeError(
-                "generate_batch: prompts are not left-padded "
-                "(attention_mask[:, -1] has zeros or mask missing); "
-                "refusing to decode a divergent batch. "
-                f"mask_tail={None if mask is None else mask[:, -1].tolist()}"
-            )
-        target_device = next(self.model.parameters()).device
-        inputs = inputs.to(target_device)
-        model_dtype = next(self.model.parameters()).dtype
-        for k, v in list(inputs.items()):
-            if isinstance(v, torch.Tensor) and v.dtype.is_floating_point:
-                inputs[k] = v.to(model_dtype)
 
         gen_kwargs: dict[str, Any] = {
             "max_new_tokens": max_new_tokens or self.cfg.max_new_tokens,
