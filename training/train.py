@@ -397,9 +397,12 @@ class Collator:
     prompt via apply_chat_template(add_generation_prompt=True) exactly as
     VLModel.generate builds it, content via a plain tokenizer call whose
     offset mapping maps char spans onto token weights. Extra processor
-    outputs (pixel_values, token_type_ids, ...) pass through: id-shaped int
-    tensors are extended over the appended target tokens with fill 0,
-    floating tensors are cast to the compute dtype."""
+    outputs (pixel_values, image_position_ids, token_type_ids, ...) pass
+    through: id-shaped int tensors aligned with the prompt length are
+    extended over the appended target tokens with fill 0; other per-example
+    aux tensors (vision geometry, etc.) pass unchanged; floating tensors
+    are cast to the compute dtype. ``build_batch`` stacks the aux tensors
+    on the batch dim (trailing shapes must match)."""
 
     def __init__(self, processor: Any, adapter: Any, terminator_id: int,
                  compute_dtype: Any, device: Any):
@@ -518,23 +521,41 @@ class Collator:
                  for b in builds]
             ),
         }
+        seq_lens = [b["model_inputs"]["input_ids"].shape[1] for b in builds]
         for key in builds[0]["model_inputs"]:
             if key in batch:
                 continue
             vals = [b["model_inputs"][key] for b in builds]
-            if (not vals[0].dtype.is_floating_point and vals[0].dim() == 2):
-                # id-shaped per-token tensor: pad like input_ids, fill 0.
+            # Per-token id tensors aligned with each example's sequence
+            # (e.g. mm_token_type_ids): right-pad to max_len like input_ids.
+            if (not vals[0].dtype.is_floating_point
+                    and vals[0].dim() == 2
+                    and all(v.shape[1] == sl
+                            for v, sl in zip(vals, seq_lens))):
                 batch[key] = torch.cat([pad_to(v, 0) for v in vals])
-            elif vals[0].dtype.is_floating_point:
-                # pixel tensors: stack images in example order (the model
-                # consumes them in image-token order, which is row-major
-                # over the batch).
+                continue
+            # Everything else with a leading singleton batch dim -- pixel
+            # tensors, image_position_ids (Gemma 4: [1, soft_tokens, 2]),
+            # num_soft_tokens_per_image, etc. -- stacks on dim 0. Trailing
+            # shapes must match; mismatched vision geometry is a bucket
+            # bug, not something to silently pad.
+            if all(v.dim() >= 1 and v.shape[0] == 1 for v in vals):
+                trailing = {tuple(v.shape[1:]) for v in vals}
+                if len(trailing) > 1:
+                    raise ValueError(
+                        f"build_batch: key {key!r} has mismatched trailing "
+                        f"shapes {sorted(trailing)} across the micro-batch "
+                        "-- examples with different vision geometries "
+                        "cannot share a batch"
+                    )
+                if vals[0].dtype.is_floating_point:
+                    vals = [v.to(self.compute_dtype) for v in vals]
                 batch[key] = torch.cat(vals, dim=0)
-            else:
-                raise ValueError(
-                    f"build_batch: don't know how to batch key {key!r} "
-                    f"(shape {tuple(vals[0].shape)}, dtype {vals[0].dtype})"
-                )
+                continue
+            raise ValueError(
+                f"build_batch: don't know how to batch key {key!r} "
+                f"(shape {tuple(vals[0].shape)}, dtype {vals[0].dtype})"
+            )
         weights = torch.cat([pad_to(b["weights"], 0.0) for b in builds])
         return {"model_inputs": batch, "weights": weights}
 
