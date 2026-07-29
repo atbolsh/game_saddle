@@ -40,7 +40,10 @@ means the left-padding/pixel-routing is wrong.
 
 Stage 4 note: the rollback variant relies on `--lr 0.05` wrecking the
 adapter between saves, which is near-certain but stochastic; if no
-`rolled_back` event fires, rerun once before treating it as a bug.
+`rolled_back` event fires, rerun once before treating it as a bug. The
+batch-4 vs batch-1 loss parity check allows up to ~10% relative (or 0.05
+absolute) deviation -- bf16/SDPA and Gemma 4 multimodal padding are not
+bit-identical across shapes; treat order-of-magnitude gaps as a real bug.
 
 ## Manual appendix (not automatable)
 

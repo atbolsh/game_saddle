@@ -123,8 +123,9 @@ stack, length bin to bound padding waste — then the batch list is shuffled
 so sources still interleave. The collator right-pads (training never
 generates), padded positions carry weight 0, and `weighted_loss` normalizes
 each example by its OWN absolute-weight sum before averaging the batch, so
-a micro-batch of 4 is exactly 4 batch-1 passes averaged (selftest t4
-asserts the parity). `--micro-batch 1` restores the old behavior.
+a micro-batch of 4 is the mean of the same per-example losses as 4
+batch-1 passes (selftest t4 asserts parity within bf16/SDPA noise).
+`--micro-batch 1` restores the old behavior.
 
 ## The recipe, with justifications
 
