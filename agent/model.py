@@ -234,12 +234,16 @@ def stack_equal_length(
 ) -> dict[str, Any]:
     """Stack per-row encodings that already share one sequence length.
 
-    Gemma 4 Unified (KV-shared layers + SDPA) matches solo generate on
-    zero-pad batches and diverges on left-padded shorter rows even when
-    every sequence-aligned tensor (``mm_token_type_ids`` included) is padded
-    in lockstep with ``input_ids`` -- we verified that by hand-collating and
-    it still diverged. So ``generate_batch`` only stacks equal-length rows;
-    it never left-pads for decode, and mixed lengths here are a hard error.
+    Gemma 4 Unified: a left-padded row inside a multi-row multimodal batch
+    is CORRUPTED at prefill (measured ~40-logit deltas, argmax flipping to
+    modality special tokens; see training/probe_pad_divergence.py), even
+    with every sequence-aligned tensor hand-collated in lockstep with
+    ``input_ids``. Batch-1 padding and unpadded rows in the same batch show
+    only bounded bf16 wobble (~0.5 logits), so the defect is in the HF
+    batched multimodal prefill path (image-feature scatter / vision mask),
+    not padding per se. Hence ``generate_batch`` only stacks equal-length
+    rows; it never left-pads for decode, and mixed lengths here are a hard
+    error.
     """
     if not rows:
         return {}
@@ -635,13 +639,14 @@ class VLModel:
         are BATCH-WIDE (dispatcher groups by identical stop signature). Mixed
         image counts are refused.
 
-        Gemma 4 Unified: left-padded variable-length multimodal batches
-        diverge from solo ``generate`` on shorter rows (KV-shared layers +
-        SDPA; same finding as other Gemma 4 batch servers -- zero-pad /
-        equal-length batches match serial). So we encode each row, then run
-        one true GPU batch **per distinct prompt length** (no left-pad on
-        the decode path). Same-length peers amortize weight reads; rows
-        whose length is unique in the batch decode alone.
+        Gemma 4 Unified: a left-padded row inside a multi-row multimodal
+        batch is corrupted at prefill (probe evidence in
+        training/probe_pad_divergence.py and stack_equal_length's
+        docstring); equal-length batches match solo exactly. So we encode
+        each row, then run one true GPU batch **per distinct prompt
+        length** (no left-pad on the decode path). Same-length peers
+        amortize weight reads; rows whose length is unique in the batch
+        decode alone.
         """
         if not batch:
             return []
