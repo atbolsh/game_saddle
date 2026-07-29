@@ -35,7 +35,7 @@ recorded here as a crutch to add only if training fails without it.
 | 2 | Concrete `DataSource`s: game traces from self-eval sessions (incl. image augmentation), planted-error generator | next |
 | 3 | Replay `DataSource`s (arithmetic, reasoning, general instruction, AV) + the early-warning probe suite wired into `train.py`'s eval hooks | after 2 |
 | 4 | First real training iteration: generate → grade → train → eval → repeat | after 3 |
-| 5+ | Possible: analyst training under a verified metric, prompt internalization, image-decoder graft (see [IMAGE_DECODER_GRAFT.md](../IMAGE_DECODER_GRAFT.md)) | discussion |
+| 5+ | Possible: analyst training under a verified metric, prompt internalization + instinct-move default (staged plan in [TRAINING_TRACE_EXTRAS.md](TRAINING_TRACE_EXTRAS.md)), image-decoder graft (see [IMAGE_DECODER_GRAFT.md](../IMAGE_DECODER_GRAFT.md)) | discussion |
 
 ## The `train.py` contract
 

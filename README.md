@@ -380,6 +380,11 @@ regression)**: the analyst rating as the reply-wide base, -1.0 on verified
 `WRONG:` spans, and a discounted `0.2 * 0.9^d` win boost added uniformly on
 won games — and re-noises the frames per run. Details and knobs in
 [training/TRAINING_GAME_TRACES.md](training/TRAINING_GAME_TRACES.md).
+The recorded long-term direction (staged, not scheduled) is **prompt
+internalization**: context-distill the system prompt and then the
+reasoning prose into the weights, until frame + terse request → bare move
+token is the model's default behavior — staged plan in
+[training/TRAINING_TRACE_EXTRAS.md](training/TRAINING_TRACE_EXTRAS.md).
 
 **Intermission optimizations** (between phase 3 and the first real run):
 datagen runs `--parallel 3` game sessions by default, merged into batched
