@@ -40,7 +40,8 @@ at SPECIFIC pad lengths — `scripts/gemma4_pad_batch_repro.py` measured
 pad=7 on a 282-token image prompt giving ~40-logit deltas with the argmax
 flipping to `<audio|>`, while pads 1–6, 8, 9, 15, 16, 63, 64 stay within
 ~0.5-logit bf16 wobble (batch size and transformers 5.13/5.14 version
-irrelevant; bit-identical). Upstream transformers bug, not collation:
+irrelevant; bit-identical). Upstream transformers bug
+(https://github.com/huggingface/transformers/issues/47651), not collation:
 every aux tensor was verified suffix-identical to solo. Since poisonous
 offsets are unpredictable, `generate_batch` runs one true GPU batch per
 distinct prompt length (zero pad); rows whose length is unique decode

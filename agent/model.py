@@ -239,8 +239,10 @@ def stack_equal_length(
     ~40-logit deltas with the argmax flipping to ``<audio|>``; pads 1-6, 8,
     9, 15, 16, 63, 64 stay within ~0.5 bf16 wobble; batch size and
     transformers version are irrelevant -- see
-    scripts/gemma4_pad_batch_repro.py). Which offsets are poisonous is not
-    predictable from the outside, so the only safe policy is ZERO padding:
+    scripts/gemma4_pad_batch_repro.py, reported upstream as
+    https://github.com/huggingface/transformers/issues/47651). Which
+    offsets are poisonous is not predictable from the outside, so the
+    only safe policy is ZERO padding:
     ``generate_batch`` only stacks equal-length rows, and mixed lengths
     here are a hard error.
     """
