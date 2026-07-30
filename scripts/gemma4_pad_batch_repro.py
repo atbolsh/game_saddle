@@ -7,13 +7,16 @@ different token lengths around it, and compares next-token prefill logits
 across three conditions:
 
   A. each prompt solo (batch=1, no padding)          -> baseline
-  B. short prompt left-padded, still batch=1         -> ~0.5 max |dLogit|
-                                                        (bf16 wobble, sane)
+  B. short prompt left-padded, still batch=1
   C. short prompt left-padded, stacked in a batch of
-     2 with the long prompt                          -> ~40 max |dLogit|,
-                                                        argmax flips to a
-                                                        modality special
-                                                        token ('<audio|>')
+     2 with the long prompt
+
+Expected: B and C stay within bf16 wobble (<~1 max |dLogit|) of A.
+Observed: corrupted conditions show ~40 max |dLogit| with the argmax
+flipping to a modality special token ('<audio|>') on an image prompt.
+B sweeps pad lengths because the corruption appears to depend on the
+pad length itself (multiples of 8 were observed benign, pad=7 corrupt),
+not on batch size.
 
 Every sequence-aligned tensor (input_ids, attention_mask, token type ids)
 is padded in lockstep, position_ids follow the attention mask (same
@@ -124,6 +127,10 @@ def main() -> int:
     ap.add_argument("--model", default="google/gemma-4-12B-it")
     args = ap.parse_args()
 
+    import transformers
+    print(f"transformers=={transformers.__version__}  "
+          f"torch=={torch.__version__}")
+
     processor = AutoProcessor.from_pretrained(args.model, padding_side="left")
     model = AutoModelForMultimodalLM.from_pretrained(
         args.model, dtype="auto", attn_implementation="sdpa",
@@ -145,15 +152,20 @@ def main() -> int:
     padded_s = left_pad(enc_s, len_l - len_s, pad_id)
 
     print(f"\nsolo short top5: {top5(tok, solo_s)}")
-    # B: same padded row, alone in the batch -- only bf16-scale wobble.
-    report(tok, "B. padded, batch=1",
-           solo_s, last_logits(model, padded_s)[0])
+    # B: same row, alone in the batch, over a sweep of pad lengths --
+    # the corruption tracks the pad length (alignment), not batch size.
+    corrupted = False
+    for pad_len in (1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 63, 64):
+        corrupted |= report(
+            tok, f"B. padded, batch=1, pad={pad_len}",
+            solo_s, last_logits(model, left_pad(enc_s, pad_len, pad_id))[0],
+        )
 
     # C: same padded row, batch of 2 with the (unpadded) long prompt.
     stacked = {k: torch.cat([padded_s[k], enc_l[k]], dim=0)
                for k in padded_s if isinstance(padded_s[k], torch.Tensor)}
     both = last_logits(model, stacked)
-    corrupted = report(tok, "C. padded, batch=2 (BUG)", solo_s, both[0])
+    corrupted |= report(tok, "C. padded, batch=2", solo_s, both[0])
     report(tok, "   unpadded control row", solo_l, both[1])
 
     # User-visible symptom: greedy generate, solo vs the same batch of 2.
@@ -172,10 +184,10 @@ def main() -> int:
     print(f"\ngreedy solo   : {solo_text.strip()!r}")
     print(f"greedy batched: {batch_text.strip()!r}")
 
-    print("\nExpected: B and the control row show max|dLogit| <~ 1 (bf16 "
-          "wobble). BUG: C shows max|dLogit| in the tens with the argmax "
-          "flipped to a modality special token, and the batched greedy "
-          "text diverges from solo.")
+    print("\nExpected: every condition within max|dLogit| <~ 1 of solo "
+          "(bf16 wobble). BUG: a padded condition shows max|dLogit| in "
+          "the tens with the argmax flipped to a modality special token, "
+          "and the batched greedy text diverges from solo.")
     return 1 if corrupted else 0
 
 
