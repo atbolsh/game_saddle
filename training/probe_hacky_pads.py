@@ -427,8 +427,14 @@ def test3_rehearsal(model: Any, picked: list[tuple[int, dict]],
         ok = s == b
         if not ok:
             failures += 1
+        gen = out[i][chosen_T:]
+        n_gen = int((gen != pad_id).sum())
+        crossed = [w for w in range(chosen_T + 1, chosen_T + n_gen + 1)
+                   if w % POISON_TOTAL_MOD == POISON_TOTAL_RESIDUE]
         print(f"row{i} (L={lens[i]}, pad={chosen_T - lens[i]}): "
-              f"{'IDENTICAL' if ok else 'DIVERGED'}")
+              f"{'IDENTICAL' if ok else 'DIVERGED'} "
+              f"({n_gen} tok generated; mid-decode widths ~=1 mod 32 "
+              f"crossed: {crossed or 'none'})")
         if not ok:
             print(f"    solo    : {s[:120]!r}")
             print(f"    batched : {b[:120]!r}")
@@ -441,6 +447,107 @@ def test3_rehearsal(model: Any, picked: list[tuple[int, dict]],
         print("\nALL ROWS IDENTICAL: parity-checked padding survives the "
               "full decode INCLUDING stop_strings + stop_regex -- "
               "implementable in generate_batch.")
+    return failures
+
+
+def test4_mid_decode(model: Any, picked: list[tuple[int, dict]],
+                     pad_id: int) -> int:
+    """Does decode corrupt when the RUNNING width crosses ~=1 mod 32?
+
+    The prefill poison fires at padded width ~= 1 mod 32. During decode
+    the attended width grows by one per step, so every reply longer than
+    32 tokens crosses that residue WITH pads in the mask -- if the
+    crossing corrupts, padding is unusable without per-step repadding.
+    Adversarial setup: T ~= 0 mod 32, so the very FIRST decode step
+    attends width T+1 ~= 1 mod 32 (and step 33 crosses again). Greedy, no
+    stop strings, raw per-step logits via output_logits=True; compare
+    each padded row's step logits and tokens against its solo run.
+    """
+    import torch
+    from agent.model import left_pad_stack
+
+    print("\n=== HACKY_ANSWER test 4: mid-decode boundary crossing ===")
+    chosen = picked[:2]
+    lens = [length for length, _ in chosen]
+    rows = [enc for _, enc in chosen]
+    steps = 64
+    # Smallest T >= max length with T ~= 0 mod 32.
+    T = max(lens) + (-max(lens)) % POISON_TOTAL_MOD
+    boundary_steps = [k for k in range(steps)
+                      if (T + k) % POISON_TOTAL_MOD == POISON_TOTAL_RESIDUE]
+    print(f"rows L={lens} padded to T={T} (T%{POISON_TOTAL_MOD}="
+          f"{T % POISON_TOTAL_MOD}); padded width hits residue "
+          f"{POISON_TOTAL_RESIDUE} at decode steps {boundary_steps}")
+
+    def _gen_with_logits(enc: dict[str, Any]):
+        inputs = model._move_inputs_to_model(enc)
+        with torch.inference_mode():
+            out = model.model.generate(
+                **inputs, max_new_tokens=steps, do_sample=False,
+                return_dict_in_generate=True, output_logits=True,
+            )
+        return (out.sequences.cpu(),
+                [step.float().cpu() for step in out.logits])
+
+    solo = [_gen_with_logits(enc) for enc in rows]
+    stacked, pads = left_pad_stack(rows, pad_id, target_len=T)
+    seqs, step_logits = _gen_with_logits(stacked)
+
+    eos_id = getattr(
+        getattr(model.processor, "tokenizer", model.processor),
+        "eos_token_id", None,
+    )
+    failures = 0
+    for i in range(len(rows)):
+        length = lens[i]
+        solo_seq, solo_logits = solo[i]
+        gen_solo = solo_seq[0][length:]
+        gen_pad = seqs[i][T:]
+        n = min(len(gen_solo), len(gen_pad),
+                len(solo_logits), len(step_logits))
+        # Stop comparing at solo's own end-of-turn: beyond it a finished
+        # row only accumulates padding.
+        for k in range(n):
+            if eos_id is not None and int(gen_solo[k]) == eos_id:
+                n = k + 1
+                break
+        first_bad: int | None = None
+        max_delta = 0.0
+        print(f"--- row{i} (L={length}, pad={T - length}, comparing "
+              f"{n} steps) ---")
+        for k in range(n):
+            delta = float(
+                (step_logits[k][i] - solo_logits[k][0]).abs().max()
+            )
+            max_delta = max(max_delta, delta)
+            tok_ok = int(gen_pad[k]) == int(gen_solo[k])
+            if not tok_ok and first_bad is None:
+                first_bad = k
+            marks = []
+            if (T + k) % POISON_TOTAL_MOD == POISON_TOTAL_RESIDUE:
+                marks.append("padded-width boundary")
+            if (length + k) % POISON_TOTAL_MOD == POISON_TOTAL_RESIDUE:
+                marks.append("solo-width boundary")
+            if marks or not tok_ok or delta > POISON_DLOGIT:
+                print(f"  k={k:<3d} max|dLogit|={delta:8.3f} "
+                      f"token_match={tok_ok}"
+                      f"{('  <-- ' + ', '.join(marks)) if marks else ''}")
+        if first_bad is None:
+            print(f"row{i}: all {n} tokens IDENTICAL, peak per-step "
+                  f"max|dLogit|={max_delta:.3f} -- boundary crossings "
+                  "harmless in decode")
+        else:
+            failures += 1
+            print(f"row{i}: FIRST TOKEN MISMATCH at step {first_bad} "
+                  f"(padded width {(T + first_bad)}, residue "
+                  f"{(T + first_bad) % POISON_TOTAL_MOD}); peak "
+                  f"max|dLogit|={max_delta:.3f}")
+    if failures:
+        print("\nMID-DECODE CORRUPTION CONFIRMED: padding needs per-step "
+              "repadding around the boundary (or cohorts stay).")
+    else:
+        print("\nNO mid-decode corruption: the poison is prefill-only; "
+              "skipping T ~= 1 mod 32 at batch build time is sufficient.")
     return failures
 
 
@@ -488,6 +595,11 @@ def main(argv: list[str] | None = None) -> int:
         default="data_game/selftest_t8_serial/traces.jsonl",
         help="datagen traces.jsonl to draw real prompts from",
     )
+    parser.add_argument(
+        "--only", default=None,
+        help="comma-separated test numbers to run (e.g. --only 4); "
+             "default: all",
+    )
     args = parser.parse_args(argv)
 
     from agent.model import get_model
@@ -505,9 +617,16 @@ def main(argv: list[str] | None = None) -> int:
         prompts_by_len.setdefault(int(enc["input_ids"].shape[1]), msgs)
     picked = pick_spread(model, prompts, N_PROMPTS)
 
-    test1_pad_vs_total(model, picked, pad_id)
-    test2_content(model, prompts, picked, pad_id)
-    failures = test3_rehearsal(model, picked, prompts_by_len, pad_id)
+    want = set((args.only or "1,2,3,4").split(","))
+    failures = 0
+    if "1" in want:
+        test1_pad_vs_total(model, picked, pad_id)
+    if "2" in want:
+        test2_content(model, prompts, picked, pad_id)
+    if "3" in want:
+        failures += test3_rehearsal(model, picked, prompts_by_len, pad_id)
+    if "4" in want:
+        failures += test4_mid_decode(model, picked, pad_id)
     print(f"\n(full output saved to {log_path})")
     return 1 if failures else 0
 
