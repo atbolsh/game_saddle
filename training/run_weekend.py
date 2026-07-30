@@ -1,9 +1,11 @@
-"""Unattended weekend self-training: N serial epochs of datagen -> train.
+"""Unattended weekend self-training: N sequential epochs of datagen -> train.
 
 One "epoch" here is one full expert-iteration cycle. For epoch k (1-based):
 
   1. datagen   ``python -m training.generate_game_traces --label
-     <prefix>_iter<k> --parallel 1 --checkpoint <previous epoch's adapter>``
+     <prefix>_iter<k> --parallel <--parallel, default 16> --checkpoint
+     <previous epoch's adapter>`` (``--parallel 1`` restores the fully
+     serial datagen path)
   2. train     ``python -m training.run_weekend --train-iter <k>`` -- the
      epoch's GameTraceSource + AnalystTraceSource plus the manifest replay
      sources, resumed from the previous epoch's adapter (epoch 1 starts
@@ -35,13 +37,23 @@ Crash policy -- the run must survive an unattended weekend:
 
 The exit code is the number of failed stages (0 = clean weekend).
 
+MONITORING: the orchestrator samples topline GPU memory (``nvidia-smi``,
+summed over GPUs) every minute, tagged with the running stage, appending
+to ``data_game/<prefix>_vram.jsonl``; the final log prints a VRAM summary
+(peak overall, mean during datagen, mean during training) plus total
+datagen and train hours. If ``nvidia-smi`` is unusable the monitor warns
+ONCE and stops -- monitoring must never take down the weekend.
+
 Run on the remote box (NAMS up, repo root, inside tmux or nohup)::
 
     nohup python -m training.run_weekend > weekend.log 2>&1 &
 
-Budget arithmetic before launching: selftest t8 measures the real serial
-seconds-per-generation; one epoch costs about ``--max-generations`` x that,
-plus the train stage. Trim ``--max-generations`` (and ``--games``) so
+Budget arithmetic before launching: one datagen epoch costs about
+``--max-generations`` x the seconds-per-generation of your ``--parallel``
+setting, plus the train stage. Measured 2026-07-30: serial 24.1 s/gen
+(selftest t8), ``--parallel 10`` 8.5, ``--parallel 24`` 6.4 -- so the
+default 3000-generation epoch is ~20 h serial but ~6 h at the default
+parallelism. Trim ``--max-generations`` (and ``--games``) so
 ``epochs x (datagen + train)`` fits the window you have. Details in
 TRAINING_OVERVIEW.md ("The weekend run").
 """
@@ -54,6 +66,7 @@ import logging
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -69,6 +82,128 @@ DATA_GAME_DIR = REPO_ROOT / "data_game"
 #: hiccup, CUDA OOM on an unlucky batch) should not cost the weekend; a
 #: deterministic crash should not burn it in a loop either.
 MAX_ATTEMPTS = 2
+
+#: Seconds between VRAM samples (plus one extra sample at every stage
+#: boundary, so even sub-minute smoke-test stages appear in the log).
+VRAM_SAMPLE_INTERVAL_S = 60.0
+
+
+# ============================================================ VRAM monitor
+
+class VramMonitor:
+    """Every-minute topline GPU-memory samples, from the orchestrator.
+
+    The orchestrator never touches the GPU itself (both stages are
+    subprocesses), so samples come from ``nvidia-smi`` and reflect the
+    box's true topline: ``memory.used`` summed over all GPUs, in MiB.
+    Each sample is appended immediately to
+    ``data_game/<prefix>_vram.jsonl`` (one JSON object per line:
+    ``{"t": unix_time, "stage": "datagen1 attempt 1"|"train2 ..."|null,
+    "mib": N}``; stage null = between stages) so a crashed run still has
+    its trace. :meth:`finish` logs the summary: peak overall, mean during
+    datagen, mean during training.
+
+    If ``nvidia-smi`` is missing or unparseable the monitor logs ONE
+    warning and stops sampling -- monitoring must never take down the
+    weekend, and a silent zero would be worse than no data
+    (visible-fallback rule).
+    """
+
+    def __init__(self, prefix: str):
+        self.path = DATA_GAME_DIR / f"{prefix}_vram.jsonl"
+        self.samples: list[tuple[str | None, int]] = []
+        self._stage: str | None = None
+        self._warned = False
+        self._file_dead = False
+        self._stopping = False
+        self._wake = threading.Event()
+        self._thread = threading.Thread(
+            target=self._loop, name="vram-monitor", daemon=True
+        )
+        self._thread.start()
+
+    def set_stage(self, stage: str | None) -> None:
+        self._stage = stage
+        self._wake.set()  # immediate boundary sample
+
+    def _read_mib(self) -> int | None:
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.used",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if out.returncode != 0:
+                raise RuntimeError(out.stderr.strip()
+                                   or f"exit {out.returncode}")
+            return sum(int(line.strip())
+                       for line in out.stdout.splitlines() if line.strip())
+        except Exception as exc:
+            if not self._warned:
+                self._warned = True
+                logger.warning("VRAM monitor DISABLED (nvidia-smi failed: "
+                               "%s) -- no VRAM log for this run", exc)
+            return None
+
+    def _loop(self) -> None:
+        while not self._stopping:
+            mib = self._read_mib()
+            if mib is None:
+                return
+            stage = self._stage
+            self.samples.append((stage, mib))
+            if not self._file_dead:
+                # A dead trace file (disk full, permissions) must not
+                # stop in-memory sampling: the end-of-run summary still
+                # works. One WARNING, then stop writing.
+                try:
+                    self.path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(self.path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "t": round(time.time(), 1),
+                            "stage": stage, "mib": mib,
+                        }) + "\n")
+                except OSError as exc:
+                    self._file_dead = True
+                    logger.warning("VRAM trace file %s unwritable (%s) -- "
+                                   "keeping in-memory samples only",
+                                   self.path, exc)
+            self._wake.wait(timeout=VRAM_SAMPLE_INTERVAL_S)
+            self._wake.clear()
+
+    def finish(self) -> None:
+        """Stop sampling and log the summary."""
+        self._stopping = True
+        self._wake.set()
+        self._thread.join(timeout=15)
+        if not self.samples:
+            logger.warning("VRAM summary: no samples recorded")
+            return
+
+        def _mean_gib(kind: str) -> float | None:
+            vals = [m for s, m in self.samples if s and s.startswith(kind)]
+            return (sum(vals) / len(vals) / 1024.0) if vals else None
+
+        peak_stage, peak = max(self.samples, key=lambda sm: sm[1])
+        parts = [f"peak {peak / 1024.0:.1f} GiB "
+                 f"(during {peak_stage or 'idle'})"]
+        for kind in ("datagen", "train"):
+            mean = _mean_gib(kind)
+            parts.append(f"mean {kind} {mean:.1f} GiB" if mean is not None
+                         else f"no {kind} samples")
+        trace = ("(trace file was unwritable; in-memory samples only)"
+                 if self._file_dead else f"full trace: {self.path}")
+        logger.info("VRAM summary (%d samples, 1/min): %s -- %s",
+                    len(self.samples), "; ".join(parts), trace)
+
+
+#: Set by orchestrate(); _run_stage tags the monitor + stage-hours ledger.
+_MONITOR: VramMonitor | None = None
+
+#: Total wall hours per stage kind, across epochs AND retry attempts
+#: (time spent is time spent, success or not). Logged at the end of the
+#: run next to the VRAM summary.
+_STAGE_HOURS: dict[str, float] = {"datagen": 0.0, "train": 0.0}
 
 
 # ==================================================================== state
@@ -127,11 +262,21 @@ def _latest_checkpoint(label: str) -> str | None:
 
 def _run_stage(cmd: list[str], stage: str) -> bool:
     """One subprocess attempt; True on exit 0. Output inherits our
-    stdout/stderr so everything lands in the one weekend log."""
+    stdout/stderr so everything lands in the one weekend log. Also
+    brackets the VRAM monitor's stage tag and books the wall time into
+    the per-kind hours ledger (stage names start with the kind)."""
     logger.info("[%s] starting: %s", stage, " ".join(cmd))
+    kind = "datagen" if stage.startswith("datagen") else "train"
+    if _MONITOR is not None:
+        _MONITOR.set_stage(stage)
     t0 = time.perf_counter()
-    proc = subprocess.run(cmd, cwd=REPO_ROOT)
-    hours = (time.perf_counter() - t0) / 3600
+    try:
+        proc = subprocess.run(cmd, cwd=REPO_ROOT)
+    finally:
+        hours = (time.perf_counter() - t0) / 3600
+        _STAGE_HOURS[kind] += hours
+        if _MONITOR is not None:
+            _MONITOR.set_stage(None)
     if proc.returncode == 0:
         logger.info("[%s] finished in %.2fh", stage, hours)
         return True
@@ -144,7 +289,7 @@ def _run_stage(cmd: list[str], stage: str) -> bool:
 
 def _datagen(k: int, checkpoint: str | None,
              args: argparse.Namespace) -> bool:
-    """Datagen for epoch k, serial, resumable. True if any traces exist
+    """Datagen for epoch k, resumable. True if any traces exist
     afterwards (training can proceed)."""
     label = f"{args.prefix}_iter{k}"
     traces = DATA_GAME_DIR / label / "traces.jsonl"
@@ -158,7 +303,7 @@ def _datagen(k: int, checkpoint: str | None,
         cmd = [
             sys.executable, "-m", "training.generate_game_traces",
             "--label", label,
-            "--parallel", "1",
+            "--parallel", str(args.parallel),
             "--games", str(args.games),
             "--max-generations", str(remaining),
             # Distinct noise/question streams per epoch AND per resume
@@ -246,6 +391,8 @@ def train_one_epoch(k: int, prefix: str, resume: str | None,
 # ============================================================= orchestrator
 
 def orchestrate(args: argparse.Namespace) -> int:
+    global _MONITOR
+    _MONITOR = VramMonitor(args.prefix)
     state = _load_state(args.prefix)
     checkpoint = args.start_checkpoint
     failures = 0
@@ -288,26 +435,36 @@ def orchestrate(args: argparse.Namespace) -> int:
 
     logger.info("weekend run complete: %d epoch(s), %d failed stage(s), "
                 "final checkpoint %r", args.epochs, failures, checkpoint)
+    logger.info("stage time: datagen %.2fh, train %.2fh (all epochs + "
+                "retries)", _STAGE_HOURS["datagen"], _STAGE_HOURS["train"])
+    _MONITOR.finish()
     return failures
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m training.run_weekend",
-        description="Serial multi-epoch self-training loop "
+        description="Unattended multi-epoch self-training loop "
                     "(datagen -> train per epoch, subprocess per stage)",
     )
     p.add_argument("--epochs", type=int, default=3,
-                   help="expert-iteration cycles (default 3: Friday "
-                        "afternoon -> Monday morning at ~20h/epoch serial "
-                        "datagen, t8 2026-07-30; see TRAINING_OVERVIEW.md)")
+                   help="expert-iteration cycles (default 3; fits Friday "
+                        "afternoon -> Monday morning even serially at "
+                        "~20h/epoch, t8 2026-07-30 -- with lots of slack "
+                        "at the default parallelism)")
     p.add_argument("--games", type=int, default=60,
                    help="games per datagen epoch (generate_game_traces "
                         "default)")
     p.add_argument("--max-generations", type=int, default=3000,
                    help="player-generation budget per datagen epoch; THE "
-                        "knob for fitting the weekend (epoch datagen "
-                        "hours ~= this x t8's s/gen / 3600)")
+                        "knob for fitting the window (epoch datagen hours "
+                        "~= this x s/gen / 3600; measured s/gen in the "
+                        "module docstring)")
+    p.add_argument("--parallel", type=int, default=16,
+                   help="concurrent datagen sessions per epoch (passed to "
+                        "generate_game_traces); 1 = the fully serial "
+                        "conservative path; default 16 is set by VRAM "
+                        "headroom on a 96 GB box")
     p.add_argument("--seed", type=int, default=17,
                    help="base seed; each epoch and resume attempt derives "
                         "a distinct noise/question stream from it")

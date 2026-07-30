@@ -53,11 +53,15 @@ Housekeeping per the committed plan: frames are noised at inference
 memory is reset to the seeded semantic model (tips are ``Preference`` nodes
 and survive) every ``--reset-every`` games.
 
-**Parallelism** (``--parallel``, default 3): N sessions play N games
+**Parallelism** (``--parallel``, default 16): N sessions play N games
 concurrently, one worker thread each, sharing ONE model through
 ``agent.parallel_gen`` -- concurrent generations merge into batched decode
-calls (batch-1 decode is bandwidth-bound, so a batch of 3 costs barely more
-than a batch of 1). NAMS resets happen at BLOCK boundaries: games run in
+calls (batch-1 decode is bandwidth-bound, so extra rows are cheap).
+Measured 2026-07-30 (96 GB box, base weights): serial 24.1 s/gen,
+``--parallel 10`` 8.5, ``--parallel 24`` 6.4 -- returns diminish but never
+invert, so the default is set by VRAM comfort, not scaling efficiency
+(24 ran close to the limit; 16 leaves headroom). NAMS resets happen at
+BLOCK boundaries: games run in
 sequential blocks of ``--reset-every``, all workers drain between blocks,
 one session resets, all restart. Each concurrent session is invisible to
 the others' players exactly as PAST sessions are (current-session
@@ -567,10 +571,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "generations)")
     p.add_argument("--max-generations", type=int, default=3000,
                    help="hard cap on player generations for the whole run")
-    p.add_argument("--parallel", type=int, default=3,
+    p.add_argument("--parallel", type=int, default=16,
                    help="concurrent game sessions sharing one model via "
                         "batched decode (agent/parallel_gen.py); 1 = the "
-                        "plain sequential loop")
+                        "plain sequential loop; default 16 is set by VRAM "
+                        "headroom on a 96 GB box, not scaling efficiency "
+                        "(returns diminish but never invert -- module "
+                        "docstring)")
     p.add_argument("--reset-every", type=int, default=100,
                    help="reset NAMS episodic memory (tips survive) every N "
                         "games (default 100 per TRAINING_EXTRA_DATASETS.md)")

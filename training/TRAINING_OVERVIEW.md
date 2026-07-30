@@ -49,19 +49,20 @@ deviations and calls the loop — copy
 (`python -m training.train --data ...`, every flag mapping 1:1 onto a
 `TrainConfig` field) is kept for ad-hoc runs.
 
-### The weekend run (serial, multi-epoch)
+### The weekend run (multi-epoch, unattended)
 
 `python -m training.run_weekend` chains **3 expert-iteration epochs**
-unattended: for each epoch k it runs serial datagen
-(`generate_game_traces --label weekend_iter<k> --parallel 1`, on the
+unattended: for each epoch k it runs datagen
+(`generate_game_traces --label weekend_iter<k> --parallel 16`, on the
 previous epoch's adapter) and then trains on that epoch's traces + the
-manifest replay sources, resumed from the previous adapter. Serial is the
-conservative choice: the Gemma 4 left-pad prefill bug
+manifest replay sources, resumed from the previous adapter. Datagen is
+parallel by default: the Gemma 4 left-pad prefill bug
 ([huggingface/transformers#47651](https://github.com/huggingface/transformers/issues/47651))
-now has a verified workaround that makes `--parallel N` correct (stage-6
-notes in [TO_TEST.md](TO_TEST.md)), but the unattended run stays on the
-longest-validated path until the parallel speedup is proven out (stage
-8/9 notes there).
+has a verified workaround (stage-6 notes in [TO_TEST.md](TO_TEST.md)),
+and measured scaling (2026-07-30, 96 GB box) never inverts: serial
+24.1 s/gen, `--parallel 10` 8.5, `--parallel 24` 6.4. The default 16 is
+set by VRAM comfort — 24 ran close to the limit. `--parallel 1` restores
+the fully serial conservative path.
 
 Launch (remote box, NAMS up, external data downloaded, from repo root):
 
@@ -69,14 +70,12 @@ Launch (remote box, NAMS up, external data downloaded, from repo root):
 nohup python -m training.run_weekend > weekend.log 2>&1 &
 ```
 
-**Fitting the window.** Run selftest t8 first for the real serial
-seconds-per-generation. One epoch costs roughly
-`--max-generations x s/gen` of datagen (~20 h at the last measurement:
-24.1 s/gen, t8 2026-07-30) plus one train stage; `--max-generations`
-(default 3000) is the knob — e.g. `--max-generations 2400` shaves ~4 h
-per epoch. `--epochs`,
-`--games`, `--start-checkpoint`, and `--prefix` are also flags. Before the
-real launch, rehearse the whole orchestration cheaply (TO_TEST.md,
+**Fitting the window.** One epoch costs roughly
+`--max-generations x s/gen` of datagen (~6 h at default parallelism,
+~20 h serial, per the measurements above) plus one train stage;
+`--max-generations` (default 3000) is the knob. `--epochs`, `--games`,
+`--parallel`, `--start-checkpoint`, and `--prefix` are also flags. Before
+the real launch, rehearse the whole orchestration cheaply (TO_TEST.md,
 "weekend rehearsal"): a tiny budget plus `--train-max-steps` exercises
 subprocess chaining, checkpoint hand-off, and the state file in under an
 hour.
@@ -99,7 +98,11 @@ the `data_game/weekend_iter<k>/` directory).
 **Monitoring:** `tail -f weekend.log`; per-epoch
 `data_game/weekend_iter<k>/generation_stats.json` (wall clock,
 `seconds_per_generation`) and `logs/train_weekend_iter<k>_<stamp>/`
-(steps, evals, rollbacks).
+(steps, evals, rollbacks). The orchestrator also samples topline GPU
+memory once a minute (stage-tagged, `data_game/weekend_vram.jsonl`) and
+ends the log with a **VRAM summary** (peak, mean during datagen, mean
+during training) plus total datagen/train hours — check those before
+raising `--parallel`.
 
 The loop is deliberately source-agnostic. Everything it knows about data
 comes through two small types:

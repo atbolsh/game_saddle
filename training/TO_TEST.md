@@ -128,9 +128,12 @@ each stage in its own subprocess; (2) epoch 2's datagen logs
 point; (3) `data_game/smoke_state.json` records the stages, and re-running
 the same command immediately exits after "already complete" skips; (4)
 checkpoints exist under `weights/<arch>/smoke_iter1_step*` and
-`smoke_iter2_step*`. Then delete `data_game/smoke_iter*`,
-`data_game/smoke_state.json`, and `weights/<arch>/smoke_iter*` before the
-real run. Kill-resume is worth one extra check if time permits: Ctrl-C
+`smoke_iter2_step*`; (5) `data_game/smoke_vram.jsonl` has stage-tagged
+samples from BOTH stage kinds and the log ends with a `VRAM summary`
+line (peak + per-stage means) and a `stage time:` line — that's the
+monitoring you'll read Monday morning. Then delete `data_game/smoke_iter*`,
+`data_game/smoke_state.json`, `data_game/smoke_vram.jsonl`, and
+`weights/<arch>/smoke_iter*` before the real run. Kill-resume is worth one extra check if time permits: Ctrl-C
 mid-datagen, rerun, and confirm it resumes with `--append` and the
 remaining budget.
 
