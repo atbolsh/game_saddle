@@ -395,15 +395,15 @@ token is the model's default behavior — staged plan in
 datagen runs `--parallel 3` game sessions by default, merged into batched
 decode calls on the one shared model (`agent/parallel_gen.py` — decode is
 bandwidth-bound, so a batch of 3 costs barely more than a batch of 1;
-Gemma 4 Unified only true-batches equal-token-length prompts, see
-TRAINING_GAME_TRACES.md), and
+mixed-length prompts batch via a verified left-pad workaround for a Gemma 4
+prefill bug, see the banner in `agent/model.py`), and
 finishes by writing signal-check plots to `logs/datagen_stats_<label>_*/`
 (look at the rating histogram before spending training hours). Training
 runs micro-batched (`micro_batch=4` x `grad_accum=4` = the same effective
 batch 16), caps held-out eval at 100 examples per source, drops overlong
 examples loudly (`max_example_chars`), and aborts after `--max-rollbacks`
 (default 3) rollbacks instead of oscillating. The formal verification
-protocol is `python -m training.selftest <t0..t7|all>` — ordered stages
+protocol is `python -m training.selftest <t0..t9|all>` — ordered stages
 printing `TEST <id> PASS/FAIL` lines; see
 [training/TO_TEST.md](training/TO_TEST.md).
 
@@ -508,7 +508,7 @@ training/
   planted_errors.py  # planted-error scrambler (labeled corruptions; not hooked up)
   image_noise.py     # label-safe frame degradation (inference + training)
   datagen_plots.py   # end-of-datagen signal-check plots -> logs/datagen_stats_*/
-  selftest.py        # the formal test suite (stages t0-t7, TEST id PASS/FAIL lines)
+  selftest.py        # the formal test suite (stages t0-t9, TEST id PASS/FAIL lines)
   TRAINING_OVERVIEW.md      # self-training roadmap + the train.py contract/recipe
   TRAINING_GAME_TRACES.md   # standard use of game traces (self-eval loop as data generator)
   TRAINING_EXTRA_DATASETS.md# replay mixing vs. forgetting; the early-warning suite

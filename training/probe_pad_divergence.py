@@ -1,10 +1,18 @@
 """Diagnose the Gemma 4 left-pad divergence: precision noise or mask bug?
 
-Background (see TO_TEST.md stage-6 note): left-padded variable-length
-multimodal decode diverges from solo generate even when every collated
-tensor is suffix-identical to the solo encoding, so ``generate_batch`` only
-true-batches equal-length rows. The open question is WHY the padded path
-diverges. Two competing theories with different fingerprints:
+STATUS: question ANSWERED -- it is a real upstream bug (mask/vision
+defect, transformers#47651), not precision noise. This probe produced the
+first evidence (the second fingerprint below, at specific pad lengths); the full
+characterization (poison modes, mod-32 rule) lives in
+training/probe_hacky_pads.py, and the shipped workaround in
+agent/model.py's KNOWN TRANSFORMERS BUG WORKAROUND banner. Kept as the
+minimal single-row prefill probe.
+
+Background (historical, pre-workaround): left-padded variable-length
+multimodal decode diverged from solo generate even when every collated
+tensor was suffix-identical to the solo encoding, so ``generate_batch``
+at the time only true-batched equal-length rows. The open question was
+WHY. Two competing theories with different fingerprints:
 
   * bf16/SDPA kernel noise -- next-token logits differ by ~1e-2, deltas do
     NOT grow with pad length, argmax flips (if any) land on near-tie
@@ -16,9 +24,9 @@ diverges. Two competing theories with different fingerprints:
     rows, which uncorrelated noise cannot explain).
 
 One prompt, one prefill forward pass per condition: solo, then the same row
-left-padded by 8 / 64 / 256 positions inside a batch-1 tensor (padding with
-the tokenizer's pad token; attention_mask zeros; every sequence-aligned int
-tensor padded in lockstep, exactly like the removed generate-path collate).
+left-padded by 8 / 64 / 256 positions inside a batch-1 tensor (via the
+canonical ``agent.model.left_pad_row``: pad token for input_ids, zeros for
+attention_mask and every other sequence-aligned int tensor, in lockstep).
 Also runs a text-only prompt to isolate the vision-block mask. Compares the
 last-position logits.
 
@@ -155,11 +163,11 @@ def run_probe() -> int:
         "\nVERDICT GUIDE: max|dLogit| ~1e-2 flat across pad lengths and no "
         "argmax flips => bf16 kernel noise. Deltas >~0.5, growing with pad "
         "length, or flips toward caption-style tokens ('a', 'an') => real "
-        "mask/position defect. If batch-1 padding is tame but the "
-        "batch-of-2 padded row diverges hard, the bug is in the batched "
-        "multimodal path (image-feature scatter / mask across rows) -- "
-        "report upstream; equal-length-only batching stays mandatory "
-        "either way."
+        "mask/position defect. (Historical guide -- the defect verdict "
+        "WON, reported as transformers#47651; production now pads through "
+        "the parity-checked workaround in agent/model.py. Rerun this "
+        "probe after transformers upgrades: all-tame output at every pad "
+        "would mean the upstream fix landed.)"
     )
     return 1 if suspicious else 0
 

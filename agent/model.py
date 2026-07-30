@@ -240,10 +240,11 @@ def stack_equal_length(
     9, 15, 16, 63, 64 stay within ~0.5 bf16 wobble; batch size and
     transformers version are irrelevant -- see
     scripts/gemma4_pad_batch_repro.py, reported upstream as
-    https://github.com/huggingface/transformers/issues/47651). Which
-    offsets are poisonous is not predictable from the outside, so the
-    only safe policy is ZERO padding:
-    ``generate_batch`` only stacks equal-length rows, and mixed lengths
+    https://github.com/huggingface/transformers/issues/47651). The poison
+    pattern was later characterized (mod-32 rule, KNOWN TRANSFORMERS BUG
+    WORKAROUND banner below) and ``generate_batch`` now pads mixed-length
+    rows through the verified path -- but THIS function stays the
+    zero-padding primitive for equal-length cohorts, so mixed lengths
     here are a hard error.
     """
     if not rows:
@@ -438,8 +439,9 @@ class RegexStopCriteria(StoppingCriteria):
     Per-row aware: returns a bool tensor of shape ``[batch]``, so in a
     batched generate each row halts individually on its own match while the
     others continue (transformers ORs per-row criteria into its
-    unfinished-sequences mask). Batches are equal-length (no padding), so a
-    single ``prompt_len`` is correct for every row.
+    unfinished-sequences mask). A single ``prompt_len`` (the stacked width)
+    is correct for every row whether the batch is equal-length or
+    LEFT-padded: generated tokens always land after the stacked width.
     """
 
     #: How many of the most recent generated tokens to decode per check.

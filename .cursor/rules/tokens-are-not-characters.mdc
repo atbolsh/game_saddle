@@ -12,10 +12,12 @@ prompts with identical token length can differ by hundreds of characters
 length never sees. When an invariant is defined in token space, enforce it in
 token space — encode first, then compare exact integers.
 
-Real bug this rule comes from: `generate_batch` may only true-batch rows
-whose **prompt token lengths are exactly equal** (Gemma 4 Unified left-pad
-decode diverges from solo generate). A dispatcher "optimization" grouped
-requests by `text_chars // 32` buckets. That proxy:
+Real bug this rule comes from: at the time, `generate_batch` could only
+true-batch rows whose **prompt token lengths were exactly equal** (the
+Gemma 4 Unified left-pad prefill bug, transformers#47651 — since worked
+around with token-exact arithmetic, which only sharpens the point). A
+dispatcher "optimization" grouped requests by `text_chars // 32` buckets.
+That proxy:
 
 - could not create equal-token-length cohorts (chars don't determine tokens),
 - actively *prevented* same-token-length prompts from ever batching when

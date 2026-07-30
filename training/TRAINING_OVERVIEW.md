@@ -55,10 +55,13 @@ deviations and calls the loop — copy
 unattended: for each epoch k it runs serial datagen
 (`generate_game_traces --label weekend_iter<k> --parallel 1`, on the
 previous epoch's adapter) and then trains on that epoch's traces + the
-manifest replay sources, resumed from the previous adapter. Serial because
-of the Gemma 4 left-pad prefill bug
-([huggingface/transformers#47651](https://github.com/huggingface/transformers/issues/47651));
-see the stage-6/8/9 notes in [TO_TEST.md](TO_TEST.md).
+manifest replay sources, resumed from the previous adapter. Serial is the
+conservative choice: the Gemma 4 left-pad prefill bug
+([huggingface/transformers#47651](https://github.com/huggingface/transformers/issues/47651))
+now has a verified workaround that makes `--parallel N` correct (stage-6
+notes in [TO_TEST.md](TO_TEST.md)), but the unattended run stays on the
+longest-validated path until the parallel speedup is proven out (stage
+8/9 notes there).
 
 Launch (remote box, NAMS up, external data downloaded, from repo root):
 

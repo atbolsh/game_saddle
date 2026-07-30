@@ -474,7 +474,9 @@ def test3_rehearsal(model: Any, picked: list[tuple[int, dict]],
         print("\nPARITY CHECK PASSED BUT GREEDY DECODE DIVERGED -- the "
               "prefill check does NOT guarantee clean decode; the padded "
               "approach is dead as designed (escalate to outcome c: solo "
-              "prefill + KV stitching).")
+              "prefill + KV stitching -- but read 'KV reuse: attempted, "
+              "reverted' in TO_TEST.md first: transformers 5.14 cache "
+              "surgery has landmines).")
     else:
         print("\nALL ROWS IDENTICAL: parity-checked padding survives the "
               "full decode INCLUDING stop_strings + stop_regex -- "

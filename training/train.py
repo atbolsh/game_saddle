@@ -42,8 +42,10 @@ multimodal forward. An example that declares an image but produces no pixel
 tensor is a hard error (no silent text-only degradation). Vision/audio
 towers stay frozen (name-excluded from LoRA); the vision embedder
 (``embed_vision`` on Gemma 4) trains via PEFT ``modules_to_save`` and so
-rides inside the adapter checkpoint. Micro-batch is fixed at 1 (variable-size
-multimodal padding is a swamp; effective batch comes from grad accumulation).
+rides inside the adapter checkpoint. Micro-batches are length-bucketed and
+RIGHT-padded (:meth:`Collator.build_batch`; safe under causal attention +
+weight-0 pads, unlike inference-side LEFT padding -- see the workaround
+banner in agent/model.py); effective batch = micro_batch * grad_accum.
 
 RECIPE (flags override): 4-bit NF4 + double quant + bf16 compute (QLoRA,
 Dettmers et al. 2023); LoRA r=32/alpha=64/dropout=0.05 on all language-model

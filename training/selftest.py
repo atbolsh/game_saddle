@@ -512,9 +512,10 @@ def t1_pure() -> str:
     assert max(totals) < 1.1 * min(totals), f"unbalanced groups: {totals}"
     checks += 1
 
-    # ---- stack_equal_length: the generate_batch collation (Gemma 4 cannot
-    #      left-pad decode, so only equal-length rows may share a batch and
-    #      mixed lengths must be a hard error, not a silent pad)
+    # ---- stack_equal_length: generate_batch's equal-length-cohort
+    #      collation (mixed lengths must be a hard error, not a silent pad:
+    #      only the parity-checked path in _plan_padded_batch may left-pad
+    #      on Gemma 4 -- see the workaround banner in agent/model.py)
     import torch
 
     from agent.model import stack_equal_length
