@@ -16,7 +16,7 @@ lines back for review. On a FAIL, also paste the traceback that precedes it.
 | 3 | `python -m training.selftest t3` | minutes | 4-bit QLoRA load; LoRA target discovery + projector resolution; terminator id; one collated forward+backward per loss kind (image example included); fresh-adapter KD loss equals teacher entropy (the `disable_adapter()` teacher path) |
 | 4 | `python -m training.selftest t4` | ~15–30 min | batch-4 vs batch-1 per-example loss parity (mixed CE/KD/image/negative-span buckets); CLI smoke train lands a checkpoint + `eval_log.jsonl` rows; destructive-LR variant fires the rollback path |
 | 5 | `python -m training.selftest t5` | ~10–20 min | datagen 2 games x 5 moves at `--parallel 2`: traces + stored frames + stats + plots written, one record per generation, tripwire silent, ratings parsed; `analyst_traces.jsonl` has one record per round (minus counted truncated-search skips), analyses nonempty, frames shared with player records |
-| 6 | `python -m training.selftest t6` | minutes | equal-length identical-prompt true GPU batch vs solo; variable-length via length cohorts vs solo (Gemma 4: no left-pad decode) |
+| 6 | `python -m training.selftest t6` | minutes | equal-length identical-prompt true GPU batch vs solo; variable-length via the VERIFIED LEFT-PAD workaround vs solo (must byte-match AND must actually take the padded path, not the cohort fallback) |
 | 7 | `python -m training.selftest t7` | minutes | t5's traces through `GameTraceSource` + `AnalystTraceSource` and real train steps (RL weights + KD-vs-base analyst anchor, mixed CE/KD buckets, per-run noised frames, finite losses; the tiny epoch is drained so the KD bucket is guaranteed to train) |
 | 8 | `python -m training.selftest t8` | ~5–15 min | REAL serial datagen timing: the tiny shared workload (2 games × 3 moves, `--parallel 1`) through the actual session harness with the model pre-loaded/warmed (startup excluded); reports `seconds_per_generation` and the serial wall-clock a default epoch (3000 gens) implies. Its `generation_stats.json` is t9's baseline |
 | 9 | `python -m training.selftest t9` | ~5–15 min | t8's EXACT workload at `--parallel 2` (run t8 first — its stats file is the serial baseline), compared on `seconds_per_generation`; asserts parallel is not ≫ slower, REPORTS the speedup |
@@ -37,17 +37,24 @@ PID holding VRAM.
 Stage 6 note: greedy equality is the strict criterion. If it fails only on
 a near-tie token deep into a reply (both outputs sane, divergence late),
 that is bf16 batched-matmul nondeterminism — paste both replies and we
-judge. Gemma 4 Unified: left-padding a multimodal row corrupts its prefill
-at SPECIFIC pad lengths — `scripts/gemma4_pad_batch_repro.py` measured
-pad=7 on a 282-token image prompt giving ~40-logit deltas with the argmax
-flipping to `<audio|>`, while pads 1–6, 8, 9, 15, 16, 63, 64 stay within
-~0.5-logit bf16 wobble (batch size and transformers 5.13/5.14 version
-irrelevant; bit-identical). Upstream transformers bug
-(https://github.com/huggingface/transformers/issues/47651), not collation:
-every aux tensor was verified suffix-identical to solo. Since poisonous
-offsets are unpredictable, `generate_batch` runs one true GPU batch per
-distinct prompt length (zero pad); rows whose length is unique decode
-alone. Equal-length early divergence is a true-batch bug.
+judge. KNOWN TRANSFORMERS BUG WORKAROUND in play (full banner in
+`agent/model.py`): Gemma 4 Unified corrupts a left-padded multimodal
+prefill whenever the padded total width ≡ 1 mod 32 — ~35–52-logit deltas,
+argmax flipping to junk like `<audio|>`; every other width is ordinary
+bf16 wobble. Measured 6/6 across prompt lengths 282–2867
+(`training/probe_hacky_pads.py`; standalone repro
+`scripts/gemma4_pad_batch_repro.py`; upstream
+https://github.com/huggingface/transformers/issues/47651 and
+https://huggingface.co/google/gemma-4-12B-it/discussions/50). The poison
+is prefill-only — decode steps crossing the residue are harmless (probe
+test 4). So `generate_batch` left-pads mixed-length rows to a target
+width that dodges ≡ 1 mod 32 AND parity-checks each row's padded prefill
+against its solo prefill before decoding; on rejection (which would mean
+the mod-32 rule has an exception — logged at WARNING) it falls back to
+one batch per distinct length. t6 FAILS if the padded path did not
+engage: a silent cohort fallback would pass equality while quietly
+serializing parallel datagen. Equal-length early divergence is a
+true-batch bug.
 
 Stage 8/9 note: these two stages measure, they mostly don't judge — the
 decision they feed is "is serial datagen fast enough for an overnight
@@ -55,12 +62,16 @@ epoch, or do we need real batching (server / upstream fix)?". Both time
 the REAL harness (no synthetic prompts), so t8's `s/gen` already includes
 prompt building, NAMS retrieval, image noise, and the analyst call,
 amortized per player generation — the unit `--max-generations` caps. Read
-t8's epoch extrapolation first; then t9's speedup: x~1.0 means the parallel
-sessions never landed equal-length prompts in the same dispatch window
-(decode fully serialized — expected with divergent game histories), and
-anything ≥ x1.3 means cohorts DO form on this workload. The only assertion
-is that `--parallel 2` is not ≥1.6x SLOWER per generation than serial,
-which would indicate dispatcher pathology rather than absent cohorts.
+t8's epoch extrapolation first; then t9's speedup. With the verified
+left-pad workaround (stage 6 note), mixed-length rows in one dispatch
+window now decode as ONE padded batch, so x~1.0 no longer means "no
+equal-length cohorts" — it means the dispatch windows themselves rarely
+held 2 requests (sessions out of phase), or the per-batch overhead (solo
+prefills for the parity check) ate the win on this tiny workload. Check
+`batch_mode` in `llm_calls.jsonl`: `padded(...)` entries confirm the
+workaround engaged. The only assertion is that `--parallel 2` is not
+≥1.6x SLOWER per generation than serial, which would indicate dispatcher
+pathology.
 Both stages share t9's caveat: sampled replies make single runs noisy —
 treat ±15% as measurement error, rerun before drawing conclusions from
 small differences.

@@ -16,10 +16,11 @@ The pieces:
     Stop knobs are batch-wide in ``generate_batch`` (a per-row mix would let
     an analyst quoting "[FORWARD]" be truncated by a player row's stop
     string). Prompt length is deliberately NOT part of the signature:
-    ``generate_batch`` itself splits a group into exact-token-length cohorts
-    (Gemma 4 Unified cannot left-pad decode), and only the exact token
-    count decides who batches -- any cheaper proxy (e.g. char buckets)
-    would split same-length peers that could have shared a batch.
+    ``generate_batch`` itself decides how a group decodes -- mixed lengths
+    go through the VERIFIED LEFT-PAD path (the KNOWN TRANSFORMERS BUG
+    WORKAROUND for transformers#47651, see agent/model.py's banner), with
+    exact-token-length cohorts only as its fallback. Bucketing here by any
+    length proxy would just fragment groups that the padded path can batch.
   * :class:`BatchingProxy` -- duck-types ``VLModel`` for a session: same
     ``generate(...)`` signature, everything else forwarded to the real
     model. Installed as ``session.model``, so the session code does not know

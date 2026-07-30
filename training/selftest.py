@@ -897,12 +897,20 @@ def t5_datagen() -> str:
 
 
 def t6_ab() -> str:
-    """Batched vs solo generation A/B (Gemma 4: equal-length cohorts only).
+    """Batched vs solo generation A/B.
 
       (1) identical prompts x3 -- true GPU batch (no pad); must match solo.
-      (2) variable-length prompts -- generate_batch splits into length
-          cohorts (still must match solo; may be B=1 per cohort).
+      (2) variable-length prompts -- ONE verified left-padded batch via
+          the KNOWN TRANSFORMERS BUG WORKAROUND in agent/model.py
+          (transformers#47651: padded totals ~= 1 mod 32 corrupt the
+          multimodal prefill; generate_batch dodges those widths and
+          parity-checks the padded prefill against solo before decoding).
+          Must match solo byte-for-byte AND must actually engage the
+          padded path -- a silent fallback to length cohorts would fake
+          this pass while t9's speedup silently dies.
     """
+    import logging as _logging
+
     from agent.model import get_model, stack_equal_length
 
     model = get_model()
@@ -953,11 +961,36 @@ def t6_ab() -> str:
             solo_var = [
                 model.generate(p, max_new_tokens=48) for p in var_prompts
             ]
-            batched_var = model.generate_batch(
-                [{"messages": p} for p in var_prompts], max_new_tokens=48,
-            )
+
+            class _Capture(_logging.Handler):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.lines: list[str] = []
+
+                def emit(self, record: _logging.LogRecord) -> None:
+                    self.lines.append(record.getMessage())
+
+            cap = _Capture()
+            _logging.getLogger("agent.model").addHandler(cap)
+            try:
+                batched_var = model.generate_batch(
+                    [{"messages": p} for p in var_prompts],
+                    max_new_tokens=48,
+                )
+            finally:
+                _logging.getLogger("agent.model").removeHandler(cap)
         finally:
             model._sampling_kwargs = original
+
+    padded_engaged = any(
+        "padded batch verified clean" in line for line in cap.lines
+    )
+    assert padded_engaged, (
+        "variable-length batch did NOT take the verified-padded path "
+        "(KNOWN TRANSFORMERS BUG WORKAROUND, transformers#47651) -- it "
+        "fell back to length cohorts, which kills parallel-datagen "
+        "throughput. generate_batch log: " + " | ".join(cap.lines)
+    )
 
     mism_same = [
         (i, s, b) for i, (s, b) in enumerate(zip(solo_same, batched_same))
@@ -974,14 +1007,16 @@ def t6_ab() -> str:
         )
     )
     assert not mism_var, (
-        "variable-length (length-cohort) batch != solo: "
+        "variable-length VERIFIED-PADDED batch != solo (the parity check "
+        "passed but decode diverged -- transformers#47651 workaround "
+        "assumption broken?): "
         + "; ".join(
             f"[{i}] solo={s!r} batched={b!r}" for i, s, b in mism_var
         )
     )
     return (
         f"equal-len 3/3 identical (true batch); var-len 3/3 identical "
-        f"via length cohorts {sorted(var_lens)}; "
+        f"via verified left-pad, lengths {sorted(var_lens)}; "
         f"e.g. same0={solo_same[0][:50]!r}"
     )
 
@@ -1084,10 +1119,13 @@ def t9_parallel() -> str:
     ``seconds_per_generation``. GPU + NAMS; run t8 FIRST (its
     generation_stats.json is the serial baseline).
 
-    The speedup is REPORTED, not asserted: with Gemma 4 equal-length
-    cohorts (TO_TEST stage-6 note) it is workload-dependent, and x~1.0
-    simply means no cohorts formed and decode stayed serialized. The only
-    assertion is the slowdown tripwire (dispatcher pathology).
+    The speedup is REPORTED, not asserted: with the verified left-pad
+    workaround (TO_TEST stage-6 note, transformers#47651) mixed-length
+    rows sharing a dispatch window decode as ONE padded batch, so x~1.0
+    now means the windows rarely held 2 requests (sessions out of phase)
+    or parity-check overhead ate the win on this tiny workload -- check
+    `batch_mode` in llm_calls.jsonl. The only assertion is the slowdown
+    tripwire (dispatcher pathology).
     """
     base = (REPO_ROOT / "data_game" / "selftest_t8_serial"
             / "generation_stats.json")
@@ -1100,8 +1138,8 @@ def t9_parallel() -> str:
     s_par = summary["seconds_per_generation"]
     speedup = s_ser / s_par
     # Tripwire only: --parallel 2 must not be catastrophically SLOWER
-    # than serial (that would mean dispatcher pathology, not just absent
-    # cohorts). Wins are evidence, not assertions.
+    # than serial (that would mean dispatcher pathology, not just
+    # under-filled dispatch windows). Wins are evidence, not assertions.
     assert s_par <= 1.6 * s_ser, (
         f"--parallel 2 much slower than serial: {s_par:.1f} vs "
         f"{s_ser:.1f} s/gen -- dispatcher pathology?"
@@ -1111,7 +1149,8 @@ def t9_parallel() -> str:
         f"{serial['wall_seconds']:.0f}s wall) vs --parallel 2 "
         f"{s_par:.1f}s/gen ({summary['generations']} gens, "
         f"{summary['wall_seconds']:.0f}s wall): speedup x{speedup:.2f} "
-        "(x~1.0 = no equal-length cohorts, decode serial)"
+        "(x~1.0 = dispatch windows rarely held 2 requests; check "
+        "batch_mode in llm_calls.jsonl for padded(...) entries)"
     )
 
 

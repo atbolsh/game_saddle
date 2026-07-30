@@ -17,6 +17,12 @@ everything else is deterministic bf16 kernel wobble (<= ~1.75, no argmax
 flip, grows with L, same class equal-length batching shows). This rerun
 scores that rule and rehearses production with it.
 
+STATUS: the workaround this probe validated NOW SHIPS in
+agent/model.py's generate_batch (VLModel._padded_batch_prefill; see the
+KNOWN TRANSFORMERS BUG WORKAROUND banner there). Keep this probe: it is
+the regression check for the mod-32 rule after any transformers upgrade,
+and the evidence trail for why the hack exists.
+
 Three tests, all output marked HACKY_ANSWER:
 
   1. pad-vs-total: several real prompts of different lengths x a pad sweep
@@ -65,21 +71,20 @@ PAD_SWEEP: list[int] = list(range(1, 33)) + [
     48, 64, 96, 128, 192, 256, 384, 512, 768, 1024,
 ]
 
-#: A pad is POISON if the argmax flips or any logit moves by more than
-#: this. The 2026-07-30 run on real game prompts (L 1547-2867) measured
-#: two cleanly separated populations: deterministic bf16 kernel wobble up
-#: to ~1.75 with NO argmax flips (same class equal-length batching shows,
-#: and t6 passes byte-for-byte there), vs 34-52-logit corruption WITH a
-#: flip. 8.0 sits in the empty middle.
-POISON_DLOGIT = 8.0
-
-#: THE RULE (hypothesis from the 2026-07-30 run, 6/6 including the old
-#: 282-token repro): corruption fires exactly when the PADDED TOTAL
-#: length is ~= 1 (mod 32). Pad amount alone showed no pattern
-#: (22, 3, 26, 18, 14). Test 1 scores this prediction; test 3 uses it to
-#: choose T.
-POISON_TOTAL_MOD = 32
-POISON_TOTAL_RESIDUE = 1
+#: The threshold and THE RULE this probe discovered (2026-07-30 runs) are
+#: now PRODUCTION constants in agent/model.py -- see the KNOWN TRANSFORMERS
+#: BUG WORKAROUND banner there. Alias them so the probe always scores the
+#: exact values generate_batch ships with:
+#:   * POISON_DLOGIT: two cleanly separated populations -- bf16 wobble up
+#:     to ~1.75 with no argmax flips vs 34-52-logit corruption WITH a
+#:     flip; 8.0 sits in the empty middle.
+#:   * corruption fires exactly when PADDED TOTAL ~= 1 (mod 32), 6/6
+#:     across L = 282..2867; pad amount alone showed no pattern.
+from agent.model import (  # noqa: E402  (needs the sys.path shim above)
+    PAD_PARITY_DLOGIT as POISON_DLOGIT,
+    PAD_POISON_MOD as POISON_TOTAL_MOD,
+    PAD_POISON_RESIDUE as POISON_TOTAL_RESIDUE,
+)
 
 #: How many prompts test 1 sweeps (spread across the length range).
 N_PROMPTS = 5
