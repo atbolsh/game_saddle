@@ -12,11 +12,11 @@ across three conditions:
      2 with the long prompt
 
 Expected: B and C stay within bf16 wobble (<~1 max |dLogit|) of A.
-Observed: corrupted conditions show ~40 max |dLogit| with the argmax
-flipping to a modality special token ('<audio|>') on an image prompt.
-B sweeps pad lengths because the corruption appears to depend on the
-pad length itself (multiples of 8 were observed benign, pad=7 corrupt),
-not on batch size.
+Observed: on this 282-token image prompt, pad=7 corrupts (~40 max
+|dLogit|, argmax flips to the modality special token '<audio|>') while
+pads 1-6, 8, 9, 15, 16, 63, 64 all stay within wobble. Batch size is
+irrelevant (batch=1 pad=7 corrupts identically to the batch of 2), and
+transformers 5.13.1 / 5.14.1 produce bit-identical results.
 
 Every sequence-aligned tensor (input_ids, attention_mask, token type ids)
 is padded in lockstep, position_ids follow the attention mask (same

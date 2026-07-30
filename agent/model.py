@@ -234,16 +234,15 @@ def stack_equal_length(
 ) -> dict[str, Any]:
     """Stack per-row encodings that already share one sequence length.
 
-    Gemma 4 Unified: a left-padded row inside a multi-row multimodal batch
-    is CORRUPTED at prefill (measured ~40-logit deltas, argmax flipping to
-    modality special tokens; see training/probe_pad_divergence.py), even
-    with every sequence-aligned tensor hand-collated in lockstep with
-    ``input_ids``. Batch-1 padding and unpadded rows in the same batch show
-    only bounded bf16 wobble (~0.5 logits), so the defect is in the HF
-    batched multimodal prefill path (image-feature scatter / vision mask),
-    not padding per se. Hence ``generate_batch`` only stacks equal-length
-    rows; it never left-pads for decode, and mixed lengths here are a hard
-    error.
+    Gemma 4 Unified: left-padding a multimodal row corrupts its prefill at
+    SPECIFIC pad lengths (measured: pad=7 on a 282-token image prompt gives
+    ~40-logit deltas with the argmax flipping to ``<audio|>``; pads 1-6, 8,
+    9, 15, 16, 63, 64 stay within ~0.5 bf16 wobble; batch size and
+    transformers version are irrelevant -- see
+    scripts/gemma4_pad_batch_repro.py). Which offsets are poisonous is not
+    predictable from the outside, so the only safe policy is ZERO padding:
+    ``generate_batch`` only stacks equal-length rows, and mixed lengths
+    here are a hard error.
     """
     if not rows:
         return {}
@@ -639,14 +638,13 @@ class VLModel:
         are BATCH-WIDE (dispatcher groups by identical stop signature). Mixed
         image counts are refused.
 
-        Gemma 4 Unified: a left-padded row inside a multi-row multimodal
-        batch is corrupted at prefill (probe evidence in
-        training/probe_pad_divergence.py and stack_equal_length's
-        docstring); equal-length batches match solo exactly. So we encode
-        each row, then run one true GPU batch **per distinct prompt
-        length** (no left-pad on the decode path). Same-length peers
-        amortize weight reads; rows whose length is unique in the batch
-        decode alone.
+        Gemma 4 Unified: left-padding a multimodal row corrupts its prefill
+        at specific, unpredictable pad lengths (evidence in
+        stack_equal_length's docstring and scripts/gemma4_pad_batch_repro.py);
+        equal-length batches match solo exactly. So we encode each row,
+        then run one true GPU batch **per distinct prompt length** (no
+        left-pad on the decode path). Same-length peers amortize weight
+        reads; rows whose length is unique in the batch decode alone.
         """
         if not batch:
             return []

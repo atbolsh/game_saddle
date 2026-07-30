@@ -35,15 +35,16 @@ PID holding VRAM.
 Stage 6 note: greedy equality is the strict criterion. If it fails only on
 a near-tie token deep into a reply (both outputs sane, divergence late),
 that is bf16 batched-matmul nondeterminism — paste both replies and we
-judge. Gemma 4 Unified: a left-padded row inside a multi-row multimodal
-batch is corrupted at prefill — `python -m training.probe_pad_divergence`
-measured ~40-logit deltas with the argmax flipping to `<audio|>` on the
-padded row, while batch-1 padding and the unpadded row in the same batch
-stay within ~0.5-logit bf16 wobble. This is an upstream transformers bug
-(batched multimodal prefill), not collation: every aux tensor was verified
-suffix-identical to solo. `generate_batch` therefore runs one true GPU
-batch per distinct prompt length (zero pad); rows whose length is unique
-decode alone. Equal-length early divergence is a true-batch bug.
+judge. Gemma 4 Unified: left-padding a multimodal row corrupts its prefill
+at SPECIFIC pad lengths — `scripts/gemma4_pad_batch_repro.py` measured
+pad=7 on a 282-token image prompt giving ~40-logit deltas with the argmax
+flipping to `<audio|>`, while pads 1–6, 8, 9, 15, 16, 63, 64 stay within
+~0.5-logit bf16 wobble (batch size and transformers 5.13/5.14 version
+irrelevant; bit-identical). Upstream transformers bug, not collation:
+every aux tensor was verified suffix-identical to solo. Since poisonous
+offsets are unpredictable, `generate_batch` runs one true GPU batch per
+distinct prompt length (zero pad); rows whose length is unique decode
+alone. Equal-length early divergence is a true-batch bug.
 
 Stage 4 note: the rollback variant relies on `--lr 0.05` wrecking the
 adapter between saves, which is near-certain but stochastic; if no
