@@ -95,6 +95,16 @@ rename fails loudly as TypeError in t6); without it the parity check
 transiently materialized multi-GB full-vocab logits, which is what would
 have made `--parallel 3` VRAM-tight. With it, batch 3 adds only ~0.5 GB
 of KV cache per extra row at game-size contexts.
+
+KV REUSE (added after the x1.59 analysis): the parity-check forward now
+doubles as the batch's prefill — its KV cache is cropped by one position
+and handed to `generate`, so the batched prompt is no longer prefilled
+twice (~10% of round time at 3x4k tokens). This leans on two transformers
+APIs that a version bump could rename, both failing LOUDLY by design:
+`Cache.crop` (AttributeError) and `generate(past_key_values=...)`
+continuation (t6 byte-parity would break). Rerun t6 before trusting any
+new timing numbers: it exercises the reused-cache decode end to end
+against solo replies.
 Both stages share t9's caveat: sampled replies make single runs noisy —
 treat ±15% as measurement error, rerun before drawing conclusions from
 small differences.
