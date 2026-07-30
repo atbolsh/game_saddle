@@ -10,6 +10,13 @@ the player saw) and rehearses the production hack: pad to a common length,
 verify each row's prefill against its solo prefill (exact check), decode
 batched only if every row passes.
 
+FINDING (2026-07-30 run, logs/probe_hacky_pads_2026-07-30_18-31-54.log):
+it is the TOTAL. Corruption fired exactly when padded_total ~= 1 (mod 32),
+6/6 across L = 282..2867 (pad amounts 22, 3, 26, 18, 14, 7 -- no pattern);
+everything else is deterministic bf16 kernel wobble (<= ~1.75, no argmax
+flip, grows with L, same class equal-length batching shows). This rerun
+scores that rule and rehearses production with it.
+
 Three tests, all output marked HACKY_ANSWER:
 
   1. pad-vs-total: several real prompts of different lengths x a pad sweep
@@ -59,9 +66,20 @@ PAD_SWEEP: list[int] = list(range(1, 33)) + [
 ]
 
 #: A pad is POISON if the argmax flips or any logit moves by more than
-#: this. Prior measurements separate cleanly: benign pads stay within
-#: ~0.5 (bf16 wobble), the poisoned pad hit ~40.
-POISON_DLOGIT = 0.5
+#: this. The 2026-07-30 run on real game prompts (L 1547-2867) measured
+#: two cleanly separated populations: deterministic bf16 kernel wobble up
+#: to ~1.75 with NO argmax flips (same class equal-length batching shows,
+#: and t6 passes byte-for-byte there), vs 34-52-logit corruption WITH a
+#: flip. 8.0 sits in the empty middle.
+POISON_DLOGIT = 8.0
+
+#: THE RULE (hypothesis from the 2026-07-30 run, 6/6 including the old
+#: 282-token repro): corruption fires exactly when the PADDED TOTAL
+#: length is ~= 1 (mod 32). Pad amount alone showed no pattern
+#: (22, 3, 26, 18, 14). Test 1 scores this prediction; test 3 uses it to
+#: choose T.
+POISON_TOTAL_MOD = 32
+POISON_TOTAL_RESIDUE = 1
 
 #: How many prompts test 1 sweeps (spread across the length range).
 N_PROMPTS = 5
@@ -163,6 +181,24 @@ def test1_pad_vs_total(model: Any, picked: list[tuple[int, dict]],
             print(f"    pad={p:<5d} total={length + p:<6d} "
                   f"max|dLogit|={delta:.3f} argmax_flipped={flipped}")
 
+    # Score THE RULE: poison iff (L + p) % 32 == 1.
+    print("\n--- mod-32 rule scorecard ---")
+    hits = misses = false_alarms = 0
+    for length, poisons in sorted(poison_map.items()):
+        predicted = {
+            p for p in PAD_SWEEP
+            if (length + p) % POISON_TOTAL_MOD == POISON_TOTAL_RESIDUE
+        }
+        hits += len(predicted & poisons)
+        misses += len(poisons - predicted)
+        false_alarms += len(predicted - poisons)
+        print(f"L={length}: predicted {sorted(predicted)} "
+              f"observed {sorted(poisons)} "
+              f"{'MATCH' if predicted == poisons else 'MISMATCH'}")
+    print(f"rule totals: {hits} hit(s), {misses} unpredicted poison(s), "
+          f"{false_alarms} false alarm(s) -- 0/0 in the last two slots "
+          "means 'never pad to a total ~= 1 mod 32' is sufficient")
+
     # Alignment analysis over prompt pairs.
     print("\n--- alignment analysis ---")
     pairs = list(itertools.combinations(sorted(poison_map), 2))
@@ -230,7 +266,14 @@ def _retarget_length(model: Any, messages: list[dict],
         n = int(enc["input_ids"].shape[1])
         if n == target:
             return enc
-        if n > target:
+        if n > target + 40:
+            # Coarse chop: ~4 chars/token, deliberately undershooting the
+            # estimate so the fine loop below lands the exact target.
+            cut = (n - target) * 3
+            if cut >= len(text_part["text"]):
+                return None
+            text_part["text"] = text_part["text"][:-cut]
+        elif n > target:
             words = text_part["text"].rsplit(" ", 1)
             if len(words) < 2:
                 return None
@@ -247,8 +290,16 @@ def test2_content(model: Any, prompts: list[list[dict]],
     print("\n=== HACKY_ANSWER test 2: content dependence at equal length ===")
     target = picked[0][0]
     enc_a = picked[0][1]
+    # Candidates nearest the target length first: least trimming, most
+    # preserved game content.
+    ranked = sorted(
+        prompts,
+        key=lambda m: abs(
+            int(model.encode_messages(m)["input_ids"].shape[1]) - target
+        ),
+    )
     enc_b = None
-    for msgs in prompts[::-1]:  # search from the far end: different game
+    for msgs in ranked:
         enc_b = _retarget_length(model, msgs, target)
         if enc_b is not None:
             same = bool(
@@ -261,7 +312,12 @@ def test2_content(model: Any, prompts: list[list[dict]],
         print("SKIPPED: could not adjust a second prompt to exactly "
               f"{target} tokens -- rerun with a bigger traces file")
         return
-    sweep = list(range(1, 17)) + [24, 32, 64, 256]
+    # Include the rule-predicted poison pad for this length (plus
+    # neighbors) -- the interesting comparison point.
+    predicted = ((POISON_TOTAL_RESIDUE - target) % POISON_TOTAL_MOD
+                 or POISON_TOTAL_MOD)
+    sweep = sorted({*range(1, 17), 24, 32, 64, 256,
+                    max(predicted - 1, 1), predicted, predicted + 1})
     res_a = _sweep_one(model, enc_a, pad_id, sweep)
     res_b = _sweep_one(model, enc_b, pad_id, sweep)
     set_a = {p for p, (bad, _, _) in res_a.items() if bad}
@@ -291,13 +347,18 @@ def test3_rehearsal(model: Any, picked: list[tuple[int, dict]],
     messages = [prompts_by_len[length] for length in lens]
     solo_logits = [model.prefill_last_logits(enc)[0] for enc in rows]
 
-    # The production T search: start at max length, bump while any row's
-    # padded prefill diverges from its solo prefill.
+    # The production T search: start at max length, SKIP totals hitting
+    # the mod-32 poison rule, and verify the remainder with the parity
+    # check (belt and suspenders).
     import torch
 
     target = max(lens)
     chosen_T = None
     for T in range(target, target + 9):
+        if T % POISON_TOTAL_MOD == POISON_TOTAL_RESIDUE:
+            print(f"T={T}: SKIPPED by rule (T ~= "
+                  f"{POISON_TOTAL_RESIDUE} mod {POISON_TOTAL_MOD})")
+            continue
         stacked, pads = left_pad_stack(rows, pad_id, target_len=T)
         batch_logits = model.prefill_last_logits(stacked)
         verdicts = [
