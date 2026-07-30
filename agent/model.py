@@ -283,6 +283,62 @@ def stack_equal_length(
     return batch
 
 
+def left_pad_row(
+    enc: dict[str, Any], pad_len: int, pad_token_id: int
+) -> dict[str, Any]:
+    """Left-pad one batch-1 encoding by ``pad_len`` positions.
+
+    Every sequence-aligned integer tensor (2D, second dim == the sequence
+    length) is padded on the left -- ``input_ids`` with the pad token,
+    everything else (attention_mask, token_type_ids, mm_token_type_ids,
+    ...) with 0. Other entries (e.g. ``pixel_values``) pass through
+    untouched. Semantics lifted from training/probe_pad_divergence.py,
+    where the padded tensors were verified suffix-identical to the solo
+    encoding.
+
+    WARNING: on Gemma 4 Unified a left-padded multimodal prefill is
+    corrupted at unpredictable pad lengths (transformers#47651). Never
+    decode from a padded batch without the prefill-parity check.
+    """
+    if pad_len <= 0:
+        return dict(enc)
+    seq_len = int(enc["input_ids"].shape[1])
+    out: dict[str, Any] = {}
+    for k, v in enc.items():
+        if (isinstance(v, torch.Tensor) and not v.dtype.is_floating_point
+                and v.dim() == 2 and v.shape[1] == seq_len):
+            fill = pad_token_id if k == "input_ids" else 0
+            out[k] = torch.cat(
+                [v.new_full((v.shape[0], pad_len), fill), v], dim=1
+            )
+        else:
+            out[k] = v
+    return out
+
+
+def left_pad_stack(
+    rows: list[dict[str, Any]],
+    pad_token_id: int,
+    target_len: int | None = None,
+) -> tuple[dict[str, Any], list[int]]:
+    """Left-pad variable-length batch-1 encodings to one common length and
+    stack them. Returns ``(batch, pads)`` where ``pads[i]`` is row i's pad
+    amount; ``target_len`` defaults to the longest row (zero pad there).
+
+    This is the HACKY_ANSWER path: padding is only trustworthy together
+    with the per-row prefill-parity check (see
+    :meth:`VLModel.prefill_last_logits`), because Gemma 4 corrupts padded
+    multimodal prefills at unpredictable pad lengths (transformers#47651).
+    """
+    lens = [int(r["input_ids"].shape[1]) for r in rows]
+    target = max(lens) if target_len is None else target_len
+    if target < max(lens):
+        raise ValueError(f"target_len {target} < longest row {max(lens)}")
+    pads = [target - n for n in lens]
+    padded = [left_pad_row(r, p, pad_token_id) for r, p in zip(rows, pads)]
+    return stack_equal_length(padded), pads
+
+
 # ============================================================ stop criteria
 
 class RegexStopCriteria(StoppingCriteria):
@@ -506,6 +562,25 @@ class VLModel:
             return_dict=True,
             return_tensors="pt",
         )
+
+    def prefill_last_logits(self, enc: dict[str, Any]) -> torch.Tensor:
+        """Next-token logits after prefilling ``enc`` (any batch size).
+
+        Mirrors generate's prefill: position_ids derive from the attention
+        mask (pad positions clamped to 0, real tokens 0..L-1). Returns
+        ``[batch, vocab]`` float32 on CPU. This is the probe/parity-check
+        primitive: comparing a row's padded-batch prefill logits against
+        its solo prefill logits detects the Gemma 4 left-pad corruption
+        (transformers#47651) exactly, before any decode happens.
+        """
+        if not self._loaded:
+            self.load()
+        inputs = self._move_inputs_to_model(enc)
+        mask = inputs["attention_mask"]
+        inputs["position_ids"] = (mask.long().cumsum(-1) - 1).clamp(min=0)
+        with torch.inference_mode():
+            out = self.model(**inputs)
+        return out.logits[:, -1].float().cpu()
 
     def _move_inputs_to_model(self, inputs: dict[str, Any]) -> dict[str, Any]:
         target_device = next(self.model.parameters()).device
