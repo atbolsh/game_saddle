@@ -339,10 +339,7 @@ def stack_equal_length(
 #       padded-batch prefill logits must match its solo prefill logits
 #       within PAD_PARITY_DLOGIT with no argmax flip. Rows that fail
 #       (a THIRD poison mode we have not met yet => WARNING) are demoted
-#       to cohorts individually; the survivors decode as one batch. The
-#       verification forward doubles as the batch's prefill: its KV cache
-#       is handed to generate (cropped by one position), so the parity
-#       check's batched forward is NOT extra work.
+#       to cohorts individually; the survivors decode as one batch.
 # Remove all of this ONLY when the upstream bug is fixed AND
 # training/probe_hacky_pads.py passes on the fixed version with padding
 # to total % 32 == 1.
@@ -650,24 +647,15 @@ class VLModel:
             return_tensors="pt",
         )
 
-    def prefill_last_logits(
-        self, enc: dict[str, Any], return_cache: bool = False
-    ) -> torch.Tensor | tuple[torch.Tensor, Any]:
+    def prefill_last_logits(self, enc: dict[str, Any]) -> torch.Tensor:
         """Next-token logits after prefilling ``enc`` (any batch size).
 
         Mirrors generate's prefill: position_ids derive from the attention
         mask (pad positions clamped to 0, real tokens 0..L-1). Returns
-        ``[batch, vocab]`` float32 on CPU -- or ``(logits, kv_cache)``
-        with ``return_cache=True``, so a caller that will decode from
-        this exact batch can hand the cache to ``generate`` instead of
-        paying the same prefill twice (see :meth:`_plan_padded_batch`).
-        With ``return_cache=False`` the forward runs ``use_cache=False``:
-        no point building a multi-GB cache just to read one logit row.
-
-        This is the probe/parity-check primitive: comparing a row's
-        padded-batch prefill logits against its solo prefill logits
-        detects the Gemma 4 left-pad corruption (transformers#47651)
-        exactly, before any decode happens.
+        ``[batch, vocab]`` float32 on CPU. This is the probe/parity-check
+        primitive: comparing a row's padded-batch prefill logits against
+        its solo prefill logits detects the Gemma 4 left-pad corruption
+        (transformers#47651) exactly, before any decode happens.
         """
         if not self._loaded:
             self.load()
@@ -681,12 +669,13 @@ class VLModel:
             # parity check would then dominate batch-3 memory). A renamed/
             # removed kwarg fails loudly with TypeError -- by design, never
             # silently fall back to full logits.
-            out = self.model(**inputs, logits_to_keep=1,
-                             use_cache=return_cache)
-        logits = out.logits[:, -1].float().cpu()
-        if return_cache:
-            return logits, out.past_key_values
-        return logits
+            # use_cache=False: this forward only ever feeds the parity
+            # check/probes, so building a multi-GB KV cache here is pure
+            # waste. Reusing that cache for the decode was TRIED AND
+            # REVERTED -- see "KV reuse: attempted, reverted" in
+            # training/TO_TEST.md before trying it again.
+            out = self.model(**inputs, logits_to_keep=1, use_cache=False)
+        return out.logits[:, -1].float().cpu()
 
     def _move_inputs_to_model(self, inputs: dict[str, Any]) -> dict[str, Any]:
         target_device = next(self.model.parameters()).device
@@ -784,26 +773,18 @@ class VLModel:
         max_new_tokens: int | None,
         stop_strings: list[str] | None,
         stop_regex: str | None,
-        past_key_values: Any = None,
     ) -> list[str]:
         """Decode one prepared (device-resident) stacked batch.
 
         ``prompt_len`` is the stacked width; with left-padded rows every
         generated token still lands after that index for EVERY row, so the
         decode slicing and RegexStopCriteria's single prompt_len stay
-        correct whether the rows were equal-length or verified-padded.
-
-        ``past_key_values``: an optional prompt KV cache covering all but
-        the LAST prompt position (see the KV-reuse note in
-        :meth:`_plan_padded_batch`); generate then re-processes only that
-        final token instead of re-running the whole prefill."""
+        correct whether the rows were equal-length or verified-padded."""
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
         gen_kwargs: dict[str, Any] = {
             "max_new_tokens": max_new_tokens or self.cfg.max_new_tokens,
             **self._sampling_kwargs(),
         }
-        if past_key_values is not None:
-            gen_kwargs["past_key_values"] = past_key_values
         prompt_len = inputs["input_ids"].shape[-1]
         if stop_strings:
             gen_kwargs["stop_strings"] = stop_strings
@@ -877,24 +858,14 @@ class VLModel:
 
     def _plan_padded_batch(
         self, rows: list[dict[str, Any]]
-    ) -> tuple[dict[str, Any], list[int], list[int], Any] | None:
+    ) -> tuple[dict[str, Any], list[int], list[int]] | None:
         """KNOWN TRANSFORMERS BUG WORKAROUND (see module banner): plan ONE
         verified left-padded batch over as many rows as the bug allows.
 
-        Returns ``(device_inputs, row_indices, pads, kv_cache)`` -- the
-        rows NOT in ``row_indices`` must decode via equal-length cohorts
-        -- or None if padding cannot beat cohorts (fewer than 2 paddable
-        rows, or the paddable rows already share one length).
-
-        KV REUSE: the verification forward IS the batch's prefill, so its
-        cache is returned for ``generate`` instead of being thrown away
-        (measured ~10% of round time re-prefilling 3x4k-token batches).
-        The cache is cropped by ONE position: generate needs at least one
-        uncached token to forward, and re-processing the final prompt
-        token also makes it skip ``pixel_values`` (cache_position > 0),
-        exactly like any continuation step. A transformers upgrade that
-        renames ``Cache.crop`` fails loudly (AttributeError) -- never
-        silently fall back to double prefill.
+        Returns ``(device_inputs, row_indices, pads)`` -- the rows NOT in
+        ``row_indices`` must decode via equal-length cohorts -- or None if
+        padding cannot beat cohorts (fewer than 2 paddable rows, or the
+        paddable rows already share one length).
 
         Defenses, all mandatory (evidence in the module banner):
 
@@ -948,9 +919,7 @@ class VLModel:
             stacked, pads = left_pad_stack(
                 [rows[i] for i in cand], pad_id, target_len=target
             )
-            batch_logits, kv_cache = self.prefill_last_logits(
-                stacked, return_cache=True
-            )
+            batch_logits = self.prefill_last_logits(stacked)
             bad: list[tuple[int, float, bool]] = []
             for j, i in enumerate(cand):
                 delta = float((batch_logits[j] - solo[i]).abs().max())
@@ -961,12 +930,9 @@ class VLModel:
             if not bad:
                 logger.info(
                     "generate_batch: padded batch verified clean at T=%d "
-                    "(rows %s, pads %s; prefill KV reused for decode)",
-                    target, cand, pads,
+                    "(rows %s, pads %s)", target, cand, pads,
                 )
-                kv_cache.crop(target - 1)
-                return (self._move_inputs_to_model(stacked), list(cand),
-                        pads, kv_cache)
+                return self._move_inputs_to_model(stacked), list(cand), pads
             logger.warning(
                 "generate_batch: prefill parity check REJECTED row(s) at "
                 "T=%d, (row, max|dLogit|, argmax_flip): %s -- an "
@@ -1085,7 +1051,7 @@ class VLModel:
                     if len(by_len) > 1 else None)
             done: set[int] = set()
             if plan is not None:
-                inputs, idxs, pads, kv_cache = plan
+                inputs, idxs, pads = plan
                 mode = (f"padded(T={int(inputs['input_ids'].shape[-1])},"
                         f"rows={idxs},pads={pads})")
                 sub_replies = self._generate_stacked(
@@ -1093,7 +1059,6 @@ class VLModel:
                     max_new_tokens=max_new_tokens,
                     stop_strings=stop_strings,
                     stop_regex=stop_regex,
-                    past_key_values=kv_cache,
                 )
                 for i, reply in zip(idxs, sub_replies):
                     replies[i] = reply

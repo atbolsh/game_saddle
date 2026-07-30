@@ -96,15 +96,22 @@ transiently materialized multi-GB full-vocab logits, which is what would
 have made `--parallel 3` VRAM-tight. With it, batch 3 adds only ~0.5 GB
 of KV cache per extra row at game-size contexts.
 
-KV REUSE (added after the x1.59 analysis): the parity-check forward now
-doubles as the batch's prefill — its KV cache is cropped by one position
-and handed to `generate`, so the batched prompt is no longer prefilled
-twice (~10% of round time at 3x4k tokens). This leans on two transformers
-APIs that a version bump could rename, both failing LOUDLY by design:
-`Cache.crop` (AttributeError) and `generate(past_key_values=...)`
-continuation (t6 byte-parity would break). Rerun t6 before trusting any
-new timing numbers: it exercises the reused-cache decode end to end
-against solo replies.
+KV reuse: attempted, REVERTED — do not retry. The "obvious" optimization
+of handing the parity check's KV cache to `generate` (skipping the
+second prefill, ~10% of round time) fails on two hard transformers 5.14
+facts, both observed on the remote box 2026-07-30: (1)
+`DynamicSlidingWindowLayer.crop` raises ValueError once a sliding layer
+has seen more tokens than its window, so "crop the cache by one so
+generate has an uncached token" is impossible at game-size prompts; (2)
+Gemma 4 Unified's `generate` passes `pixel_values` into its first
+forward even when a cache is supplied, and the model hard-errors with
+"Image features and image tokens do not match, tokens: 0, features:
+768" when the remaining input has no image tokens. A workaround exists
+(prefill T-1 tokens, deepcopy the cache for the parity step, strip
+`pixel_values`, shift the mod-32 rule to T-1) but was judged not worth
+the complexity for ~10%. The parity forward now runs `use_cache=False`
+and the padded batch is prefilled twice, deliberately.
+
 Both stages share t9's caveat: sampled replies make single runs noisy —
 treat ±15% as measurement error, rerun before drawing conclusions from
 small differences.
