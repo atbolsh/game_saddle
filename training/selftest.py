@@ -901,15 +901,17 @@ def t6_ab() -> str:
 
       (1) identical prompts x3 -- true GPU batch (no pad); must match solo.
       (2) variable-length prompts -- the KNOWN TRANSFORMERS BUG WORKAROUND
-          in agent/model.py (transformers#47651): paddable rows decode as
-          ONE verified left-padded batch, rows whose own length ~= 1 mod
-          32 are unpaddable (poison mode 2, discovered by THIS test on
-          2026-07-30) and decode via cohorts. Prompt lengths are chosen
-          AT RUNTIME with that arithmetic in mind: two distinct paddable
-          lengths (so padding genuinely engages -- asserted via the
-          generate_batch log; silent cohort fallback = FAIL) plus, when
-          the token grid allows, one unpaddable row to exercise the
-          hybrid path. All rows must match solo byte-for-byte.
+          in agent/model.py (transformers#47651): rows decode as ONE
+          verified left-padded batch. A row whose own length ~= 1 mod 32
+          is unpaddable (poison mode 2, discovered by THIS test on
+          2026-07-30) and gets the POISON MODE 2 RESCUE: one harmless
+          filler token nudges it off the residue so it joins the batch,
+          so its byte-parity reference is the NUDGED prompt's solo
+          reply. Prompt lengths are chosen AT RUNTIME: two distinct
+          paddable lengths (so padding genuinely engages -- asserted via
+          the generate_batch log; silent cohort fallback = FAIL) plus,
+          when the token grid allows, one unpaddable row to exercise the
+          rescue. All rows must match their solo reference byte-for-byte.
     """
     import logging as _logging
 
@@ -987,9 +989,23 @@ def t6_ab() -> str:
             batched_same = model.generate_batch(
                 [{"messages": p} for p in same_prompts], max_new_tokens=48,
             )
-            solo_var = [
-                model.generate(p, max_new_tokens=48) for p in var_prompts
-            ]
+            solo_var = []
+            for n, p in zip(var_lens, var_prompts):
+                if n % PAD_POISON_MOD == PAD_POISON_RESIDUE:
+                    # The padded batch decodes the NUDGED prompt (POISON
+                    # MODE 2 RESCUE, banner in agent/model.py), so this
+                    # row's byte-parity reference is the nudged prompt's
+                    # solo reply, built with the same canonical helper.
+                    nudge = model._nudge_unpaddable(p)
+                    assert nudge is not None, (
+                        f"POISON MODE 2 RESCUE could not nudge the L={n} "
+                        "prompt off the residue"
+                    )
+                    solo_var.append(
+                        model.generate(nudge[0], max_new_tokens=48)
+                    )
+                else:
+                    solo_var.append(model.generate(p, max_new_tokens=48))
 
             class _Capture(_logging.Handler):
                 def __init__(self) -> None:
@@ -1021,10 +1037,10 @@ def t6_ab() -> str:
         "throughput. generate_batch log: " + " | ".join(cap.lines)
     )
     if unpaddable:
-        assert any("UNPADDABLE" in line for line in cap.lines), (
+        assert any("POISON MODE 2 RESCUE" in line for line in cap.lines), (
             f"row of length {unpaddable[0]} (~= "
-            f"{PAD_POISON_RESIDUE} mod {PAD_POISON_MOD}) was NOT routed "
-            "around the padded path -- poison mode 2 guard missing? "
+            f"{PAD_POISON_RESIDUE} mod {PAD_POISON_MOD}) was NOT nudged "
+            "off the poison residue -- mode 2 rescue missing? "
             "generate_batch log: " + " | ".join(cap.lines)
         )
 
@@ -1051,7 +1067,8 @@ def t6_ab() -> str:
         )
     )
     hybrid = (
-        f" + unpaddable {unpaddable[0]} via cohort" if unpaddable
+        f" + unpaddable {unpaddable[0]} nudged into the batch"
+        if unpaddable
         else " (no unpaddable length on the filler grid this run)"
     )
     return (

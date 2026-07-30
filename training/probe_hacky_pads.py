@@ -28,8 +28,13 @@ sweeps): a row whose OWN unpadded length is ~= 1 (mod 32) is corrupted by
 ANY left pad (L=289 rejected at every T in 290..297, ~24.8-logit deltas,
 argmax flips). This probe's prompts never hit that residue class
 (L mod 32 was 11, 30, 7, 15, 19), which is why the sweeps only exposed
-the padded-TOTAL mode. Production therefore refuses to pad such rows at
-all -- they decode in natural-width equal-length cohorts.
+the padded-TOTAL mode. Test 5 then confirmed the mode at full strength
+(natural-residue game prompt poisoned at 32/32 pads, run
+2026-07-30_19-46-07) AND validated the rescue: appending one harmless
+token (" ."; "\n" is swallowed by the chat template) moves the row off
+the residue and it pads cleanly, greedy reply content-identical.
+Production now ships that rescue (VLModel._nudge_unpaddable) instead of
+demoting such rows to solo cohorts.
 
 The tests, all output marked HACKY_ANSWER:
 

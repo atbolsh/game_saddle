@@ -48,18 +48,21 @@ across prompt lengths 282–2867, `training/probe_hacky_pads.py`), and
 upstream https://github.com/huggingface/transformers/issues/47651 and
 https://huggingface.co/google/gemma-4-12B-it/discussions/50. The poison
 is prefill-only — decode steps crossing the residue are harmless (probe
-test 4). So `generate_batch` excludes unpaddable rows (mode 2) into
-natural-width cohorts, left-pads the rest to the longest remaining
-length (never ≡ 1 mod 32 by construction — mode 1 dodged), and
+test 4). Probe test 5 (2026-07-30) measured a natural-residue prompt
+poisoned at 32/32 pads and validated the rescue: one harmless filler
+token (" .") moves it off the residue and it pads cleanly, with a
+content-identical greedy reply. So `generate_batch` NUDGES unpaddable
+rows off the residue (POISON MODE 2 RESCUE — serving-stack-only, traces
+keep the un-nudged prompt; ~1/32 of mixed-length rows), left-pads to the
+longest length (never ≡ 1 mod 32 by construction — mode 1 dodged), and
 parity-checks each padded row's prefill against its solo prefill before
-decoding; rows rejected there (an UNCATALOGUED third mode — WARNING) are
-demoted to cohorts individually. t6 picks its prompt lengths at runtime
-around this arithmetic and FAILS if the padded path did not engage: a
-silent cohort fallback would pass equality while quietly serializing
-parallel datagen. Probe test 5 (`--only 5`) characterizes mode 2 and
-auditions the planned rescue — nudging an unpaddable row off the residue
-with one harmless token. Equal-length early divergence is a true-batch
-bug.
+decoding; rows the nudge cannot move (WARNING) or that the parity check
+rejects (an UNCATALOGUED third mode — WARNING) decode via cohorts. t6
+picks its prompt lengths at runtime around this arithmetic, compares the
+nudged row against the NUDGED prompt's solo reply, and FAILS if the
+padded path or the rescue did not engage: a silent cohort fallback would
+pass equality while quietly serializing parallel datagen. Equal-length
+early divergence is a true-batch bug.
 
 Stage 8/9 note: these two stages measure, they mostly don't judge — the
 decision they feed is "is serial datagen fast enough for an overnight

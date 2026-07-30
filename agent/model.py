@@ -317,9 +317,22 @@ def stack_equal_length(
 #   * https://huggingface.co/google/gemma-4-12B-it/discussions/50
 # Standalone repro: scripts/gemma4_pad_batch_repro.py
 #
-# THE SCOTCH-TAPE FIX (HACKY_ANSWER), in VLModel._plan_padded_batch:
-#   (1) rows with unpaddable lengths (L ~= 1 mod 32) are excluded up front
-#       and decode in natural-width equal-length cohorts (always safe);
+# THE SCOTCH-TAPE FIX (HACKY_ANSWER):
+#   (0) POISON MODE 2 RESCUE, in VLModel._nudge_unpaddable + generate_batch:
+#       a row with L ~= 1 mod 32 gets ONE harmless filler token appended to
+#       its last text part, moving it off the residue so it can join the
+#       padded batch. Probe test 5 (probe_hacky_pads_2026-07-30_19-46-07)
+#       measured a natural-residue game prompt poisoned at 32/32 pads,
+#       while the nudged copy (" ." appended, L 1569 -> 1570) padded
+#       cleanly at every rule-clean pad and produced a content-identical
+#       greedy reply. DELIBERATE TRADE: the nudge is serving-stack-only --
+#       datagen traces record the UN-nudged messages, so on ~1/32 rows the
+#       trained prompt lacks the one trailing filler token inference saw.
+#       If no filler moves the length (template normalization), the row
+#       falls back to a natural-width cohort (WARNING).
+#   In VLModel._plan_padded_batch:
+#   (1) any row still on an unpaddable length is excluded and decodes in
+#       natural-width equal-length cohorts (always safe);
 #   (2) the remaining rows are left-padded to the longest of THEIR lengths
 #       (which is ~= 1 mod 32 by construction impossible -- mode 1 dodged);
 #   (3) before any decode, the prefill-parity tripwire: each row's
@@ -344,6 +357,11 @@ PAD_POISON_RESIDUE = 1
 #: measured populations are far apart (wobble <= ~1.75, poison >= ~24.7);
 #: 8.0 sits in the empty middle.
 PAD_PARITY_DLOGIT = 8.0
+
+#: POISON MODE 2 RESCUE fillers, tried in order until one moves the row's
+#: length off the poison residue. " ." is the measured winner (probe test
+#: 5); "\n" is listed last because the chat template swallowed it there.
+PAD_NUDGE_FILLERS: tuple[str, ...] = (" .", " Okay.", "\n")
 
 
 def left_pad_row(
@@ -790,6 +808,43 @@ class VLModel:
             stop_regex=stop_regex,
         )
 
+    def _nudge_unpaddable(
+        self, messages: list[dict]
+    ) -> tuple[list[dict], dict[str, Any]] | None:
+        """KNOWN TRANSFORMERS BUG WORKAROUND, POISON MODE 2 RESCUE (module
+        banner): move a naturally-unpaddable prompt (L ~= 1 mod 32) off
+        the poison residue by appending one harmless filler token to its
+        last text part.
+
+        Returns ``(nudged_messages, encoding)`` with a paddable length,
+        or None if no filler shifts it (no text part, or the chat
+        template normalizes every filler away). Probe test 5 measured the
+        nudged row padding cleanly at every rule-clean pad with a
+        content-identical greedy reply.
+        """
+        import copy
+
+        for filler in PAD_NUDGE_FILLERS:
+            msgs = copy.deepcopy(messages)
+            part = None
+            for m in reversed(msgs):
+                content = m.get("content")
+                if isinstance(content, list):
+                    for p in reversed(content):
+                        if isinstance(p, dict) and p.get("type") == "text":
+                            part = p
+                            break
+                if part is not None:
+                    break
+            if part is None:
+                return None
+            part["text"] += filler
+            enc = self.encode_messages(msgs)
+            if (int(enc["input_ids"].shape[1]) % PAD_POISON_MOD
+                    != PAD_POISON_RESIDUE):
+                return msgs, enc
+        return None
+
     def _plan_padded_batch(
         self, rows: list[dict[str, Any]]
     ) -> tuple[dict[str, Any], list[int], list[int]] | None:
@@ -892,13 +947,16 @@ class VLModel:
 
         KNOWN TRANSFORMERS BUG WORKAROUND in play here (module banner,
         transformers#47651): mixed-length rows ARE left-padded into one
-        true GPU batch, but only through :meth:`_plan_padded_batch`,
-        which excludes unpaddable rows (L ~= 1 mod 32, poison mode 2),
-        pads to a width that dodges poison mode 1 (total ~= 1 mod 32),
-        and verifies every padded row's prefill against its solo prefill
-        before any decode. Rows the plan excludes or rejects decode via
-        one batch per distinct prompt length (zero pad -- always safe,
-        but decode serializes across cohorts).
+        true GPU batch. Naturally-unpaddable rows (L ~= 1 mod 32, poison
+        mode 2) are first NUDGED off the residue with one harmless
+        filler token (:meth:`_nudge_unpaddable`; serving-stack-only, the
+        caller's messages are not altered). Then :meth:`_plan_padded_batch`
+        excludes any row still unpaddable, pads to a width that dodges
+        poison mode 1 (total ~= 1 mod 32), and verifies every padded
+        row's prefill against its solo prefill before any decode. Rows
+        the plan excludes or rejects decode via one batch per distinct
+        prompt length (zero pad -- always safe, but decode serializes
+        across cohorts).
         """
         if not batch:
             return []
@@ -927,9 +985,43 @@ class VLModel:
             )
 
         rows = [self.encode_messages(r["messages"]) for r in batch]
+        lens = [int(r["input_ids"].shape[1]) for r in rows]
+
+        # POISON MODE 2 RESCUE (module banner): a row whose OWN length is
+        # ~= 1 mod 32 cannot be left-padded at all (transformers#47651),
+        # which would demote it to a solo cohort. One harmless filler
+        # token moves it off the residue; probe test 5 measured the
+        # nudged row padding cleanly. Only mixed-length batches pad, so
+        # equal-length batches are left untouched. The nudge is
+        # SERVING-STACK-ONLY: traces record the un-nudged messages.
+        nudged_rows: list[int] = []
+        if len(set(lens)) > 1:
+            for i, length in enumerate(lens):
+                if length % PAD_POISON_MOD != PAD_POISON_RESIDUE:
+                    continue
+                nudge = self._nudge_unpaddable(batch[i]["messages"])
+                if nudge is None:
+                    logger.warning(
+                        "generate_batch: row %d (len %d ~= %d mod %d, "
+                        "UNPADDABLE poison mode 2) could not be nudged "
+                        "off the residue -- it will decode in its own "
+                        "cohort", i, length,
+                        PAD_POISON_RESIDUE, PAD_POISON_MOD,
+                    )
+                    continue
+                rows[i] = nudge[1]
+                lens[i] = int(rows[i]["input_ids"].shape[1])
+                nudged_rows.append(i)
+                logger.info(
+                    "generate_batch: row %d nudged %d -> %d tokens "
+                    "(POISON MODE 2 RESCUE, transformers#47651: length "
+                    "~= 1 mod 32 corrupts under any left pad)",
+                    i, length, lens[i],
+                )
+
         by_len: dict[int, list[int]] = {}
-        for i, enc in enumerate(rows):
-            by_len.setdefault(int(enc["input_ids"].shape[1]), []).append(i)
+        for i, length in enumerate(lens):
+            by_len.setdefault(length, []).append(i)
 
         # Always log the batch structure: this is THE datagen-throughput
         # signal (mode=cohorts with cohorts of 1 means the parallel
@@ -995,6 +1087,10 @@ class VLModel:
                         "stop_strings": stop_strings,
                         "stop_regex": stop_regex,
                         "seq_len": int(rows[i]["input_ids"].shape[1]),
+                        # Rows whose prompt got the POISON MODE 2 RESCUE
+                        # filler; the logged messages are the UN-nudged
+                        # originals (module banner).
+                        "nudged_rows": nudged_rows,
                         "batch_mode": mode,
                         "length_cohorts": {
                             str(k): len(v) for k, v in by_len.items()
