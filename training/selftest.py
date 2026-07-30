@@ -900,18 +900,25 @@ def t6_ab() -> str:
     """Batched vs solo generation A/B.
 
       (1) identical prompts x3 -- true GPU batch (no pad); must match solo.
-      (2) variable-length prompts -- ONE verified left-padded batch via
-          the KNOWN TRANSFORMERS BUG WORKAROUND in agent/model.py
-          (transformers#47651: padded totals ~= 1 mod 32 corrupt the
-          multimodal prefill; generate_batch dodges those widths and
-          parity-checks the padded prefill against solo before decoding).
-          Must match solo byte-for-byte AND must actually engage the
-          padded path -- a silent fallback to length cohorts would fake
-          this pass while t9's speedup silently dies.
+      (2) variable-length prompts -- the KNOWN TRANSFORMERS BUG WORKAROUND
+          in agent/model.py (transformers#47651): paddable rows decode as
+          ONE verified left-padded batch, rows whose own length ~= 1 mod
+          32 are unpaddable (poison mode 2, discovered by THIS test on
+          2026-07-30) and decode via cohorts. Prompt lengths are chosen
+          AT RUNTIME with that arithmetic in mind: two distinct paddable
+          lengths (so padding genuinely engages -- asserted via the
+          generate_batch log; silent cohort fallback = FAIL) plus, when
+          the token grid allows, one unpaddable row to exercise the
+          hybrid path. All rows must match solo byte-for-byte.
     """
     import logging as _logging
 
-    from agent.model import get_model, stack_equal_length
+    from agent.model import (
+        PAD_POISON_MOD,
+        PAD_POISON_RESIDUE,
+        get_model,
+        stack_equal_length,
+    )
 
     model = get_model()
     with tempfile.TemporaryDirectory(prefix="selftest_t6_") as tmp:
@@ -924,30 +931,52 @@ def t6_ab() -> str:
             ]}]
             for _ in range(3)
         ]
-        var_prompts = [
-            [{"role": "user", "content": [
-                {"type": "image", "url": str(img)},
-                {"type": "text", "text": q},
-            ]}]
-            for q in (
-                "In one short sentence, what colors do you see?",
-                "Answer briefly: is the grid mostly empty? Explain in one "
-                "sentence why you think so.",
-                "Reply with a single word: light or dark background?",
-            )
-        ]
-
         same_enc = [model.encode_messages(p) for p in same_prompts]
         same_lens = {int(e["input_ids"].shape[1]) for e in same_enc}
         assert len(same_lens) == 1, same_lens
         stacked = stack_equal_length(same_enc)
         assert stacked["input_ids"].shape[0] == 3
 
-        var_lens = {
-            int(model.encode_messages(p)["input_ids"].shape[1])
-            for p in var_prompts
-        }
-        assert len(var_lens) > 1, f"var probe not variable: {sorted(var_lens)}"
+        # Variable-length prompts, chosen AT RUNTIME around the poison
+        # arithmetic (KNOWN TRANSFORMERS BUG WORKAROUND banner in
+        # agent/model.py): repeated " again" nudges the token length ~1
+        # per rep, giving a spread of lengths to pick from. We need two
+        # DISTINCT lengths not ~= 1 mod 32 (so the padded path genuinely
+        # engages) and, if the token grid yields one, a length ~= 1 mod
+        # 32 (unpaddable, poison mode 2) to exercise the hybrid
+        # padded+cohorts split.
+        base_q = ("Answer briefly: is the grid mostly empty? Explain in "
+                  "one sentence why you think so.")
+
+        def _var_prompt(text: str) -> list[dict]:
+            return [{"role": "user", "content": [
+                {"type": "image", "url": str(img)},
+                {"type": "text", "text": text},
+            ]}]
+
+        len_to_text: dict[int, str] = {}
+        for k in range(48):
+            text = base_q + " again" * k
+            n = int(
+                model.encode_messages(_var_prompt(text))["input_ids"].shape[1]
+            )
+            len_to_text.setdefault(n, text)
+            paddable = sorted(
+                n for n in len_to_text
+                if n % PAD_POISON_MOD != PAD_POISON_RESIDUE
+            )
+            unpaddable = sorted(
+                n for n in len_to_text
+                if n % PAD_POISON_MOD == PAD_POISON_RESIDUE
+            )
+            if len(paddable) >= 2 and unpaddable:
+                break
+        assert len(paddable) >= 2, (
+            f"could not build 2 distinct paddable lengths from the filler "
+            f"scan: {sorted(len_to_text)}"
+        )
+        var_lens = [paddable[0], paddable[-1]] + unpaddable[:1]
+        var_prompts = [_var_prompt(len_to_text[n]) for n in var_lens]
 
         original = model._sampling_kwargs
         model._sampling_kwargs = lambda: {"do_sample": False}
@@ -991,6 +1020,13 @@ def t6_ab() -> str:
         "fell back to length cohorts, which kills parallel-datagen "
         "throughput. generate_batch log: " + " | ".join(cap.lines)
     )
+    if unpaddable:
+        assert any("UNPADDABLE" in line for line in cap.lines), (
+            f"row of length {unpaddable[0]} (~= "
+            f"{PAD_POISON_RESIDUE} mod {PAD_POISON_MOD}) was NOT routed "
+            "around the padded path -- poison mode 2 guard missing? "
+            "generate_batch log: " + " | ".join(cap.lines)
+        )
 
     mism_same = [
         (i, s, b) for i, (s, b) in enumerate(zip(solo_same, batched_same))
@@ -1014,9 +1050,14 @@ def t6_ab() -> str:
             f"[{i}] solo={s!r} batched={b!r}" for i, s, b in mism_var
         )
     )
+    hybrid = (
+        f" + unpaddable {unpaddable[0]} via cohort" if unpaddable
+        else " (no unpaddable length on the filler grid this run)"
+    )
     return (
-        f"equal-len 3/3 identical (true batch); var-len 3/3 identical "
-        f"via verified left-pad, lengths {sorted(var_lens)}; "
+        f"equal-len 3/3 identical (true batch); var-len "
+        f"{len(var_prompts)}/{len(var_prompts)} identical, padded rows "
+        f"{paddable[0]}+{paddable[-1]}{hybrid}; "
         f"e.g. same0={solo_same[0][:50]!r}"
     )
 

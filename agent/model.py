@@ -286,54 +286,64 @@ def stack_equal_length(
 # ===========================================================================
 # !!! KNOWN TRANSFORMERS BUG WORKAROUND -- READ BEFORE TOUCHING ANY OF THE !!!
 # !!! PADDED-BATCH CODE BELOW (left_pad_row / left_pad_stack /            !!!
-# !!! VLModel._padded_batch_prefill / VLModel.generate_batch)             !!!
+# !!! VLModel._plan_padded_batch / VLModel.generate_batch)                !!!
 #
 # Gemma 4 Unified has an upstream bug: a LEFT-PADDED MULTIMODAL PREFILL is
-# CATASTROPHICALLY CORRUPTED whenever the padded total width satisfies
+# CATASTROPHICALLY CORRUPTED in (at least) TWO measured modes:
 #
-#         total % 32 == 1        (PAD_POISON_MOD / PAD_POISON_RESIDUE)
+#   POISON MODE 1 -- padded TOTAL width ~= 1 mod 32
+#         (PAD_POISON_MOD / PAD_POISON_RESIDUE): the whole target width is
+#         poisoned. Measured 6/6 across prompt lengths 282..2867 in
+#         training/probe_hacky_pads.py (logs probe_hacky_pads_2026-07-30_*),
+#         ~35-52-logit deltas, argmax flips to junk like '<audio|>'.
+#   POISON MODE 2 -- a row whose OWN unpadded length ~= 1 mod 32 is
+#         corrupted by ANY left pad, at every rule-clean target width.
+#         Measured in the 2026-07-30 t6 run: an L=289 row rejected at ALL
+#         of T=290..297 (~24.8-logit deltas, argmax flips) while its
+#         L=282 batchmates stayed clean at the same widths. The probe
+#         never hit this mode (its prompt lengths had residues 11, 30, 7,
+#         15, 19 -- none ~= 1). NOTE such a row is mathematically
+#         unpaddable: pad=0 needs T = L ~= 1 mod 32, which is mode 1.
 #
-# The corrupted row's next-token logits shift by ~35-52 (argmax flips to
-# junk like '<audio|>'); every other width shows only deterministic bf16
-# kernel wobble (<= ~1.75 at game-size prompts, no argmax flips -- the same
-# class of noise equal-length batching has always had). Measured 6/6 across
-# prompt lengths 282..2867 in training/probe_hacky_pads.py (logs
-# probe_hacky_pads_2026-07-30_*.log); decode steps crossing the residue
-# mid-generation are HARMLESS (probe test 4) -- the poison is PREFILL-ONLY,
-# almost certainly in the padded image-feature scatter / chunked mask
-# construction, which never re-runs during decode.
+# Every clean width/row shows only deterministic bf16 kernel wobble
+# (<= ~1.75 at game-size prompts, no argmax flips -- the same class of
+# noise equal-length batching has always had). Decode steps crossing the
+# residue mid-generation are HARMLESS (probe test 4): the poison is
+# PREFILL-ONLY, almost certainly in the padded image-feature scatter /
+# chunked mask construction, which never re-runs during decode.
 #
 # Upstream reports (check these before "simplifying" any of this away):
 #   * https://github.com/huggingface/transformers/issues/47651
 #   * https://huggingface.co/google/gemma-4-12B-it/discussions/50
 # Standalone repro: scripts/gemma4_pad_batch_repro.py
 #
-# THE SCOTCH-TAPE FIX (HACKY_ANSWER): mixed-length batches ARE left-padded,
-# but (1) the padded target width NEVER lands on total % 32 == 1, and
-# (2) every padded batch is verified before decode by the prefill-parity
-# check -- each row's padded-batch prefill logits must match its solo
-# prefill logits within PAD_PARITY_DLOGIT with no argmax flip. If no clean
-# target exists (rule exception => WARNING), we fall back to the always-
-# safe equal-length cohorts. Remove all of this ONLY when the upstream bug
-# is fixed AND training/probe_hacky_pads.py passes on the fixed version
-# with padding to total % 32 == 1.
+# THE SCOTCH-TAPE FIX (HACKY_ANSWER), in VLModel._plan_padded_batch:
+#   (1) rows with unpaddable lengths (L ~= 1 mod 32) are excluded up front
+#       and decode in natural-width equal-length cohorts (always safe);
+#   (2) the remaining rows are left-padded to the longest of THEIR lengths
+#       (which is ~= 1 mod 32 by construction impossible -- mode 1 dodged);
+#   (3) before any decode, the prefill-parity tripwire: each row's
+#       padded-batch prefill logits must match its solo prefill logits
+#       within PAD_PARITY_DLOGIT with no argmax flip. Rows that fail
+#       (a THIRD poison mode we have not met yet => WARNING) are demoted
+#       to cohorts individually; the survivors decode as one batch.
+# Remove all of this ONLY when the upstream bug is fixed AND
+# training/probe_hacky_pads.py passes on the fixed version with padding
+# to total % 32 == 1.
 # ===========================================================================
 
-#: Poisoned padded-prefill widths: total % PAD_POISON_MOD == PAD_POISON_RESIDUE.
+#: The poisoned residue class (both modes): padded TOTAL widths with
+#: total % PAD_POISON_MOD == PAD_POISON_RESIDUE are poisoned targets, and
+#: rows whose OWN length L % PAD_POISON_MOD == PAD_POISON_RESIDUE are
+#: unpaddable (corrupted by any left pad).
 PAD_POISON_MOD = 32
 PAD_POISON_RESIDUE = 1
 
 #: Prefill-parity verdict: a padded row is POISONED if its prefill argmax
-#: flips or any logit moves by more than this vs its solo prefill. The two
-#: measured populations are far apart (wobble <= ~1.75, poison >= ~35);
+#: flips or any logit moves by more than this vs its solo prefill. The
+#: measured populations are far apart (wobble <= ~1.75, poison >= ~24.7);
 #: 8.0 sits in the empty middle.
 PAD_PARITY_DLOGIT = 8.0
-
-#: How far above the longest row the padded-target search may go before
-#: falling back to cohorts. Each candidate costs one batched prefill; with
-#: the mod-32 rule the FIRST candidate should always pass, so > 1 attempt
-#: already means the rule has an exception (logged at WARNING).
-PAD_SEARCH_SLACK = 8
 
 
 def left_pad_row(
@@ -350,9 +360,11 @@ def left_pad_row(
     encoding.
 
     WARNING: on Gemma 4 Unified a left-padded multimodal prefill is
-    CORRUPTED at padded totals ~= 1 mod 32 (see the KNOWN TRANSFORMERS
-    BUG WORKAROUND banner above). Never decode from a padded batch
-    without dodging those widths AND running the prefill-parity check.
+    CORRUPTED at padded totals ~= 1 mod 32 AND for rows whose own length
+    is ~= 1 mod 32 (see the KNOWN TRANSFORMERS BUG WORKAROUND banner
+    above). Never decode from a padded batch except through
+    :meth:`VLModel._plan_padded_batch`, which dodges both modes and runs
+    the prefill-parity check.
     """
     if pad_len <= 0:
         return dict(enc)
@@ -382,7 +394,7 @@ def left_pad_stack(
     This is the HACKY_ANSWER path: padding is only trustworthy when the
     target dodges the poisoned widths and the batch passes the
     prefill-parity check -- see the KNOWN TRANSFORMERS BUG WORKAROUND
-    banner above and :meth:`VLModel._padded_batch_prefill`.
+    banner above and :meth:`VLModel._plan_padded_batch`.
     """
     lens = [int(r["input_ids"].shape[1]) for r in rows]
     target = max(lens) if target_len is None else target_len
@@ -778,29 +790,37 @@ class VLModel:
             stop_regex=stop_regex,
         )
 
-    def _padded_batch_prefill(
+    def _plan_padded_batch(
         self, rows: list[dict[str, Any]]
-    ) -> tuple[dict[str, Any], list[int]] | None:
-        """KNOWN TRANSFORMERS BUG WORKAROUND (see module banner): left-pad
-        mixed-length rows into ONE verified batch, or None for cohorts.
+    ) -> tuple[dict[str, Any], list[int], list[int]] | None:
+        """KNOWN TRANSFORMERS BUG WORKAROUND (see module banner): plan ONE
+        verified left-padded batch over as many rows as the bug allows.
 
-        Two independent defenses, both mandatory:
+        Returns ``(device_inputs, row_indices, pads)`` -- the rows NOT in
+        ``row_indices`` must decode via equal-length cohorts -- or None if
+        padding cannot beat cohorts (fewer than 2 paddable rows, or the
+        paddable rows already share one length).
 
-        1. THE RULE: never pad to a total width ~= PAD_POISON_RESIDUE
-           (mod PAD_POISON_MOD) -- the measured poison widths of
-           transformers#47651. With the rule alone the first candidate
-           target should always be clean.
-        2. THE TRIPWIRE: before any decode, each row's padded-batch
-           prefill logits must match its solo prefill logits (no argmax
-           flip, max delta <= PAD_PARITY_DLOGIT). A rejection here means
-           the mod-32 rule has an exception on this hardware/version --
-           logged at WARNING because that is new information about the
-           upstream bug, not routine flow.
+        Defenses, all mandatory (evidence in the module banner):
 
-        Steady-state cost when the first target passes: one solo prefill
-        per row (exactly what serial generation would have spent anyway)
-        plus one batched prefill -- small next to the decode this unlocks
-        batching for.
+        1. Rows whose OWN length ~= PAD_POISON_RESIDUE mod PAD_POISON_MOD
+           are excluded up front: poison mode 2 corrupts them under ANY
+           left pad (t6 2026-07-30: L=289 rejected at every T in
+           290..297), and pad=0 would need a mode-1 target width.
+        2. The target width is the longest remaining row's length, which
+           by construction is NOT ~= 1 mod 32 -- poison mode 1 dodged
+           without any search.
+        3. The prefill-parity tripwire: each padded row's prefill logits
+           must match its solo prefill (no argmax flip, max delta <=
+           PAD_PARITY_DLOGIT). Rows that fail are a poison mode we have
+           NOT catalogued yet -- logged at WARNING and demoted to
+           cohorts individually; the survivors are re-planned and must
+           pass before any decode.
+
+        Steady-state cost: one solo prefill per paddable row (what serial
+        would have spent anyway) plus one batched prefill per planning
+        round (exactly one when no new poison mode fires) -- small next
+        to the decode loop this unlocks batching for.
         """
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
         pad_id = tokenizer.pad_token_id
@@ -810,44 +830,52 @@ class VLModel:
                 "pad, falling back to equal-length cohorts"
             )
             return None
-        solo = [self.prefill_last_logits(r)[0] for r in rows]
-        max_len = max(int(r["input_ids"].shape[1]) for r in rows)
-        for target in range(max_len, max_len + PAD_SEARCH_SLACK + 1):
-            if target % PAD_POISON_MOD == PAD_POISON_RESIDUE:
-                logger.info(
-                    "generate_batch: skipping padded T=%d (KNOWN poison "
-                    "width: T %% %d == %d, transformers#47651)",
-                    target, PAD_POISON_MOD, PAD_POISON_RESIDUE,
-                )
-                continue
-            stacked, pads = left_pad_stack(rows, pad_id, target_len=target)
+        lens = [int(r["input_ids"].shape[1]) for r in rows]
+        cand = [i for i in range(len(rows))
+                if lens[i] % PAD_POISON_MOD != PAD_POISON_RESIDUE]
+        excluded = [i for i in range(len(rows)) if i not in cand]
+        if excluded:
+            logger.info(
+                "generate_batch: row(s) %s have UNPADDABLE length(s) %s "
+                "(L %% %d == %d corrupts under any left pad, poison mode "
+                "2 of transformers#47651) -> natural-width cohorts",
+                excluded, [lens[i] for i in excluded],
+                PAD_POISON_MOD, PAD_POISON_RESIDUE,
+            )
+        solo: dict[int, torch.Tensor] = {}
+        while True:
+            if len(cand) < 2 or len({lens[i] for i in cand}) < 2:
+                return None  # cohorts already handle this optimally
+            for i in cand:
+                if i not in solo:
+                    solo[i] = self.prefill_last_logits(rows[i])[0]
+            target = max(lens[i] for i in cand)
+            stacked, pads = left_pad_stack(
+                [rows[i] for i in cand], pad_id, target_len=target
+            )
             batch_logits = self.prefill_last_logits(stacked)
             bad: list[tuple[int, float, bool]] = []
-            for i in range(len(rows)):
-                delta = float((batch_logits[i] - solo[i]).abs().max())
-                flipped = (int(batch_logits[i].argmax())
+            for j, i in enumerate(cand):
+                delta = float((batch_logits[j] - solo[i]).abs().max())
+                flipped = (int(batch_logits[j].argmax())
                            != int(solo[i].argmax()))
                 if flipped or delta > PAD_PARITY_DLOGIT:
                     bad.append((i, round(delta, 3), flipped))
             if not bad:
                 logger.info(
                     "generate_batch: padded batch verified clean at T=%d "
-                    "(pads %s)", target, pads,
+                    "(rows %s, pads %s)", target, cand, pads,
                 )
-                return self._move_inputs_to_model(stacked), pads
+                return self._move_inputs_to_model(stacked), list(cand), pads
             logger.warning(
-                "generate_batch: padded T=%d REJECTED by prefill parity "
-                "check, (row, max|dLogit|, argmax_flip): %s -- a "
-                "rule-clean width failed, i.e. transformers#47651 has an "
-                "exception beyond total %% 32 == 1 here",
-                target, bad,
+                "generate_batch: prefill parity check REJECTED row(s) at "
+                "T=%d, (row, max|dLogit|, argmax_flip): %s -- an "
+                "UNCATALOGUED poison mode of transformers#47651 (not "
+                "total %% 32 == 1, not L %% 32 == 1); demoting them to "
+                "natural-width cohorts", target, bad,
             )
-        logger.warning(
-            "generate_batch: no clean padded target in [%d, %d] -- "
-            "falling back to equal-length cohorts",
-            max_len, max_len + PAD_SEARCH_SLACK,
-        )
-        return None
+            rejected = {b[0] for b in bad}
+            cand = [i for i in cand if i not in rejected]
 
     def generate_batch(
         self,
@@ -864,12 +892,13 @@ class VLModel:
 
         KNOWN TRANSFORMERS BUG WORKAROUND in play here (module banner,
         transformers#47651): mixed-length rows ARE left-padded into one
-        true GPU batch, but only through :meth:`_padded_batch_prefill`,
-        which dodges the poisoned widths (total ~= 1 mod 32) and verifies
-        the padded prefill against each row's solo prefill before any
-        decode. If no verified target exists, we drop to one batch per
-        distinct prompt length (zero pad -- always safe, but decode
-        serializes across cohorts).
+        true GPU batch, but only through :meth:`_plan_padded_batch`,
+        which excludes unpaddable rows (L ~= 1 mod 32, poison mode 2),
+        pads to a width that dodges poison mode 1 (total ~= 1 mod 32),
+        and verifies every padded row's prefill against its solo prefill
+        before any decode. Rows the plan excludes or rejects decode via
+        one batch per distinct prompt length (zero pad -- always safe,
+        but decode serializes across cohorts).
         """
         if not batch:
             return []
@@ -915,29 +944,39 @@ class VLModel:
         err: str | None = None
         mode = "cohorts"
         try:
-            padded = (self._padded_batch_prefill(rows)
-                      if len(by_len) > 1 else None)
-            if padded is not None:
-                inputs, pads = padded
+            plan = (self._plan_padded_batch(rows)
+                    if len(by_len) > 1 else None)
+            done: set[int] = set()
+            if plan is not None:
+                inputs, idxs, pads = plan
                 mode = (f"padded(T={int(inputs['input_ids'].shape[-1])},"
-                        f"pads={pads})")
-                replies = list(self._generate_stacked(
-                    inputs, len(rows),
+                        f"rows={idxs},pads={pads})")
+                sub_replies = self._generate_stacked(
+                    inputs, len(idxs),
                     max_new_tokens=max_new_tokens,
                     stop_strings=stop_strings,
                     stop_regex=stop_regex,
-                ))
-            else:
-                for _length, indices in by_len.items():
-                    sub_rows = [rows[i] for i in indices]
-                    sub_replies = self._generate_equal_length_batch(
-                        sub_rows,
-                        max_new_tokens=max_new_tokens,
-                        stop_strings=stop_strings,
-                        stop_regex=stop_regex,
-                    )
-                    for i, reply in zip(indices, sub_replies):
-                        replies[i] = reply
+                )
+                for i, reply in zip(idxs, sub_replies):
+                    replies[i] = reply
+                done.update(idxs)
+            leftover = {
+                length: [i for i in indices if i not in done]
+                for length, indices in by_len.items()
+            }
+            leftover = {L: idx for L, idx in leftover.items() if idx}
+            if leftover and plan is not None:
+                mode += "+cohorts"
+            for _length, indices in leftover.items():
+                sub_rows = [rows[i] for i in indices]
+                sub_replies = self._generate_equal_length_batch(
+                    sub_rows,
+                    max_new_tokens=max_new_tokens,
+                    stop_strings=stop_strings,
+                    stop_regex=stop_regex,
+                )
+                for i, reply in zip(indices, sub_replies):
+                    replies[i] = reply
             assert all(r is not None for r in replies)
             return list(replies)  # type: ignore[arg-type]
         except Exception as exc:

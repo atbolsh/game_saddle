@@ -18,12 +18,20 @@ flip, grows with L, same class equal-length batching shows). This rerun
 scores that rule and rehearses production with it.
 
 STATUS: the workaround this probe validated NOW SHIPS in
-agent/model.py's generate_batch (VLModel._padded_batch_prefill; see the
+agent/model.py's generate_batch (VLModel._plan_padded_batch; see the
 KNOWN TRANSFORMERS BUG WORKAROUND banner there). Keep this probe: it is
 the regression check for the mod-32 rule after any transformers upgrade,
 and the evidence trail for why the hack exists.
 
-Three tests, all output marked HACKY_ANSWER:
+SECOND FINDING (t6 remote run, 2026-07-30, discovered AFTER this probe's
+sweeps): a row whose OWN unpadded length is ~= 1 (mod 32) is corrupted by
+ANY left pad (L=289 rejected at every T in 290..297, ~24.8-logit deltas,
+argmax flips). This probe's prompts never hit that residue class
+(L mod 32 was 11, 30, 7, 15, 19), which is why the sweeps only exposed
+the padded-TOTAL mode. Production therefore refuses to pad such rows at
+all -- they decode in natural-width equal-length cohorts.
+
+The tests, all output marked HACKY_ANSWER:
 
   1. pad-vs-total: several real prompts of different lengths x a pad sweep
      (dense 1..32, coarse up to 1024). Prints the poison map and whether
@@ -38,6 +46,17 @@ Three tests, all output marked HACKY_ANSWER:
      actual stop machinery vs solo generate -- byte equality is the pass
      criterion, and it exercises RegexStopCriteria/stop_strings under
      padding.
+  4. mid-decode boundary crossing: pad to T ~= 0 mod 32 so the running
+     width hits the poison residue at decode steps 1 and 33; per-step
+     logits + tokens vs solo decide whether the poison is prefill-only.
+     (2026-07-30 result: prefill-only, crossings harmless.)
+  5. naturally ~= 1 mod 32 + rescue: poison mode 2 (a row whose OWN
+     length is ~= 1 mod 32 corrupts under ANY pad -- found by t6, not by
+     this probe's sweeps). Reproduces it on a real prompt, then tries
+     nudging the length off the residue with one harmless token (append
+     or prepend) and prices the nudge against the original greedy reply.
+     If a rescue works, production can pad ex-unpaddable rows instead of
+     demoting them to solo cohorts.
 
 Exit code: 1 if the parity check passed but greedy decode still diverged
 (the outcome that kills the whole approach), else 0.
@@ -247,11 +266,13 @@ def test1_pad_vs_total(model: Any, picked: list[tuple[int, dict]],
     return poison_map
 
 
-def _retarget_length(model: Any, messages: list[dict],
-                     target: int) -> dict[str, Any] | None:
+def _retarget_length(
+    model: Any, messages: list[dict], target: int
+) -> tuple[list[dict], dict[str, Any]] | None:
     """Trim words from (or append single-token filler to) the last text
     part until the encoded length is exactly ``target``. Keeps the prompt
-    game-real except for the trailing words. None if it will not converge."""
+    game-real except for the trailing words. Returns ``(messages, enc)``
+    or None if it will not converge."""
     import copy
 
     msgs = copy.deepcopy(messages)
@@ -270,7 +291,7 @@ def _retarget_length(model: Any, messages: list[dict],
         enc = model.encode_messages(msgs)
         n = int(enc["input_ids"].shape[1])
         if n == target:
-            return enc
+            return msgs, enc
         if n > target + 40:
             # Coarse chop: ~4 chars/token, deliberately undershooting the
             # estimate so the fine loop below lands the exact target.
@@ -305,8 +326,9 @@ def test2_content(model: Any, prompts: list[list[dict]],
     )
     enc_b = None
     for msgs in ranked:
-        enc_b = _retarget_length(model, msgs, target)
-        if enc_b is not None:
+        got = _retarget_length(model, msgs, target)
+        if got is not None:
+            enc_b = got[1]
             same = bool(
                 (enc_b["input_ids"] == enc_a["input_ids"]).all()
             )
@@ -556,6 +578,146 @@ def test4_mid_decode(model: Any, picked: list[tuple[int, dict]],
     return failures
 
 
+def _nudged_copy(messages: list[dict], where: str,
+                 filler: str) -> list[dict]:
+    """Deep-copy `messages` with `filler` glued onto the first ('prepend')
+    or last ('append') text part -- the candidate production rescue for
+    naturally-unpaddable rows."""
+    import copy
+
+    msgs = copy.deepcopy(messages)
+    parts = [
+        part
+        for m in msgs
+        for part in (m.get("content") or [])
+        if isinstance(part, dict) and part.get("type") == "text"
+    ]
+    assert parts, "no text part to nudge"
+    if where == "prepend":
+        parts[0]["text"] = filler + parts[0]["text"]
+    else:
+        parts[-1]["text"] = parts[-1]["text"] + filler
+    return msgs
+
+
+def _greedy_reply(model: Any, enc: dict[str, Any], steps: int = 48) -> str:
+    """Plain greedy decode of one batch-1 encoding, decoded reply text."""
+    import torch
+
+    inputs = model._move_inputs_to_model(enc)
+    with torch.inference_mode():
+        out = model.model.generate(
+            **inputs, max_new_tokens=steps, do_sample=False,
+        )
+    n = int(enc["input_ids"].shape[1])
+    return model.processor.decode(out[0][n:], skip_special_tokens=True).strip()
+
+
+def test5_natural_residue(model: Any, prompts: list[list[dict]],
+                          pad_id: int) -> int:
+    """HACKY_ANSWER test 5: rows NATURALLY ~= 1 mod 32, and their rescue.
+
+    Poison mode 2 (discovered by the t6 remote run 2026-07-30, AFTER this
+    probe's sweeps): a row whose OWN unpadded length is ~= 1 mod 32 is
+    corrupted by ANY left pad, even at rule-clean target widths.
+    Production currently refuses to pad such rows (they decode in their
+    own cohort). This test (a) reproduces the mode on a REAL game prompt
+    retargeted to the residue, sweeping pads 1..32, and (b) evaluates the
+    candidate rescue: nudge the row off the residue with one generally
+    harmless extra token -- appended after the last text part, or
+    prepended before the first -- and check that the nudged row pads
+    cleanly like any ordinary row. It also prices the nudge: greedy reply
+    of the nudged prompt vs the original (REPORTED, not asserted -- a
+    near-tie flip from one extra whitespace token is acceptable noise in
+    sampled production datagen, but we want to see it).
+
+    Returns the number of FAILED rescues (a shifted length that still
+    poisons at rule-clean pads); whitespace swallowed by the chat
+    template is reported but not a failure.
+    """
+    print("\n=== HACKY_ANSWER test 5: naturally ~= 1 mod 32 + rescue ===")
+    base = None
+    for msgs in prompts:
+        n = int(model.encode_messages(msgs)["input_ids"].shape[1])
+        target = n + ((POISON_TOTAL_RESIDUE - n) % POISON_TOTAL_MOD)
+        got = _retarget_length(model, msgs, target)
+        if got is not None:
+            base = got
+            break
+    if base is None:
+        print("SKIPPED: could not retarget any real prompt to "
+              f"~= {POISON_TOTAL_RESIDUE} mod {POISON_TOTAL_MOD}")
+        return 0
+    base_msgs, base_enc = base
+    L = int(base_enc["input_ids"].shape[1])
+    print(f"natural-residue row: L={L} "
+          f"(L % {POISON_TOTAL_MOD} = {L % POISON_TOTAL_MOD})")
+
+    # (a) Baseline poison map: pads 1..32 on the natural-residue row.
+    # t6 evidence predicts poison at (nearly) EVERY pad; the one pad
+    # hitting total ~= 1 mod 32 is poison mode 1 regardless.
+    sweep = list(range(1, POISON_TOTAL_MOD + 1))
+    res = _sweep_one(model, base_enc, pad_id, sweep)
+    poisons = sorted(p for p, (bad, _, _) in res.items() if bad)
+    mode1 = [p for p in poisons
+             if (L + p) % POISON_TOTAL_MOD == POISON_TOTAL_RESIDUE]
+    worst = max(res.values(), key=lambda r: r[1])
+    print(f"baseline: {len(poisons)}/{len(sweep)} pads poisoned "
+          f"{sorted(poisons) or 'NONE'} (mode-1 totals among them: "
+          f"{mode1}; worst max|dLogit|={worst[1]:.3f})")
+
+    solo_reply = _greedy_reply(model, base_enc)
+    failures = 0
+    for where, fillers in (
+        ("append", ["\n", " .", " Okay."]),
+        ("prepend", [" ", ". ", "Note: "]),
+    ):
+        rescued = None
+        tried: list[tuple[str, int]] = []
+        for filler in fillers:
+            msgs2 = _nudged_copy(base_msgs, where, filler)
+            enc2 = model.encode_messages(msgs2)
+            L2 = int(enc2["input_ids"].shape[1])
+            tried.append((filler, L2))
+            if (L2 != L
+                    and L2 % POISON_TOTAL_MOD != POISON_TOTAL_RESIDUE):
+                rescued = (filler, enc2, L2)
+                break
+        if rescued is None:
+            print(f"{where}: NO filler moved the length off the residue "
+                  f"(filler -> new L: {tried}) -- chat template likely "
+                  "normalizes it; strategy unusable")
+            continue
+        filler, enc2, L2 = rescued
+        res2 = _sweep_one(model, enc2, pad_id, sweep)
+        poisons2 = sorted(p for p, (bad, _, _) in res2.items() if bad)
+        predicted2 = [p for p in sweep
+                      if (L2 + p) % POISON_TOTAL_MOD
+                      == POISON_TOTAL_RESIDUE]
+        unpredicted = [p for p in poisons2 if p not in predicted2]
+        print(f"{where} filler {filler!r}: L {L} -> {L2} "
+              f"(residue {L2 % POISON_TOTAL_MOD}); poison pads "
+              f"{poisons2 or 'NONE'}, mode-1 prediction {predicted2}")
+        if unpredicted:
+            failures += 1
+            print(f"  RESCUE FAILED: rule-clean pads still poisoned: "
+                  f"{unpredicted}")
+        else:
+            print("  RESCUE WORKS: nudged row pads like any ordinary row "
+                  "(only the mode-1 total is poisoned, and production "
+                  "never pads to it)")
+        reply2 = _greedy_reply(model, enc2)
+        if reply2 == solo_reply:
+            print(f"  nudge cost ({where} {filler!r}): greedy reply "
+                  "IDENTICAL to the un-nudged prompt's")
+        else:
+            print(f"  nudge cost ({where} {filler!r}): greedy reply "
+                  "DIFFERS from the un-nudged prompt's:")
+            print(f"    original: {solo_reply[:120]!r}")
+            print(f"    nudged  : {reply2[:120]!r}")
+    return failures
+
+
 # ===================================================================== main
 
 class _Tee:
@@ -622,7 +784,7 @@ def main(argv: list[str] | None = None) -> int:
         prompts_by_len.setdefault(int(enc["input_ids"].shape[1]), msgs)
     picked = pick_spread(model, prompts, N_PROMPTS)
 
-    want = set((args.only or "1,2,3,4").split(","))
+    want = set((args.only or "1,2,3,4,5").split(","))
     failures = 0
     if "1" in want:
         test1_pad_vs_total(model, picked, pad_id)
@@ -632,6 +794,8 @@ def main(argv: list[str] | None = None) -> int:
         failures += test3_rehearsal(model, picked, prompts_by_len, pad_id)
     if "4" in want:
         failures += test4_mid_decode(model, picked, pad_id)
+    if "5" in want:
+        failures += test5_natural_residue(model, prompts, pad_id)
     print(f"\n(full output saved to {log_path})")
     return 1 if failures else 0
 

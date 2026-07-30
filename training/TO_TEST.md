@@ -39,22 +39,27 @@ a near-tie token deep into a reply (both outputs sane, divergence late),
 that is bf16 batched-matmul nondeterminism — paste both replies and we
 judge. KNOWN TRANSFORMERS BUG WORKAROUND in play (full banner in
 `agent/model.py`): Gemma 4 Unified corrupts a left-padded multimodal
-prefill whenever the padded total width ≡ 1 mod 32 — ~35–52-logit deltas,
-argmax flipping to junk like `<audio|>`; every other width is ordinary
-bf16 wobble. Measured 6/6 across prompt lengths 282–2867
-(`training/probe_hacky_pads.py`; standalone repro
-`scripts/gemma4_pad_batch_repro.py`; upstream
-https://github.com/huggingface/transformers/issues/47651 and
-https://huggingface.co/google/gemma-4-12B-it/discussions/50). The poison
+prefill in two measured modes — (1) padded TOTAL width ≡ 1 mod 32
+(~35–52-logit deltas, argmax flipping to junk like `<audio|>`; 6/6
+across prompt lengths 282–2867, `training/probe_hacky_pads.py`), and
+(2) a row whose OWN length ≡ 1 mod 32 corrupts under ANY left pad
+(found by the 2026-07-30 t6 run: L=289 rejected at every T in 290–297,
+~24.8-logit deltas). Standalone repro `scripts/gemma4_pad_batch_repro.py`;
+upstream https://github.com/huggingface/transformers/issues/47651 and
+https://huggingface.co/google/gemma-4-12B-it/discussions/50. The poison
 is prefill-only — decode steps crossing the residue are harmless (probe
-test 4). So `generate_batch` left-pads mixed-length rows to a target
-width that dodges ≡ 1 mod 32 AND parity-checks each row's padded prefill
-against its solo prefill before decoding; on rejection (which would mean
-the mod-32 rule has an exception — logged at WARNING) it falls back to
-one batch per distinct length. t6 FAILS if the padded path did not
-engage: a silent cohort fallback would pass equality while quietly
-serializing parallel datagen. Equal-length early divergence is a
-true-batch bug.
+test 4). So `generate_batch` excludes unpaddable rows (mode 2) into
+natural-width cohorts, left-pads the rest to the longest remaining
+length (never ≡ 1 mod 32 by construction — mode 1 dodged), and
+parity-checks each padded row's prefill against its solo prefill before
+decoding; rows rejected there (an UNCATALOGUED third mode — WARNING) are
+demoted to cohorts individually. t6 picks its prompt lengths at runtime
+around this arithmetic and FAILS if the padded path did not engage: a
+silent cohort fallback would pass equality while quietly serializing
+parallel datagen. Probe test 5 (`--only 5`) characterizes mode 2 and
+auditions the planned rescue — nudging an unpaddable row off the residue
+with one harmless token. Equal-length early divergence is a true-batch
+bug.
 
 Stage 8/9 note: these two stages measure, they mostly don't judge — the
 decision they feed is "is serial datagen fast enough for an overnight
