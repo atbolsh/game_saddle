@@ -191,10 +191,12 @@ def test1_pad_vs_total(model: Any, picked: list[tuple[int, dict]],
                   "(inconclusive)")
 
     # Determinism spot-check: same (L, p) probed twice must match exactly.
+    # One poison pad and one safe pad when both exist; a prompt where ALL
+    # pads poison (or none do) still gets checked with what it has.
     length, enc = picked[0]
-    probe_pads = sorted(poison_map[length])[:1] or [PAD_SWEEP[6]]
-    probe_pads.append(next(p for p in PAD_SWEEP
-                           if p not in poison_map[length]))
+    poisons = sorted(poison_map[length])
+    safes = [p for p in PAD_SWEEP if p not in poison_map[length]]
+    probe_pads = poisons[:1] + safes[:1]
     for p in probe_pads:
         r1 = _sweep_one(model, enc, pad_id, [p])[p]
         r2 = _sweep_one(model, enc, pad_id, [p])[p]
@@ -383,11 +385,38 @@ def test3_rehearsal(model: Any, picked: list[tuple[int, dict]],
 
 # ===================================================================== main
 
+class _Tee:
+    """Duplicate a text stream into the console and the probe log file."""
+
+    def __init__(self, *streams: Any):
+        self._streams = streams
+
+    def write(self, s: str) -> int:
+        for st in self._streams:
+            st.write(s)
+            st.flush()
+        return len(s)
+
+    def flush(self) -> None:
+        for st in self._streams:
+            st.flush()
+
+
 def main(argv: list[str] | None = None) -> int:
+    import time
+
+    log_path = (REPO_ROOT / "logs"
+                / f"probe_hacky_pads_{time.strftime('%Y-%m-%d_%H-%M-%S')}.log")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = open(log_path, "w", encoding="utf-8")
+    sys.stdout = _Tee(sys.__stdout__, log_file)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[logging.StreamHandler(),
+                  logging.StreamHandler(log_file)],
     )
+    print(f"(full output duplicated to {log_path})")
     parser = argparse.ArgumentParser(
         prog="python -m training.probe_hacky_pads",
         description="HACKY_ANSWER: characterize safe left-pads on real "
@@ -418,6 +447,7 @@ def main(argv: list[str] | None = None) -> int:
     test1_pad_vs_total(model, picked, pad_id)
     test2_content(model, prompts, picked, pad_id)
     failures = test3_rehearsal(model, picked, prompts_by_len, pad_id)
+    print(f"\n(full output saved to {log_path})")
     return 1 if failures else 0
 
 
