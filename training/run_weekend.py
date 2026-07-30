@@ -299,8 +299,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--epochs", type=int, default=3,
                    help="expert-iteration cycles (default 3: Friday "
-                        "afternoon -> Monday morning at ~22h/epoch serial "
-                        "datagen; see TRAINING_OVERVIEW.md)")
+                        "afternoon -> Monday morning at ~20h/epoch serial "
+                        "datagen, t8 2026-07-30; see TRAINING_OVERVIEW.md)")
     p.add_argument("--games", type=int, default=60,
                    help="games per datagen epoch (generate_game_traces "
                         "default)")

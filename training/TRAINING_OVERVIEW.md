@@ -71,9 +71,10 @@ nohup python -m training.run_weekend > weekend.log 2>&1 &
 
 **Fitting the window.** Run selftest t8 first for the real serial
 seconds-per-generation. One epoch costs roughly
-`--max-generations x s/gen` of datagen (~22 h at the last measurement)
-plus one train stage; `--max-generations` (default 3000) is the knob —
-e.g. `--max-generations 2400` shaves ~4.5 h per epoch. `--epochs`,
+`--max-generations x s/gen` of datagen (~20 h at the last measurement:
+24.1 s/gen, t8 2026-07-30) plus one train stage; `--max-generations`
+(default 3000) is the knob — e.g. `--max-generations 2400` shaves ~4 h
+per epoch. `--epochs`,
 `--games`, `--start-checkpoint`, and `--prefix` are also flags. Before the
 real launch, rehearse the whole orchestration cheaply (TO_TEST.md,
 "weekend rehearsal"): a tiny budget plus `--train-max-steps` exercises
