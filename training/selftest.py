@@ -11,6 +11,8 @@ finished::
     python -m training.selftest t5     # ~10-20m   datagen 2 games, --parallel 2
     python -m training.selftest t6     # minutes   batched-vs-solo generation A/B
     python -m training.selftest t7     # minutes   t5 traces -> real train steps
+    python -m training.selftest t8     # ~5-15m    real serial datagen timing
+    python -m training.selftest t9     # ~5-15m    same workload at --parallel 2
 
 or everything in order with ``python -m training.selftest all``. Every stage
 prints exactly one line ``TEST <id> PASS/FAIL: <evidence>`` (paste those
@@ -33,6 +35,10 @@ Stage map (rationale in the Intermission plan):
                 plots, tripwire silent
   * t6-ab       generate_batch vs generate equivalence, greedy
   * t7-e2e      GameTraceSource over t5's output through real train steps
+  * t8-timing   REAL serial datagen run (startup excluded), s/generation
+                + serial epoch extrapolation; t9's baseline
+  * t9-parallel t8's exact workload at --parallel 2, compared on
+                seconds_per_generation (speedup reported, slowdown asserted)
 """
 
 from __future__ import annotations
@@ -1018,6 +1024,97 @@ def t7_e2e() -> str:
     )
 
 
+#: One tiny datagen workload, shared by t8 (serial) and t9 (--parallel 2)
+#: so their seconds_per_generation are directly comparable.
+_TIMING_WORKLOAD = ["--games", "2", "--max-moves", "3", "--seed", "11"]
+
+
+def _warmed_timed_datagen(label: str, parallel: int) -> dict:
+    """Run the shared timing workload through the REAL datagen harness with
+    startup excluded: the process-singleton model is loaded and warmed (one
+    untimed generation) before run_generation's wall clock starts."""
+    from agent.model import get_model
+    from training.generate_game_traces import build_parser, run_generation
+
+    model = get_model()
+    with tempfile.TemporaryDirectory(prefix="selftest_warmup_") as tmp:
+        img = _tiny_png(Path(tmp) / "warm.png", seed=3)
+        model.generate([{"role": "user", "content": [
+            {"type": "image", "url": str(img)},
+            {"type": "text", "text": "One word: bright or dark?"},
+        ]}], max_new_tokens=8)  # warmup, untimed
+
+    out_dir = REPO_ROOT / "data_game" / label
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    args = build_parser().parse_args(
+        ["--label", label, "--parallel", str(parallel)] + _TIMING_WORKLOAD
+    )
+    summary = run_generation(args)
+    assert summary["generations"] > 0, summary
+    assert summary["seconds_per_generation"], summary
+    return summary
+
+
+def t8_timing() -> str:
+    """Per-generation timing of REAL serial datagen + epoch extrapolation.
+    GPU + NAMS required.
+
+    No synthetic prompts: this plays the tiny shared workload through the
+    actual session harness (--parallel 1) and reads
+    ``seconds_per_generation`` from generation_stats.json. Startup (model
+    load, CUDA warmup) is excluded; what remains is the true per-episode
+    cost -- prompt building, NAMS retrieval, image noise, the analyst
+    generation -- amortized per PLAYER generation, which is exactly the
+    unit ``--max-generations`` caps. t9 reuses this run as its serial
+    baseline.
+    """
+    summary = _warmed_timed_datagen("selftest_t8_serial", parallel=1)
+    s_gen = summary["seconds_per_generation"]
+    epoch_h = 3000 * s_gen / 3600
+    return (
+        f"{s_gen:.1f}s/gen over {summary['generations']} real player gens "
+        f"({summary['wall_seconds']:.0f}s wall, serial); default epoch "
+        f"(--max-generations 3000) ~= {epoch_h:.1f}h serial"
+    )
+
+
+def t9_parallel() -> str:
+    """t8's exact workload at ``--parallel 2``, compared on
+    ``seconds_per_generation``. GPU + NAMS; run t8 FIRST (its
+    generation_stats.json is the serial baseline).
+
+    The speedup is REPORTED, not asserted: with Gemma 4 equal-length
+    cohorts (TO_TEST stage-6 note) it is workload-dependent, and x~1.0
+    simply means no cohorts formed and decode stayed serialized. The only
+    assertion is the slowdown tripwire (dispatcher pathology).
+    """
+    base = (REPO_ROOT / "data_game" / "selftest_t8_serial"
+            / "generation_stats.json")
+    assert base.is_file(), "run t8 first (its serial run is the baseline)"
+    serial = json.loads(base.read_text(encoding="utf-8"))
+    s_ser = serial["seconds_per_generation"]
+    assert serial["parallel"] == 1 and s_ser, serial
+
+    summary = _warmed_timed_datagen("selftest_t9_par2", parallel=2)
+    s_par = summary["seconds_per_generation"]
+    speedup = s_ser / s_par
+    # Tripwire only: --parallel 2 must not be catastrophically SLOWER
+    # than serial (that would mean dispatcher pathology, not just absent
+    # cohorts). Wins are evidence, not assertions.
+    assert s_par <= 1.6 * s_ser, (
+        f"--parallel 2 much slower than serial: {s_par:.1f} vs "
+        f"{s_ser:.1f} s/gen -- dispatcher pathology?"
+    )
+    return (
+        f"serial {s_ser:.1f}s/gen ({serial['generations']} gens, "
+        f"{serial['wall_seconds']:.0f}s wall) vs --parallel 2 "
+        f"{s_par:.1f}s/gen ({summary['generations']} gens, "
+        f"{summary['wall_seconds']:.0f}s wall): speedup x{speedup:.2f} "
+        "(x~1.0 = no equal-length cohorts, decode serial)"
+    )
+
+
 # ================================================================== runner
 
 STAGES: list[tuple[str, str, "callable"]] = [
@@ -1029,6 +1126,8 @@ STAGES: list[tuple[str, str, "callable"]] = [
     ("t5-datagen", "parallel datagen smoke", t5_datagen),
     ("t6-ab", "batched vs solo generation", t6_ab),
     ("t7-e2e", "traces -> train steps", t7_e2e),
+    ("t8-timing", "real serial datagen s/gen + epoch extrapolation", t8_timing),
+    ("t9-parallel", "t8's workload at --parallel 2, compared", t9_parallel),
 ]
 
 

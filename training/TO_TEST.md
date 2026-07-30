@@ -18,6 +18,8 @@ lines back for review. On a FAIL, also paste the traceback that precedes it.
 | 5 | `python -m training.selftest t5` | ~10–20 min | datagen 2 games x 5 moves at `--parallel 2`: traces + stored frames + stats + plots written, one record per generation, tripwire silent, ratings parsed; `analyst_traces.jsonl` has one record per round (minus counted truncated-search skips), analyses nonempty, frames shared with player records |
 | 6 | `python -m training.selftest t6` | minutes | equal-length identical-prompt true GPU batch vs solo; variable-length via length cohorts vs solo (Gemma 4: no left-pad decode) |
 | 7 | `python -m training.selftest t7` | minutes | t5's traces through `GameTraceSource` + `AnalystTraceSource` and real train steps (RL weights + KD-vs-base analyst anchor, mixed CE/KD buckets, per-run noised frames, finite losses; the tiny epoch is drained so the KD bucket is guaranteed to train) |
+| 8 | `python -m training.selftest t8` | ~5–15 min | REAL serial datagen timing: the tiny shared workload (2 games × 3 moves, `--parallel 1`) through the actual session harness with the model pre-loaded/warmed (startup excluded); reports `seconds_per_generation` and the serial wall-clock a default epoch (3000 gens) implies. Its `generation_stats.json` is t9's baseline |
+| 9 | `python -m training.selftest t9` | ~5–15 min | t8's EXACT workload at `--parallel 2` (run t8 first — its stats file is the serial baseline), compared on `seconds_per_generation`; asserts parallel is not ≫ slower, REPORTS the speedup |
 
 (`python -m training.selftest all` runs everything in order; the exit code
 is the number of failures.)
@@ -46,6 +48,22 @@ every aux tensor was verified suffix-identical to solo. Since poisonous
 offsets are unpredictable, `generate_batch` runs one true GPU batch per
 distinct prompt length (zero pad); rows whose length is unique decode
 alone. Equal-length early divergence is a true-batch bug.
+
+Stage 8/9 note: these two stages measure, they mostly don't judge — the
+decision they feed is "is serial datagen fast enough for an overnight
+epoch, or do we need real batching (server / upstream fix)?". Both time
+the REAL harness (no synthetic prompts), so t8's `s/gen` already includes
+prompt building, NAMS retrieval, image noise, and the analyst call,
+amortized per player generation — the unit `--max-generations` caps. Read
+t8's epoch extrapolation first; then t9's speedup: x~1.0 means the parallel
+sessions never landed equal-length prompts in the same dispatch window
+(decode fully serialized — expected with divergent game histories), and
+anything ≥ x1.3 means cohorts DO form on this workload. The only assertion
+is that `--parallel 2` is not ≥1.6x SLOWER per generation than serial,
+which would indicate dispatcher pathology rather than absent cohorts.
+Both stages share t9's caveat: sampled replies make single runs noisy —
+treat ±15% as measurement error, rerun before drawing conclusions from
+small differences.
 
 Stage 4 note: the rollback variant relies on `--lr 0.05` wrecking the
 adapter between saves, which is near-certain but stochastic; if no
