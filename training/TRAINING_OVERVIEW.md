@@ -49,6 +49,54 @@ deviations and calls the loop — copy
 (`python -m training.train --data ...`, every flag mapping 1:1 onto a
 `TrainConfig` field) is kept for ad-hoc runs.
 
+### The weekend run (serial, multi-epoch)
+
+`python -m training.run_weekend` chains **3 expert-iteration epochs**
+unattended: for each epoch k it runs serial datagen
+(`generate_game_traces --label weekend_iter<k> --parallel 1`, on the
+previous epoch's adapter) and then trains on that epoch's traces + the
+manifest replay sources, resumed from the previous adapter. Serial because
+of the Gemma 4 left-pad prefill bug
+([huggingface/transformers#47651](https://github.com/huggingface/transformers/issues/47651));
+see the stage-6/8/9 notes in [TO_TEST.md](TO_TEST.md).
+
+Launch (remote box, NAMS up, external data downloaded, from repo root):
+
+```bash
+nohup python -m training.run_weekend > weekend.log 2>&1 &
+```
+
+**Fitting the window.** Run selftest t8 first for the real serial
+seconds-per-generation. One epoch costs roughly
+`--max-generations x s/gen` of datagen (~22 h at the last measurement)
+plus one train stage; `--max-generations` (default 3000) is the knob —
+e.g. `--max-generations 2400` shaves ~4.5 h per epoch. `--epochs`,
+`--games`, `--start-checkpoint`, and `--prefix` are also flags. Before the
+real launch, rehearse the whole orchestration cheaply (TO_TEST.md,
+"weekend rehearsal"): a tiny budget plus `--train-max-steps` exercises
+subprocess chaining, checkpoint hand-off, and the state file in under an
+hour.
+
+**Weights survive every epoch by construction:** each epoch's train stage
+saves under `weights/<arch>/weekend_iter<k>_step<N>/` (periodic +
+final saves), and labels differ per epoch, so nothing is ever
+overwritten. The final adapter name is logged at the end and recorded in
+the state file.
+
+**Crashes and restarts.** Every stage is a subprocess, retried once on
+failure. A partially-crashed datagen resumes via `--append` with the
+remaining generation budget; a twice-failed train stage carries the
+previous epoch's checkpoint forward (always logged at ERROR, never
+silently). `data_game/weekend_state.json` records finished stages, so
+rerunning the same command after a box reboot skips completed work; to
+force a stage to rerun, delete its entry from that file (and for datagen,
+the `data_game/weekend_iter<k>/` directory).
+
+**Monitoring:** `tail -f weekend.log`; per-epoch
+`data_game/weekend_iter<k>/generation_stats.json` (wall clock,
+`seconds_per_generation`) and `logs/train_weekend_iter<k>_<stamp>/`
+(steps, evals, rollbacks).
+
 The loop is deliberately source-agnostic. Everything it knows about data
 comes through two small types:
 

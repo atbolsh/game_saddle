@@ -65,6 +65,24 @@ Both stages share t9's caveat: sampled replies make single runs noisy —
 treat ±15% as measurement error, rerun before drawing conclusions from
 small differences.
 
+Weekend rehearsal (NEW, before launching `training/run_weekend.py` for
+real): with NAMS up and external data downloaded, run
+
+    python -m training.run_weekend --prefix smoke --epochs 2 \
+        --games 2 --max-generations 8 --train-max-steps 25
+
+(~30–60 min). Verify: (1) it runs datagen → train → datagen → train with
+each stage in its own subprocess; (2) epoch 2's datagen logs
+`--checkpoint smoke_iter1_step<N>` — the checkpoint hand-off is the whole
+point; (3) `data_game/smoke_state.json` records the stages, and re-running
+the same command immediately exits after "already complete" skips; (4)
+checkpoints exist under `weights/<arch>/smoke_iter1_step*` and
+`smoke_iter2_step*`. Then delete `data_game/smoke_iter*`,
+`data_game/smoke_state.json`, and `weights/<arch>/smoke_iter*` before the
+real run. Kill-resume is worth one extra check if time permits: Ctrl-C
+mid-datagen, rerun, and confirm it resumes with `--append` and the
+remaining budget.
+
 Stage 4 note: the rollback variant relies on `--lr 0.05` wrecking the
 adapter between saves, which is near-certain but stochastic; if no
 `rolled_back` event fires, rerun once before treating it as a bug. The
