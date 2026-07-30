@@ -663,7 +663,13 @@ class VLModel:
         mask = inputs["attention_mask"]
         inputs["position_ids"] = (mask.long().cumsum(-1) - 1).clamp(min=0)
         with torch.inference_mode():
-            out = self.model(**inputs)
+            # logits_to_keep=1: only the last position's logits are needed,
+            # and materializing the full [batch, seq, ~262k-vocab] tensor
+            # costs GIGABYTES of transient VRAM at game-size prompts (the
+            # parity check would then dominate batch-3 memory). A renamed/
+            # removed kwarg fails loudly with TypeError -- by design, never
+            # silently fall back to full logits.
+            out = self.model(**inputs, logits_to_keep=1)
         return out.logits[:, -1].float().cpu()
 
     def _move_inputs_to_model(self, inputs: dict[str, Any]) -> dict[str, Any]:

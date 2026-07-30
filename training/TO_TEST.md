@@ -18,8 +18,8 @@ lines back for review. On a FAIL, also paste the traceback that precedes it.
 | 5 | `python -m training.selftest t5` | ~10–20 min | datagen 2 games x 5 moves at `--parallel 2`: traces + stored frames + stats + plots written, one record per generation, tripwire silent, ratings parsed; `analyst_traces.jsonl` has one record per round (minus counted truncated-search skips), analyses nonempty, frames shared with player records |
 | 6 | `python -m training.selftest t6` | minutes | equal-length identical-prompt true GPU batch vs solo; variable-length via the VERIFIED LEFT-PAD workaround vs solo (must byte-match AND must actually take the padded path, not the cohort fallback) |
 | 7 | `python -m training.selftest t7` | minutes | t5's traces through `GameTraceSource` + `AnalystTraceSource` and real train steps (RL weights + KD-vs-base analyst anchor, mixed CE/KD buckets, per-run noised frames, finite losses; the tiny epoch is drained so the KD bucket is guaranteed to train) |
-| 8 | `python -m training.selftest t8` | ~5–15 min | REAL serial datagen timing: the tiny shared workload (2 games × 3 moves, `--parallel 1`) through the actual session harness with the model pre-loaded/warmed (startup excluded); reports `seconds_per_generation` and the serial wall-clock a default epoch (3000 gens) implies. Its `generation_stats.json` is t9's baseline |
-| 9 | `python -m training.selftest t9` | ~5–15 min | t8's EXACT workload at `--parallel 2` (run t8 first — its stats file is the serial baseline), compared on `seconds_per_generation`; asserts parallel is not ≫ slower, REPORTS the speedup |
+| 8 | `python -m training.selftest t8` | ~15–40 min | REAL serial datagen timing: the shared workload (3 games × 4 moves, `--parallel 1`) through the actual session harness with the model pre-loaded/warmed (startup excluded); reports `seconds_per_generation` and the serial wall-clock a default epoch (3000 gens) implies. Its `generation_stats.json` is t9's baseline (t9 checks the game count and refuses a stale one) |
+| 9 | `python -m training.selftest t9` | ~10–25 min | t8's EXACT workload at `--parallel 3` (run t8 first — its stats file is the serial baseline), compared on `seconds_per_generation`; asserts parallel is not ≫ slower, REPORTS the speedup (expect a real one now: phase-locking dispatcher + verified left-pad batching) |
 
 (`python -m training.selftest all` runs everything in order; the exit code
 is the number of failures.)
@@ -70,16 +70,31 @@ epoch, or do we need real batching (server / upstream fix)?". Both time
 the REAL harness (no synthetic prompts), so t8's `s/gen` already includes
 prompt building, NAMS retrieval, image noise, and the analyst call,
 amortized per player generation — the unit `--max-generations` caps. Read
-t8's epoch extrapolation first; then t9's speedup. With the verified
-left-pad workaround (stage 6 note), mixed-length rows in one dispatch
-window now decode as ONE padded batch, so x~1.0 no longer means "no
-equal-length cohorts" — it means the dispatch windows themselves rarely
-held 2 requests (sessions out of phase), or the per-batch overhead (solo
-prefills for the parity check) ate the win on this tiny workload. Check
-`batch_mode` in `llm_calls.jsonl`: `padded(...)` entries confirm the
-workaround engaged. The only assertion is that `--parallel 2` is not
-≥1.6x SLOWER per generation than serial, which would indicate dispatcher
-pathology.
+t8's epoch extrapolation first; then t9's speedup. Two mechanisms have to
+cooperate for a real speedup: the verified left-pad workaround (stage 6
+note) lets mixed-length rows decode as ONE padded batch, and the
+PHASE-LOCKING dispatcher (agent/parallel_gen.py) gets compatible requests
+to be concurrent in the first place — player and analyst generations have
+different stop signatures and can never batch with each other, so with
+the old fixed 50 ms window two sessions drifted into stable anti-phase
+and measured x1.18; the scheduler now holds requests until every live
+worker has submitted, then serves the smallest signature group first so
+the sessions re-align (one solo generation of re-sync cost, then players
+batch with players and analysts with analysts). Diagnosis order for a low
+number: (1) `dispatch: group of N [reason]` lines in the run log — N
+should reach the worker count with reason `full-batch` after the first
+round or two; persistent `phase-lock`/size-1 groups mean the sessions
+never aligned; (2) `batch_mode` in `llm_calls.jsonl` — `padded(...)`
+entries confirm the stage-6 workaround engaged; (3) frequent
+`hold-timeout` reasons mean a worker keeps stalling >120 s in non-GPU
+work (NAMS?). The only assertion is that `--parallel 3` is not ≥1.6x
+SLOWER per generation than serial, which would indicate dispatcher
+pathology. NOTE for this rerun: `prefill_last_logits` now passes
+`logits_to_keep=1` (kwarg assumed present in transformers 5.14 — a
+rename fails loudly as TypeError in t6); without it the parity check
+transiently materialized multi-GB full-vocab logits, which is what would
+have made `--parallel 3` VRAM-tight. With it, batch 3 adds only ~0.5 GB
+of KV cache per extra row at game-size contexts.
 Both stages share t9's caveat: sampled replies make single runs noisy —
 treat ±15% as measurement error, rerun before drawing conclusions from
 small differences.

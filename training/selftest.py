@@ -11,8 +11,8 @@ finished::
     python -m training.selftest t5     # ~10-20m   datagen 2 games, --parallel 2
     python -m training.selftest t6     # minutes   batched-vs-solo generation A/B
     python -m training.selftest t7     # minutes   t5 traces -> real train steps
-    python -m training.selftest t8     # ~5-15m    real serial datagen timing
-    python -m training.selftest t9     # ~5-15m    same workload at --parallel 2
+    python -m training.selftest t8     # ~15-40m   real serial datagen timing
+    python -m training.selftest t9     # ~10-25m   same workload at --parallel 3
 
 or everything in order with ``python -m training.selftest all``. Every stage
 prints exactly one line ``TEST <id> PASS/FAIL: <evidence>`` (paste those
@@ -37,7 +37,7 @@ Stage map (rationale in the Intermission plan):
   * t7-e2e      GameTraceSource over t5's output through real train steps
   * t8-timing   REAL serial datagen run (startup excluded), s/generation
                 + serial epoch extrapolation; t9's baseline
-  * t9-parallel t8's exact workload at --parallel 2, compared on
+  * t9-parallel t8's exact workload at --parallel 3, compared on
                 seconds_per_generation (speedup reported, slowdown asserted)
 """
 
@@ -1117,9 +1117,17 @@ def t7_e2e() -> str:
     )
 
 
-#: One tiny datagen workload, shared by t8 (serial) and t9 (--parallel 2)
-#: so their seconds_per_generation are directly comparable.
-_TIMING_WORKLOAD = ["--games", "2", "--max-moves", "3", "--seed", "11"]
+#: One small datagen workload, shared by t8 (serial) and t9 (--parallel 3)
+#: so their seconds_per_generation are directly comparable. Sized for the
+#: parallel measurement: 3 games so each of t9's 3 workers plays exactly
+#: one (no straggler imbalance beyond game-length variance), 4 moves so the
+#: phase-locked steady state (agent/parallel_gen.py) outweighs the one-off
+#: re-sync cost. The old 2x3 workload was mostly ramp and tail, which is
+#: why its speedup read as noise.
+_TIMING_GAMES = 3
+_TIMING_MOVES = 4
+_TIMING_WORKLOAD = ["--games", str(_TIMING_GAMES),
+                    "--max-moves", str(_TIMING_MOVES), "--seed", "11"]
 
 
 def _warmed_timed_datagen(label: str, parallel: int) -> dict:
@@ -1173,17 +1181,19 @@ def t8_timing() -> str:
 
 
 def t9_parallel() -> str:
-    """t8's exact workload at ``--parallel 2``, compared on
+    """t8's exact workload at ``--parallel 3``, compared on
     ``seconds_per_generation``. GPU + NAMS; run t8 FIRST (its
     generation_stats.json is the serial baseline).
 
-    The speedup is REPORTED, not asserted: with the verified left-pad
-    workaround (TO_TEST stage-6 note, transformers#47651) mixed-length
-    rows sharing a dispatch window decode as ONE padded batch, so x~1.0
-    now means the windows rarely held 2 requests (sessions out of phase)
-    or parity-check overhead ate the win on this tiny workload -- check
-    `batch_mode` in llm_calls.jsonl. The only assertion is the slowdown
-    tripwire (dispatcher pathology).
+    With the phase-locking dispatcher (agent/parallel_gen.py) plus the
+    verified left-pad workaround (TO_TEST stage-6 note,
+    transformers#47651), concurrent sessions should lock into the same
+    round phase and decode as real batches -- expect a solid speedup, not
+    the x1.18 the old fixed-window dispatcher measured. If it reads
+    x~1.0-1.2, check the `dispatch: group of N [reason]` lines in the run
+    log (are groups forming?) and `batch_mode` in llm_calls.jsonl (did
+    padding engage?). The speedup is still REPORTED, not asserted; the
+    only assertion is the slowdown tripwire (dispatcher pathology).
     """
     base = (REPO_ROOT / "data_game" / "selftest_t8_serial"
             / "generation_stats.json")
@@ -1191,24 +1201,29 @@ def t9_parallel() -> str:
     serial = json.loads(base.read_text(encoding="utf-8"))
     s_ser = serial["seconds_per_generation"]
     assert serial["parallel"] == 1 and s_ser, serial
+    assert serial.get("games") == _TIMING_GAMES, (
+        f"t8 baseline played {serial.get('games')} game(s) but the current "
+        f"timing workload is {_TIMING_GAMES} -- the workload definition "
+        "changed since that run; rerun t8 first"
+    )
 
-    summary = _warmed_timed_datagen("selftest_t9_par2", parallel=2)
+    summary = _warmed_timed_datagen("selftest_t9_par3", parallel=3)
     s_par = summary["seconds_per_generation"]
     speedup = s_ser / s_par
-    # Tripwire only: --parallel 2 must not be catastrophically SLOWER
-    # than serial (that would mean dispatcher pathology, not just
-    # under-filled dispatch windows). Wins are evidence, not assertions.
+    # Tripwire only: --parallel 3 must not be catastrophically SLOWER
+    # than serial (that would mean dispatcher pathology, e.g. phase-lock
+    # holds gone wrong). Wins are evidence, not assertions.
     assert s_par <= 1.6 * s_ser, (
-        f"--parallel 2 much slower than serial: {s_par:.1f} vs "
+        f"--parallel 3 much slower than serial: {s_par:.1f} vs "
         f"{s_ser:.1f} s/gen -- dispatcher pathology?"
     )
     return (
         f"serial {s_ser:.1f}s/gen ({serial['generations']} gens, "
-        f"{serial['wall_seconds']:.0f}s wall) vs --parallel 2 "
+        f"{serial['wall_seconds']:.0f}s wall) vs --parallel 3 "
         f"{s_par:.1f}s/gen ({summary['generations']} gens, "
         f"{summary['wall_seconds']:.0f}s wall): speedup x{speedup:.2f} "
-        "(x~1.0 = dispatch windows rarely held 2 requests; check "
-        "batch_mode in llm_calls.jsonl for padded(...) entries)"
+        "(low? check 'dispatch: group of N' log lines and batch_mode in "
+        "llm_calls.jsonl)"
     )
 
 
@@ -1224,7 +1239,7 @@ STAGES: list[tuple[str, str, "callable"]] = [
     ("t6-ab", "batched vs solo generation", t6_ab),
     ("t7-e2e", "traces -> train steps", t7_e2e),
     ("t8-timing", "real serial datagen s/gen + epoch extrapolation", t8_timing),
-    ("t9-parallel", "t8's workload at --parallel 2, compared", t9_parallel),
+    ("t9-parallel", "t8's workload at --parallel 3, compared", t9_parallel),
 ]
 
 
