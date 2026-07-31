@@ -267,13 +267,20 @@ analyst / training all see the same bytes) and again at training time
 (strength 1.0, fresh per-run noised copies made by `GameTraceSource`) —
 **label-safe image regularization**, sampled per image:
 
-- Gaussian pixel noise;
+- Gaussian pixel noise, plus weaker per-pixel speckle (multiplicative);
 - mild blur OR JPEG compression artifacts (one of the two);
 - brightness / contrast / color jitter;
-- 2–6 small discolored patches (semi-transparent tints, a few percent of
-  the image side each — mild local discoloration, not dropout);
+- 2–6 BIG discolored patches (semi-transparent tints, 8–25% of the image
+  side each; placed uniformly at random, so partially covering the agent or
+  the gold is allowed and intended — tints, not dropout);
+- one whole-image color-drift tint (a full-frame translucent rectangle,
+  weaker than the patches);
 - slight random crops / rescales (≤4% per edge — small enough not to cut
   off the agent or the gold).
+
+Magnitudes are tuned by eye in `notebooks/noise_tuner.ipynb` (sliders over a
+live board frame; a "Regenerate" button rerolls the board and every random
+draw).
 
 **NOT label-safe here, do not use naively:** horizontal/vertical flips and
 rotations. They invert or shift the clock/bearing semantics that the OBS

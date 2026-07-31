@@ -8,10 +8,14 @@ gets mild, LABEL-SAFE degradation, sampled per image:
   * slight random crop + rescale back (small enough never to cut off the
     agent or the gold);
   * brightness / contrast / color jitter;
-  * 2-6 small DISCOLORED patches -- semi-transparent color tints, each a few
-    percent of the image side. Deliberately not dropout: no black boxes, no
-    big occlusions, just mild local discoloration;
-  * gaussian pixel noise;
+  * 2-6 BIG discolored rectangles -- semi-transparent color tints, each
+    8-25% of the image side. Placed uniformly at random, so they CAN land
+    on the agent or the gold: partial occlusion is deliberate perception
+    stress. Still tints, never opaque black boxes -- not dropout;
+  * ONE whole-image color drift tint (a full-frame translucent rectangle,
+    much weaker than the patches);
+  * weak per-pixel speckle (multiplicative) + gaussian pixel noise
+    (additive);
   * mild gaussian blur OR a JPEG re-encode (compression artifacts), one of
     the two.
 
@@ -31,6 +35,12 @@ Used in two places with different strengths:
 
 Everything is driven by a caller-provided ``random.Random`` -- deterministic
 under a fixed seed, varying across a stream of calls.
+
+Magnitudes are tuned BY EYE in ``notebooks/noise_tuner.ipynb`` (sliders over
+a live board frame + a regenerate button); the keyword overrides on
+:func:`noise_image` exist for that notebook. When new magnitudes are chosen,
+update the module constants here -- the overrides are for experimentation,
+production callers pass none.
 """
 
 from __future__ import annotations
@@ -46,19 +56,42 @@ INFERENCE_STRENGTH = 0.5
 TRAINING_STRENGTH = 1.0
 
 #: Max crop margin per edge at strength 1.0 -- 4% of a side cannot cut off
-#: the agent or the gold (both are drawn well inside the board).
+#: the agent or the gold (both are drawn well inside the board). This is the
+#: ONLY sprite-protecting guard: the patches below have none, by design.
 _MAX_CROP = 0.04
-#: Patch geometry: each side is 2-8% of the image side at strength 1.0.
-_PATCH_SIDE = (0.02, 0.08)
+#: Patch geometry: each side is 8-25% of the image side at strength 1.0 --
+#: big enough to (sometimes) cover the agent or the gold.
+_PATCH_SIDE = (0.08, 0.25)
 #: Patch tint opacity range at strength 1.0 (alpha fraction).
 _PATCH_ALPHA = (0.12, 0.30)
+#: Whole-image color-drift tint opacity at strength 1.0 -- one full-frame
+#: translucent rectangle, deliberately weaker than the patches.
+_DRIFT_ALPHA = (0.04, 0.10)
+#: Speckle: per-pixel MULTIPLICATIVE noise sigma (fraction of the pixel
+#: value) at strength 1.0 -- deliberately weaker than the additive gaussian.
+_SPECKLE_SIGMA = (0.01, 0.04)
 
 
-def noise_image(img, rng: random.Random, strength: float = TRAINING_STRENGTH):
+def noise_image(img, rng: random.Random, strength: float = TRAINING_STRENGTH,
+                *,
+                patch_alpha: tuple[float, float] | None = None,
+                drift_alpha: tuple[float, float] | None = None,
+                speckle_sigma: tuple[float, float] | None = None):
     """Return a degraded RGB copy of a PIL image. ``strength`` scales every
-    magnitude (0 = identity); geometry stays fixed so labels stay true."""
+    magnitude (0 = identity); geometry stays fixed so labels stay true.
+
+    The keyword ranges override the module constants (same meaning) -- they
+    exist for notebooks/noise_tuner.ipynb. Every random draw happens
+    UNCONDITIONALLY and magnitudes only scale afterwards, so under a fixed
+    seed the same patches/tints/noise fields appear at every magnitude --
+    that is what makes the tuner's sliders rescale a frozen scene instead
+    of redrawing it."""
     import numpy as np
     from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
+
+    patch_alpha = patch_alpha or _PATCH_ALPHA
+    drift_alpha = drift_alpha or _DRIFT_ALPHA
+    speckle_sigma = speckle_sigma or _SPECKLE_SIGMA
 
     img = img.convert("RGB")
     w, h = img.size
@@ -80,7 +113,8 @@ def noise_image(img, rng: random.Random, strength: float = TRAINING_STRENGTH):
         factor = 1.0 + rng.uniform(-0.15, 0.15) * strength
         img = enhancer(img).enhance(factor)
 
-    # -- small discolored patches (tints, never opaque, never large)
+    # -- big discolored patches (tints, never opaque; placed uniformly at
+    #    random, so covering the agent or the gold is allowed and intended)
     overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     for _ in range(rng.randint(2, 6)):
@@ -89,15 +123,28 @@ def noise_image(img, rng: random.Random, strength: float = TRAINING_STRENGTH):
         x = rng.randint(0, max(0, w - pw))
         y = rng.randint(0, max(0, h - ph))
         tint = (rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255))
-        alpha = int(255 * rng.uniform(*_PATCH_ALPHA) * strength)
+        alpha = int(255 * rng.uniform(*patch_alpha) * strength)
         draw.rectangle([x, y, x + pw, y + ph], fill=(*tint, alpha))
     img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
 
-    # -- gaussian pixel noise
+    # -- whole-image color drift: one translucent tint over the entire frame
+    #    (the patches' full-frame little sibling)
+    tint = (rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255))
+    alpha = int(255 * rng.uniform(*drift_alpha) * strength)
+    if alpha > 0:
+        drift = Image.new("RGBA", (w, h), (*tint, alpha))
+        img = Image.alpha_composite(img.convert("RGBA"), drift).convert("RGB")
+
+    # -- per-pixel noise: weak multiplicative speckle, then additive
+    #    gaussian. Fields are drawn as STANDARD normals and scaled after, so
+    #    a magnitude change rescales the same pattern (see docstring).
     np_rng = np.random.default_rng(rng.getrandbits(32))
-    sigma = rng.uniform(2.0, 6.0) * strength
     arr = np.asarray(img, dtype=np.float32)
-    arr = arr + np_rng.normal(0.0, sigma, size=arr.shape)
+    speckle = rng.uniform(*speckle_sigma) * strength
+    arr = arr * (1.0 + speckle
+                 * np_rng.standard_normal(arr.shape, dtype=np.float32))
+    sigma = rng.uniform(2.0, 6.0) * strength
+    arr = arr + sigma * np_rng.standard_normal(arr.shape, dtype=np.float32)
     img = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
 
     # -- mild blur OR jpeg artifacts (one of the two)
