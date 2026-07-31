@@ -581,7 +581,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reset-every", type=int, default=100,
                    help="reset NAMS episodic memory (tips survive) every N "
                         "games (default 100 per TRAINING_EXTRA_DATASETS.md)")
-    p.add_argument("--question-rate", type=float, default=0.2,
+    p.add_argument("--question-rate", type=float, default=0.15,
                    help="probability that a round asks a perception "
                         "question (direction-balanced pool, see "
                         "PERCEPTION_QUESTION_GROUPS) instead of the default "
