@@ -118,6 +118,7 @@ import datetime
 import json
 import logging
 import math
+import os
 import random
 import subprocess
 import sys
@@ -131,6 +132,16 @@ from typing import Any, Callable, Iterator
 # ``agent`` package would not import.
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# FRAGMENTATION GUARD. weighted_loss passes a per-batch ``logits_to_keep``
+# tail, so kept-logit tensors come in many different sizes; the default
+# CUDA caching allocator fragments badly under variable-size multi-GiB
+# allocations (the 2026-07-31 t10 OOM showed 14.13 GiB "reserved but
+# unallocated" -- memory the process owned but could not use).
+# ``expandable_segments`` lets the allocator grow/shrink segments instead of
+# stranding them. Must be set BEFORE the first CUDA allocation, hence at
+# module import; ``setdefault`` so an explicit user setting wins.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 logger = logging.getLogger("train")
 
@@ -836,6 +847,15 @@ def weighted_loss(model: Any, model_inputs: dict, weights: Any,
     silently fall back to full-sequence logits (agent/model.py leans on the
     same kwarg).
 
+    KD ORDERING: the TEACHER forward runs FIRST, is immediately gathered
+    down to the masked (weighted) positions, and its kept-logit tensor is
+    freed -- only THEN does the student forward run. Second lesson learned
+    the hard way (t10, same day): with the student's kept logits + autograd
+    graph resident, the teacher's own multi-GiB kept-logit allocation
+    OOM'd even after the logits_to_keep fix. Teacher-first means the two
+    sides' big tensors never coexist, so a KD batch peaks at roughly the
+    same VRAM as a CE batch of the same geometry.
+
     With ``return_per_example=True`` returns ``(loss, per_example)`` where
     ``per_example`` is the detached [B] tensor of per-example normalized
     losses (exact per-source logging from mixed-source batches)."""
@@ -854,17 +874,47 @@ def weighted_loss(model: Any, model_inputs: dict, weights: Any,
     nz = weights[:, 1:] != 0
     first = int(nz.float().argmax(dim=1).min()) + 1 if bool(nz.any()) else 1
     tail = seq_len - first  # trailing label positions covering every weight
+
+    # Mask/bookkeeping first: it depends only on weights + input_ids, and
+    # the KD teacher (below) needs the mask BEFORE the student forward.
+    shift_labels = input_ids[:, -tail:]       # the tail's labels
+    n_rows, n_pos = shift_labels.shape
+    w = weights[:, -tail:].reshape(-1)
+    mask = w != 0
+    row_of = mask.nonzero(as_tuple=True)[0] // n_pos  # owning example per pos
+
+    # Multimodal configs (Gemma 4 Unified) keep vocab_size on text_config.
+    cfg = getattr(model, "config", None)
+    vocab = (getattr(cfg, "vocab_size", None)
+             or getattr(getattr(cfg, "text_config", None), "vocab_size", None))
+    if vocab:
+        kept_gib = n_rows * (tail + 1) * vocab * 4 / 2 ** 30
+        if kept_gib > 10.0:
+            logger.warning(
+                "weighted_loss: kept-logit tensor is ~%.1f GiB "
+                "(batch %d x tail %d x vocab %d, fp32) -- a batch mixing "
+                "short and long prompts, or very long targets, defeats the "
+                "logits_to_keep saving; check the collator's char-based "
+                "length bins (tokens != chars) if this recurs",
+                kept_gib, n_rows, tail + 1, vocab,
+            )
+
+    if loss_kind == "kd":
+        # TEACHER FIRST (see docstring): gather the masked rows and free
+        # the [B, tail+1, V] tensor before the student forward allocates
+        # its own copy + autograd graph.
+        teacher_logits = _base_model_logits(model, model_inputs,
+                                            logits_to_keep=tail + 1)
+        teacher = teacher_logits[:, :-1, :].reshape(
+            -1, teacher_logits.shape[-1]
+        )[mask].float()
+        del teacher_logits
+
     # Kept logits = positions [first-1, seq_len-1]; dropping the last one
     # below leaves exactly the logits that predict labels [first, seq_len-1].
     out = model(**model_inputs, logits_to_keep=tail + 1)
     shift_logits = out.logits[:, :-1, :]      # [B, tail, V]
-    shift_labels = input_ids[:, -tail:]       # the tail's labels
-    n_rows, n_pos = shift_labels.shape
-    w = weights[:, -tail:].reshape(-1)
-
     # Slice the weighted positions BEFORE any float32 cast.
-    mask = w != 0
-    row_of = mask.nonzero(as_tuple=True)[0] // n_pos  # owning example per pos
     student = shift_logits.reshape(-1, shift_logits.shape[-1])[mask].float()
 
     if loss_kind == "ce":
@@ -872,11 +922,6 @@ def weighted_loss(model: Any, model_inputs: dict, weights: Any,
             student, shift_labels.reshape(-1)[mask], reduction="none",
         )
     else:
-        teacher_logits = _base_model_logits(model, model_inputs,
-                                            logits_to_keep=tail + 1)
-        teacher = teacher_logits[:, :-1, :].reshape(
-            -1, teacher_logits.shape[-1]
-        )[mask].float()
         token_loss = -(F.softmax(teacher, dim=-1)
                        * F.log_softmax(student, dim=-1)).sum(dim=-1)
 

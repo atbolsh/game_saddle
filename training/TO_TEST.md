@@ -135,6 +135,22 @@ fitting the weekend window). A `logits_to_keep` rename in a future
 transformers fails loudly as TypeError in t3/t4/t10 — never silently fall
 back to full-sequence logits.
 
+Stage 10 note, round 2 (after t10's OWN OOM on 2026-07-31): the first t10
+run still died in the KD **teacher** forward (13.07 GiB allocation with
+72 GiB already resident and 14.13 GiB reserved-but-unallocated, i.e.
+fragmentation). Two further fixes in `training/train.py`: (1)
+`weighted_loss` now runs the teacher forward FIRST, gathers it down to the
+masked positions, and frees the big tensor BEFORE the student forward —
+the student's kept logits + autograd graph and the teacher's kept logits
+never coexist, so a KD batch peaks like a CE batch of the same geometry;
+(2) the module sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` at
+import (setdefault — an explicit env wins) because variable-size tail
+allocations fragment the default allocator. `weighted_loss` also logs a
+WARNING whenever a batch's kept-logit tensor would exceed ~10 GiB — if
+that fires often, the collator's char-based length bins are mixing rows
+whose TOKEN lengths differ badly (tokens != chars) and the binning needs
+revisiting. Same drill: rerun t3, t4 (correctness), then t10.
+
 Weekend rehearsal (NEW, before launching `training/run_weekend.py` for
 real): with NAMS up and external data downloaded, run
 
