@@ -50,7 +50,7 @@ whichever comes first -- each round costs two generations, and early
 wandering traces carry little signal per round, so short games are the
 cheap default; raise the cap as the player gets good enough to need it.
 
-**Perception-question rounds** (`--question-rate`, default 0.2): with this
+**Perception-question rounds** (`--question-rate`, default 0.15): with this
 probability a round asks a perception question ("Are you facing the gold?",
 "Is the gold to your left?", ...) instead of the default move request —
 targeted pressure on the identified weak point (reading the frame), with
