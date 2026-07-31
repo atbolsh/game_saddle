@@ -11,8 +11,9 @@ finished::
     python -m training.selftest t5     # ~10-20m   datagen 2 games, --parallel 2
     python -m training.selftest t6     # minutes   batched-vs-solo generation A/B
     python -m training.selftest t7     # minutes   t5 traces -> real train steps
-    python -m training.selftest t8     # ~5-15m    real serial datagen timing
-    python -m training.selftest t9     # ~5-15m    same workload at --parallel 2
+    python -m training.selftest t8     # ~15-40m   real serial datagen timing
+    python -m training.selftest t9     # ~10-25m   same workload at --parallel 3
+    python -m training.selftest t10    # ~20-30m   timed train batches + epoch est.
 
 or everything in order with ``python -m training.selftest all``. Every stage
 prints exactly one line ``TEST <id> PASS/FAIL: <evidence>`` (paste those
@@ -37,8 +38,12 @@ Stage map (rationale in the Intermission plan):
   * t7-e2e      GameTraceSource over t5's output through real train steps
   * t8-timing   REAL serial datagen run (startup excluded), s/generation
                 + serial epoch extrapolation; t9's baseline
-  * t9-parallel t8's exact workload at --parallel 2, compared on
+  * t9-parallel t8's exact workload at --parallel 3, compared on
                 seconds_per_generation (speedup reported, slowdown asserted)
+  * t10-traintime  4 timed micro-batches from every loss category on the
+                real overnight corpus (T10_DATAGEN_LABEL to change), peak
+                VRAM per category (tripwire vs the 2026-07-31 OOM), and a
+                whole-epoch train-time estimate; saves NO checkpoint
 """
 
 from __future__ import annotations
@@ -426,6 +431,22 @@ def t1_pure() -> str:
         )
     checks += 1
 
+    # ---- epoch_batches: batch_cap (long-target KD sources, e.g.
+    #      openthoughts) bounds THEIR batches without touching others
+    capped = [TrainingExample([{"role": "user", "content": [
+        {"type": "text", "text": "q" * 50}]}], "a", loss="kd", batch_cap=1)
+        for _ in range(3)]
+    batches = epoch_batches(exs + capped, micro_batch=4,
+                            rng=random.Random(0))
+    assert sum(len(b) for b in batches) == len(exs) + 3, "capped ex lost"
+    for b in batches:
+        if b[0].batch_cap is not None:
+            assert len(b) <= b[0].batch_cap, "batch_cap not enforced"
+            assert all(x.batch_cap == b[0].batch_cap for x in b)
+        else:
+            assert len(b) <= 4
+    checks += 1
+
     # ---- planted-error scrambler: deterministic, one labeled change,
     #      span points at the new text
     reply = (
@@ -512,9 +533,10 @@ def t1_pure() -> str:
     assert max(totals) < 1.1 * min(totals), f"unbalanced groups: {totals}"
     checks += 1
 
-    # ---- stack_equal_length: the generate_batch collation (Gemma 4 cannot
-    #      left-pad decode, so only equal-length rows may share a batch and
-    #      mixed lengths must be a hard error, not a silent pad)
+    # ---- stack_equal_length: generate_batch's equal-length-cohort
+    #      collation (mixed lengths must be a hard error, not a silent pad:
+    #      only the parity-checked path in _plan_padded_batch may left-pad
+    #      on Gemma 4 -- see the workaround banner in agent/model.py)
     import torch
 
     from agent.model import stack_equal_length
@@ -897,13 +919,30 @@ def t5_datagen() -> str:
 
 
 def t6_ab() -> str:
-    """Batched vs solo generation A/B (Gemma 4: equal-length cohorts only).
+    """Batched vs solo generation A/B.
 
       (1) identical prompts x3 -- true GPU batch (no pad); must match solo.
-      (2) variable-length prompts -- generate_batch splits into length
-          cohorts (still must match solo; may be B=1 per cohort).
+      (2) variable-length prompts -- the KNOWN TRANSFORMERS BUG WORKAROUND
+          in agent/model.py (transformers#47651): rows decode as ONE
+          verified left-padded batch. A row whose own length ~= 1 mod 32
+          is unpaddable (poison mode 2, discovered by THIS test on
+          2026-07-30) and gets the POISON MODE 2 RESCUE: one harmless
+          filler token nudges it off the residue so it joins the batch,
+          so its byte-parity reference is the NUDGED prompt's solo
+          reply. Prompt lengths are chosen AT RUNTIME: two distinct
+          paddable lengths (so padding genuinely engages -- asserted via
+          the generate_batch log; silent cohort fallback = FAIL) plus,
+          when the token grid allows, one unpaddable row to exercise the
+          rescue. All rows must match their solo reference byte-for-byte.
     """
-    from agent.model import get_model, stack_equal_length
+    import logging as _logging
+
+    from agent.model import (
+        PAD_POISON_MOD,
+        PAD_POISON_RESIDUE,
+        get_model,
+        stack_equal_length,
+    )
 
     model = get_model()
     with tempfile.TemporaryDirectory(prefix="selftest_t6_") as tmp:
@@ -916,30 +955,52 @@ def t6_ab() -> str:
             ]}]
             for _ in range(3)
         ]
-        var_prompts = [
-            [{"role": "user", "content": [
-                {"type": "image", "url": str(img)},
-                {"type": "text", "text": q},
-            ]}]
-            for q in (
-                "In one short sentence, what colors do you see?",
-                "Answer briefly: is the grid mostly empty? Explain in one "
-                "sentence why you think so.",
-                "Reply with a single word: light or dark background?",
-            )
-        ]
-
         same_enc = [model.encode_messages(p) for p in same_prompts]
         same_lens = {int(e["input_ids"].shape[1]) for e in same_enc}
         assert len(same_lens) == 1, same_lens
         stacked = stack_equal_length(same_enc)
         assert stacked["input_ids"].shape[0] == 3
 
-        var_lens = {
-            int(model.encode_messages(p)["input_ids"].shape[1])
-            for p in var_prompts
-        }
-        assert len(var_lens) > 1, f"var probe not variable: {sorted(var_lens)}"
+        # Variable-length prompts, chosen AT RUNTIME around the poison
+        # arithmetic (KNOWN TRANSFORMERS BUG WORKAROUND banner in
+        # agent/model.py): repeated " again" nudges the token length ~1
+        # per rep, giving a spread of lengths to pick from. We need two
+        # DISTINCT lengths not ~= 1 mod 32 (so the padded path genuinely
+        # engages) and, if the token grid yields one, a length ~= 1 mod
+        # 32 (unpaddable, poison mode 2) to exercise the hybrid
+        # padded+cohorts split.
+        base_q = ("Answer briefly: is the grid mostly empty? Explain in "
+                  "one sentence why you think so.")
+
+        def _var_prompt(text: str) -> list[dict]:
+            return [{"role": "user", "content": [
+                {"type": "image", "url": str(img)},
+                {"type": "text", "text": text},
+            ]}]
+
+        len_to_text: dict[int, str] = {}
+        for k in range(48):
+            text = base_q + " again" * k
+            n = int(
+                model.encode_messages(_var_prompt(text))["input_ids"].shape[1]
+            )
+            len_to_text.setdefault(n, text)
+            paddable = sorted(
+                n for n in len_to_text
+                if n % PAD_POISON_MOD != PAD_POISON_RESIDUE
+            )
+            unpaddable = sorted(
+                n for n in len_to_text
+                if n % PAD_POISON_MOD == PAD_POISON_RESIDUE
+            )
+            if len(paddable) >= 2 and unpaddable:
+                break
+        assert len(paddable) >= 2, (
+            f"could not build 2 distinct paddable lengths from the filler "
+            f"scan: {sorted(len_to_text)}"
+        )
+        var_lens = [paddable[0], paddable[-1]] + unpaddable[:1]
+        var_prompts = [_var_prompt(len_to_text[n]) for n in var_lens]
 
         original = model._sampling_kwargs
         model._sampling_kwargs = lambda: {"do_sample": False}
@@ -950,14 +1011,60 @@ def t6_ab() -> str:
             batched_same = model.generate_batch(
                 [{"messages": p} for p in same_prompts], max_new_tokens=48,
             )
-            solo_var = [
-                model.generate(p, max_new_tokens=48) for p in var_prompts
-            ]
-            batched_var = model.generate_batch(
-                [{"messages": p} for p in var_prompts], max_new_tokens=48,
-            )
+            solo_var = []
+            for n, p in zip(var_lens, var_prompts):
+                if n % PAD_POISON_MOD == PAD_POISON_RESIDUE:
+                    # The padded batch decodes the NUDGED prompt (POISON
+                    # MODE 2 RESCUE, banner in agent/model.py), so this
+                    # row's byte-parity reference is the nudged prompt's
+                    # solo reply, built with the same canonical helper.
+                    nudge = model._nudge_unpaddable(p)
+                    assert nudge is not None, (
+                        f"POISON MODE 2 RESCUE could not nudge the L={n} "
+                        "prompt off the residue"
+                    )
+                    solo_var.append(
+                        model.generate(nudge[0], max_new_tokens=48)
+                    )
+                else:
+                    solo_var.append(model.generate(p, max_new_tokens=48))
+
+            class _Capture(_logging.Handler):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.lines: list[str] = []
+
+                def emit(self, record: _logging.LogRecord) -> None:
+                    self.lines.append(record.getMessage())
+
+            cap = _Capture()
+            _logging.getLogger("agent.model").addHandler(cap)
+            try:
+                batched_var = model.generate_batch(
+                    [{"messages": p} for p in var_prompts],
+                    max_new_tokens=48,
+                )
+            finally:
+                _logging.getLogger("agent.model").removeHandler(cap)
         finally:
             model._sampling_kwargs = original
+
+    padded_engaged = any(
+        "padded batch verified clean" in line for line in cap.lines
+    )
+    assert padded_engaged, (
+        "variable-length batch did NOT take the verified-padded path "
+        "(KNOWN TRANSFORMERS BUG WORKAROUND, transformers#47651) -- it "
+        "fell back to length cohorts, which kills parallel-datagen "
+        "throughput. generate_batch log: " + " | ".join(cap.lines)
+    )
+    if unpaddable:
+        assert any("POISON MODE 2 RESCUE" in line for line in cap.lines), (
+            f"row of length {unpaddable[0]} (~= "
+            f"{PAD_POISON_RESIDUE} mod {PAD_POISON_MOD}) was NOT nudged "
+            "off the poison residue -- mode 2 rescue missing? "
+            "generate_batch log: " + " | ".join(cap.lines)
+        )
 
     mism_same = [
         (i, s, b) for i, (s, b) in enumerate(zip(solo_same, batched_same))
@@ -974,14 +1081,22 @@ def t6_ab() -> str:
         )
     )
     assert not mism_var, (
-        "variable-length (length-cohort) batch != solo: "
+        "variable-length VERIFIED-PADDED batch != solo (the parity check "
+        "passed but decode diverged -- transformers#47651 workaround "
+        "assumption broken?): "
         + "; ".join(
             f"[{i}] solo={s!r} batched={b!r}" for i, s, b in mism_var
         )
     )
+    hybrid = (
+        f" + unpaddable {unpaddable[0]} nudged into the batch"
+        if unpaddable
+        else " (no unpaddable length on the filler grid this run)"
+    )
     return (
-        f"equal-len 3/3 identical (true batch); var-len 3/3 identical "
-        f"via length cohorts {sorted(var_lens)}; "
+        f"equal-len 3/3 identical (true batch); var-len "
+        f"{len(var_prompts)}/{len(var_prompts)} identical, padded rows "
+        f"{paddable[0]}+{paddable[-1]}{hybrid}; "
         f"e.g. same0={solo_same[0][:50]!r}"
     )
 
@@ -1024,9 +1139,17 @@ def t7_e2e() -> str:
     )
 
 
-#: One tiny datagen workload, shared by t8 (serial) and t9 (--parallel 2)
-#: so their seconds_per_generation are directly comparable.
-_TIMING_WORKLOAD = ["--games", "2", "--max-moves", "3", "--seed", "11"]
+#: One small datagen workload, shared by t8 (serial) and t9 (--parallel 3)
+#: so their seconds_per_generation are directly comparable. Sized for the
+#: parallel measurement: 3 games so each of t9's 3 workers plays exactly
+#: one (no straggler imbalance beyond game-length variance), 4 moves so the
+#: phase-locked steady state (agent/parallel_gen.py) outweighs the one-off
+#: re-sync cost. The old 2x3 workload was mostly ramp and tail, which is
+#: why its speedup read as noise.
+_TIMING_GAMES = 3
+_TIMING_MOVES = 4
+_TIMING_WORKLOAD = ["--games", str(_TIMING_GAMES),
+                    "--max-moves", str(_TIMING_MOVES), "--seed", "11"]
 
 
 def _warmed_timed_datagen(label: str, parallel: int) -> dict:
@@ -1080,14 +1203,19 @@ def t8_timing() -> str:
 
 
 def t9_parallel() -> str:
-    """t8's exact workload at ``--parallel 2``, compared on
+    """t8's exact workload at ``--parallel 3``, compared on
     ``seconds_per_generation``. GPU + NAMS; run t8 FIRST (its
     generation_stats.json is the serial baseline).
 
-    The speedup is REPORTED, not asserted: with Gemma 4 equal-length
-    cohorts (TO_TEST stage-6 note) it is workload-dependent, and x~1.0
-    simply means no cohorts formed and decode stayed serialized. The only
-    assertion is the slowdown tripwire (dispatcher pathology).
+    With the phase-locking dispatcher (agent/parallel_gen.py) plus the
+    verified left-pad workaround (TO_TEST stage-6 note,
+    transformers#47651), concurrent sessions should lock into the same
+    round phase and decode as real batches -- expect a solid speedup, not
+    the x1.18 the old fixed-window dispatcher measured. If it reads
+    x~1.0-1.2, check the `dispatch: group of N [reason]` lines in the run
+    log (are groups forming?) and `batch_mode` in llm_calls.jsonl (did
+    padding engage?). The speedup is still REPORTED, not asserted; the
+    only assertion is the slowdown tripwire (dispatcher pathology).
     """
     base = (REPO_ROOT / "data_game" / "selftest_t8_serial"
             / "generation_stats.json")
@@ -1095,23 +1223,212 @@ def t9_parallel() -> str:
     serial = json.loads(base.read_text(encoding="utf-8"))
     s_ser = serial["seconds_per_generation"]
     assert serial["parallel"] == 1 and s_ser, serial
+    assert serial.get("games") == _TIMING_GAMES, (
+        f"t8 baseline played {serial.get('games')} game(s) but the current "
+        f"timing workload is {_TIMING_GAMES} -- the workload definition "
+        "changed since that run; rerun t8 first"
+    )
 
-    summary = _warmed_timed_datagen("selftest_t9_par2", parallel=2)
+    summary = _warmed_timed_datagen("selftest_t9_par3", parallel=3)
     s_par = summary["seconds_per_generation"]
     speedup = s_ser / s_par
-    # Tripwire only: --parallel 2 must not be catastrophically SLOWER
-    # than serial (that would mean dispatcher pathology, not just absent
-    # cohorts). Wins are evidence, not assertions.
+    # Tripwire only: --parallel 3 must not be catastrophically SLOWER
+    # than serial (that would mean dispatcher pathology, e.g. phase-lock
+    # holds gone wrong). Wins are evidence, not assertions.
     assert s_par <= 1.6 * s_ser, (
-        f"--parallel 2 much slower than serial: {s_par:.1f} vs "
+        f"--parallel 3 much slower than serial: {s_par:.1f} vs "
         f"{s_ser:.1f} s/gen -- dispatcher pathology?"
     )
     return (
         f"serial {s_ser:.1f}s/gen ({serial['generations']} gens, "
-        f"{serial['wall_seconds']:.0f}s wall) vs --parallel 2 "
+        f"{serial['wall_seconds']:.0f}s wall) vs --parallel 3 "
         f"{s_par:.1f}s/gen ({summary['generations']} gens, "
         f"{summary['wall_seconds']:.0f}s wall): speedup x{speedup:.2f} "
-        "(x~1.0 = no equal-length cohorts, decode serial)"
+        "(low? check 'dispatch: group of N' log lines and batch_mode in "
+        "llm_calls.jsonl)"
+    )
+
+
+#: t10 profiles the train loop on a REAL datagen corpus. Default: the
+#: 2026-07-30 overnight run (3000 generations, game-length contexts -- the
+#: corpus that exposed all three training OOMs; the four VRAM rules that
+#: fixed them live in train.weighted_loss's docstring). Override with
+#: T10_DATAGEN_LABEL=<label> to profile a different data_game/<label>/.
+_T10_LABEL = os.environ.get("T10_DATAGEN_LABEL", "overnight_iter1")
+_T10_BATCHES_PER_SOURCE = 4
+#: Peak-VRAM tripwire: the box is ~95 GiB; the overnight OOM happened at
+#: 86.85 GiB held + 18.52 GiB requested. If profiling peaks above this,
+#: do NOT launch the weekend run.
+_T10_VRAM_LIMIT_GIB = 88.0
+
+
+def t10_traintime() -> str:
+    """Timed train micro-batches from EVERY loss category, on the real
+    overnight corpus, + a whole-epoch runtime estimate. GPU required; no
+    NAMS. NO CHECKPOINT IS SAVED (this stage never calls save_checkpoint).
+
+    Categories = data sources: GameTraceSource (player records, weighted
+    CE -- the RL/"REINFORCE" signal), AnalystTraceSource (KD vs the frozen
+    base -- the analyst anchor), and every enabled manifest source. For
+    each: 4 real micro-batches (collation + forward + backward, KD incl.
+    the teacher forward) through the same
+    build_model/Collator/weighted_loss/PagedAdamW8bit stack as
+    run_training, timed with CUDA sync, with per-source peak VRAM (this is
+    the pre-launch check on weighted_loss's four VRAM rules; consolidated
+    stage-10 note in TO_TEST.md).
+
+    The epoch estimate uses run_training's own batch arithmetic
+    (weight-scaled contributions / micro_batch, + optimizer steps every
+    grad_accum batches). It slightly UNDERestimates a real epoch: bucket
+    remainders add a few short batches, and save-time eval hooks (held-out
+    loss + probes, ~3-5 min per save) are not included.
+    """
+    import math
+    import random as pyrandom
+    import time
+
+    import torch
+
+    from agent.config import CONFIG
+    from agent.model import ADAPTERS, spec_for
+    from training.external_data import sources_from_manifest
+    from training.game_traces import AnalystTraceSource, GameTraceSource
+    from training.train import (
+        Collator,
+        TrainConfig,
+        attach_neftune,
+        build_model,
+        epoch_batches,
+        materialize,
+        resolve_terminator_id,
+        weighted_loss,
+    )
+
+    traces_dir = REPO_ROOT / "data_game" / _T10_LABEL
+    assert (traces_dir / "traces.jsonl").is_file(), (
+        f"No generated data to use for the simulated training run: "
+        f"{traces_dir}/traces.jsonl does not exist. t10 profiles a REAL "
+        "datagen corpus -- run a datagen (training/generate_game_traces) "
+        "first, or point T10_DATAGEN_LABEL at an existing "
+        "data_game/<label> directory."
+    )
+    # Exactly the weekend run's source stack (run_weekend.train_one_epoch).
+    sources = [
+        GameTraceSource(traces_dir / "traces.jsonl"),
+        AnalystTraceSource(traces_dir / "analyst_traces.jsonl"),
+        *sources_from_manifest(),
+    ]
+    cfg = TrainConfig(label="selftest_t10")  # defaults = the real recipe
+    src_weights = {s.name: s.weight for s in sources}
+
+    print(f"[t10] corpus {traces_dir.name} + {len(sources) - 2} manifest "
+          "source(s); materializing (expect ~10-15 min: game-frame "
+          "noising + manifest loading)...", flush=True)
+    t0 = time.perf_counter()
+    by_source = materialize(sources, max_example_chars=cfg.max_example_chars)
+    setup_data_s = time.perf_counter() - t0
+    assert by_source, "materialize produced no sources"
+    print(f"[t10] materialized {sum(len(v) for v in by_source.values())} "
+          f"examples from {len(by_source)} source(s) in "
+          f"{setup_data_s / 60:.1f} min; loading 4-bit model + LoRA...",
+          flush=True)
+
+    t0 = time.perf_counter()
+    spec = spec_for(cfg.architecture or CONFIG.model_key)
+    model, processor, _targets, _proj = build_model(spec, cfg, CONFIG.hf_token)
+    attach_neftune(model, cfg.neftune_alpha)
+    terminator = resolve_terminator_id(
+        model, getattr(processor, "tokenizer", processor)
+    )
+    collator = Collator(processor, ADAPTERS[spec.family], terminator,
+                        compute_dtype=torch.bfloat16, device=cfg.device)
+    import bitsandbytes as bnb
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = bnb.optim.PagedAdamW8bit(params, lr=cfg.lr,
+                                         weight_decay=cfg.weight_decay)
+    model.train()
+    setup_model_s = time.perf_counter() - t0
+    print(f"[t10] model ready in {setup_model_s / 60:.1f} min; timing "
+          f"{_T10_BATCHES_PER_SOURCE} micro-batches per source (warmup "
+          "first, untimed)...", flush=True)
+
+    def _one_batch(exs: list) -> float:
+        """One real training micro-batch (collation + fwd + bwd), timed."""
+        torch.cuda.synchronize()
+        t = time.perf_counter()
+        built = collator.build_batch(exs)
+        loss = weighted_loss(model, built["model_inputs"], built["weights"],
+                             loss_kind=exs[0].loss)
+        assert torch.isfinite(loss), f"non-finite loss on {exs[0].source}"
+        (loss / cfg.grad_accum).backward()
+        torch.cuda.synchronize()
+        return time.perf_counter() - t
+
+    def _opt_step() -> float:
+        torch.cuda.synchronize()
+        t = time.perf_counter()
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        torch.cuda.synchronize()
+        return time.perf_counter() - t
+
+    rng = pyrandom.Random(0)
+    per_source: dict[str, dict] = {}
+    opt_s: float | None = None
+    warmed = False
+    for name, exs in sorted(by_source.items()):
+        batches = epoch_batches(list(exs), cfg.micro_batch, rng)
+        assert batches, f"source {name} materialized but produced no batches"
+        if not warmed:
+            # One untimed batch: CUDA context, allocator pools, cudnn
+            # autotuning all land here instead of in source #1's numbers.
+            _one_batch(batches[0])
+            _opt_step()
+            warmed = True
+        torch.cuda.reset_peak_memory_stats()
+        times = [_one_batch(b)
+                 for b in batches[:_T10_BATCHES_PER_SOURCE]]
+        step_s = _opt_step()
+        opt_s = step_s if opt_s is None else min(opt_s, step_s)
+        peak_gib = torch.cuda.max_memory_allocated() / 2**30
+        # run_training's own arithmetic for this source's share of an epoch
+        # (micro_batch_cap sources ride in smaller batches -> more of them)
+        eff_mb = min(cfg.micro_batch, exs[0].batch_cap or cfg.micro_batch)
+        n_epoch_batches = math.ceil(
+            max(1, round(src_weights.get(name, 1.0) * len(exs))) / eff_mb
+        )
+        per_source[name] = {
+            "loss_kind": batches[0][0].loss,
+            "n_examples": len(exs),
+            "mean_batch_s": sum(times) / len(times),
+            "peak_gib": peak_gib,
+            "epoch_batches": n_epoch_batches,
+        }
+        print(f"[t10] {name}[{batches[0][0].loss}]: "
+              f"{per_source[name]['mean_batch_s']:.2f}s/batch over "
+              f"{len(times)}, peak {peak_gib:.1f} GiB", flush=True)
+        assert peak_gib < _T10_VRAM_LIMIT_GIB, (
+            f"source {name} peaked at {peak_gib:.1f} GiB (> "
+            f"{_T10_VRAM_LIMIT_GIB} tripwire) -- the weekend run would "
+            "OOM; shrink micro_batch for this bucket before launching"
+        )
+
+    total_batches = sum(s["epoch_batches"] for s in per_source.values())
+    train_s = sum(s["epoch_batches"] * s["mean_batch_s"]
+                  for s in per_source.values())
+    train_s += (total_batches / cfg.grad_accum) * (opt_s or 0.0)
+    epoch_h = (setup_data_s + setup_model_s + train_s) / 3600
+
+    lines = [
+        f"{name}[{s['loss_kind']}]: {s['mean_batch_s']:.2f}s/batch, "
+        f"peak {s['peak_gib']:.1f}GiB, {s['epoch_batches']} batches/epoch"
+        for name, s in per_source.items()
+    ]
+    return (
+        f"epoch estimate ~{epoch_h:.1f}h ({total_batches} micro-batches + "
+        f"setup {(setup_data_s + setup_model_s) / 60:.0f}min; excludes "
+        "save-time eval hooks) -- " + "; ".join(lines)
     )
 
 
@@ -1127,7 +1444,9 @@ STAGES: list[tuple[str, str, "callable"]] = [
     ("t6-ab", "batched vs solo generation", t6_ab),
     ("t7-e2e", "traces -> train steps", t7_e2e),
     ("t8-timing", "real serial datagen s/gen + epoch extrapolation", t8_timing),
-    ("t9-parallel", "t8's workload at --parallel 2, compared", t9_parallel),
+    ("t9-parallel", "t8's workload at --parallel 3, compared", t9_parallel),
+    ("t10-traintime", "timed train batches per loss category + epoch "
+                      "estimate", t10_traintime),
 ]
 
 

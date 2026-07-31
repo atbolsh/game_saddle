@@ -1,10 +1,18 @@
 """Diagnose the Gemma 4 left-pad divergence: precision noise or mask bug?
 
-Background (see TO_TEST.md stage-6 note): left-padded variable-length
-multimodal decode diverges from solo generate even when every collated
-tensor is suffix-identical to the solo encoding, so ``generate_batch`` only
-true-batches equal-length rows. The open question is WHY the padded path
-diverges. Two competing theories with different fingerprints:
+STATUS: question ANSWERED -- it is a real upstream bug (mask/vision
+defect, transformers#47651), not precision noise. This probe produced the
+first evidence (the second fingerprint below, at specific pad lengths); the full
+characterization (poison modes, mod-32 rule) lives in
+training/probe_hacky_pads.py, and the shipped workaround in
+agent/model.py's KNOWN TRANSFORMERS BUG WORKAROUND banner. Kept as the
+minimal single-row prefill probe.
+
+Background (historical, pre-workaround): left-padded variable-length
+multimodal decode diverged from solo generate even when every collated
+tensor was suffix-identical to the solo encoding, so ``generate_batch``
+at the time only true-batched equal-length rows. The open question was
+WHY. Two competing theories with different fingerprints:
 
   * bf16/SDPA kernel noise -- next-token logits differ by ~1e-2, deltas do
     NOT grow with pad length, argmax flips (if any) land on near-tie
@@ -16,9 +24,9 @@ diverges. Two competing theories with different fingerprints:
     rows, which uncorrelated noise cannot explain).
 
 One prompt, one prefill forward pass per condition: solo, then the same row
-left-padded by 8 / 64 / 256 positions inside a batch-1 tensor (padding with
-the tokenizer's pad token; attention_mask zeros; every sequence-aligned int
-tensor padded in lockstep, exactly like the removed generate-path collate).
+left-padded by 8 / 64 / 256 positions inside a batch-1 tensor (via the
+canonical ``agent.model.left_pad_row``: pad token for input_ids, zeros for
+attention_mask and every other sequence-aligned int tensor, in lockstep).
 Also runs a text-only prompt to isolate the vision-block mask. Compares the
 last-position logits.
 
@@ -38,38 +46,18 @@ logger = logging.getLogger(__name__)
 
 def _left_pad_row(enc: dict[str, Any], pad_len: int,
                   pad_token_id: int) -> dict[str, Any]:
-    """Left-pad one batch-1 encoding by pad_len positions (probe-only)."""
-    import torch
+    """Canonical left-pad (agent.model.left_pad_row) plus probe-only
+    sanity asserts."""
+    from agent.model import left_pad_row
 
-    seq_len = enc["input_ids"].shape[1]
-    out: dict[str, Any] = {}
-    for k, v in enc.items():
-        if not isinstance(v, torch.Tensor):
-            continue
-        if (not v.dtype.is_floating_point and v.dim() == 2
-                and v.shape[1] == seq_len):
-            fill = pad_token_id if k == "input_ids" else 0
-            pad = v.new_full((1, pad_len), fill)
-            out[k] = torch.cat([pad, v], dim=1)
-        else:
-            out[k] = v
+    out = left_pad_row(enc, pad_len, pad_token_id)
     assert out["attention_mask"][0, :pad_len].sum() == 0
     assert (out["input_ids"][0, pad_len:] == enc["input_ids"][0]).all()
     return out
 
 
 def _last_logits(model: Any, enc: dict[str, Any]) -> Any:
-    import torch
-
-    inputs = model._move_inputs_to_model(enc)
-    # Mirror generate's prefill: position_ids from the attention mask (pad
-    # positions clamped to 0, real tokens 0..L-1). A bare forward would
-    # default to arange over the padded length instead.
-    mask = inputs["attention_mask"]
-    inputs["position_ids"] = (mask.long().cumsum(-1) - 1).clamp(min=0)
-    with torch.inference_mode():
-        out = model.model(**inputs)
-    return out.logits[:, -1].float().cpu()
+    return model.prefill_last_logits(enc)
 
 
 def _describe(tok: Any, logits: Any, k: int = 5) -> str:
@@ -175,11 +163,11 @@ def run_probe() -> int:
         "\nVERDICT GUIDE: max|dLogit| ~1e-2 flat across pad lengths and no "
         "argmax flips => bf16 kernel noise. Deltas >~0.5, growing with pad "
         "length, or flips toward caption-style tokens ('a', 'an') => real "
-        "mask/position defect. If batch-1 padding is tame but the "
-        "batch-of-2 padded row diverges hard, the bug is in the batched "
-        "multimodal path (image-feature scatter / mask across rows) -- "
-        "report upstream; equal-length-only batching stays mandatory "
-        "either way."
+        "mask/position defect. (Historical guide -- the defect verdict "
+        "WON, reported as transformers#47651; production now pads through "
+        "the parity-checked workaround in agent/model.py. Rerun this "
+        "probe after transformers upgrades: all-tame output at every pad "
+        "would mean the upstream fix landed.)"
     )
     return 1 if suspicious else 0
 

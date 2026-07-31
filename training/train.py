@@ -42,8 +42,13 @@ multimodal forward. An example that declares an image but produces no pixel
 tensor is a hard error (no silent text-only degradation). Vision/audio
 towers stay frozen (name-excluded from LoRA); the vision embedder
 (``embed_vision`` on Gemma 4) trains via PEFT ``modules_to_save`` and so
-rides inside the adapter checkpoint. Micro-batch is fixed at 1 (variable-size
-multimodal padding is a swamp; effective batch comes from grad accumulation).
+rides inside the adapter checkpoint. Micro-batches are length-bucketed and
+RIGHT-padded (:meth:`Collator.build_batch`; safe under causal attention +
+weight-0 pads, unlike inference-side LEFT padding -- see the workaround
+banner in agent/model.py); effective batch = micro_batch * grad_accum. A
+source may cap its own micro-batch (``TrainingExample.batch_cap``) when its
+loss needs more VRAM per example than the default allows -- the four VRAM
+rules that shape the loss live in :func:`weighted_loss`'s docstring.
 
 RECIPE (flags override): 4-bit NF4 + double quant + bf16 compute (QLoRA,
 Dettmers et al. 2023); LoRA r=32/alpha=64/dropout=0.05 on all language-model
@@ -116,6 +121,7 @@ import datetime
 import json
 import logging
 import math
+import os
 import random
 import subprocess
 import sys
@@ -129,6 +135,16 @@ from typing import Any, Callable, Iterator
 # ``agent`` package would not import.
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# FRAGMENTATION GUARD. weighted_loss passes a per-batch ``logits_to_keep``
+# tail, so kept-logit tensors come in many different sizes; the default
+# CUDA caching allocator fragments badly under variable-size multi-GiB
+# allocations (the 2026-07-31 t10 OOM showed 14.13 GiB "reserved but
+# unallocated" -- memory the process owned but could not use).
+# ``expandable_segments`` lets the allocator grow/shrink segments instead of
+# stranding them. Must be set BEFORE the first CUDA allocation, hence at
+# module import; ``setdefault`` so an explicit user setting wins.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 logger = logging.getLogger("train")
 
@@ -147,7 +163,11 @@ class TrainingExample:
     (see agent/model.py); ``target_text`` is the assistant reply to train on;
     ``span_weights`` are (char_start, char_end, weight) triples over
     ``target_text`` -- absent means plain SFT (every target token weighs 1);
-    ``loss`` picks the loss kind (see VALID_LOSSES)."""
+    ``loss`` picks the loss kind (see VALID_LOSSES); ``batch_cap`` (usually
+    None) caps the micro-batch this example may ride in -- for sources
+    whose targets span nearly the whole sequence, where full micro-batches
+    of kept logits would OOM (see weighted_loss; per-example loss
+    normalization means the cap changes memory, never results)."""
 
     messages: list[dict]
     target_text: str
@@ -155,6 +175,7 @@ class TrainingExample:
     loss: str = "ce"
     source: str = "unknown"
     meta: dict = field(default_factory=dict)
+    batch_cap: int | None = None
 
     def declares_image(self) -> bool:
         for m in self.messages:
@@ -779,19 +800,25 @@ def attach_neftune(model: Any, alpha: float) -> None:
 
 # ================================================================== loss
 
-def _base_model_logits(model: Any, model_inputs: dict) -> Any:
+def _base_model_logits(model: Any, model_inputs: dict,
+                       logits_to_keep: int = 0) -> Any:
     """Teacher forward for KD: the frozen base model's logits on the same
     inputs, via PEFT's ``disable_adapter()`` (bypasses BOTH the LoRA deltas
     and the modules_to_save projector copy -- VERIFY the projector part on
     the remote box, see TO_TEST.md). Forced to eval mode for the duration so
-    the NEFTune hook and dropout cannot perturb the teacher."""
+    the NEFTune hook and dropout cannot perturb the teacher.
+
+    ``logits_to_keep``: only project the LAST k positions to vocab space
+    (0 = all, the HF convention). weighted_loss always passes the tail it
+    needs -- full-sequence teacher logits are what OOM'd the 2026-07-31
+    overnight run (VRAM rule 1 in weighted_loss's docstring)."""
     import torch
 
     was_training = model.training
     model.eval()
     try:
         with torch.no_grad(), model.disable_adapter():
-            out = model(**model_inputs)
+            out = model(**model_inputs, logits_to_keep=logits_to_keep)
     finally:
         if was_training:
             model.train()
@@ -800,54 +827,128 @@ def _base_model_logits(model: Any, model_inputs: dict) -> Any:
 
 def weighted_loss(model: Any, model_inputs: dict, weights: Any,
                   loss_kind: str = "ce", return_per_example: bool = False):
-    """Per-token weighted loss: each example is normalized by ITS OWN sum of
-    ABSOLUTE weights (so plain-SFT and annotated/negative-weight examples
-    arrive at comparable gradient scale, and long examples don't dominate),
-    then the batch is the mean over examples -- a micro-batch of B is
-    EXACTLY equivalent to B batch-1 passes averaged, padding positions
-    carry weight 0 and vanish entirely.
+    """Per-token weighted loss over one collated micro-batch.
+
+    Each example is normalized by ITS OWN sum of ABSOLUTE weights (so
+    plain-SFT and annotated/negative-weight examples arrive at comparable
+    gradient scale, and long examples don't dominate), then the batch is
+    the mean over examples. Key consequence, used throughout the trainer:
+    a micro-batch of B is EXACTLY equivalent to B batch-1 passes averaged
+    -- padding positions carry weight 0 and vanish, so batch composition
+    can never change results, only memory and speed.
 
     ``loss_kind="ce"``: token cross-entropy against the example's targets.
     ``loss_kind="kd"``: soft cross-entropy against the frozen BASE model's
     distribution on the same inputs (self-distillation replay -- preserve,
-    don't teach).
+    don't teach). With ``return_per_example=True`` returns
+    ``(loss, per_example)``, the latter a detached [B] tensor of
+    per-example losses (exact per-source logging from mixed batches).
 
-    BOTH paths slice the weighted target positions out of the logits BEFORE
-    any float32 cast: at a 262k vocab a full-sequence fp32 logit copy costs
-    ~1 GB per 1k tokens, all of it spent on prompt positions whose weight is
-    zero.
+    VRAM RULES. At Gemma 4's 262k vocab, ONE fp32 logit tensor for a
+    batch-4 game-length sequence is ~19 GiB, so this function is written
+    around four rules -- each one the fix for a real OOM (three crashes on
+    2026-07-31: the overnight run, then selftest t10 twice; consolidated
+    stage-10 note in TO_TEST.md):
 
-    With ``return_per_example=True`` returns ``(loss, per_example)`` where
-    ``per_example`` is the detached [B] tensor of per-example normalized
-    losses (exact per-source logging from mixed-source batches)."""
+    1. NEVER MATERIALIZE FULL-SEQUENCE LOGITS. The collator builds every
+       example as prompt + target + terminator (+ right pads), so all
+       weighted positions live in a trailing TAIL of the sequence; both
+       forwards pass ``logits_to_keep=tail+1`` and the lm_head projects
+       only that tail. The cut must happen INSIDE the model -- the OOM
+       fired at Gemma's logit softcapping, before loss code could slice.
+       If transformers renames the kwarg this fails loudly with TypeError;
+       never silently fall back to full-sequence logits (agent/model.py
+       leans on the same kwarg).
+    2. TEACHER BEFORE STUDENT (kd only). The teacher forward runs first
+       and is reduced to probabilities at the weighted positions, freeing
+       its kept-logit tensor BEFORE the student forward builds its own
+       kept logits + autograd graph. The two sides' multi-GiB tensors
+       never coexist, so a KD batch peaks like a CE batch of equal shape.
+    3. GATHER BY 2-D INDEX, never reshape-then-mask. For batch > 1,
+       ``logits[:, :-1, :]`` is a NON-contiguous view, so a following
+       ``.reshape(-1, V)`` silently COPIES the whole multi-GiB tensor
+       before any mask applies. ``logits[rows, cols]`` gathers the
+       weighted positions directly, no intermediate copy.
+    4. LONG-TARGET SOURCES GET A SMALLER BATCH. When the target spans
+       nearly the whole sequence (openthoughts), the tail IS the sequence
+       and rule 1 saves nothing -- cap the micro-batch instead
+       (``micro_batch_cap`` in datasets.json -> TrainingExample.batch_cap
+       -> epoch_batches). Harmless by the batch-equivalence above.
+
+    Any batch whose kept-logit tensor would still exceed ~10 GiB logs a
+    WARNING with its geometry -- the early alarm for a new pathological
+    source or a bad char-based length bucket (tokens != chars)."""
     import torch
     import torch.nn.functional as F
 
     if loss_kind not in VALID_LOSSES:
         raise ValueError(f"weighted_loss: bad loss_kind {loss_kind!r}")
 
-    out = model(**model_inputs)
-    logits = out.logits  # [B, L, V]
-    shift_logits = logits[:, :-1, :]
-    shift_labels = model_inputs["input_ids"][:, 1:]
-    n_rows, n_pos = shift_labels.shape
-    w = weights[:, 1:].reshape(-1)
+    input_ids = model_inputs["input_ids"]
+    seq_len = int(input_ids.shape[1])
+    # The tail (VRAM rule 1): everything from the batch's first weighted
+    # label position to the end. Position 0 can never be trained (no logit
+    # predicts it), so the search starts at 1 -- which also makes all-zero
+    # rows (impossible by the collator's contract) degrade to a full-width
+    # tail instead of a bogus slice.
+    nz = weights[:, 1:] != 0
+    first = int(nz.float().argmax(dim=1).min()) + 1 if bool(nz.any()) else 1
+    tail = seq_len - first  # trailing label positions covering every weight
 
-    # Slice the weighted positions BEFORE any float32 cast.
-    mask = w != 0
-    row_of = mask.nonzero(as_tuple=True)[0] // n_pos  # owning example per pos
-    student = shift_logits.reshape(-1, shift_logits.shape[-1])[mask].float()
+    # Gather indices next: they depend only on weights + input_ids, and the
+    # KD teacher (below) needs them BEFORE the student forward (rule 2).
+    # The model will keep tail+1 logit positions; kept position j predicts
+    # tail label j (the last kept position predicts nothing and is never
+    # gathered -- col_of < tail by construction).
+    shift_labels = input_ids[:, -tail:]       # the tail's labels
+    n_rows, n_pos = shift_labels.shape
+    w = weights[:, -tail:].reshape(-1)
+    mask = w != 0                             # flat over [B * tail]
+    mask_idx = mask.nonzero(as_tuple=True)[0]
+    row_of = mask_idx // n_pos                # owning example per position
+    col_of = mask_idx % n_pos                 # position within the tail
+
+    # Early alarm (see docstring): estimate the kept-logit tensor size.
+    # Multimodal configs (Gemma 4 Unified) keep vocab_size on text_config;
+    # the embedding table is the always-available fallback.
+    cfg = getattr(model, "config", None)
+    vocab = (getattr(cfg, "vocab_size", None)
+             or getattr(getattr(cfg, "text_config", None), "vocab_size", None)
+             or model.get_input_embeddings().num_embeddings)
+    kept_gib = n_rows * (tail + 1) * vocab * 4 / 2 ** 30
+    if kept_gib > 10.0:
+        logger.warning(
+            "weighted_loss: kept-logit tensor is ~%.1f GiB "
+            "(batch %d x tail %d x vocab %d, fp32) -- a batch mixing "
+            "short and long prompts, or very long targets, defeats the "
+            "logits_to_keep saving; consider a micro_batch_cap for this "
+            "source (see docstring), or check the collator's char-based "
+            "length bins (tokens != chars) if the mix looks wrong",
+            kept_gib, n_rows, tail + 1, vocab,
+        )
+
+    teacher_probs = None
+    if loss_kind == "kd":
+        # VRAM rules 2 + 3: teacher first, gathered by 2-D index, reduced
+        # to probabilities; both big teacher tensors are gone before the
+        # student forward starts.
+        teacher_logits = _base_model_logits(model, model_inputs,
+                                            logits_to_keep=tail + 1)
+        teacher = teacher_logits[row_of, col_of].float()
+        del teacher_logits
+        teacher_probs = F.softmax(teacher, dim=-1)
+        del teacher
+
+    # Student forward: same tail (rule 1), same 2-D gather (rule 3).
+    out = model(**model_inputs, logits_to_keep=tail + 1)
+    student = out.logits[row_of, col_of].float()
 
     if loss_kind == "ce":
         token_loss = F.cross_entropy(
             student, shift_labels.reshape(-1)[mask], reduction="none",
         )
     else:
-        teacher_logits = _base_model_logits(model, model_inputs)
-        teacher = teacher_logits[:, :-1, :].reshape(
-            -1, teacher_logits.shape[-1]
-        )[mask].float()
-        token_loss = -(F.softmax(teacher, dim=-1)
+        token_loss = -(teacher_probs
                        * F.log_softmax(student, dim=-1)).sum(dim=-1)
 
     zeros = torch.zeros(n_rows, dtype=token_loss.dtype,
@@ -1051,7 +1152,8 @@ def epoch_order(by_source: dict[str, list[TrainingExample]],
 
 def _batch_bucket_key(ex: TrainingExample) -> tuple:
     """Examples may share a micro-batch iff these match: loss kind (KD needs
-    the extra teacher forward), image count (pixel tensors must stack), and
+    the extra teacher forward), batch_cap (capped sources must not fill a
+    bucket past their cap), image count (pixel tensors must stack), and
     a coarse length bin (padding waste stays bounded; chars ~ 4x tokens is
     plenty accurate for binning)."""
     n_images = sum(
@@ -1065,7 +1167,7 @@ def _batch_bucket_key(ex: TrainingExample) -> tuple:
     while chars > edge:
         edge = int(edge * 1.5)
         length_bin += 1
-    return (ex.loss, n_images, length_bin)
+    return (ex.loss, ex.batch_cap, n_images, length_bin)
 
 
 def epoch_batches(order: list[TrainingExample], micro_batch: int,
@@ -1075,7 +1177,12 @@ def epoch_batches(order: list[TrainingExample], micro_batch: int,
     flush remainders as short batches, then shuffle the batch list so
     sources and buckets interleave. Bucket remainders make the batch count
     slightly larger than ``ceil(len(order) / micro_batch)`` -- the scheduler
-    estimate tolerates that (a few trailing steps at the LR floor)."""
+    estimate tolerates that (a few trailing steps at the LR floor).
+
+    An example's ``batch_cap`` lowers the fill limit for its bucket
+    (batch_cap is part of the bucket key, so a bucket is cap-homogeneous):
+    long-target KD sources ride in smaller batches to bound the kept-logit
+    tensor in weighted_loss."""
     if micro_batch <= 1:
         return [[ex] for ex in order]
     buckets: dict[tuple, list[TrainingExample]] = {}
@@ -1083,7 +1190,7 @@ def epoch_batches(order: list[TrainingExample], micro_batch: int,
     for ex in order:
         bucket = buckets.setdefault(_batch_bucket_key(ex), [])
         bucket.append(ex)
-        if len(bucket) >= micro_batch:
+        if len(bucket) >= min(micro_batch, ex.batch_cap or micro_batch):
             batches.append(bucket.copy())
             bucket.clear()
     for bucket in buckets.values():
@@ -1164,9 +1271,10 @@ def run_training(
         params, lr=cfg.lr, weight_decay=cfg.weight_decay
     )
     # Estimate: bucket remainders in epoch_batches add a few extra batches
-    # per epoch beyond ceil(n / micro_batch) (at most one per bucket), so
-    # the cosine schedule may end a handful of steps early -- those trailing
-    # steps just run at the LR floor.
+    # per epoch beyond ceil(n / micro_batch) (at most one per bucket), and
+    # micro_batch_cap sources (see TrainingExample.batch_cap) add more, so
+    # the cosine schedule may end some steps early -- those trailing steps
+    # just run at the LR floor.
     contributions = sum(max(1, round(src_weights.get(n, 1.0) * len(v)))
                         for n, v in by_source.items())
     steps_per_epoch = math.ceil(

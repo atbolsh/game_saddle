@@ -96,17 +96,20 @@ structural — no loader reads both files.
 
 Housekeeping baked into the generator:
 
-- **Parallel sessions** (`--parallel`, default 3): N sessions play N games
+- **Parallel sessions** (`--parallel`, default 16): N sessions play N games
   concurrently, one worker thread each, sharing the ONE loaded model
   through `agent/parallel_gen.py` — concurrent generations merge into
-  batched decode calls (batch-1 decode is memory-bandwidth-bound, so a
-  batch of 3 costs barely more than a batch of 1). Caveat for Gemma 4
-  Unified: left-padded decode diverges from solo, so `generate_batch` only
-  true-batches rows whose prompt token lengths are exactly equal; grouped
-  requests with unique lengths decode sequentially inside the call. The
-  realized speedup therefore depends on how often concurrent sessions'
-  prompt lengths coincide — measure the datagen wall-clock before counting
-  on ~2–2.5x. Requests batch only with identical stop signatures,
+  batched decode calls (batch-1 decode is memory-bandwidth-bound, so
+  extra rows are cheap; measured 2026-07-30: serial 24.1 s/gen,
+  `--parallel 10` 8.5, `--parallel 24` 6.4 — diminishing but
+  never-inverting returns, default set by VRAM headroom). Caveat for Gemma 4
+  Unified: a left-padded multimodal prefill is corrupted at specific
+  widths (upstream transformers#47651), so `generate_batch` pads
+  mixed-length rows around the poisoned widths and parity-checks every
+  padded row's prefill before decoding (KNOWN TRANSFORMERS BUG WORKAROUND
+  banner in `agent/model.py`); rows that fail the check fall back to
+  equal-length cohorts that decode sequentially inside the call.
+  Requests batch only with identical stop signatures,
   so player-phase and analyst-phase generations never truncate each other.
   A concurrent session's analyst text is exactly as visible to another
   player as a PAST session's (the intended cross-game learning channel);
