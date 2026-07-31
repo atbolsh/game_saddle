@@ -13,6 +13,7 @@ finished::
     python -m training.selftest t7     # minutes   t5 traces -> real train steps
     python -m training.selftest t8     # ~15-40m   real serial datagen timing
     python -m training.selftest t9     # ~10-25m   same workload at --parallel 3
+    python -m training.selftest t10    # ~20-30m   timed train batches + epoch est.
 
 or everything in order with ``python -m training.selftest all``. Every stage
 prints exactly one line ``TEST <id> PASS/FAIL: <evidence>`` (paste those
@@ -39,6 +40,10 @@ Stage map (rationale in the Intermission plan):
                 + serial epoch extrapolation; t9's baseline
   * t9-parallel t8's exact workload at --parallel 3, compared on
                 seconds_per_generation (speedup reported, slowdown asserted)
+  * t10-traintime  4 timed micro-batches from every loss category on the
+                real overnight corpus (T10_DATAGEN_LABEL to change), peak
+                VRAM per category (tripwire vs the 2026-07-31 OOM), and a
+                whole-epoch train-time estimate; saves NO checkpoint
 """
 
 from __future__ import annotations
@@ -1228,6 +1233,172 @@ def t9_parallel() -> str:
     )
 
 
+#: t10 profiles the train loop on a REAL datagen corpus. Default: the
+#: 2026-07-30 overnight run (3000 generations, game-length contexts -- the
+#: corpus whose analyst KD batches OOM'd before the logits_to_keep fix in
+#: train.weighted_loss). Override with T10_DATAGEN_LABEL=<label> to profile
+#: against a different data_game/<label>/ directory.
+_T10_LABEL = os.environ.get("T10_DATAGEN_LABEL", "overnight_iter1")
+_T10_BATCHES_PER_SOURCE = 4
+#: Peak-VRAM tripwire: the box is ~95 GiB; the overnight OOM happened at
+#: 86.85 GiB held + 18.52 GiB requested. If profiling peaks above this,
+#: do NOT launch the weekend run.
+_T10_VRAM_LIMIT_GIB = 88.0
+
+
+def t10_traintime() -> str:
+    """Timed train micro-batches from EVERY loss category, on the real
+    overnight corpus, + a whole-epoch runtime estimate. GPU required; no
+    NAMS. NO CHECKPOINT IS SAVED (this stage never calls save_checkpoint).
+
+    Categories = data sources: GameTraceSource (player records, weighted
+    CE -- the RL/"REINFORCE" signal), AnalystTraceSource (KD vs the frozen
+    base -- the analyst anchor; the loss that OOM'd the 2026-07-31
+    overnight train before weighted_loss got logits_to_keep), and every
+    enabled manifest source. For each: 4 real micro-batches (collation +
+    forward + backward, KD incl. the teacher forward) through the same
+    build_model/Collator/weighted_loss/PagedAdamW8bit stack as
+    run_training, timed with CUDA sync, with per-source peak VRAM.
+
+    The epoch estimate uses run_training's own batch arithmetic
+    (weight-scaled contributions / micro_batch, + optimizer steps every
+    grad_accum batches). It slightly UNDERestimates a real epoch: bucket
+    remainders add a few short batches, and save-time eval hooks (held-out
+    loss + probes, ~3-5 min per save) are not included.
+    """
+    import math
+    import random as pyrandom
+    import time
+
+    import torch
+
+    from agent.config import CONFIG
+    from agent.model import ADAPTERS, spec_for
+    from training.external_data import sources_from_manifest
+    from training.game_traces import AnalystTraceSource, GameTraceSource
+    from training.train import (
+        Collator,
+        TrainConfig,
+        attach_neftune,
+        build_model,
+        epoch_batches,
+        materialize,
+        resolve_terminator_id,
+        weighted_loss,
+    )
+
+    traces_dir = REPO_ROOT / "data_game" / _T10_LABEL
+    assert (traces_dir / "traces.jsonl").is_file(), (
+        f"{traces_dir}/traces.jsonl not found -- t10 profiles a REAL "
+        "datagen corpus; run datagen or set T10_DATAGEN_LABEL to an "
+        "existing data_game/<label>"
+    )
+    # Exactly the weekend run's source stack (run_weekend.train_one_epoch).
+    sources = [
+        GameTraceSource(traces_dir / "traces.jsonl"),
+        AnalystTraceSource(traces_dir / "analyst_traces.jsonl"),
+        *sources_from_manifest(),
+    ]
+    cfg = TrainConfig(label="selftest_t10")  # defaults = the real recipe
+    src_weights = {s.name: s.weight for s in sources}
+
+    t0 = time.perf_counter()
+    by_source = materialize(sources, max_example_chars=cfg.max_example_chars)
+    setup_data_s = time.perf_counter() - t0
+    assert by_source, "materialize produced no sources"
+
+    t0 = time.perf_counter()
+    spec = spec_for(cfg.architecture or CONFIG.model_key)
+    model, processor, _targets, _proj = build_model(spec, cfg, CONFIG.hf_token)
+    attach_neftune(model, cfg.neftune_alpha)
+    terminator = resolve_terminator_id(
+        model, getattr(processor, "tokenizer", processor)
+    )
+    collator = Collator(processor, ADAPTERS[spec.family], terminator,
+                        compute_dtype=torch.bfloat16, device=cfg.device)
+    import bitsandbytes as bnb
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = bnb.optim.PagedAdamW8bit(params, lr=cfg.lr,
+                                         weight_decay=cfg.weight_decay)
+    model.train()
+    setup_model_s = time.perf_counter() - t0
+
+    def _one_batch(exs: list) -> float:
+        """One real training micro-batch (collation + fwd + bwd), timed."""
+        torch.cuda.synchronize()
+        t = time.perf_counter()
+        built = collator.build_batch(exs)
+        loss = weighted_loss(model, built["model_inputs"], built["weights"],
+                             loss_kind=exs[0].loss)
+        assert torch.isfinite(loss), f"non-finite loss on {exs[0].source}"
+        (loss / cfg.grad_accum).backward()
+        torch.cuda.synchronize()
+        return time.perf_counter() - t
+
+    def _opt_step() -> float:
+        torch.cuda.synchronize()
+        t = time.perf_counter()
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        torch.cuda.synchronize()
+        return time.perf_counter() - t
+
+    rng = pyrandom.Random(0)
+    per_source: dict[str, dict] = {}
+    opt_s: float | None = None
+    warmed = False
+    for name, exs in sorted(by_source.items()):
+        batches = epoch_batches(list(exs), cfg.micro_batch, rng)
+        assert batches, f"source {name} materialized but produced no batches"
+        if not warmed:
+            # One untimed batch: CUDA context, allocator pools, cudnn
+            # autotuning all land here instead of in source #1's numbers.
+            _one_batch(batches[0])
+            _opt_step()
+            warmed = True
+        torch.cuda.reset_peak_memory_stats()
+        times = [_one_batch(b)
+                 for b in batches[:_T10_BATCHES_PER_SOURCE]]
+        step_s = _opt_step()
+        opt_s = step_s if opt_s is None else min(opt_s, step_s)
+        peak_gib = torch.cuda.max_memory_allocated() / 2**30
+        # run_training's own arithmetic for this source's share of an epoch
+        n_epoch_batches = math.ceil(
+            max(1, round(src_weights.get(name, 1.0) * len(exs)))
+            / cfg.micro_batch
+        )
+        per_source[name] = {
+            "loss_kind": batches[0][0].loss,
+            "n_examples": len(exs),
+            "mean_batch_s": sum(times) / len(times),
+            "peak_gib": peak_gib,
+            "epoch_batches": n_epoch_batches,
+        }
+        assert peak_gib < _T10_VRAM_LIMIT_GIB, (
+            f"source {name} peaked at {peak_gib:.1f} GiB (> "
+            f"{_T10_VRAM_LIMIT_GIB} tripwire) -- the weekend run would "
+            "OOM; shrink micro_batch for this bucket before launching"
+        )
+
+    total_batches = sum(s["epoch_batches"] for s in per_source.values())
+    train_s = sum(s["epoch_batches"] * s["mean_batch_s"]
+                  for s in per_source.values())
+    train_s += (total_batches / cfg.grad_accum) * (opt_s or 0.0)
+    epoch_h = (setup_data_s + setup_model_s + train_s) / 3600
+
+    lines = [
+        f"{name}[{s['loss_kind']}]: {s['mean_batch_s']:.2f}s/batch, "
+        f"peak {s['peak_gib']:.1f}GiB, {s['epoch_batches']} batches/epoch"
+        for name, s in per_source.items()
+    ]
+    return (
+        f"epoch estimate ~{epoch_h:.1f}h ({total_batches} micro-batches + "
+        f"setup {(setup_data_s + setup_model_s) / 60:.0f}min; excludes "
+        "save-time eval hooks) -- " + "; ".join(lines)
+    )
+
+
 # ================================================================== runner
 
 STAGES: list[tuple[str, str, "callable"]] = [
@@ -1241,6 +1412,8 @@ STAGES: list[tuple[str, str, "callable"]] = [
     ("t7-e2e", "traces -> train steps", t7_e2e),
     ("t8-timing", "real serial datagen s/gen + epoch extrapolation", t8_timing),
     ("t9-parallel", "t8's workload at --parallel 3, compared", t9_parallel),
+    ("t10-traintime", "timed train batches per loss category + epoch "
+                      "estimate", t10_traintime),
 ]
 
 

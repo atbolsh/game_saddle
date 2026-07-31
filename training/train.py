@@ -781,19 +781,25 @@ def attach_neftune(model: Any, alpha: float) -> None:
 
 # ================================================================== loss
 
-def _base_model_logits(model: Any, model_inputs: dict) -> Any:
+def _base_model_logits(model: Any, model_inputs: dict,
+                       logits_to_keep: int = 0) -> Any:
     """Teacher forward for KD: the frozen base model's logits on the same
     inputs, via PEFT's ``disable_adapter()`` (bypasses BOTH the LoRA deltas
     and the modules_to_save projector copy -- VERIFY the projector part on
     the remote box, see TO_TEST.md). Forced to eval mode for the duration so
-    the NEFTune hook and dropout cannot perturb the teacher."""
+    the NEFTune hook and dropout cannot perturb the teacher.
+
+    ``logits_to_keep``: only project the LAST k positions to vocab space
+    (0 = all, the HF convention). See weighted_loss for why this matters:
+    the teacher's full-sequence logit tensor is what OOM'd the 2026-07-31
+    overnight run."""
     import torch
 
     was_training = model.training
     model.eval()
     try:
         with torch.no_grad(), model.disable_adapter():
-            out = model(**model_inputs)
+            out = model(**model_inputs, logits_to_keep=logits_to_keep)
     finally:
         if was_training:
             model.train()
@@ -814,10 +820,21 @@ def weighted_loss(model: Any, model_inputs: dict, weights: Any,
     distribution on the same inputs (self-distillation replay -- preserve,
     don't teach).
 
-    BOTH paths slice the weighted target positions out of the logits BEFORE
-    any float32 cast: at a 262k vocab a full-sequence fp32 logit copy costs
-    ~1 GB per 1k tokens, all of it spent on prompt positions whose weight is
-    zero.
+    NO FULL-SEQUENCE LOGIT TENSOR IS EVER MATERIALIZED. The loss only needs
+    logits at the positions that predict target tokens, and the collator
+    builds every example as ``prompt + target + terminator`` (+ right pads
+    in a batch), so all weighted positions live in a trailing TAIL of the
+    sequence. Both forwards therefore pass ``logits_to_keep=tail+1`` so the
+    lm_head projects only that tail: at a 262k vocab the vocab projection
+    inflates a 3.8k-float hidden state ~68x, and the prompt is ~90% of a
+    game-length sequence. Lesson learned the hard way -- the 2026-07-31
+    overnight run OOM'd (18.52 GiB single allocation, batch 4 x ~4.7k-token
+    analyst KD examples) inside Gemma 4's forward at the logit softcapping,
+    BEFORE the loss code could slice; slicing here was too late, the slice
+    has to happen inside the model. A transformers rename of
+    ``logits_to_keep`` fails loudly with TypeError -- by design, never
+    silently fall back to full-sequence logits (agent/model.py leans on the
+    same kwarg).
 
     With ``return_per_example=True`` returns ``(loss, per_example)`` where
     ``per_example`` is the detached [B] tensor of per-example normalized
@@ -828,12 +845,22 @@ def weighted_loss(model: Any, model_inputs: dict, weights: Any,
     if loss_kind not in VALID_LOSSES:
         raise ValueError(f"weighted_loss: bad loss_kind {loss_kind!r}")
 
-    out = model(**model_inputs)
-    logits = out.logits  # [B, L, V]
-    shift_logits = logits[:, :-1, :]
-    shift_labels = model_inputs["input_ids"][:, 1:]
+    input_ids = model_inputs["input_ids"]
+    seq_len = int(input_ids.shape[1])
+    # First trainable label position across the batch. Position 0 can never
+    # be trained (no logit predicts it), so the search starts at 1 -- which
+    # also makes all-zero rows (impossible by the collator's contract)
+    # degrade to a full-width tail instead of a bogus slice.
+    nz = weights[:, 1:] != 0
+    first = int(nz.float().argmax(dim=1).min()) + 1 if bool(nz.any()) else 1
+    tail = seq_len - first  # trailing label positions covering every weight
+    # Kept logits = positions [first-1, seq_len-1]; dropping the last one
+    # below leaves exactly the logits that predict labels [first, seq_len-1].
+    out = model(**model_inputs, logits_to_keep=tail + 1)
+    shift_logits = out.logits[:, :-1, :]      # [B, tail, V]
+    shift_labels = input_ids[:, -tail:]       # the tail's labels
     n_rows, n_pos = shift_labels.shape
-    w = weights[:, 1:].reshape(-1)
+    w = weights[:, -tail:].reshape(-1)
 
     # Slice the weighted positions BEFORE any float32 cast.
     mask = w != 0
@@ -845,7 +872,8 @@ def weighted_loss(model: Any, model_inputs: dict, weights: Any,
             student, shift_labels.reshape(-1)[mask], reduction="none",
         )
     else:
-        teacher_logits = _base_model_logits(model, model_inputs)
+        teacher_logits = _base_model_logits(model, model_inputs,
+                                            logits_to_keep=tail + 1)
         teacher = teacher_logits[:, :-1, :].reshape(
             -1, teacher_logits.shape[-1]
         )[mask].float()

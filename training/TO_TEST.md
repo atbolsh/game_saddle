@@ -20,6 +20,7 @@ lines back for review. On a FAIL, also paste the traceback that precedes it.
 | 7 | `python -m training.selftest t7` | minutes | t5's traces through `GameTraceSource` + `AnalystTraceSource` and real train steps (RL weights + KD-vs-base analyst anchor, mixed CE/KD buckets, per-run noised frames, finite losses; the tiny epoch is drained so the KD bucket is guaranteed to train) |
 | 8 | `python -m training.selftest t8` | ~15–40 min | REAL serial datagen timing: the shared workload (3 games × 4 moves, `--parallel 1`) through the actual session harness with the model pre-loaded/warmed (startup excluded); reports `seconds_per_generation` and the serial wall-clock a default epoch (3000 gens) implies. Its `generation_stats.json` is t9's baseline (t9 checks the game count and refuses a stale one) |
 | 9 | `python -m training.selftest t9` | ~10–25 min | t8's EXACT workload at `--parallel 3` (run t8 first — its stats file is the serial baseline), compared on `seconds_per_generation`; asserts parallel is not ≫ slower, REPORTS the speedup (expect a real one now: phase-locking dispatcher + verified left-pad batching) |
+| 10 | `python -m training.selftest t10` | ~20–30 min | 4 timed train micro-batches from EVERY loss category (player CE/RL, analyst-anchor KD incl. teacher forward, each manifest source) on the real overnight corpus (`data_game/overnight_iter1`, override `T10_DATAGEN_LABEL`); per-category peak VRAM (asserts < 88 GiB — the 2026-07-31 OOM tripwire) and a whole-epoch train-time estimate; saves NO checkpoint |
 
 (`python -m training.selftest all` runs everything in order; the exit code
 is the number of failures.)
@@ -115,6 +116,24 @@ and the padded batch is prefilled twice, deliberately.
 Both stages share t9's caveat: sampled replies make single runs noisy —
 treat ±15% as measurement error, rerun before drawing conclusions from
 small differences.
+
+Stage 10 note (NEW, after the 2026-07-31 overnight train OOM):
+`weighted_loss` now passes `logits_to_keep=tail+1` on BOTH the student and
+the KD teacher forward, so neither ever materializes full-sequence
+`[batch, seq, 262k-vocab]` logits — the overnight run died on exactly that
+tensor (18.52 GiB single allocation at Gemma 4's logit softcapping, batch
+4 × ~4.7k-token analyst KD examples; slicing in the loss came too late
+because the tensor is born inside the model's forward). **Rerun t3 and t4
+before t10**: they are the correctness tests for the refactored loss (t3's
+fresh-adapter-KD-equals-teacher-entropy check and t4's batch-4 vs batch-1
+parity both go through `weighted_loss`). t10 then profiles the loop on the
+real overnight corpus and answers two questions: does any category still
+peak near the VRAM ceiling (hard assert at 88 GiB), and how long is a real
+train epoch (REPORTED estimate; it excludes save-time eval hooks, ~3–5 min
+per save, and bucket-remainder short batches, so pad it ~10–15% when
+fitting the weekend window). A `logits_to_keep` rename in a future
+transformers fails loudly as TypeError in t3/t4/t10 — never silently fall
+back to full-sequence logits.
 
 Weekend rehearsal (NEW, before launching `training/run_weekend.py` for
 real): with NAMS up and external data downloaded, run
