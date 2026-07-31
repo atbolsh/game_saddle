@@ -267,7 +267,7 @@ analyst / training all see the same bytes) and again at training time
 (strength 1.0, fresh per-run noised copies made by `GameTraceSource`) —
 **label-safe image regularization**, sampled per image:
 
-- Gaussian pixel noise, plus weaker per-pixel speckle (multiplicative);
+- Gaussian pixel noise, plus per-pixel speckle (multiplicative);
 - mild blur OR JPEG compression artifacts (one of the two);
 - brightness / contrast / color jitter;
 - 2–6 BIG discolored patches (semi-transparent tints, 8–25% of the image

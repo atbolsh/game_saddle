@@ -14,8 +14,7 @@ gets mild, LABEL-SAFE degradation, sampled per image:
     stress. Still tints, never opaque black boxes -- not dropout;
   * ONE whole-image color drift tint (a full-frame translucent rectangle,
     much weaker than the patches);
-  * weak per-pixel speckle (multiplicative) + gaussian pixel noise
-    (additive);
+  * per-pixel speckle (multiplicative) + gaussian pixel noise (additive);
   * mild gaussian blur OR a JPEG re-encode (compression artifacts), one of
     the two.
 
@@ -68,8 +67,11 @@ _PATCH_ALPHA = (0.12, 0.30)
 #: translucent rectangle, deliberately weaker than the patches.
 _DRIFT_ALPHA = (0.04, 0.10)
 #: Speckle: per-pixel MULTIPLICATIVE noise sigma (fraction of the pixel
-#: value) at strength 1.0 -- deliberately weaker than the additive gaussian.
-_SPECKLE_SIGMA = (0.01, 0.04)
+#: value) at strength 1.0. Tuned by eye in noise_tuner.ipynb (2026-07-31):
+#: bumped from the initial (0.01, 0.04) -- frames stay legible to a human
+#: even harsher than this, but model perception is more fragile, so the
+#: rest of the magnitudes stay at their first-guess values.
+_SPECKLE_SIGMA = (0.025, 0.1)
 
 
 def noise_image(img, rng: random.Random, strength: float = TRAINING_STRENGTH,
@@ -135,9 +137,9 @@ def noise_image(img, rng: random.Random, strength: float = TRAINING_STRENGTH,
         drift = Image.new("RGBA", (w, h), (*tint, alpha))
         img = Image.alpha_composite(img.convert("RGBA"), drift).convert("RGB")
 
-    # -- per-pixel noise: weak multiplicative speckle, then additive
-    #    gaussian. Fields are drawn as STANDARD normals and scaled after, so
-    #    a magnitude change rescales the same pattern (see docstring).
+    # -- per-pixel noise: multiplicative speckle, then additive gaussian.
+    #    Fields are drawn as STANDARD normals and scaled after, so a
+    #    magnitude change rescales the same pattern (see docstring).
     np_rng = np.random.default_rng(rng.getrandbits(32))
     arr = np.asarray(img, dtype=np.float32)
     speckle = rng.uniform(*speckle_sigma) * strength
