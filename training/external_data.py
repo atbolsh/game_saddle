@@ -86,6 +86,13 @@ class DatasetEntry:
     converter: str | None = None   #: key into CONVERTERS (hf entries)
     generator: str | None = None   #: key into GENERATORS (synthetic entries)
     probe: dict | None = None      #: {"split"?, "n", "kind"}
+    #: cap on the training micro-batch for this source's examples (None =
+    #: TrainConfig.micro_batch). For long-TARGET KD sources: the KD loss
+    #: needs logits over every target position, so batch x ~whole-sequence
+    #: x 262k-vocab kept-logit tensors OOM at full micro-batch (t10,
+    #: 2026-07-31, openthoughts). Results are unchanged by construction --
+    #: weighted_loss normalizes per example (see its docstring).
+    micro_batch_cap: int | None = None
     notes: str = ""
 
     @property
@@ -118,6 +125,7 @@ def load_manifest(path: str | Path | None = None) -> list[DatasetEntry]:
             converter=obj.get("converter"),
             generator=obj.get("generator"),
             probe=obj.get("probe"),
+            micro_batch_cap=obj.get("micro_batch_cap"),
             notes=obj.get("notes", ""),
         )
         if entry.name in seen:
@@ -475,6 +483,7 @@ class ExternalSource(JsonlSource):
     def examples(self) -> Iterator[TrainingExample]:
         base = str(self.entry.data_dir)
         for ex in super().examples():
+            ex.batch_cap = self.entry.micro_batch_cap
             for m in ex.messages:
                 content = m.get("content")
                 if not isinstance(content, list):

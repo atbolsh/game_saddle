@@ -431,6 +431,22 @@ def t1_pure() -> str:
         )
     checks += 1
 
+    # ---- epoch_batches: batch_cap (long-target KD sources, e.g.
+    #      openthoughts) bounds THEIR batches without touching others
+    capped = [TrainingExample([{"role": "user", "content": [
+        {"type": "text", "text": "q" * 50}]}], "a", loss="kd", batch_cap=1)
+        for _ in range(3)]
+    batches = epoch_batches(exs + capped, micro_batch=4,
+                            rng=random.Random(0))
+    assert sum(len(b) for b in batches) == len(exs) + 3, "capped ex lost"
+    for b in batches:
+        if b[0].batch_cap is not None:
+            assert len(b) <= b[0].batch_cap, "batch_cap not enforced"
+            assert all(x.batch_cap == b[0].batch_cap for x in b)
+        else:
+            assert len(b) <= 4
+    checks += 1
+
     # ---- planted-error scrambler: deterministic, one labeled change,
     #      span points at the new text
     reply = (
@@ -1376,9 +1392,10 @@ def t10_traintime() -> str:
         opt_s = step_s if opt_s is None else min(opt_s, step_s)
         peak_gib = torch.cuda.max_memory_allocated() / 2**30
         # run_training's own arithmetic for this source's share of an epoch
+        # (micro_batch_cap sources ride in smaller batches -> more of them)
+        eff_mb = min(cfg.micro_batch, exs[0].batch_cap or cfg.micro_batch)
         n_epoch_batches = math.ceil(
-            max(1, round(src_weights.get(name, 1.0) * len(exs)))
-            / cfg.micro_batch
+            max(1, round(src_weights.get(name, 1.0) * len(exs))) / eff_mb
         )
         per_source[name] = {
             "loss_kind": batches[0][0].loss,

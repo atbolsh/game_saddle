@@ -11,7 +11,10 @@
     "(strengthen: train on the dataset's targets) or 'kd' (preserve: match the",
     "student's logits to the untrained base model over the same tokens);",
     "examples_per_epoch (ABSOLUTE per-epoch quota -- mixture share never depends",
-    "on dataset size); probe (fixed eval slice: split/n/kind); enabled."
+    "on dataset size); probe (fixed eval slice: split/n/kind); micro_batch_cap",
+    "(optional, cap the training micro-batch for this source -- set 1 for",
+    "long-TARGET kd sources whose kept-logit tensors OOM at full micro-batch,",
+    "see train.weighted_loss); enabled."
   ],
   "version": 1,
   "datasets": [
@@ -94,8 +97,9 @@
       "loss": "kd",
       "examples_per_epoch": 200,
       "probe": null,
+      "micro_batch_cap": 1,
       "enabled": true,
-      "notes": "Long-form reasoning traces (math/science/code/puzzles). KD: preserve general reasoning, don't teach another model's style."
+      "notes": "Long-form reasoning traces (math/science/code/puzzles). KD: preserve general reasoning, don't teach another model's style. micro_batch_cap=1: the TARGET is nearly the whole sequence, so KD kept-logit tensors are batch x seq x 262k-vocab -- a full micro-batch OOM'd t10 on 2026-07-31 (~23k positions, 11.4 GiB per copy)."
     },
     {
       "name": "slimorca",

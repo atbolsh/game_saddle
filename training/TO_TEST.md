@@ -151,6 +151,27 @@ that fires often, the collator's char-based length bins are mixing rows
 whose TOKEN lengths differ badly (tokens != chars) and the binning needs
 revisiting. Same drill: rerun t3, t4 (correctness), then t10.
 
+Stage 10 note, round 3 (t10 OOM'd again, 2026-07-31 17:07): now with
+per-source prints, the culprit was pinpointed — nine sources passed with
+sane peaks (worst: analyst KD 44.2 GiB), then **openthoughts** blew up.
+Two distinct problems, both fixed in `training/train.py` +
+`training/external_data.py` + `training/datasets.json`:
+(1) `logits[:, :-1, :].reshape(-1, V)` on a batch>1 tensor is a
+NON-contiguous view, so the reshape silently materialized a full 11.41 GiB
+COPY before the mask gather — `weighted_loss` now gathers masked positions
+directly by 2-D index (`logits[rows, cols]`), no intermediate copy, and
+converts the teacher to probabilities immediately so the raw gather frees.
+(2) openthoughts is long-form reasoning with KD: its TARGET spans nearly
+the whole sequence, so `logits_to_keep` can't help — the tail IS the
+sequence. New `micro_batch_cap` manifest field (openthoughts = 1), flowing
+through `DatasetEntry` → `TrainingExample.batch_cap` → `epoch_batches`
+(cap is part of the bucket key). Per-example loss normalization makes a
+capped batch mathematically identical to a full one — memory changes,
+results don't. t1 grew a unit check for the cap. slimorca (also KD, sorts
+after openthoughts, never reached) has shorter targets and stays uncapped;
+t10 will profile it — if it trips the 88 GiB tripwire, give it a cap too.
+Same drill again: t3, t4, then t10.
+
 Weekend rehearsal (NEW, before launching `training/run_weekend.py` for
 real): with NAMS up and external data downloaded, run
 
