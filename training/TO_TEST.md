@@ -117,62 +117,42 @@ Both stages share t9's caveat: sampled replies make single runs noisy —
 treat ±15% as measurement error, rerun before drawing conclusions from
 small differences.
 
-Stage 10 note (NEW, after the 2026-07-31 overnight train OOM):
-`weighted_loss` now passes `logits_to_keep=tail+1` on BOTH the student and
-the KD teacher forward, so neither ever materializes full-sequence
-`[batch, seq, 262k-vocab]` logits — the overnight run died on exactly that
-tensor (18.52 GiB single allocation at Gemma 4's logit softcapping, batch
-4 × ~4.7k-token analyst KD examples; slicing in the loss came too late
-because the tensor is born inside the model's forward). **Rerun t3 and t4
-before t10**: they are the correctness tests for the refactored loss (t3's
-fresh-adapter-KD-equals-teacher-entropy check and t4's batch-4 vs batch-1
-parity both go through `weighted_loss`). t10 then profiles the loop on the
-real overnight corpus and answers two questions: does any category still
-peak near the VRAM ceiling (hard assert at 88 GiB), and how long is a real
-train epoch (REPORTED estimate; it excludes save-time eval hooks, ~3–5 min
-per save, and bucket-remainder short batches, so pad it ~10–15% when
-fitting the weekend window). A `logits_to_keep` rename in a future
-transformers fails loudly as TypeError in t3/t4/t10 — never silently fall
-back to full-sequence logits.
+Stage 10 note: t10 exists because training OOM'd three times on
+2026-07-31 (the overnight run, then t10 itself twice — each crash exposed
+a different memory bug). `weighted_loss` is now written around four VRAM
+rules, spelled out in its docstring; the short version: (1) both forwards
+pass `logits_to_keep=tail+1` so full-sequence `[batch, seq, 262k-vocab]`
+logit tensors are never materialized (the cut happens inside the model —
+slicing in loss code is too late); (2) for KD the teacher forward runs
+BEFORE the student and is reduced to probabilities first, so the two
+sides' multi-GiB tensors never coexist; (3) weighted positions are
+gathered by 2-D index, never `[:, :-1, :].reshape(...)` — that reshape
+silently copies the whole non-contiguous tensor; (4) sources whose target
+spans nearly the whole sequence (openthoughts) get `micro_batch_cap` in
+`datasets.json` (→ `TrainingExample.batch_cap` → `epoch_batches`), which
+per-example loss normalization makes mathematically free. Two supporting
+pieces: `train.py` sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+at import (variable tail sizes fragment the default allocator — one crash
+had 14 GiB stranded as reserved-but-unallocated; an explicit env setting
+wins over the setdefault), and `weighted_loss` logs a WARNING whenever a
+batch's kept-logit tensor would exceed ~10 GiB — the early alarm for a
+new long-target source or a bad char-based length bucket.
 
-Stage 10 note, round 2 (after t10's OWN OOM on 2026-07-31): the first t10
-run still died in the KD **teacher** forward (13.07 GiB allocation with
-72 GiB already resident and 14.13 GiB reserved-but-unallocated, i.e.
-fragmentation). Two further fixes in `training/train.py`: (1)
-`weighted_loss` now runs the teacher forward FIRST, gathers it down to the
-masked positions, and frees the big tensor BEFORE the student forward —
-the student's kept logits + autograd graph and the teacher's kept logits
-never coexist, so a KD batch peaks like a CE batch of the same geometry;
-(2) the module sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` at
-import (setdefault — an explicit env wins) because variable-size tail
-allocations fragment the default allocator. `weighted_loss` also logs a
-WARNING whenever a batch's kept-logit tensor would exceed ~10 GiB — if
-that fires often, the collator's char-based length bins are mixing rows
-whose TOKEN lengths differ badly (tokens != chars) and the binning needs
-revisiting. Same drill: rerun t3, t4 (correctness), then t10.
+**Verified 2026-07-31 18:05** on the overnight corpus: all 12 sources
+pass, worst peak 39.1 GiB (analyst KD; tripwire 88), epoch estimate ~2.0h
+plus setup. Reading t10: it times 4 micro-batches per source, so it
+samples rather than proves — the single worst batch of a real epoch can
+run somewhat hotter than the printed peaks (bounded by
+`max_example_chars` and the 1.5x length buckets). The epoch estimate
+excludes save-time eval hooks (~3–5 min per save) and bucket-remainder
+short batches; pad it ~10–15% when fitting the weekend window. After ANY
+change to `weighted_loss` or collation, rerun t3 and t4 first (the loss
+correctness tests: fresh-adapter KD equals teacher entropy; batch-4 vs
+batch-1 parity), then t10. A `logits_to_keep` rename in a future
+transformers fails loudly as TypeError in t3/t4/t10 — never silently
+fall back to full-sequence logits.
 
-Stage 10 note, round 3 (t10 OOM'd again, 2026-07-31 17:07): now with
-per-source prints, the culprit was pinpointed — nine sources passed with
-sane peaks (worst: analyst KD 44.2 GiB), then **openthoughts** blew up.
-Two distinct problems, both fixed in `training/train.py` +
-`training/external_data.py` + `training/datasets.json`:
-(1) `logits[:, :-1, :].reshape(-1, V)` on a batch>1 tensor is a
-NON-contiguous view, so the reshape silently materialized a full 11.41 GiB
-COPY before the mask gather — `weighted_loss` now gathers masked positions
-directly by 2-D index (`logits[rows, cols]`), no intermediate copy, and
-converts the teacher to probabilities immediately so the raw gather frees.
-(2) openthoughts is long-form reasoning with KD: its TARGET spans nearly
-the whole sequence, so `logits_to_keep` can't help — the tail IS the
-sequence. New `micro_batch_cap` manifest field (openthoughts = 1), flowing
-through `DatasetEntry` → `TrainingExample.batch_cap` → `epoch_batches`
-(cap is part of the bucket key). Per-example loss normalization makes a
-capped batch mathematically identical to a full one — memory changes,
-results don't. t1 grew a unit check for the cap. slimorca (also KD, sorts
-after openthoughts, never reached) has shorter targets and stays uncapped;
-t10 will profile it — if it trips the 88 GiB tripwire, give it a cap too.
-Same drill again: t3, t4, then t10.
-
-Weekend rehearsal (NEW, before launching `training/run_weekend.py` for
+Weekend rehearsal (before launching `training/run_weekend.py` for
 real): with NAMS up and external data downloaded, run
 
     python -m training.run_weekend --prefix smoke --epochs 2 \

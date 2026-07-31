@@ -53,9 +53,11 @@ Budget arithmetic before launching: one datagen epoch costs about
 setting, plus the train stage. Measured 2026-07-30: serial 24.1 s/gen
 (selftest t8), ``--parallel 10`` 8.5, ``--parallel 24`` 6.4 -- so the
 default 3000-generation epoch is ~20 h serial but ~6 h at the default
-parallelism. Trim ``--max-generations`` (and ``--games``) so
-``epochs x (datagen + train)`` fits the window you have. Details in
-TRAINING_OVERVIEW.md ("The weekend run").
+parallelism. The train stage on that corpus measured ~2 h + setup
+(selftest t10, 2026-07-31; pad ~10-15% for save-time eval hooks). Trim
+``--max-generations`` (and ``--games``) so ``epochs x (datagen + train)``
+fits the window you have. Details in TRAINING_OVERVIEW.md ("The weekend
+run").
 """
 
 from __future__ import annotations

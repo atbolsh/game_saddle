@@ -95,8 +95,11 @@ self-distillation costs one offline generation pass per dataset plus the
 extra jsonl on disk, after which training is a single ordinary CE forward
 on text in the base model's own voice. **Run with KD first.** Switch a
 dataset to self-distilled targets only on evidence from the early-warning
-suite: KD sources still drifting, OOMs on long examples (TO_TEST item 15),
-or a broken `disable_adapter()` teacher path (TO_TEST item 14).
+suite: KD sources still drifting (per-source held-out guards), a broken
+`disable_adapter()` teacher path (selftest t3's KD-equals-teacher-entropy
+check), or KD memory pressure that `micro_batch_cap` can't tame (the
+stage-10 note in [TO_TEST.md](TO_TEST.md) — long-target sources like
+openthoughts already run capped).
 
 ### The analyst KD anchor (implemented — in-domain replay)
 

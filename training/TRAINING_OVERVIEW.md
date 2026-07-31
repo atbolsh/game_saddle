@@ -72,7 +72,9 @@ nohup python -m training.run_weekend > weekend.log 2>&1 &
 
 **Fitting the window.** One epoch costs roughly
 `--max-generations x s/gen` of datagen (~6 h at default parallelism,
-~20 h serial, per the measurements above) plus one train stage;
+~20 h serial, per the measurements above) plus one train stage
+(measured ~2 h + setup on the 3000-generation overnight corpus, selftest
+t10 2026-07-31; pad ~10–15% for save-time eval hooks);
 `--max-generations` (default 3000) is the knob. `--epochs`, `--games`,
 `--parallel`, `--start-checkpoint`, and `--prefix` are also flags. Before
 the real launch, rehearse the whole orchestration cheaply (TO_TEST.md,

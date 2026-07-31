@@ -45,7 +45,10 @@ towers stay frozen (name-excluded from LoRA); the vision embedder
 rides inside the adapter checkpoint. Micro-batches are length-bucketed and
 RIGHT-padded (:meth:`Collator.build_batch`; safe under causal attention +
 weight-0 pads, unlike inference-side LEFT padding -- see the workaround
-banner in agent/model.py); effective batch = micro_batch * grad_accum.
+banner in agent/model.py); effective batch = micro_batch * grad_accum. A
+source may cap its own micro-batch (``TrainingExample.batch_cap``) when its
+loss needs more VRAM per example than the default allows -- the four VRAM
+rules that shape the loss live in :func:`weighted_loss`'s docstring.
 
 RECIPE (flags override): 4-bit NF4 + double quant + bf16 compute (QLoRA,
 Dettmers et al. 2023); LoRA r=32/alpha=64/dropout=0.05 on all language-model
@@ -806,9 +809,9 @@ def _base_model_logits(model: Any, model_inputs: dict,
     the NEFTune hook and dropout cannot perturb the teacher.
 
     ``logits_to_keep``: only project the LAST k positions to vocab space
-    (0 = all, the HF convention). See weighted_loss for why this matters:
-    the teacher's full-sequence logit tensor is what OOM'd the 2026-07-31
-    overnight run."""
+    (0 = all, the HF convention). weighted_loss always passes the tail it
+    needs -- full-sequence teacher logits are what OOM'd the 2026-07-31
+    overnight run (VRAM rule 1 in weighted_loss's docstring)."""
     import torch
 
     was_training = model.training
@@ -824,63 +827,57 @@ def _base_model_logits(model: Any, model_inputs: dict,
 
 def weighted_loss(model: Any, model_inputs: dict, weights: Any,
                   loss_kind: str = "ce", return_per_example: bool = False):
-    """Per-token weighted loss: each example is normalized by ITS OWN sum of
-    ABSOLUTE weights (so plain-SFT and annotated/negative-weight examples
-    arrive at comparable gradient scale, and long examples don't dominate),
-    then the batch is the mean over examples -- a micro-batch of B is
-    EXACTLY equivalent to B batch-1 passes averaged, padding positions
-    carry weight 0 and vanish entirely.
+    """Per-token weighted loss over one collated micro-batch.
+
+    Each example is normalized by ITS OWN sum of ABSOLUTE weights (so
+    plain-SFT and annotated/negative-weight examples arrive at comparable
+    gradient scale, and long examples don't dominate), then the batch is
+    the mean over examples. Key consequence, used throughout the trainer:
+    a micro-batch of B is EXACTLY equivalent to B batch-1 passes averaged
+    -- padding positions carry weight 0 and vanish, so batch composition
+    can never change results, only memory and speed.
 
     ``loss_kind="ce"``: token cross-entropy against the example's targets.
     ``loss_kind="kd"``: soft cross-entropy against the frozen BASE model's
     distribution on the same inputs (self-distillation replay -- preserve,
-    don't teach).
+    don't teach). With ``return_per_example=True`` returns
+    ``(loss, per_example)``, the latter a detached [B] tensor of
+    per-example losses (exact per-source logging from mixed batches).
 
-    NO FULL-SEQUENCE LOGIT TENSOR IS EVER MATERIALIZED. The loss only needs
-    logits at the positions that predict target tokens, and the collator
-    builds every example as ``prompt + target + terminator`` (+ right pads
-    in a batch), so all weighted positions live in a trailing TAIL of the
-    sequence. Both forwards therefore pass ``logits_to_keep=tail+1`` so the
-    lm_head projects only that tail: at a 262k vocab the vocab projection
-    inflates a 3.8k-float hidden state ~68x, and the prompt is ~90% of a
-    game-length sequence. Lesson learned the hard way -- the 2026-07-31
-    overnight run OOM'd (18.52 GiB single allocation, batch 4 x ~4.7k-token
-    analyst KD examples) inside Gemma 4's forward at the logit softcapping,
-    BEFORE the loss code could slice; slicing here was too late, the slice
-    has to happen inside the model. A transformers rename of
-    ``logits_to_keep`` fails loudly with TypeError -- by design, never
-    silently fall back to full-sequence logits (agent/model.py leans on the
-    same kwarg).
+    VRAM RULES. At Gemma 4's 262k vocab, ONE fp32 logit tensor for a
+    batch-4 game-length sequence is ~19 GiB, so this function is written
+    around four rules -- each one the fix for a real OOM (three crashes on
+    2026-07-31: the overnight run, then selftest t10 twice; consolidated
+    stage-10 note in TO_TEST.md):
 
-    KD ORDERING: the TEACHER forward runs FIRST, is immediately gathered
-    down to the masked (weighted) positions, and its kept-logit tensor is
-    freed -- only THEN does the student forward run. Second lesson learned
-    the hard way (t10, same day): with the student's kept logits + autograd
-    graph resident, the teacher's own multi-GiB kept-logit allocation
-    OOM'd even after the logits_to_keep fix. Teacher-first means the two
-    sides' big tensors never coexist, so a KD batch peaks at roughly the
-    same VRAM as a CE batch of the same geometry.
+    1. NEVER MATERIALIZE FULL-SEQUENCE LOGITS. The collator builds every
+       example as prompt + target + terminator (+ right pads), so all
+       weighted positions live in a trailing TAIL of the sequence; both
+       forwards pass ``logits_to_keep=tail+1`` and the lm_head projects
+       only that tail. The cut must happen INSIDE the model -- the OOM
+       fired at Gemma's logit softcapping, before loss code could slice.
+       If transformers renames the kwarg this fails loudly with TypeError;
+       never silently fall back to full-sequence logits (agent/model.py
+       leans on the same kwarg).
+    2. TEACHER BEFORE STUDENT (kd only). The teacher forward runs first
+       and is reduced to probabilities at the weighted positions, freeing
+       its kept-logit tensor BEFORE the student forward builds its own
+       kept logits + autograd graph. The two sides' multi-GiB tensors
+       never coexist, so a KD batch peaks like a CE batch of equal shape.
+    3. GATHER BY 2-D INDEX, never reshape-then-mask. For batch > 1,
+       ``logits[:, :-1, :]`` is a NON-contiguous view, so a following
+       ``.reshape(-1, V)`` silently COPIES the whole multi-GiB tensor
+       before any mask applies. ``logits[rows, cols]`` gathers the
+       weighted positions directly, no intermediate copy.
+    4. LONG-TARGET SOURCES GET A SMALLER BATCH. When the target spans
+       nearly the whole sequence (openthoughts), the tail IS the sequence
+       and rule 1 saves nothing -- cap the micro-batch instead
+       (``micro_batch_cap`` in datasets.json -> TrainingExample.batch_cap
+       -> epoch_batches). Harmless by the batch-equivalence above.
 
-    GATHER BY 2-D INDEX, NEVER reshape-then-mask. Third lesson (t10, same
-    day, one line further): ``logits[:, :-1, :]`` is a NON-CONTIGUOUS view
-    for batch > 1, so ``.reshape(-1, V)`` silently materializes a full COPY
-    of the multi-GiB tensor before the mask ever runs -- t10 OOM'd on that
-    exact copy (11.41 GiB) with the openthoughts KD source. Advanced
-    indexing ``logits[rows, cols]`` gathers the masked positions directly
-    without an intermediate copy. The teacher's gathered logits are also
-    converted to probabilities immediately so the raw gather can be freed.
-
-    Sources whose TARGET spans nearly the whole sequence (long-form
-    reasoning traces like openthoughts) defeat the tail optimization by
-    construction -- the tail IS the sequence. For those, cap the
-    micro-batch instead (``micro_batch_cap`` in the dataset manifest ->
-    ``TrainingExample.batch_cap`` -> ``epoch_batches``): per-example loss
-    normalization makes a batch of 1 mathematically identical to a batch
-    of 4, so a cap changes memory, not results.
-
-    With ``return_per_example=True`` returns ``(loss, per_example)`` where
-    ``per_example`` is the detached [B] tensor of per-example normalized
-    losses (exact per-source logging from mixed-source batches)."""
+    Any batch whose kept-logit tensor would still exceed ~10 GiB logs a
+    WARNING with its geometry -- the early alarm for a new pathological
+    source or a bad char-based length bucket (tokens != chars)."""
     import torch
     import torch.nn.functional as F
 
@@ -889,24 +886,29 @@ def weighted_loss(model: Any, model_inputs: dict, weights: Any,
 
     input_ids = model_inputs["input_ids"]
     seq_len = int(input_ids.shape[1])
-    # First trainable label position across the batch. Position 0 can never
-    # be trained (no logit predicts it), so the search starts at 1 -- which
-    # also makes all-zero rows (impossible by the collator's contract)
-    # degrade to a full-width tail instead of a bogus slice.
+    # The tail (VRAM rule 1): everything from the batch's first weighted
+    # label position to the end. Position 0 can never be trained (no logit
+    # predicts it), so the search starts at 1 -- which also makes all-zero
+    # rows (impossible by the collator's contract) degrade to a full-width
+    # tail instead of a bogus slice.
     nz = weights[:, 1:] != 0
     first = int(nz.float().argmax(dim=1).min()) + 1 if bool(nz.any()) else 1
     tail = seq_len - first  # trailing label positions covering every weight
 
-    # Mask/bookkeeping first: it depends only on weights + input_ids, and
-    # the KD teacher (below) needs the mask BEFORE the student forward.
+    # Gather indices next: they depend only on weights + input_ids, and the
+    # KD teacher (below) needs them BEFORE the student forward (rule 2).
+    # The model will keep tail+1 logit positions; kept position j predicts
+    # tail label j (the last kept position predicts nothing and is never
+    # gathered -- col_of < tail by construction).
     shift_labels = input_ids[:, -tail:]       # the tail's labels
     n_rows, n_pos = shift_labels.shape
     w = weights[:, -tail:].reshape(-1)
-    mask = w != 0
+    mask = w != 0                             # flat over [B * tail]
     mask_idx = mask.nonzero(as_tuple=True)[0]
     row_of = mask_idx // n_pos                # owning example per position
     col_of = mask_idx % n_pos                 # position within the tail
 
+    # Early alarm (see docstring): estimate the kept-logit tensor size.
     # Multimodal configs (Gemma 4 Unified) keep vocab_size on text_config;
     # the embedding table is the always-available fallback.
     cfg = getattr(model, "config", None)
@@ -927,23 +929,17 @@ def weighted_loss(model: Any, model_inputs: dict, weights: Any,
 
     teacher_probs = None
     if loss_kind == "kd":
-        # TEACHER FIRST (see docstring): gather the masked positions by 2-D
-        # index (NO reshape -- a non-contiguous reshape copies the whole
-        # tensor) and free the [B, tail+1, V] tensor before the student
-        # forward allocates its own copy + autograd graph. Kept logit j
-        # predicts tail label j, so col_of indexes it directly.
+        # VRAM rules 2 + 3: teacher first, gathered by 2-D index, reduced
+        # to probabilities; both big teacher tensors are gone before the
+        # student forward starts.
         teacher_logits = _base_model_logits(model, model_inputs,
                                             logits_to_keep=tail + 1)
         teacher = teacher_logits[row_of, col_of].float()
         del teacher_logits
-        # Probabilities now, so the raw gathered logits free immediately
-        # (the teacher is grad-free; only the probs are needed below).
         teacher_probs = F.softmax(teacher, dim=-1)
         del teacher
 
-    # Kept logits = positions [first-1, seq_len-1]; kept index j predicts
-    # label [first+j], i.e. tail label j -- gather with the same 2-D
-    # indices as the teacher (again: no non-contiguous reshape copies).
+    # Student forward: same tail (rule 1), same 2-D gather (rule 3).
     out = model(**model_inputs, logits_to_keep=tail + 1)
     student = out.logits[row_of, col_of].float()
 

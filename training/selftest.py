@@ -1251,9 +1251,9 @@ def t9_parallel() -> str:
 
 #: t10 profiles the train loop on a REAL datagen corpus. Default: the
 #: 2026-07-30 overnight run (3000 generations, game-length contexts -- the
-#: corpus whose analyst KD batches OOM'd before the logits_to_keep fix in
-#: train.weighted_loss). Override with T10_DATAGEN_LABEL=<label> to profile
-#: against a different data_game/<label>/ directory.
+#: corpus that exposed all three training OOMs; the four VRAM rules that
+#: fixed them live in train.weighted_loss's docstring). Override with
+#: T10_DATAGEN_LABEL=<label> to profile a different data_game/<label>/.
 _T10_LABEL = os.environ.get("T10_DATAGEN_LABEL", "overnight_iter1")
 _T10_BATCHES_PER_SOURCE = 4
 #: Peak-VRAM tripwire: the box is ~95 GiB; the overnight OOM happened at
@@ -1269,12 +1269,13 @@ def t10_traintime() -> str:
 
     Categories = data sources: GameTraceSource (player records, weighted
     CE -- the RL/"REINFORCE" signal), AnalystTraceSource (KD vs the frozen
-    base -- the analyst anchor; the loss that OOM'd the 2026-07-31
-    overnight train before weighted_loss got logits_to_keep), and every
-    enabled manifest source. For each: 4 real micro-batches (collation +
-    forward + backward, KD incl. the teacher forward) through the same
+    base -- the analyst anchor), and every enabled manifest source. For
+    each: 4 real micro-batches (collation + forward + backward, KD incl.
+    the teacher forward) through the same
     build_model/Collator/weighted_loss/PagedAdamW8bit stack as
-    run_training, timed with CUDA sync, with per-source peak VRAM.
+    run_training, timed with CUDA sync, with per-source peak VRAM (this is
+    the pre-launch check on weighted_loss's four VRAM rules; consolidated
+    stage-10 note in TO_TEST.md).
 
     The epoch estimate uses run_training's own batch arithmetic
     (weight-scaled contributions / micro_batch, + optimizer steps every
