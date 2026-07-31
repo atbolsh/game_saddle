@@ -1289,9 +1289,11 @@ def t10_traintime() -> str:
 
     traces_dir = REPO_ROOT / "data_game" / _T10_LABEL
     assert (traces_dir / "traces.jsonl").is_file(), (
-        f"{traces_dir}/traces.jsonl not found -- t10 profiles a REAL "
-        "datagen corpus; run datagen or set T10_DATAGEN_LABEL to an "
-        "existing data_game/<label>"
+        f"No generated data to use for the simulated training run: "
+        f"{traces_dir}/traces.jsonl does not exist. t10 profiles a REAL "
+        "datagen corpus -- run a datagen (training/generate_game_traces) "
+        "first, or point T10_DATAGEN_LABEL at an existing "
+        "data_game/<label> directory."
     )
     # Exactly the weekend run's source stack (run_weekend.train_one_epoch).
     sources = [
@@ -1302,10 +1304,17 @@ def t10_traintime() -> str:
     cfg = TrainConfig(label="selftest_t10")  # defaults = the real recipe
     src_weights = {s.name: s.weight for s in sources}
 
+    print(f"[t10] corpus {traces_dir.name} + {len(sources) - 2} manifest "
+          "source(s); materializing (expect ~10-15 min: game-frame "
+          "noising + manifest loading)...", flush=True)
     t0 = time.perf_counter()
     by_source = materialize(sources, max_example_chars=cfg.max_example_chars)
     setup_data_s = time.perf_counter() - t0
     assert by_source, "materialize produced no sources"
+    print(f"[t10] materialized {sum(len(v) for v in by_source.values())} "
+          f"examples from {len(by_source)} source(s) in "
+          f"{setup_data_s / 60:.1f} min; loading 4-bit model + LoRA...",
+          flush=True)
 
     t0 = time.perf_counter()
     spec = spec_for(cfg.architecture or CONFIG.model_key)
@@ -1322,6 +1331,9 @@ def t10_traintime() -> str:
                                          weight_decay=cfg.weight_decay)
     model.train()
     setup_model_s = time.perf_counter() - t0
+    print(f"[t10] model ready in {setup_model_s / 60:.1f} min; timing "
+          f"{_T10_BATCHES_PER_SOURCE} micro-batches per source (warmup "
+          "first, untimed)...", flush=True)
 
     def _one_batch(exs: list) -> float:
         """One real training micro-batch (collation + fwd + bwd), timed."""
@@ -1375,6 +1387,9 @@ def t10_traintime() -> str:
             "peak_gib": peak_gib,
             "epoch_batches": n_epoch_batches,
         }
+        print(f"[t10] {name}[{batches[0][0].loss}]: "
+              f"{per_source[name]['mean_batch_s']:.2f}s/batch over "
+              f"{len(times)}, peak {peak_gib:.1f} GiB", flush=True)
         assert peak_gib < _T10_VRAM_LIMIT_GIB, (
             f"source {name} peaked at {peak_gib:.1f} GiB (> "
             f"{_T10_VRAM_LIMIT_GIB} tripwire) -- the weekend run would "
