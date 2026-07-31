@@ -262,9 +262,13 @@ native binary `neo4j-admin database dump` produced by `scripts/neo4j_db.sh save`
 
 ## Interactive notebooks
 
-Two Jupyter notebooks live in `notebooks/`. Install the extra deps
-(`pip install -r requirements.txt` pulls in `ipywidgets` and `pyvis`) and
-launch Jupyter from the repo root:
+The Jupyter notebooks live in `notebooks/`: `play` (mode-1 play),
+`interactive_self_eval` (the player/analyst loop, mode 3), `debrief`
+(privileged post-game analysis, mode 4), `trace_viewer` (step through
+recorded datagen traces — no GPU/NAMS needed), and `visualize_memory`
+(the memory graph). Install the extra deps (`pip install -r
+requirements.txt` pulls in `ipywidgets` and `pyvis`) and launch Jupyter
+from the repo root:
 
 ```bash
 jupyter notebook   # or: jupyter lab
@@ -520,6 +524,9 @@ data_external/       # materialized replay datasets + probes (git-ignored; setup
 data_game/           # generated self-eval game traces + frames (git-ignored; setup_env.sh)
 notebooks/
   play.ipynb            # interactive mode-1 play (Ask + Restart conversation)
+  interactive_self_eval.ipynb # player/analyst two-phase loop (mode 3)
+  debrief.ipynb         # privileged post-game debrief (mode 4)
+  trace_viewer.ipynb    # step through recorded datagen traces (no GPU/NAMS)
   visualize_memory.ipynb# pyvis interactive graph of the memory graph
 scripts/
   vast_neo4j_launch.sh       # bare-metal Neo4j setup (no Docker; Vast.ai)

@@ -183,7 +183,10 @@ bit-identical across shapes; treat order-of-magnitude gaps as a real bug.
 ## Manual appendix (not automatable)
 
 These need eyes or box-level state; check them once per box / after big
-changes rather than every run:
+changes rather than every run. For anything that means reading recorded
+datagen traces (noised frames, win stamping, question-round analyses),
+`notebooks/trace_viewer.ipynb` steps through any `data_game/<label>` run
+game-by-game, move-by-move — no GPU or NAMS needed:
 
 1. **Checkpoint dropdowns** — the smoke checkpoint from t4 appears in the
    notebooks' Checkpoint dropdown, loads and generates via the picker, via
