@@ -53,6 +53,12 @@ supports video. Future work:
   single still, and let the agent reason about motion;
 * record those modalities into NAMS as `GameSnapshot`-style media nodes
   (audio/video bytes on disk, path + small preview on the node, mirroring
-  the image-storage approach in `agent/image_store.py`).
+  the image-storage approach in `agent/image_store.py`);
+* enable the video/audio KD **replay** placeholders in
+  `training/datasets.json` — independent of all of the above (replay needs
+  no game-harness connection). Deliberately sidelined for the first
+  training rounds: the vision/audio towers are LoRA-frozen, so drift risk
+  is low, and enabling costs converters + a fresh VRAM profile (rationale
+  in `training/TRAINING_EXTRA_DATASETS.md`).
 
 Currently only image + text are used.

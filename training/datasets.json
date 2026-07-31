@@ -169,7 +169,7 @@
       "examples_per_epoch": 0,
       "probe": null,
       "enabled": false,
-      "notes": "PLACEHOLDER, no converter yet. Video comprehension replay -- enable only if the deployed checkpoint actually exercises video (see TRAINING_EXTRA_DATASETS.md); the downloader refuses loudly if enabled without a converter."
+      "notes": "PLACEHOLDER, no converter yet. Video comprehension replay -- sidelined by priority, not necessity (rationale in TRAINING_EXTRA_DATASETS.md: towers are LoRA-frozen so drift risk is low; enabling needs a converter, a micro_batch_cap, and a t10 re-profile -- many frames = long-sequence KD). The downloader refuses loudly if enabled without a converter."
     },
     {
       "name": "audio_qa",
@@ -183,7 +183,7 @@
       "examples_per_epoch": 0,
       "probe": null,
       "enabled": false,
-      "notes": "PLACEHOLDER, no dataset chosen and no converter yet. Audio comprehension replay -- probe-only unless the harness starts exercising audio."
+      "notes": "PLACEHOLDER, no dataset chosen and no converter yet. Audio comprehension replay -- sidelined by priority, not necessity (rationale in TRAINING_EXTRA_DATASETS.md). Before writing any code, verify remotely that the deployed 12B checkpoint accepts audio input at all (docs only promise audio for Gemma 4 E4B)."
     }
   ]
 }
