@@ -24,18 +24,21 @@ new dependencies -- plain asserts.
 Stage map (rationale in the Intermission plan):
 
   * t0-env      imports + versions + CUDA + bitsandbytes
-  * t1-pure     parse_rating, build_span_weights, image noise, tripwire,
-                _rewrite_image_urls, GameTraceSource on a fabricated dir,
-                epoch_batches bucketing, stack_equal_length
+  * t1-pure     parse_rating, build_span_weights (non-negative mapping),
+                image noise, tripwire, _rewrite_image_urls, Game/Player-
+                Anchor/Analyst sources on a fabricated dir, epoch_batches
+                bucketing, stack_equal_length
   * t2-data     manifest loads, per-source counts vs meta.json, probes exist
   * t3-model    4-bit QLoRA load, terminator, CE/KD forward+backward
-                (image example included), teacher-path sanity
+                (image example included), teacher-path sanity, kd_anchor
+                base-fallback parity
   * t4-train    batch-4 vs batch-1 loss parity, CLI smoke train (CE + KD +
-                negative span + image), forced-rollback variant
+                negative span + image), forced-rollback variant (hard tier)
   * t5-datagen  2 games x 5 moves at --parallel 2: traces, images, stats,
                 plots, tripwire silent
   * t6-ab       generate_batch vs generate equivalence, greedy
-  * t7-e2e      GameTraceSource over t5's output through real train steps
+  * t7-e2e      Game + PlayerAnchor + Analyst sources over t5's output
+                through real train steps
   * t8-timing   REAL serial datagen run (startup excluded), s/generation
                 + serial epoch extrapolation; t9's baseline
   * t9-parallel t8's exact workload at --parallel 3, compared on
@@ -216,6 +219,7 @@ def t1_pure() -> str:
     from training.game_traces import (
         AnalystTraceSource,
         GameTraceSource,
+        PlayerAnchorSource,
         build_span_weights,
     )
     from training.generate_game_traces import (
@@ -248,21 +252,26 @@ def t1_pure() -> str:
         assert got == expected, f"parse_rating({text!r}) = {got}, want {expected}"
         checks += 1
 
-    # ---- build_span_weights: base, WRONG override, win boost, neg scale
+    # ---- build_span_weights: non-negative mapping max(0, (r+0.5)/1.5),
+    # WRONG spans masked to 0, win boost, hard floor (2026-08-01 collapse
+    # fix -- rationale above the function in training/game_traces.py)
     tgt = "go left WRONG: gold is right done"
     spans = build_span_weights(tgt, rating=0.5, wrong_spans=["WRONG: gold is right"],
                                game_won=False, moves_from_end=None)
-    assert spans[0] == (0, len(tgt), 0.5), spans[0]
-    assert spans[1][2] == -1.0 and tgt[spans[1][0]:spans[1][1]].startswith("WRONG"), spans[1]
+    assert abs(spans[0][2] - (1.0 / 1.5)) < 1e-9, spans[0]  # (0.5+0.5)/1.5
+    assert (spans[0][0], spans[0][1]) == (0, len(tgt)), spans[0]
+    assert spans[1][2] == 0.0 and tgt[spans[1][0]:spans[1][1]].startswith("WRONG"), spans[1]
     win = build_span_weights(tgt, rating=0.9, wrong_spans=["WRONG: gold is right"],
                              game_won=True, moves_from_end=0)
-    assert abs(win[0][2] - 1.0) < 1e-9, win[0]     # clamp(0.9 + 0.2)
-    assert abs(win[1][2] - (-0.8)) < 1e-9, win[1]  # clamp(-1.0 + 0.2)
-    gentle = build_span_weights(tgt, rating=-0.5, wrong_spans=[],
-                                game_won=False, moves_from_end=None,
-                                negative_scale=0.5)
-    assert abs(gentle[0][2] - (-0.25)) < 1e-9, gentle[0]
-    checks += 4
+    assert abs(win[0][2] - 1.0) < 1e-9, win[0]   # clamp01(1.4/1.5 + 0.2)
+    assert abs(win[1][2] - 0.2) < 1e-9, win[1]   # masked WRONG + win boost
+    floor = build_span_weights(tgt, rating=-0.5, wrong_spans=[],
+                               game_won=False, moves_from_end=None)
+    assert floor[0][2] == 0.0, floor[0]          # cutoff hits 0 exactly
+    worst = build_span_weights(tgt, rating=-1.0, wrong_spans=[],
+                               game_won=False, moves_from_end=None)
+    assert worst[0][2] == 0.0, worst[0]          # NEVER negative
+    checks += 6
 
     # ---- image noise: deterministic per seed, identity at strength 0
     base_img = Image.new("RGB", (64, 64), (120, 40, 40))
@@ -360,8 +369,25 @@ def t1_pure() -> str:
             "image url not resolved against the trace dir"
         )
         base_w = ex.span_weights[0][2]
-        assert abs(base_w - 0.7) < 1e-9, f"win boost wrong: {base_w}"
+        # (0.5 + 0.5) / 1.5 mapped base + 0.2 win boost at moves_from_end=0
+        assert abs(base_w - (1.0 / 1.5 + 0.2)) < 1e-9, (
+            f"mapped base + win boost wrong: {base_w}"
+        )
         checks += 4
+
+        # ---- PlayerAnchorSource on the same fabricated dir: trust-region
+        # semantics -- EVERY parseable record kept (rating-null included),
+        # uniform weights, kd_anchor loss.
+        psrc = PlayerAnchorSource(trace_dir / "traces.jsonl",
+                                  noise_strength=0.0)
+        pexs = list(psrc.examples())
+        assert len(pexs) == 2, (
+            f"expected 2 anchor examples (rating-null KEPT), got {len(pexs)}"
+        )
+        assert all(x.loss == "kd_anchor" and x.span_weights is None
+                   for x in pexs), pexs
+        assert abs(psrc.weight - 0.25) < 1e-9, psrc.weight
+        checks += 3
 
         # ---- AnalystTraceSource: KD anchor semantics on a fabricated file
         analyst_fixtures = [
@@ -695,12 +721,26 @@ def t3_model() -> str:
                 f"fresh-adapter KD loss {kd_loss:.4f} != teacher entropy "
                 f"{entropy:.4f} -- disable_adapter() may not bypass the adapter"
             )
+
+            # kd_anchor fallback sanity: with NO anchor adapter loaded the
+            # anchor teacher deliberately falls back to the base (epoch-1
+            # semantics, train.py THREE LOSS KINDS), so kd and kd_anchor
+            # must agree on the same example (bf16 tolerance only).
+            kda_loss = float(weighted_loss(
+                model, built["model_inputs"], built["weights"],
+                loss_kind="kd_anchor",
+            ).detach())
+            assert abs(kda_loss - kd_loss) < 0.02, (
+                f"kd_anchor without an anchor adapter gave {kda_loss:.4f} "
+                f"vs kd {kd_loss:.4f} -- the base fallback is broken"
+            )
             peak = torch.cuda.max_memory_allocated() / 2**30
             return (
                 f"{len(lora_targets)} LoRA targets, {len(projector)} projector "
                 f"module(s), terminator {terminator}; losses "
                 + ", ".join(f"{k}={v:.3f}" for k, v in losses.items())
-                + f"; KD==teacher-entropy ok; peak {peak:.1f} GiB"
+                + f"; KD==teacher-entropy ok; kd_anchor fallback ok; "
+                f"peak {peak:.1f} GiB"
             )
     finally:
         _free_cuda(model)
@@ -807,13 +847,17 @@ def t4_train() -> str:
         "no heldout_loss eval row in eval_log.jsonl"
     )
 
-    # ---- (c) forced rollback: a destructive LR regresses the holdout fast
+    # ---- (c) forced rollback: a destructive LR regresses the holdout fast.
+    # --hard-multiplier 1.0 makes ANY worse-than-best eval a HARD regression
+    # (the two-tier guard only rolls back on the hard tier), so the rollback
+    # path fires deterministically without waiting for a 2x blowup.
     r2 = _run_cli([
         "training.train", "--data", str(smoke),
         "--label", "selftest_t4rb", "--epochs", "8",
         "--lr", "0.05", "--micro-batch", "2", "--grad-accum", "1",
         "--save-steps", "2", "--max-steps", "10",
         "--holdout-fraction", "0.2", "--regression-tolerance", "0",
+        "--hard-multiplier", "1.0",
         "--on-regression", "rollback", "--max-rollbacks", "0",
     ], timeout=5400)
     assert r2.returncode == 0, (
@@ -1103,25 +1147,34 @@ def t6_ab() -> str:
 
 def t7_e2e() -> str:
     """t5's traces through real train steps: GameTraceSource (weighted CE)
-    plus AnalystTraceSource (KD vs the frozen base), mixed buckets."""
-    from training.game_traces import AnalystTraceSource, GameTraceSource
+    plus PlayerAnchorSource (kd_anchor; no anchor checkpoint -> base
+    teacher, epoch-1 semantics) plus AnalystTraceSource (KD vs the frozen
+    base), mixed buckets."""
+    from training.game_traces import (
+        AnalystTraceSource,
+        GameTraceSource,
+        PlayerAnchorSource,
+    )
     from training.train import TrainConfig, run_training
 
     traces = REPO_ROOT / "data_game" / "selftest_t5" / "traces.jsonl"
     assert traces.is_file(), "run t5 first (its output is this stage's input)"
     src = GameTraceSource(traces, noise_seed=1)
+    psrc = PlayerAnchorSource(traces, weight=1.0, noise_seed=1)
     asrc = AnalystTraceSource(
         traces.parent / "analyst_traces.jsonl",
         examples_per_epoch=4, noise_seed=1,
     )
     # No step cap: the tiny t5 corpus is a handful of batches, and draining
-    # the epoch guarantees the KD (analyst) bucket actually trains.
+    # the epoch guarantees the KD (analyst) and kd_anchor (player anchor)
+    # buckets actually train. Anchor weight 1.0 here (vs the production
+    # 0.25) so the tiny corpus reliably yields anchor batches.
     cfg = TrainConfig(
         label="selftest_t7", epochs=1, max_steps=None, save_steps=999,
         micro_batch=2, grad_accum=1, holdout_fraction=0.0,
         log_steps=1,
     )
-    rc = run_training([src, asrc], cfg)
+    rc = run_training([src, psrc, asrc], cfg)
     assert rc == 0, f"run_training returned {rc}"
     run_dir = _newest("logs/train_selftest_t7_*")
     rows = [
@@ -1134,8 +1187,8 @@ def t7_e2e() -> str:
         f"no finite losses logged in {run_dir}"
     )
     return (
-        f"{len(losses)} step(s) on {src.name}+{asrc.name}, losses "
-        + ", ".join(f"{l:.3f}" for l in losses[:4])
+        f"{len(losses)} step(s) on {src.name}+{psrc.name}+{asrc.name}, "
+        "losses " + ", ".join(f"{l:.3f}" for l in losses[:4])
     )
 
 
@@ -1268,9 +1321,11 @@ def t10_traintime() -> str:
     NAMS. NO CHECKPOINT IS SAVED (this stage never calls save_checkpoint).
 
     Categories = data sources: GameTraceSource (player records, weighted
-    CE -- the RL/"REINFORCE" signal), AnalystTraceSource (KD vs the frozen
-    base -- the analyst anchor), and every enabled manifest source. For
-    each: 4 real micro-batches (collation + forward + backward, KD incl.
+    CE -- the RL/"REINFORCE" signal), PlayerAnchorSource (kd_anchor -- the
+    player trust region; teacher = base here, no anchor checkpoint),
+    AnalystTraceSource (KD vs the frozen base -- the analyst anchor), and
+    every enabled manifest source. For each: 4 real micro-batches
+    (collation + forward + backward, KD incl.
     the teacher forward) through the same
     build_model/Collator/weighted_loss/PagedAdamW8bit stack as
     run_training, timed with CUDA sync, with per-source peak VRAM (this is
@@ -1292,7 +1347,11 @@ def t10_traintime() -> str:
     from agent.config import CONFIG
     from agent.model import ADAPTERS, spec_for
     from training.external_data import sources_from_manifest
-    from training.game_traces import AnalystTraceSource, GameTraceSource
+    from training.game_traces import (
+        AnalystTraceSource,
+        GameTraceSource,
+        PlayerAnchorSource,
+    )
     from training.train import (
         Collator,
         TrainConfig,
@@ -1315,13 +1374,14 @@ def t10_traintime() -> str:
     # Exactly the weekend run's source stack (run_weekend.train_one_epoch).
     sources = [
         GameTraceSource(traces_dir / "traces.jsonl"),
+        PlayerAnchorSource(traces_dir / "traces.jsonl"),
         AnalystTraceSource(traces_dir / "analyst_traces.jsonl"),
         *sources_from_manifest(),
     ]
     cfg = TrainConfig(label="selftest_t10")  # defaults = the real recipe
     src_weights = {s.name: s.weight for s in sources}
 
-    print(f"[t10] corpus {traces_dir.name} + {len(sources) - 2} manifest "
+    print(f"[t10] corpus {traces_dir.name} + {len(sources) - 3} manifest "
           "source(s); materializing (expect ~10-15 min: game-frame "
           "noising + manifest loading)...", flush=True)
     t0 = time.perf_counter()

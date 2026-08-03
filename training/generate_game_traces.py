@@ -29,8 +29,10 @@ One record per player generation, in ``data_game/<label>/traces.jsonl``:
     the live ``memory_images/`` copy does not survive NAMS resets);
   * ``target_text`` -- the raw player reply (the ONLY trainable tokens);
   * ``meta``      -- rating, wrong spans, action, game/move indices, outcome,
-    and the exact ``question`` the round asked (perception rounds are the
-    records whose question differs from the default move request).
+    the round's agent-to-gold distances (``dist_to_gold_before/after``,
+    normalized units; the rating-independent quality cross-check), and the
+    exact ``question`` the round asked (perception rounds are the records
+    whose question differs from the default move request).
 
 Analyst text is stored to NAMS exactly as in the notebook and never enters
 any PLAYER record's ``messages``/``target_text`` -- it exists in player
@@ -52,6 +54,14 @@ Housekeeping per the committed plan: frames are noised at inference
 (mild label-safe degradation, ``--no-noise`` to disable) and NAMS episodic
 memory is reset to the seeded semantic model (tips are ``Preference`` nodes
 and survive) every ``--reset-every`` games.
+
+**Degeneracy fuse**: ``DEGENERACY_FUSE`` consecutive generations with no
+parseable RATING and no parseable move mean the checkpoint is collapsed,
+not unlucky -- the run drains all workers and exits ``EXIT_POISONED`` (3)
+so the orchestrator stops instead of burning hours on gibberish (the
+2026-08-01 collapse generated ~15h of unparseable output before anyone
+noticed). Per-move gold distances (``meta.dist_to_gold_before/after``) are
+recorded as a rating-independent quality cross-check.
 
 **Parallelism** (``--parallel``, default 16): N sessions play N games
 concurrently, one worker thread each, sharing ONE model through
@@ -82,6 +92,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import random
 import shutil
 import sys
@@ -106,6 +117,24 @@ DATA_GAME_DIR = Path(__file__).resolve().parent.parent / "data_game"
 #: Long enough to never fire on a coincidental phrase, short enough to catch
 #: a truncated leak.
 _TRIPWIRE_PREFIX_LEN = 100
+
+#: DEGENERACY FUSE (2026-08-01 postmortem): a collapsed checkpoint produces
+#: replies with NO parseable move AND analyses with NO parseable RATING --
+#: 100% of its output is dropped at training time, so every further
+#: generation is pure waste (the collapsed weekend burned ~15h generating
+#: gibberish across 5 epochs). After this many CONSECUTIVE degenerate
+#: generations (run-wide, across all workers) the run declares the
+#: checkpoint poisoned, drains every worker, and exits with
+#: EXIT_POISONED so the orchestrator can stop the whole loop. 25 is far
+#: past anything a healthy model produces (a healthy run breaks a streak
+#: within a handful of generations) yet costs only ~3 minutes at
+#: --parallel 16 to trip.
+DEGENERACY_FUSE = 25
+
+#: Distinct exit code for "the checkpoint is poisoned" (vs 1 = ordinary
+#: crash): run_weekend treats it as fatal for the whole run, not a
+#: retry-and-continue failure.
+EXIT_POISONED = 3
 
 #: Perception-question rounds: with probability --question-rate a round asks
 #: one of these instead of the default move request. The player must answer
@@ -151,6 +180,21 @@ def _sample_perception_question(rng: random.Random,
     if rng.random() >= question_rate:
         return None
     return rng.choice(rng.choice(PERCEPTION_QUESTION_GROUPS))
+
+
+def _dist_to_gold(settings: dict) -> float | None:
+    """Agent-to-NEAREST-gold distance in normalized board units ([0,1]
+    square, the ``game_io`` convention), from a serialized settings dict.
+    None when no gold remains. Recorded per move (before/after) as a
+    rating-INDEPENDENT quality signal: the analyst can be wrong or absent,
+    but "did the player get closer to the gold" cannot -- it is the
+    morning cross-check on the rating distribution, not (yet) a training
+    input."""
+    gold = settings.get("gold") or []
+    if not gold:
+        return None
+    ax, ay = settings["agent_x"], settings["agent_y"]
+    return round(min(math.hypot(gx - ax, gy - ay) for gx, gy in gold), 4)
 
 
 def _rewrite_image_urls(messages: list[dict], mapping: dict[str, str]) -> int:
@@ -213,23 +257,32 @@ def _assert_no_analyst_leak(record: dict, analyses: list[str]) -> None:
 
 class _Shared:
     """Everything the worker threads touch together: the trace file, the
-    counters, and the generation budget. One lock covers it all -- these are
-    microsecond operations next to multi-second generations."""
+    counters, the generation budget, and the degeneracy fuse. One lock
+    covers it all -- these are microsecond operations next to multi-second
+    generations."""
 
     def __init__(self, out: Any, analyst_out: Any, images_dir: Path,
-                 max_generations: int):
+                 max_generations: int, checkpoint: str | None = None):
         self.lock = threading.Lock()
         self.out = out
         self.analyst_out = analyst_out
         self.images_dir = images_dir
         self.max_generations = max_generations
+        self.checkpoint = checkpoint  #: named in the fuse's ERROR line
         self.stats: Counter = Counter()
         self.rating_hist: Counter = Counter()
         self.records: list[dict] = []  #: in order written (for the plots)
+        #: Degeneracy fuse state (see DEGENERACY_FUSE): consecutive
+        #: rating-less AND move-less generations, run-wide.
+        self.degenerate_streak = 0
+        self.poisoned = False
 
     def take_generation(self) -> bool:
-        """Reserve one generation slot; False once the budget is spent."""
+        """Reserve one generation slot; False once the budget is spent or
+        the degeneracy fuse tripped (poisoned = drain everyone)."""
         with self.lock:
+            if self.poisoned:
+                return False
             if self.stats["generations"] >= self.max_generations:
                 return False
             self.stats["generations"] += 1
@@ -237,7 +290,31 @@ class _Shared:
 
     def budget_spent(self) -> bool:
         with self.lock:
-            return self.stats["generations"] >= self.max_generations
+            return (self.poisoned
+                    or self.stats["generations"] >= self.max_generations)
+
+    def note_degeneracy(self, degenerate: bool) -> None:
+        """Feed the fuse one generation's verdict (a parseable RATING or a
+        parseable move both count as signs of life). Trips at
+        DEGENERACY_FUSE consecutive degenerates, after which
+        :meth:`take_generation` refuses and all workers drain."""
+        with self.lock:
+            if not degenerate:
+                self.degenerate_streak = 0
+                return
+            self.stats["degenerate_generations"] += 1
+            self.degenerate_streak += 1
+            if self.degenerate_streak >= DEGENERACY_FUSE and not self.poisoned:
+                self.poisoned = True
+                logger.error(
+                    "DEGENERACY FUSE TRIPPED: %d consecutive generations "
+                    "with no parseable RATING and no parseable move -- "
+                    "checkpoint %r is POISONED. Draining workers and "
+                    "exiting with code %d (run_weekend stops the whole "
+                    "run on this code).",
+                    self.degenerate_streak,
+                    self.checkpoint or "<bare HF weights>", EXIT_POISONED,
+                )
 
 
 def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
@@ -252,12 +329,17 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
     those rounds do not advance the game (a correct answer is prose with no
     move token; a mistakenly emitted token still propagates, exactly as the
     game contract promises, and the analyst grades it as unrequested)."""
+    from agent import game_io  # heavy (pygame); already loaded by the session
+
     game_records: list[dict] = []
     analyst_records: list[dict] = []
     won = False
     for move_idx in range(args.max_moves):
         if not shared.take_generation():
             break
+        dist_before = _dist_to_gold(
+            game_io.game_to_settings_dict(session.game)
+        )
         question = _sample_perception_question(qrng, args.question_rate)
         is_perception = question is not None
         if question is None:
@@ -275,6 +357,9 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
         analyst = session.ask_analyst(session.DEFAULT_ANALYST_QUESTION)
         session_analyses.append(analyst["analysis"])
         outcome = session.end_round()
+        # After the pending move propagated: dist_before - dist_to_gold_after
+        # > 0 means this round moved the player toward the gold.
+        dist_after = _dist_to_gold(game_io.game_to_settings_dict(session.game))
 
         record = {
             "messages": player["messages"],
@@ -290,6 +375,10 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
                     for s in player["searches"]
                 ],
                 "gold_collected": outcome["gold_collected"],
+                # Rating-independent quality signal (see _dist_to_gold);
+                # after is None when the round's move ATE the gold.
+                "dist_to_gold_before": dist_before,
+                "dist_to_gold_after": dist_after,
                 "game_index": game_idx,
                 "move_index": move_idx,
                 "session_id": player["session_id"],
@@ -358,6 +447,15 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
                 shared.stats["moves"] += 1
             if is_perception:
                 shared.stats["perception_rounds"] += 1
+
+        # Degeneracy fuse: no parseable RATING anywhere in the analysis AND
+        # no parseable move token in the reply (bare or bracketed) means
+        # this generation is un-trainable gibberish; a long run of those is
+        # a collapsed checkpoint, not bad luck (see DEGENERACY_FUSE).
+        shared.note_degeneracy(
+            analyst["rating"] is None
+            and not player["action"] and not player["bare_move"]
+        )
 
         if outcome["gold_remaining"] == 0:
             won = True
@@ -466,7 +564,8 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
         with open(traces_path, "a", encoding="utf-8") as out, \
                 open(analyst_path, "a", encoding="utf-8") as analyst_out:
             shared = _Shared(out, analyst_out, images_dir,
-                             args.max_generations)
+                             args.max_generations,
+                             checkpoint=args.checkpoint)
             # Per-session tripwire corpora (cleared on memory reset).
             analyses: list[list[str]] = [[] for _ in range(n_workers)]
             # Per-worker question rng, persistent across blocks so no two
@@ -527,6 +626,8 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
         "traces": str(traces_path),
         "analyst_traces": str(analyst_path),
         "parallel": n_workers,
+        #: True = the degeneracy fuse tripped; main() exits EXIT_POISONED.
+        "poisoned": shared.poisoned,
         # THE number to compare across --parallel settings (model load
         # included; identical either way, so it cancels in the comparison).
         "wall_seconds": round(wall_s, 1),
@@ -600,7 +701,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(name)s %(levelname)s %(message)s")
-    run_generation(build_parser().parse_args(argv))
+    summary = run_generation(build_parser().parse_args(argv))
+    if summary.get("poisoned"):
+        # The distinctive code is the ENTIRE point: run_weekend maps 3 to
+        # "stop the whole run", vs 1 = ordinary crash = retry once.
+        return EXIT_POISONED
     return 0
 
 

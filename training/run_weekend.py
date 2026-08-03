@@ -7,9 +7,18 @@ One "epoch" here is one full expert-iteration cycle. For epoch k (1-based):
      <previous epoch's adapter>`` (``--parallel 1`` restores the fully
      serial datagen path)
   2. train     ``python -m training.run_weekend --train-iter <k>`` -- the
-     epoch's GameTraceSource + AnalystTraceSource plus the manifest replay
-     sources, resumed from the previous epoch's adapter (epoch 1 starts
-     from bare HF weights unless --start-checkpoint is given).
+     epoch's GameTraceSource + PlayerAnchorSource (the trust region,
+     anchored to the previous epoch's adapter) + AnalystTraceSource plus
+     the manifest replay sources, resumed from the previous epoch's
+     adapter (epoch 1 starts from bare HF weights unless
+     --start-checkpoint is given).
+  3. smoke eval  8 real games with the FRESH checkpoint through the same
+     datagen path (label ``<prefix>_smoke<k>``, never trained on): win
+     rate, mean/min rating, degeneracy fraction, and mean gold-distance
+     delta are logged and stored under ``smoke`` in the state file --
+     every checkpoint gets a game-performance reading even when no
+     further datagen follows it, and a poisoned checkpoint surfaces in
+     ~15 min. ``grep smoke_eval`` on the run log for the morning review.
 
 Each stage is a SUBPROCESS, deliberately: the inference model is a
 process-wide singleton (agent/model.py) and training builds its own
@@ -34,8 +43,16 @@ Crash policy -- the run must survive an unattended weekend:
 * Orchestrator restart: ``data_game/<prefix>_state.json`` records finished
   stages and per-epoch checkpoints; rerunning the same command skips
   completed work and finishes partial datagen via the --append path.
+* STOP-ON-POISON is the one deliberate exception to "keep marching": a
+  datagen or smoke-eval stage exiting with code 3 means the degeneracy
+  fuse tripped (generate_game_traces: the checkpoint emits gibberish with
+  no parseable ratings or moves). That is deterministic, not transient --
+  every later epoch would train on garbage -- so the orchestrator logs
+  the broken checkpoint at ERROR, records it under ``poisoned`` in the
+  state file, and STOPS the entire run. No retry, no later epochs.
 
-The exit code is the number of failed stages (0 = clean weekend).
+The exit code is the number of failed stages (0 = clean weekend; a
+poisoned stop adds 1).
 
 MONITORING: the orchestrator samples topline GPU memory (``nvidia-smi``,
 summed over GPUs) every minute, tagged with the running stage, appending
@@ -74,6 +91,8 @@ from pathlib import Path
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from training.generate_game_traces import EXIT_POISONED  # noqa: E402
 
 logger = logging.getLogger("run_weekend")
 
@@ -262,13 +281,16 @@ def _latest_checkpoint(label: str) -> str | None:
     return best_name
 
 
-def _run_stage(cmd: list[str], stage: str) -> bool:
-    """One subprocess attempt; True on exit 0. Output inherits our
-    stdout/stderr so everything lands in the one weekend log. Also
+def _run_stage(cmd: list[str], stage: str) -> int:
+    """One subprocess attempt; returns the exit code (0 = success; the
+    callers care about EXIT_POISONED = 3 specifically). Output inherits
+    our stdout/stderr so everything lands in the one weekend log. Also
     brackets the VRAM monitor's stage tag and books the wall time into
-    the per-kind hours ledger (stage names start with the kind)."""
+    the per-kind hours ledger (smoke evals run the datagen path and book
+    as datagen)."""
     logger.info("[%s] starting: %s", stage, " ".join(cmd))
-    kind = "datagen" if stage.startswith("datagen") else "train"
+    kind = ("datagen" if stage.startswith(("datagen", "smoke"))
+            else "train")
     if _MONITOR is not None:
         _MONITOR.set_stage(stage)
     t0 = time.perf_counter()
@@ -281,18 +303,108 @@ def _run_stage(cmd: list[str], stage: str) -> bool:
             _MONITOR.set_stage(None)
     if proc.returncode == 0:
         logger.info("[%s] finished in %.2fh", stage, hours)
-        return True
-    logger.error("[%s] FAILED (exit %d) after %.2fh",
-                 stage, proc.returncode, hours)
-    return False
+    else:
+        logger.error("[%s] FAILED (exit %d) after %.2fh",
+                     stage, proc.returncode, hours)
+    return proc.returncode
+
+
+def _summarize_traces(label: str) -> dict:
+    """Game-performance summary of ``data_game/<label>/traces.jsonl``:
+    games/wins (a game = one distinct (session_id, game_index)), mean/min
+    analyst rating, the rating-null fraction (the degeneracy meter -- a
+    healthy run sits near 0), and the mean per-move gold-distance delta
+    (positive = the player closes in on the gold; rating-independent
+    quality cross-check, recorded by generate_game_traces)."""
+    path = DATA_GAME_DIR / label / "traces.jsonl"
+    games: dict[tuple, bool] = {}
+    ratings: list[float] = []
+    deltas: list[float] = []
+    n_records = 0
+    n_rating_null = 0
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            meta = json.loads(line)["meta"]
+            n_records += 1
+            key = (meta.get("session_id"), meta.get("game_index"))
+            games[key] = games.get(key, False) or bool(meta.get("game_won"))
+            rating = meta.get("rating")
+            if rating is None:
+                n_rating_null += 1
+            else:
+                ratings.append(float(rating))
+            before = meta.get("dist_to_gold_before")
+            after = meta.get("dist_to_gold_after")
+            if before is not None and after is not None:
+                deltas.append(before - after)
+    wins = sum(games.values())
+    return {
+        "generations": n_records,
+        "games": len(games),
+        "wins": wins,
+        "win_rate": round(wins / len(games), 3) if games else None,
+        "mean_rating": (round(sum(ratings) / len(ratings), 3)
+                        if ratings else None),
+        "min_rating": min(ratings) if ratings else None,
+        "rating_null_fraction": (round(n_rating_null / n_records, 3)
+                                 if n_records else None),
+        "mean_dist_delta": (round(sum(deltas) / len(deltas), 4)
+                            if deltas else None),
+    }
 
 
 # =================================================================== stages
 
+#: Post-train smoke eval size: 8 real games (~100-200 generations,
+#: ~10-20 min at --parallel 16) -- enough for a win-rate/rating/degeneracy
+#: reading on every fresh checkpoint, cheap enough to run unconditionally.
+SMOKE_GAMES = 8
+SMOKE_MAX_GENERATIONS = 200
+
+
+def _smoke_eval(k: int, checkpoint: str | None,
+                args: argparse.Namespace) -> str:
+    """Post-train sanity check on epoch k's fresh checkpoint: a tiny run
+    through the REAL datagen path (so the degeneracy fuse and distance
+    recording apply) under the separate label ``<prefix>_smoke<k>`` --
+    smoke traces never enter a training corpus. Returns ``"ok"`` /
+    ``"poisoned"`` (fuse tripped -> stop the run) / ``"failed"`` (crash:
+    a missing reading, logged at ERROR, but NOT a failed epoch -- the
+    checkpoint may still be fine)."""
+    label = f"{args.prefix}_smoke{k}"
+    traces = DATA_GAME_DIR / label / "traces.jsonl"
+    cmd = [
+        sys.executable, "-m", "training.generate_game_traces",
+        "--label", label,
+        "--parallel", str(args.parallel),
+        "--games", str(SMOKE_GAMES),
+        "--max-generations", str(SMOKE_MAX_GENERATIONS),
+        "--seed", str(args.seed + 100 * k + 51),
+    ]
+    if checkpoint:
+        cmd += ["--checkpoint", checkpoint]
+    if traces.exists():
+        cmd += ["--append"]
+    rc = _run_stage(cmd, f"smoke{k}")
+    if rc == EXIT_POISONED:
+        return "poisoned"
+    if rc != 0:
+        return "failed"
+    return "ok"
+
+
 def _datagen(k: int, checkpoint: str | None,
-             args: argparse.Namespace) -> bool:
-    """Datagen for epoch k, resumable. True if any traces exist
-    afterwards (training can proceed)."""
+             args: argparse.Namespace) -> str:
+    """Datagen for epoch k, resumable. Returns one of:
+
+    * ``"ok"``       -- traces exist; training can proceed;
+    * ``"failed"``   -- gave up with zero traces (skip this epoch's train);
+    * ``"poisoned"`` -- the degeneracy fuse tripped (EXIT_POISONED):
+      ``checkpoint`` produces un-trainable gibberish. NOT retried -- a
+      collapsed checkpoint is deterministic, and the orchestrator must
+      stop the whole run (stop-on-poison, module docstring)."""
     label = f"{args.prefix}_iter{k}"
     traces = DATA_GAME_DIR / label / "traces.jsonl"
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -301,7 +413,7 @@ def _datagen(k: int, checkpoint: str | None,
         if done_gens and remaining <= 0:
             logger.info("[datagen%d] budget already spent (%d gens on "
                         "disk); nothing to do", k, done_gens)
-            return True
+            return "ok"
         cmd = [
             sys.executable, "-m", "training.generate_game_traces",
             "--label", label,
@@ -321,17 +433,20 @@ def _datagen(k: int, checkpoint: str | None,
             cmd += ["--append"]
             logger.warning("[datagen%d] resuming: %d gens on disk, "
                            "%d remaining", k, done_gens, remaining)
-        if _run_stage(cmd, f"datagen{k} attempt {attempt}"):
-            return True
+        rc = _run_stage(cmd, f"datagen{k} attempt {attempt}")
+        if rc == 0:
+            return "ok"
+        if rc == EXIT_POISONED:
+            return "poisoned"
     n = _count_lines(traces)
     if n:
         logger.error("[datagen%d] gave up after %d attempts but %d "
                      "generations exist -- training on the partial epoch",
                      k, MAX_ATTEMPTS, n)
-        return True
+        return "ok"
     logger.error("[datagen%d] gave up with ZERO traces -- skipping this "
                  "epoch's training", k)
-    return False
+    return "failed"
 
 
 def _train(k: int, resume: str | None, args: argparse.Namespace) -> str | None:
@@ -347,7 +462,7 @@ def _train(k: int, resume: str | None, args: argparse.Namespace) -> str | None:
     if args.train_max_steps:
         cmd += ["--train-max-steps", str(args.train_max_steps)]
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        if _run_stage(cmd, f"train{k} attempt {attempt}"):
+        if _run_stage(cmd, f"train{k} attempt {attempt}") == 0:
             ckpt = _latest_checkpoint(label)
             if ckpt:
                 logger.info("[train%d] checkpoint: %s", k, ckpt)
@@ -366,10 +481,15 @@ def _train(k: int, resume: str | None, args: argparse.Namespace) -> str | None:
 def train_one_epoch(k: int, prefix: str, resume: str | None,
                     max_steps: int | None = None) -> int:
     """The in-process train stage (child mode, --train-iter). Mirrors
-    run_first_iteration.py: the epoch's game + analyst traces, the manifest
-    replay sources, the capability probes, one pass over the data."""
+    run_first_iteration.py: the epoch's game + analyst traces, the player
+    trust-region anchor, the manifest replay sources, the capability
+    probes, one pass over the data."""
     from training.external_data import sources_from_manifest
-    from training.game_traces import AnalystTraceSource, GameTraceSource
+    from training.game_traces import (
+        AnalystTraceSource,
+        GameTraceSource,
+        PlayerAnchorSource,
+    )
     from training.probes import build_probe_hooks
     from training.train import TrainConfig, configure_logging, run_training
 
@@ -377,6 +497,10 @@ def train_one_epoch(k: int, prefix: str, resume: str | None,
     label = f"{prefix}_iter{k}"
     sources = [
         GameTraceSource(f"data_game/{label}/traces.jsonl"),
+        # Trust region over the SAME player traces: kd_anchor to the parent
+        # checkpoint (= resume; falls back to the base when resume is None,
+        # which IS epoch 1's parent). Rationale in game_traces.py.
+        PlayerAnchorSource(f"data_game/{label}/traces.jsonl"),
         AnalystTraceSource(f"data_game/{label}/analyst_traces.jsonl"),
         *sources_from_manifest(),
     ]
@@ -385,6 +509,7 @@ def train_one_epoch(k: int, prefix: str, resume: str | None,
         label=label,
         epochs=1,  # self-generated data is only on-policy the first pass
         resume_checkpoint=resume,
+        anchor_checkpoint=resume,  # the trust region's frozen teacher
         max_steps=max_steps,  # None = the full single pass
     )
     return run_training(sources, cfg, extra_hooks=hooks, extra_guards=guards)
@@ -398,6 +523,25 @@ def orchestrate(args: argparse.Namespace) -> int:
     state = _load_state(args.prefix)
     checkpoint = args.start_checkpoint
     failures = 0
+    poisoned = False
+
+    def _stop_on_poison(stage: str, bad_ckpt: str | None) -> None:
+        """STOP-ON-POISON: a tripped degeneracy fuse means ``bad_ckpt``
+        produces un-trainable gibberish -- every later epoch would train
+        on garbage, so the whole run stops HERE, loudly, with the broken
+        checkpoint on record for the morning autopsy."""
+        nonlocal poisoned
+        poisoned = True
+        state["poisoned"] = {"stage": stage, "checkpoint": bad_ckpt}
+        _save_state(args.prefix, state)
+        logger.error(
+            "STOPPING THE ENTIRE RUN: checkpoint %r is POISONED (the "
+            "degeneracy fuse tripped during %s -- consecutive generations "
+            "with no parseable rating or move). No retry, no later "
+            "epochs; recorded under 'poisoned' in %s. Inspect the "
+            "checkpoint and data_game/ output by hand before relaunching.",
+            bad_ckpt or "<bare HF weights>", stage, _state_path(args.prefix),
+        )
 
     for k in range(1, args.epochs + 1):
         # Replay this epoch's recorded outcome if it already finished.
@@ -413,17 +557,20 @@ def orchestrate(args: argparse.Namespace) -> int:
 
         if f"datagen{k}" in state["done"]:
             logger.info("[datagen%d] already complete; skipping", k)
-            have_traces = True
+            outcome = "ok"
         else:
-            have_traces = _datagen(k, checkpoint, args)
-            if have_traces:
+            outcome = _datagen(k, checkpoint, args)
+            if outcome == "ok":
                 state["done"].append(f"datagen{k}")
                 _save_state(args.prefix, state)
             else:
                 failures += 1
+        if outcome == "poisoned":
+            _stop_on_poison(f"datagen{k}", checkpoint)
+            break
 
         new_ckpt = None
-        if have_traces:
+        if outcome == "ok":
             new_ckpt = _train(k, checkpoint, args)
             if new_ckpt:
                 checkpoint = new_ckpt
@@ -435,12 +582,42 @@ def orchestrate(args: argparse.Namespace) -> int:
         state["checkpoints"][str(k)] = new_ckpt
         _save_state(args.prefix, state)
 
-    logger.info("weekend run complete: %d epoch(s), %d failed stage(s), "
-                "final checkpoint %r", args.epochs, failures, checkpoint)
-    logger.info("stage time: datagen %.2fh, train %.2fh (all epochs + "
-                "retries)", _STAGE_HOURS["datagen"], _STAGE_HOURS["train"])
+        # Post-train smoke eval (STANDARD, every fresh checkpoint): 8 real
+        # games -> win rate / ratings / degeneracy / distance deltas,
+        # logged AND stored in the state file -- so even a run whose last
+        # stage is training (no following datagen) ends with a
+        # game-performance reading, and a poisoned checkpoint surfaces in
+        # ~15 min instead of at the next epoch's multi-hour datagen.
+        if new_ckpt:
+            smoke = _smoke_eval(k, new_ckpt, args)
+            if smoke == "ok":
+                summary = _summarize_traces(f"{args.prefix}_smoke{k}")
+                logger.info("[smoke_eval%d] checkpoint %s: %s",
+                            k, new_ckpt, json.dumps(summary))
+                state.setdefault("smoke", {})[str(k)] = summary
+                _save_state(args.prefix, state)
+            elif smoke == "poisoned":
+                _stop_on_poison(f"smoke{k}", new_ckpt)
+                break
+            else:
+                logger.error("[smoke_eval%d] crashed -- no performance "
+                             "reading for %s (the checkpoint itself may "
+                             "still be fine; run the smoke eval by hand)",
+                             k, new_ckpt)
+
+    if poisoned:
+        logger.error("weekend run STOPPED ON POISON after %d failed "
+                     "stage(s); last checkpoint %r (see 'poisoned' in the "
+                     "state file)", failures, checkpoint)
+    else:
+        logger.info("weekend run complete: %d epoch(s), %d failed "
+                    "stage(s), final checkpoint %r",
+                    args.epochs, failures, checkpoint)
+    logger.info("stage time: datagen %.2fh (smoke evals included), train "
+                "%.2fh (all epochs + retries)",
+                _STAGE_HOURS["datagen"], _STAGE_HOURS["train"])
     _MONITOR.finish()
-    return failures
+    return failures + (1 if poisoned else 0)
 
 
 def build_parser() -> argparse.ArgumentParser:

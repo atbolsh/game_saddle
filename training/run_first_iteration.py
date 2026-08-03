@@ -26,7 +26,11 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from training.external_data import sources_from_manifest  # noqa: E402
-from training.game_traces import AnalystTraceSource, GameTraceSource  # noqa: E402
+from training.game_traces import (  # noqa: E402
+    AnalystTraceSource,
+    GameTraceSource,
+    PlayerAnchorSource,
+)
 from training.probes import build_probe_hooks  # noqa: E402
 from training.train import (  # noqa: E402
     DataSource,
@@ -42,9 +46,12 @@ from training.train import (  # noqa: E402
 # (TRAINING_EXTRA_DATASETS.md documents each dataset's role and loss kind).
 # The analyst KD anchor pins analyst behavior to the frozen base while the
 # player RL moves the shared weights; its auto-guarded per-source held-out
-# KD loss (heldout_loss/analyst_iter1) is the analyst-drift meter.
+# KD loss (heldout_loss/analyst_iter1) is the analyst-drift meter. The
+# player anchor is the trust region (kd_anchor); iteration 1 starts from
+# base weights, so its parent teacher IS the base (no anchor_checkpoint).
 SOURCES: list[DataSource] = [
     GameTraceSource("data_game/iter1/traces.jsonl"),
+    PlayerAnchorSource("data_game/iter1/traces.jsonl"),
     AnalystTraceSource("data_game/iter1/analyst_traces.jsonl"),
     *sources_from_manifest(),
 ]

@@ -205,11 +205,14 @@ Probe set (planned additions, next stages):
 | Planted-error analyst miss rate | Analyst quality / sycophancy drift | The planted-error generator of [TRAINING_TRACE_EXTRAS.md](TRAINING_TRACE_EXTRAS.md) |
 | Instruction-following slice | General English/agentic retention | Small fixed prompt set, scored by exact-match/format checks where possible |
 
-Each guarded metric carries a threshold (relative, default 10%); a breach
-triggers `train.py`'s regression path — ERROR-level logging and, by
-default, rollback to the best checkpoint (`--on-regression
-warn|rollback|abort`). The analyst miss-rate probe is the designated
-tripwire for the shared-network drift risk accepted in
+Each guarded metric carries a soft threshold (relative, default 10% —
+WARNING only) and a hard one (2x worse than best, an absolute ceiling
+where declared — the analyst anchor's is 5.0 — or 3 consecutive soft
+breaches); a hard breach triggers `train.py`'s regression path —
+ERROR-level logging and, by default, rollback to the last GOOD checkpoint
+(`--on-regression warn|rollback|abort`; details in
+TRAINING_OVERVIEW.md's rollback section). The analyst miss-rate probe is
+the designated tripwire for the shared-network drift risk accepted in
 [TRAINING_GAME_TRACES.md](TRAINING_GAME_TRACES.md).
 
 ## Memory (NAMS) hygiene during training epochs

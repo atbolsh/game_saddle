@@ -364,7 +364,9 @@ entry point can load one on top of the HF base weights: set
 the checkpoint dropdown in the notebooks (`[default]` = bare HF weights).
 Training runs log to `logs/train_<label>_<stamp>/` (including a flat
 `eval_log.jsonl` with every per-task eval metric per row, for graphing) and
-roll back to the best checkpoint (loudly) if a guarded eval metric regresses.
+roll back to the last good checkpoint (loudly) if a guarded eval metric
+regresses hard (soft wobbles only warn; two-tier details in
+`training/TRAINING_OVERVIEW.md`).
 
 **Game-trace data generation** is
 `python -m training.generate_game_traces --label iterN [--checkpoint ...]`:

@@ -79,8 +79,13 @@ One record per player generation lands in `data_game/<label>/traces.jsonl`:
 - `target_text` — the raw player reply, the ONLY trainable tokens;
 - `meta` — RAW annotations only: analyst rating, harness-verified `WRONG:`
   spans, action, game/move indices, the round's `question`, `game_won`,
-  `moves_from_end`. Rewards are computed at TRAINING time from these, so
-  every ratio below stays tunable without regenerating data.
+  `moves_from_end`, and the round's agent-to-gold distances
+  (`dist_to_gold_before` / `dist_to_gold_after`, normalized board units;
+  `null` when no gold remains). The distances are a rating-INDEPENDENT
+  quality signal — "did this move close in on the gold" — used to
+  cross-check the analyst's rating distribution after a run; they are not
+  (yet) a training input. Rewards are computed at TRAINING time from these
+  fields, so every ratio below stays tunable without regenerating data.
 
 A second file, `data_game/<label>/analyst_traces.jsonl`, records the
 analyst side of every round: the EXACT analyst prompt (`messages`,
@@ -133,6 +138,12 @@ Housekeeping baked into the generator:
 - Records whose analyst forgot the `RATING:` line are written with
   `rating: null` and counted; `GameTraceSource` DROPS them loudly at load
   time (never train on a guessed reward).
+- **Degeneracy fuse** (`DEGENERACY_FUSE = 25`): 25 CONSECUTIVE generations
+  with no parseable rating AND no parseable move mean the checkpoint is
+  collapsed, not unlucky. All workers drain and the run exits with code 3
+  (`EXIT_POISONED`); `run_weekend` treats that as fatal for the whole loop
+  (stop-on-poison). Added after the 2026-08-01 collapse burned ~15h
+  generating gibberish (postmortem below).
 - **End-of-run stats + plots:** counters land in
   `data_game/<label>/generation_stats.json` and, via
   `training/datagen_plots.py`, as figures in
@@ -153,26 +164,86 @@ clipping — which is also why each batch is trained for a SINGLE epoch
 (after one gradient step the data is off-policy and this estimator has no
 correction for that).
 
-Per token of the player reply, `GameTraceSource` builds the weight as:
+Per token of the player reply, `GameTraceSource` builds the weight as
+(**every output non-negative** — see the collapse postmortem below):
 
-1. **base = analyst rating** `r ∈ [-1, 1]` over the whole reply — every
-   token of a reply is the same "move", so they share its reward;
-2. **verified `WRONG:` spans override the base with -1.0** — the one
-   token-level signal the analyst gives; unverified spans never reach
-   training;
+1. **base = `max(0, (r + 0.5) / 1.5)`** from the analyst rating
+   `r ∈ [-1, 1]`, over the whole reply — every token of a reply is the same
+   "move", so they share its reward. The mapping is 0 at `r ≤ -0.5`
+   (confirmed-bad moves teach nothing) and rises linearly to 1.0 at
+   `r = +1.0`, so the analyst's gradation is preserved everywhere above the
+   floor. The offset is FIXED (+0.5), never batch-relative: the analyst's
+   zero is semantically absolute ("neither helps nor hurts"), and a batch
+   of all-good moves must not have its best moves relatively punished;
+2. **verified `WRONG:` spans override the base with 0.0** — masked out of
+   cloning, not "unlearned"; unverified spans never reach training;
 3. **win boost, won games only:** `b = 0.2 * 0.9^d` (`d` = rounds from the
    winning move) is added UNIFORMLY to every token of the message —
-   including WRONG spans (they become `-1.0 + b`). The win is the loop's one
-   ground-truth signal; on a won trajectory even flagged text gets its
-   penalty softened rather than trusted less. Magnitudes: the boost peaks at
-   0.2 on the winning move and fades with ~10-round half-life, so analyst
-   grades (|r| up to 1.0) stay the dominant signal and long wandering
-   prefixes of a lucky game get almost nothing;
-4. **clamp to [-1, 1]**, then multiply still-negative weights by
-   `negative_scale` — the committed default is **1.0 (symmetric REINFORCE,
-   negatives unlearn at full strength)**; `0.5` is the gentler first knob if
-   training destabilizes, `0.0` is filtered behavior cloning (strictly
-   positive rewards, maximally stable, learns nothing from mistakes).
+   including WRONG spans (they become `0.0 + b`). The win is the loop's one
+   ground-truth signal; on a won trajectory even flagged text gets a little
+   weight back. Magnitudes: the boost peaks at 0.2 on the winning move and
+   fades with ~10-round half-life, so analyst grades stay the dominant
+   signal and long wandering prefixes of a lucky game get almost nothing;
+4. **clamp to [0, 1]**.
+
+What negative weights were meant to buy — suppressing bad behavior — is
+provided instead by the **player trust region** (below), which is bounded
+by construction.
+
+### Postmortem: the 2026-08-01 collapse (why nothing may go negative)
+
+The original mapping used the rating directly (weights in `[-1, 1]`, with a
+`negative_scale` knob defaulting to symmetric REINFORCE). Weighted CE with
+negative weights is **unbounded below**: the model is paid to make
+negatively-weighted tokens arbitrarily unlikely, and the cheapest way to do
+that is to destroy the language model itself. The first weekend run did
+exactly that: epoch 2's corpus skewed negative, training loss fell
+0.11 → -37.5 in ~300 steps, the checkpoint fled into `<unused...>` token
+gibberish, and epochs 3–7 burned ~15h of datagen on unparseable output.
+The guards missed it because (a) no eval ran before step 200, so the first
+post-collapse eval BECAME the baseline, and (b) the rollback target tracked
+the newest checkpoint with ANY improving metric — i.e. the regressed save
+itself. The full defense stack is now: this non-negative mapping (bounded
+objective), the step-0 baseline eval + two-tier guards + `last_good_ckpt`
+rollback (train.py), the player trust region (below), the datagen
+degeneracy fuse (`DEGENERACY_FUSE` in the generator: 25 consecutive
+rating-less AND move-less generations → exit 3), and the orchestrator's
+stop-on-poison (run_weekend.py).
+
+### The player trust region (kd_anchor)
+
+`PlayerAnchorSource` ([game_traces.py](game_traces.py)) replays the SAME
+player traces with uniform weight and `loss="kd_anchor"`: soft
+cross-entropy against the **parent checkpoint** — the adapter this epoch
+resumed from, loaded as a second frozen PEFT adapter
+(`TrainConfig.anchor_checkpoint`, wired to `resume` by
+`run_weekend.train_one_epoch`). RLHF-style "don't drift too far from where
+you started".
+
+- **Parent, never base:** the point of the loop is to SURPASS the base
+  model, so a base anchor would fight the objective. The parent anchor only
+  bounds how far a SINGLE epoch can move; it advances every epoch, so
+  cumulative improvement is unbounded. (Epoch 1 from base has no parent
+  checkpoint and falls back to the base teacher — which IS its parent.)
+- **Every parseable record is kept** — including `rating: null` and
+  `r ≤ -0.5` records that the reward mapping drops or zeroes: the tokens
+  cloning is NOT pulling on are exactly the unconstrained directions a
+  collapse escapes through.
+- **Mass:** `PLAYER_ANCHOR_WEIGHT = 0.25` — a quarter of the player corpus
+  per epoch, ~half an hour of the train stage.
+- The analyst KD anchor is unchanged and stays pinned to the FROZEN BASE
+  (it must never chase its own drift); its held-out KD guard now also has
+  an absolute ceiling of 5.0 (healthy ≈ 1; the collapse hit 63).
+
+### Deferred: the analyst revamp
+
+Considered and deferred (a multi-day project): adding `CORRECT:` span marks
+beside `WRONG:`, and/or per-span ratings instead of one message-level
+rating, giving denser and more surgical per-token weights. **Trigger to
+revisit:** perception/move quality stalls across iterations while analyst
+ratings stay high — that is the signature of the message-level rating being
+too blunt an instrument. Until then the message-level rating + WRONG spans
+carry the signal. (Also listed in [FUTURE_GOALS.md](../FUTURE_GOALS.md).)
 
 ### Disagree and commit: separate LoRA adapters per role
 

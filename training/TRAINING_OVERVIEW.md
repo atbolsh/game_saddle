@@ -54,8 +54,15 @@ deviations and calls the loop — copy
 `python -m training.run_weekend` chains **3 expert-iteration epochs**
 unattended: for each epoch k it runs datagen
 (`generate_game_traces --label weekend_iter<k> --parallel 16`, on the
-previous epoch's adapter) and then trains on that epoch's traces + the
-manifest replay sources, resumed from the previous adapter. Datagen is
+previous epoch's adapter), trains on that epoch's traces (reward-weighted
+CE + the `PlayerAnchorSource` trust region anchored to the previous
+adapter — see TRAINING_GAME_TRACES.md) + the analyst anchor + the manifest
+replay sources, resumed from the previous adapter, and finishes with a
+**post-train smoke eval**: 8 real games with the fresh checkpoint (label
+`<prefix>_smoke<k>`, never trained on) whose win rate / mean rating /
+degeneracy fraction / gold-distance deltas are logged (`grep smoke_eval`)
+and stored under `smoke` in the state file — every checkpoint gets a
+game-performance reading even when nothing runs after it. Datagen is
 parallel by default: the Gemma 4 left-pad prefill bug
 ([huggingface/transformers#47651](https://github.com/huggingface/transformers/issues/47651))
 has a verified workaround (stage-6 notes in [TO_TEST.md](TO_TEST.md)),
@@ -97,6 +104,14 @@ rerunning the same command after a box reboot skips completed work; to
 force a stage to rerun, delete its entry from that file (and for datagen,
 the `data_game/weekend_iter<k>/` directory).
 
+**Stop-on-poison** is the one exception to "keep marching": if datagen or
+a smoke eval exits with code 3, the degeneracy fuse tripped
+(`DEGENERACY_FUSE` in `generate_game_traces.py`: 25 consecutive
+generations with no parseable rating or move = a collapsed checkpoint).
+That is deterministic, so the orchestrator records the broken checkpoint
+under `poisoned` in the state file and STOPS the whole run instead of
+retrying or training later epochs on garbage.
+
 **Monitoring:** `tail -f weekend.log`; per-epoch
 `data_game/weekend_iter<k>/generation_stats.json` (wall clock,
 `seconds_per_generation`) and `logs/train_weekend_iter<k>_<stamp>/`
@@ -127,8 +142,12 @@ contribute nothing, and each target token contributes
 
 - Plain SFT is the special case where every target-token weight is 1.0.
 - RL-style annotation ("these tokens were good, these were bad") is the
-  general case: arbitrary per-token weights, including negative weights for
-  tokens to suppress (an advantage-weighted / unlikelihood-flavored update).
+  general case: arbitrary per-token weights. The MECHANISM supports
+  negative weights (unlikelihood-flavored suppression), but the game
+  reward mapping deliberately never emits them — weighted CE with net-
+  negative weights is unbounded below and collapsed the 2026-08-01 run
+  (postmortem in TRAINING_GAME_TRACES.md); suppression now comes from the
+  bounded player trust region instead.
 
 Sources express weights in *character* space over `target_text` (that is what
 annotators — the analyst's `WRONG:` spans, a rating, a programmatic checker —
@@ -249,15 +268,25 @@ packing (incompatible with per-example images and span weights), adapter EMA
 
 ## Rollback and the early-warning hook
 
-`train.py` maintains an **eval-hook** interface: after every checkpoint save
-it runs each registered probe (stage 1 ships one placeholder — held-out loss
-on a reserved slice of the training data) and compares guarded metrics
-against the best value seen. On regression past the threshold it logs at
-ERROR and, per `--on-regression {warn,rollback,abort}` (default `rollback`),
-restores the best adapter and continues, or aborts the run. Rollbacks are
+`train.py` maintains an **eval-hook** interface: a **baseline eval at
+step 0** (checkpoint saved + every probe scored BEFORE the first optimizer
+step — added after the 2026-08-01 collapse hid entirely in front of the
+first periodic eval), then after every checkpoint save it runs each
+registered probe (held-out loss on a reserved slice, reported per source)
+and compares guarded metrics against the best value seen. Regressions are
+**two-tier**, sized so noise never triggers weight surgery (the collapse
+was a 70x blowup, not a 10% wobble): a SOFT regression (worse than
+best-ever by `--regression-tolerance`, default 10%) only logs a WARNING —
+unless the same metric stays soft-regressed 3 evals in a row
+(`--soft-streak-limit`), which is persistent drift and escalates; a HARD
+regression (worse by `--hard-multiplier`, default 2x, or past a guard's
+absolute ceiling — the analyst KD anchor's is 5.0) triggers
+`--on-regression {warn,rollback,abort}` (default `rollback`). Rollback
+restores `last_good_ckpt` — the newest checkpoint whose own eval had no
+hard regression — never the save that just regressed. Rollbacks are
 capped by `--max-rollbacks` (default 3): rollback restores weights but not
 the schedule position, so a persistently regressing run would otherwise
-oscillate silently — past the cap the run aborts naming the best
+oscillate silently — past the cap the run aborts naming the last good
 checkpoint. The real probe suite — per-capability benchmarks, planted-error
 analyst miss rate — is specified in
 [TRAINING_EXTRA_DATASETS.md](TRAINING_EXTRA_DATASETS.md) and lands in

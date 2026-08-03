@@ -18,15 +18,21 @@ are the same code path. Per-example loss is normalized by the sum of
 ABSOLUTE token weights so annotated and plain examples mix at comparable
 gradient scale.
 
-TWO LOSS KINDS. ``TrainingExample.loss`` selects "ce" (above -- teach the
-dataset's targets; used where we want to STRENGTHEN, e.g. arithmetic replay)
-or "kd" (knowledge distillation to the base model -- soft cross-entropy
+THREE LOSS KINDS. ``TrainingExample.loss`` selects "ce" (above -- teach the
+dataset's targets; used where we want to STRENGTHEN, e.g. arithmetic replay),
+"kd" (knowledge distillation to the base model -- soft cross-entropy
 against the frozen base's distribution over the same target positions; used
 where we want to PRESERVE, e.g. general reasoning/instruction/VQA replay,
-see TRAINING_EXTRA_DATASETS.md). KD needs no stored teacher:
-``model.disable_adapter()`` gives the base forward in the same process, and
-teacher/student softmaxes are computed over the TARGET POSITIONS ONLY
-(a full-sequence float softmax at a 262k vocab would be GBs). Both kinds
+see TRAINING_EXTRA_DATASETS.md), or "kd_anchor" (same soft cross-entropy,
+but the teacher is the PARENT CHECKPOINT the run resumed from -- an
+RLHF-style trust region that bounds how far one epoch can drift, used by
+``PlayerAnchorSource``; with no ``anchor_checkpoint`` configured it falls
+back to the base, which IS the parent on an epoch-1-from-base run). KD
+needs no stored teacher: ``model.disable_adapter()`` gives the base forward
+in the same process, and the anchor teacher is a second frozen PEFT adapter
+loaded from the parent checkpoint (see :func:`_base_model_logits`).
+Teacher/student softmaxes are computed over the TARGET POSITIONS ONLY
+(a full-sequence float softmax at a 262k vocab would be GBs). All kinds
 use the same span weights and the same normalization.
 
 SEQUENCE = EXACTLY WHAT INFERENCE PRODUCES. Trained ids are
@@ -66,15 +72,25 @@ CHECKPOINTS. Periodic PEFT-adapter saves to
 checkpoint is an adapter, never a full model copy; the notebooks/scripts load
 it on top of the HF base via the [default]/checkpoint dropdowns.
 
-ROLLBACK. After every save, registered eval hooks run: held-out loss on a
-reserved slice, reported PER SOURCE (each source gets its own guard -- for
-KD sources held-out KD loss IS the drift-from-base early-warning metric),
+ROLLBACK. A BASELINE eval runs at step 0 (checkpoint saved + every hook
+scored BEFORE the first optimizer step), so a collapse can never hide in
+front of the first eval and a rollback target always exists. After every
+subsequent save, registered eval hooks run: held-out loss on a reserved
+slice, reported PER SOURCE (each source gets its own guard -- for KD
+sources held-out KD loss IS the drift-from-base early-warning metric),
 plus any ``extra_hooks`` the run script attaches (e.g. the exact-match
-probes from ``training/probes.py``). A guarded metric regressing past its
-threshold logs at ERROR and -- per ``--on-regression warn|rollback|abort``
-(default rollback) -- restores the best adapter state and continues, or
-aborts the run. Hooks are callables ``hook(ctx: TrainContext) -> dict`` so
-they can generate, not just score.
+probes from ``training/probes.py``). Regressions are TWO-TIER (sized by
+the 2026-08-01 collapse, a 70x blowup -- noise must never trigger weight
+surgery): a SOFT regression (worse than best-ever by
+``regression_tolerance``) only logs a WARNING, unless the same metric
+stays soft-regressed ``soft_streak_limit`` evals in a row (persistent
+drift, not noise); a HARD regression (worse than best-ever by
+``hard_multiplier``, or past the guard's absolute ``ceiling`` where one
+is set) triggers ``--on-regression warn|rollback|abort`` (default
+rollback). Rollback restores ``last_good_ckpt`` -- the newest checkpoint
+whose eval had NO hard/escalated regression -- never the checkpoint that
+just regressed. Hooks are callables ``hook(ctx: TrainContext) -> dict``
+so they can generate, not just score.
 
 LOGGING. ``logs/train_<label>_<stamp>/``: config.json (resolved config +
 seed + git rev + discovered LoRA target modules), train_log.jsonl + .txt
@@ -153,8 +169,10 @@ logger = logging.getLogger("train")
 
 #: Loss kinds a TrainingExample may carry: "ce" = weighted token
 #: cross-entropy on the target text (strengthen); "kd" = soft cross-entropy
-#: against the frozen base model's distribution (preserve).
-VALID_LOSSES = ("ce", "kd")
+#: against the frozen base model's distribution (preserve); "kd_anchor" =
+#: soft cross-entropy against the PARENT checkpoint's distribution (trust
+#: region -- bound this epoch's drift; module docstring, THREE LOSS KINDS).
+VALID_LOSSES = ("ce", "kd", "kd_anchor")
 
 
 @dataclass
@@ -191,10 +209,16 @@ class DataSource(ABC):
     """A named stream of TrainingExamples with a mixture weight.
 
     Future sources (game traces, replay sets, planted errors, ...) subclass
-    this; train.py itself never learns anything source-specific."""
+    this; train.py itself never learns anything source-specific.
+
+    ``guard_ceiling``: optional ABSOLUTE bound for this source's held-out
+    loss guard (see :class:`MetricGuard`) -- a source that knows its own
+    catastrophic threshold (e.g. the analyst KD anchor) declares it here,
+    so the generic trainer never hardcodes source names."""
 
     name: str = "source"
     weight: float = 1.0
+    guard_ceiling: float | None = None
 
     @abstractmethod
     def examples(self) -> Iterator[TrainingExample]:
@@ -281,6 +305,13 @@ class TrainConfig:
     label: str = "episode"          #: names the log dir and the checkpoints
     architecture: str | None = None  #: MODEL_REGISTRY key; None = MODEL_KEY env
     resume_checkpoint: str | None = None  #: name under weights/<architecture>/
+    #: checkpoint (under weights/<architecture>/) whose adapter serves as
+    #: the FROZEN teacher for "kd_anchor" examples -- normally the same
+    #: checkpoint as resume_checkpoint (the parent this epoch started
+    #: from). None = kd_anchor teaches against the bare base model, which
+    #: is exactly right for an epoch-1-from-base run (the base IS the
+    #: parent). See the module docstring, THREE LOSS KINDS.
+    anchor_checkpoint: str | None = None
 
     # schedule
     epochs: int = 1
@@ -323,12 +354,25 @@ class TrainConfig:
     #: of the MATERIALIZED pool (~120k examples for the default manifest),
     #: which would otherwise make every eval a ~6k-forward, hour-long affair.
     holdout_cap: int = 100
-    on_regression: str = "rollback"  #: "warn" | "rollback" | "abort"
-    regression_tolerance: float = 0.10  #: relative slack before regression
-    #: rollbacks allowed per run before aborting: rollback restores the best
-    #: adapter but keeps training on the same schedule, so a persistently
-    #: regressing run would otherwise oscillate (roll back, re-regress, ...)
-    #: and burn the GPU weekend silently.
+    #: reaction to a HARD regression: "warn" | "rollback" | "abort".
+    #: SOFT regressions always only warn (module docstring, ROLLBACK).
+    on_regression: str = "rollback"
+    #: relative slack before a metric counts as SOFT-regressed (10% worse
+    #: than best-ever). Soft = log a warning, keep training, keep promoting
+    #: the rollback target -- one noisy dataset must not stall the run.
+    regression_tolerance: float = 0.10
+    #: a metric this many times worse than its best-ever is a HARD
+    #: regression (rollback/abort). Sized by the real failure signature:
+    #: the 2026-08-01 collapse moved the analyst KD loss 70x, not 10%.
+    hard_multiplier: float = 2.0
+    #: a metric SOFT-regressed on this many CONSECUTIVE evals escalates to
+    #: hard -- persistent drift is a real signal even when each step is
+    #: small; isolated wobbles reset the streak.
+    soft_streak_limit: int = 3
+    #: rollbacks allowed per run before aborting: rollback restores the
+    #: last good adapter but keeps training on the same schedule, so a
+    #: persistently regressing run would otherwise oscillate (roll back,
+    #: re-regress, ...) and burn the GPU weekend silently.
     max_rollbacks: int = 3
 
 
@@ -800,13 +844,29 @@ def attach_neftune(model: Any, alpha: float) -> None:
 
 # ================================================================== loss
 
+#: PEFT adapter name under which run_training loads cfg.anchor_checkpoint
+#: (the "default" adapter is the student being trained).
+ANCHOR_ADAPTER = "anchor"
+
+
 def _base_model_logits(model: Any, model_inputs: dict,
-                       logits_to_keep: int = 0) -> Any:
-    """Teacher forward for KD: the frozen base model's logits on the same
-    inputs, via PEFT's ``disable_adapter()`` (bypasses BOTH the LoRA deltas
-    and the modules_to_save projector copy -- VERIFY the projector part on
-    the remote box, see TO_TEST.md). Forced to eval mode for the duration so
-    the NEFTune hook and dropout cannot perturb the teacher.
+                       logits_to_keep: int = 0,
+                       teacher: str = "base") -> Any:
+    """Teacher forward for the KD losses. Forced to eval mode for the
+    duration so the NEFTune hook and dropout cannot perturb the teacher.
+
+    ``teacher="base"`` (the "kd" loss): the frozen base model's logits via
+    PEFT's ``disable_adapter()`` (bypasses BOTH the LoRA deltas and the
+    modules_to_save projector copy -- VERIFY the projector part on the
+    remote box, see TO_TEST.md).
+
+    ``teacher="anchor"`` (the "kd_anchor" loss): the PARENT checkpoint's
+    logits via the frozen second PEFT adapter run_training loaded from
+    cfg.anchor_checkpoint (``set_adapter(ANCHOR_ADAPTER)``, restored to the
+    student adapter in a finally). When no anchor adapter is loaded -- an
+    epoch-1-from-base run -- it deliberately falls back to the base
+    teacher, because the base IS that epoch's parent (same semantics, not
+    a fuzzy fallback).
 
     ``logits_to_keep``: only project the LAST k positions to vocab space
     (0 = all, the HF convention). weighted_loss always passes the tail it
@@ -814,11 +874,26 @@ def _base_model_logits(model: Any, model_inputs: dict,
     overnight run (VRAM rule 1 in weighted_loss's docstring)."""
     import torch
 
+    if teacher not in ("base", "anchor"):
+        raise ValueError(f"_base_model_logits: bad teacher {teacher!r}")
+    use_anchor = (teacher == "anchor"
+                  and ANCHOR_ADAPTER in getattr(model, "peft_config", {}))
+
     was_training = model.training
     model.eval()
     try:
-        with torch.no_grad(), model.disable_adapter():
-            out = model(**model_inputs, logits_to_keep=logits_to_keep)
+        with torch.no_grad():
+            if use_anchor:
+                try:
+                    model.set_adapter(ANCHOR_ADAPTER)
+                    out = model(**model_inputs,
+                                logits_to_keep=logits_to_keep)
+                finally:
+                    model.set_adapter("default")
+            else:
+                with model.disable_adapter():
+                    out = model(**model_inputs,
+                                logits_to_keep=logits_to_keep)
     finally:
         if was_training:
             model.train()
@@ -840,7 +915,9 @@ def weighted_loss(model: Any, model_inputs: dict, weights: Any,
     ``loss_kind="ce"``: token cross-entropy against the example's targets.
     ``loss_kind="kd"``: soft cross-entropy against the frozen BASE model's
     distribution on the same inputs (self-distillation replay -- preserve,
-    don't teach). With ``return_per_example=True`` returns
+    don't teach). ``loss_kind="kd_anchor"``: the same soft cross-entropy,
+    teacher = the PARENT checkpoint's adapter (trust region; module
+    docstring, THREE LOSS KINDS). With ``return_per_example=True`` returns
     ``(loss, per_example)``, the latter a detached [B] tensor of
     per-example losses (exact per-source logging from mixed batches).
 
@@ -928,12 +1005,15 @@ def weighted_loss(model: Any, model_inputs: dict, weights: Any,
         )
 
     teacher_probs = None
-    if loss_kind == "kd":
+    if loss_kind in ("kd", "kd_anchor"):
         # VRAM rules 2 + 3: teacher first, gathered by 2-D index, reduced
         # to probabilities; both big teacher tensors are gone before the
-        # student forward starts.
-        teacher_logits = _base_model_logits(model, model_inputs,
-                                            logits_to_keep=tail + 1)
+        # student forward starts. "kd" distills to the frozen base,
+        # "kd_anchor" to the parent checkpoint's adapter.
+        teacher_logits = _base_model_logits(
+            model, model_inputs, logits_to_keep=tail + 1,
+            teacher="anchor" if loss_kind == "kd_anchor" else "base",
+        )
         teacher = teacher_logits[row_of, col_of].float()
         del teacher_logits
         teacher_probs = F.softmax(teacher, dim=-1)
@@ -981,17 +1061,34 @@ class TrainContext:
 
 @dataclass
 class MetricGuard:
-    """Guard one eval metric: regression = worse than the best seen by more
-    than ``rel_tolerance`` (relative)."""
+    """Guard one eval metric with TWO regression tiers (rationale in the
+    module docstring, ROLLBACK): SOFT = worse than the best seen by more
+    than ``rel_tolerance`` (relative) -- warn only; HARD = worse than the
+    best seen by a factor of ``hard_multiplier``, OR past the absolute
+    ``ceiling`` when one is set (for lower-is-better metrics the ceiling
+    is an upper bound; for higher-is-better it acts as a floor) -- this is
+    the tier that triggers rollback/abort. The trainer escalates a
+    persistent soft streak to hard on its own (``soft_streak_limit``)."""
 
     metric: str
     higher_is_better: bool
     rel_tolerance: float
+    hard_multiplier: float = 2.0
+    ceiling: float | None = None
 
-    def is_regression(self, value: float, best: float) -> bool:
+    def is_soft_regression(self, value: float, best: float) -> bool:
         if self.higher_is_better:
             return value < best * (1.0 - self.rel_tolerance)
         return value > best * (1.0 + self.rel_tolerance)
+
+    def is_hard_regression(self, value: float, best: float) -> bool:
+        if self.higher_is_better:
+            if self.ceiling is not None and value < self.ceiling:
+                return True
+            return value < best / self.hard_multiplier
+        if self.ceiling is not None and value > self.ceiling:
+            return True
+        return value > best * self.hard_multiplier
 
     def is_improvement(self, value: float, best: float | None) -> bool:
         if best is None:
@@ -1261,6 +1358,23 @@ def run_training(
         resume_dir = ckpt_root / cfg.resume_checkpoint
         load_adapter_state(model, resume_dir)
         tlog.event("resumed_from", path=str(resume_dir))
+    if cfg.anchor_checkpoint:
+        # Frozen teacher for "kd_anchor" examples: the parent checkpoint as
+        # a SECOND named PEFT adapter (~360 MB; is_trainable=False keeps
+        # every anchor param out of the optimizer). _base_model_logits
+        # switches to it for the teacher forward only. A load failure here
+        # is a hard error -- a trust region that silently anchors to the
+        # wrong weights is worse than no run.
+        anchor_dir = ckpt_root / cfg.anchor_checkpoint
+        if not (anchor_dir / "adapter_config.json").is_file():
+            raise FileNotFoundError(
+                f"anchor_checkpoint {cfg.anchor_checkpoint!r}: no adapter "
+                f"under {anchor_dir}"
+            )
+        model.load_adapter(str(anchor_dir), adapter_name=ANCHOR_ADAPTER,
+                           is_trainable=False)
+        model.set_adapter("default")  # the student stays the active adapter
+        tlog.event("anchor_loaded", path=str(anchor_dir))
 
     # -------------------------------------------------------- optimizer
     import bitsandbytes as bnb
@@ -1306,11 +1420,15 @@ def run_training(
     eval_hooks.extend(extra_hooks or [])
     # Overall held-out loss + one guard PER SOURCE (for KD sources the
     # per-source held-out KD loss is the drift-from-base measure), then any
-    # run-script guards (probes) on top.
+    # run-script guards (probes) on top. A source that declares its own
+    # absolute catastrophe bound (DataSource.guard_ceiling -- e.g. the
+    # analyst anchor's 5.0) gets it wired into its guard here.
+    ceilings = {s.name: s.guard_ceiling for s in sources}
     guards = {
         "heldout_loss": MetricGuard(
             "heldout_loss", higher_is_better=False,
             rel_tolerance=cfg.regression_tolerance,
+            hard_multiplier=cfg.hard_multiplier,
         ),
     }
     for src_name in by_source:
@@ -1318,10 +1436,16 @@ def run_training(
         guards[metric] = MetricGuard(
             metric, higher_is_better=False,
             rel_tolerance=cfg.regression_tolerance,
+            hard_multiplier=cfg.hard_multiplier,
+            ceiling=ceilings.get(src_name),
         )
     guards.update(extra_guards or {})
     best_metrics: dict[str, float] = {}
-    best_ckpt: Path | None = None
+    #: Rollback target: the newest checkpoint whose eval showed NO hard or
+    #: escalated regression. NOT "the checkpoint where some metric peaked"
+    #: -- the 2026-08-01 collapse rolled back onto its own regressed save
+    #: because the old code promoted the target on ANY improving metric.
+    last_good_ckpt: Path | None = None
 
     tlog.write_config({
         **dataclasses.asdict(cfg),
@@ -1339,17 +1463,27 @@ def run_training(
     })
 
     n_rollbacks = 0
+    last_ckpt: Path | None = None
+    #: Consecutive soft-regression count per metric (reset by any eval
+    #: where the metric is not soft-regressed); at cfg.soft_streak_limit
+    #: the streak escalates to a hard regression.
+    soft_streaks: dict[str, int] = {}
 
     def run_hooks_and_guard(step: int, epoch: int) -> None:
         """After each save: run every probe, log one flat eval row, track
-        bests, react to regressions per cfg.on_regression."""
-        nonlocal best_ckpt, n_rollbacks
+        bests, and apply the two-tier regression policy (module docstring,
+        ROLLBACK): soft = warn only; hard (multiplier / ceiling / escalated
+        soft streak) = act per cfg.on_regression against last_good_ckpt.
+        An eval with no hard regression promotes last_good_ckpt."""
+        nonlocal last_good_ckpt, n_rollbacks
         all_metrics: dict[str, float] = {}
         for hook in eval_hooks:
             all_metrics.update(hook(ctx))
         if all_metrics:
             tlog.event("eval", step=step, **all_metrics)
             tlog.eval_row(step, epoch, all_metrics)
+
+        hard_hits: list[str] = []
         for mname, value in all_metrics.items():
             guard = guards.get(mname)
             if guard is None:
@@ -1357,54 +1491,104 @@ def run_training(
             best = best_metrics.get(mname)
             if guard.is_improvement(value, best):
                 best_metrics[mname] = value
-                best_ckpt = last_ckpt
-            elif best is not None and guard.is_regression(value, best):
-                tlog.event(
-                    "REGRESSION", metric=mname, value=value, best=best,
-                    action=cfg.on_regression,
-                )
+                soft_streaks[mname] = 0
+                continue
+            # best is not None from here (is_improvement is True on None).
+            if guard.is_hard_regression(value, best):
+                soft_streaks[mname] = 0
+                hard_hits.append(mname)
                 logger.error(
-                    "REGRESSION on %s: %.5g (best %.5g, tolerance %.0f%%)"
-                    " -- action: %s",
-                    mname, value, best,
-                    guard.rel_tolerance * 100, cfg.on_regression,
+                    "HARD REGRESSION on %s: %.5g (best %.5g, hard bound "
+                    "%.1fx%s)", mname, value, best, guard.hard_multiplier,
+                    "" if guard.ceiling is None
+                    else f" / ceiling {guard.ceiling:g}",
                 )
-                if cfg.on_regression == "abort":
-                    raise SystemExit(
-                        f"aborted: {mname} regressed ({value:.5g} vs best "
-                        f"{best:.5g}); best checkpoint: {best_ckpt}"
+                tlog.event("REGRESSION", metric=mname, value=value,
+                           best=best, tier="hard", action=cfg.on_regression)
+            elif guard.is_soft_regression(value, best):
+                streak = soft_streaks.get(mname, 0) + 1
+                soft_streaks[mname] = streak
+                if streak >= cfg.soft_streak_limit:
+                    # Persistent drift, not noise: escalate.
+                    soft_streaks[mname] = 0
+                    hard_hits.append(mname)
+                    logger.error(
+                        "HARD REGRESSION on %s: soft-regressed %d evals in "
+                        "a row (%.5g vs best %.5g) -- persistent drift",
+                        mname, streak, value, best,
                     )
-                if cfg.on_regression == "rollback":
-                    if best_ckpt is None:
-                        logger.error(
-                            "rollback requested but no best checkpoint "
-                            "exists yet; continuing WITHOUT rollback"
-                        )
-                    else:
-                        n_rollbacks += 1
-                        # Rollback restores the weights but not the data or
-                        # LR position, so a persistently regressing run
-                        # oscillates (roll back, re-regress, ...) forever;
-                        # cap it and hand back the best checkpoint instead.
-                        if (cfg.max_rollbacks > 0
-                                and n_rollbacks > cfg.max_rollbacks):
-                            tlog.event("rollback_limit",
-                                       n_rollbacks=n_rollbacks,
-                                       best_checkpoint=str(best_ckpt))
-                            raise SystemExit(
-                                f"aborted: {n_rollbacks} rollbacks exceed "
-                                f"max_rollbacks={cfg.max_rollbacks} -- the "
-                                "run is oscillating, not converging. Best "
-                                f"checkpoint: {best_ckpt}"
-                            )
-                        load_adapter_state(model, best_ckpt)
-                        tlog.event("rolled_back", to=str(best_ckpt),
-                                   n_rollbacks=n_rollbacks)
+                    tlog.event("REGRESSION", metric=mname, value=value,
+                               best=best, tier=f"soft_streak_{streak}",
+                               action=cfg.on_regression)
+                else:
+                    # Soft tier: a log line, nothing else -- noise on one
+                    # dataset must never trigger weight surgery or freeze
+                    # the rollback target.
+                    logger.warning(
+                        "soft regression on %s: %.5g (best %.5g, tolerance "
+                        "%.0f%%, streak %d/%d) -- warn only",
+                        mname, value, best, guard.rel_tolerance * 100,
+                        streak, cfg.soft_streak_limit,
+                    )
+                    tlog.event("soft_regression", metric=mname, value=value,
+                               best=best, streak=streak)
+            else:
+                soft_streaks[mname] = 0
+
+        if not hard_hits:
+            # Healthy eval (soft wiggles included): this checkpoint becomes
+            # the rollback target.
+            if last_ckpt is not None:
+                last_good_ckpt = last_ckpt
+            return
+
+        if cfg.on_regression == "abort":
+            raise SystemExit(
+                f"aborted: hard regression on {hard_hits}; last good "
+                f"checkpoint: {last_good_ckpt}"
+            )
+        if cfg.on_regression == "rollback":
+            if last_good_ckpt is None:
+                # Unreachable once the step-0 baseline ran, but never
+                # crash the guard itself.
+                logger.error("rollback requested but no good checkpoint "
+                             "exists yet; continuing WITHOUT rollback")
+                return
+            n_rollbacks += 1
+            # Rollback restores the weights but not the data or LR
+            # position, so a persistently regressing run oscillates
+            # (roll back, re-regress, ...) forever; cap it and hand back
+            # the last good checkpoint instead.
+            if cfg.max_rollbacks > 0 and n_rollbacks > cfg.max_rollbacks:
+                tlog.event("rollback_limit", n_rollbacks=n_rollbacks,
+                           last_good_checkpoint=str(last_good_ckpt))
+                raise SystemExit(
+                    f"aborted: {n_rollbacks} rollbacks exceed "
+                    f"max_rollbacks={cfg.max_rollbacks} -- the run is "
+                    "oscillating, not converging. Last good checkpoint: "
+                    f"{last_good_ckpt}"
+                )
+            load_adapter_state(model, last_good_ckpt)
+            tlog.event("rolled_back", to=str(last_good_ckpt),
+                       n_rollbacks=n_rollbacks)
+
+    # ------------------------------------------------- baseline (step 0)
+    # Save + eval BEFORE the first optimizer step: every guard gets a
+    # pre-training baseline (a collapse before the first periodic eval is
+    # impossible to miss) and a rollback target always exists. Costs one
+    # eval pass.
+    last_ckpt = save_checkpoint(
+        model, ckpt_root / f"{cfg.label}_step0",
+        {"step": 0, "epoch": 0, "git_rev": _git_rev(),
+         "sources": {n: len(v) for n, v in by_source.items()},
+         "baseline": True},
+        tlog,
+    )
+    run_hooks_and_guard(0, 0)
 
     # ------------------------------------------------------------- loop
     model.train()
     step = 0
-    last_ckpt: Path | None = None
     src_loss_sum: dict[str, float] = {}
     src_loss_n: dict[str, int] = {}
     done = False
@@ -1479,9 +1663,11 @@ def run_training(
         run_hooks_and_guard(step, cfg.epochs)
 
     tlog.event("done", steps=step, final_checkpoint=str(last_ckpt),
-               best_checkpoint=str(best_ckpt), best_metrics=best_metrics)
+               last_good_checkpoint=str(last_good_ckpt),
+               best_metrics=best_metrics)
     print(f"done. final checkpoint: {last_ckpt}")
-    print(f"best checkpoint ({best_metrics}): {best_ckpt}")
+    print(f"last good checkpoint (no hard regression at its eval): "
+          f"{last_good_ckpt}")
     return 0
 
 
@@ -1514,6 +1700,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resume-checkpoint", default=d.resume_checkpoint,
                    help="checkpoint name under weights/<architecture>/ to "
                         "resume the adapter from")
+    p.add_argument("--anchor-checkpoint", default=d.anchor_checkpoint,
+                   help="checkpoint whose adapter serves as the frozen "
+                        "teacher for kd_anchor examples (the trust region; "
+                        "normally = --resume-checkpoint). Default None = "
+                        "anchor to the bare base model")
     # recipe knobs (defaults per TRAINING_OVERVIEW.md, via TrainConfig)
     p.add_argument("--epochs", type=int, default=d.epochs)
     p.add_argument("--max-steps", type=int, default=d.max_steps)
@@ -1555,7 +1746,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--regression-tolerance", type=float,
                    default=d.regression_tolerance,
                    help="relative tolerance before a guarded metric counts "
-                        "as regressed")
+                        "as SOFT-regressed (warn only)")
+    p.add_argument("--hard-multiplier", type=float, default=d.hard_multiplier,
+                   help="a metric this many times worse than its best is a "
+                        "HARD regression (rollback/abort)")
+    p.add_argument("--soft-streak-limit", type=int, default=d.soft_streak_limit,
+                   help="consecutive soft-regressed evals before a metric "
+                        "escalates to a hard regression")
     p.add_argument("--max-rollbacks", type=int, default=d.max_rollbacks,
                    help="abort after this many rollbacks in one run")
     return p

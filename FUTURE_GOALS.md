@@ -62,3 +62,22 @@ supports video. Future work:
   in `training/TRAINING_EXTRA_DATASETS.md`).
 
 Currently only image + text are used.
+
+## 4. Analyst revamp: CORRECT spans + per-span ratings — *Not started*
+
+Today the analyst emits one message-level `RATING:` plus verbatim `WRONG:`
+span quotes; the reward mapping (`training/game_traces.py`) turns that into
+per-token weights. The revamp would make the signal denser and more
+surgical:
+
+* a `CORRECT:` span mark beside `WRONG:` (praise specific reasoning, not
+  just flag mistakes);
+* per-span ratings instead of (or refining) the single message-level
+  rating.
+
+Deferred as a multi-day project (new analyst prompt, new parser, new
+verification harness, new weight mapping, regenerated data). **Trigger to
+pick it up:** perception/move quality stalls across training iterations
+while analyst ratings stay high — the signature of the message-level
+rating being too blunt (see the reward-scheme section of
+`training/TRAINING_GAME_TRACES.md`).

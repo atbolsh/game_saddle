@@ -11,16 +11,16 @@ lines back for review. On a FAIL, also paste the traceback that precedes it.
 | # | Command | Cost | What it proves |
 |---|---------|------|----------------|
 | 0 | `python -m training.selftest t0` | seconds | imports; transformers >= 5.10; CUDA visible; bitsandbytes loads |
-| 1 | `python -m training.selftest t1` | seconds | pure units: `parse_rating` (incl. bold variants), `build_span_weights` (WRONG override, win boost, negative scale), image-noise determinism/identity, analyst-leak tripwire (incl. multi-line), `_rewrite_image_urls`, `GameTraceSource` on a fabricated trace dir, micro-batch bucketing, planted-error scrambler (seed determinism, all three move-token modes, clock-shift tolerance labeling, direction swap incl. the "right move" guard, inert-text fallthrough), perception-question sampling (rate honored, groups and mirrored variants balanced), `AnalystTraceSource` on a fabricated file (KD loss kind, rating-null kept, unverified-span record dropped, quota weight), `stack_equal_length` (equal-length rows stack, mixed lengths hard-error) |
+| 1 | `python -m training.selftest t1` | seconds | pure units: `parse_rating` (incl. bold variants), `build_span_weights` (NON-NEGATIVE mapping `max(0,(r+0.5)/1.5)`, WRONG spans masked to 0, win boost, hard floor at r ≤ -0.5 — the 2026-08-01 collapse fix), image-noise determinism/identity, analyst-leak tripwire (incl. multi-line), `_rewrite_image_urls`, `GameTraceSource` on a fabricated trace dir, `PlayerAnchorSource` on the same dir (kd_anchor loss, rating-null KEPT, uniform weights, 0.25 weight), micro-batch bucketing, planted-error scrambler (seed determinism, all three move-token modes, clock-shift tolerance labeling, direction swap incl. the "right move" guard, inert-text fallthrough), perception-question sampling (rate honored, groups and mirrored variants balanced), `AnalystTraceSource` on a fabricated file (KD loss kind, rating-null kept, unverified-span record dropped, quota weight), `stack_equal_length` (equal-length rows stack, mixed lengths hard-error) |
 | 2 | `python -m training.selftest t2` | seconds | every enabled manifest entry materialized; `data.jsonl` row counts match `meta.json`; probe files present |
-| 3 | `python -m training.selftest t3` | minutes | 4-bit QLoRA load; LoRA target discovery + projector resolution; terminator id; one collated forward+backward per loss kind (image example included); fresh-adapter KD loss equals teacher entropy (the `disable_adapter()` teacher path) |
-| 4 | `python -m training.selftest t4` | ~15–30 min | batch-4 vs batch-1 per-example loss parity (mixed CE/KD/image/negative-span buckets); CLI smoke train lands a checkpoint + `eval_log.jsonl` rows; destructive-LR variant fires the rollback path |
+| 3 | `python -m training.selftest t3` | minutes | 4-bit QLoRA load; LoRA target discovery + projector resolution; terminator id; one collated forward+backward per loss kind (image example included); fresh-adapter KD loss equals teacher entropy (the `disable_adapter()` teacher path); kd_anchor with NO anchor adapter loaded equals kd (the epoch-1 base fallback) |
+| 4 | `python -m training.selftest t4` | ~15–30 min | batch-4 vs batch-1 per-example loss parity (mixed CE/KD/image/negative-span buckets); CLI smoke train lands a checkpoint + `eval_log.jsonl` rows (INCLUDING the new step-0 baseline eval); destructive-LR variant fires the rollback path via the HARD tier (`--hard-multiplier 1.0` pins any regression to hard) |
 | 5 | `python -m training.selftest t5` | ~10–20 min | datagen 2 games x 5 moves at `--parallel 2`: traces + stored frames + stats + plots written, one record per generation, tripwire silent, ratings parsed; `analyst_traces.jsonl` has one record per round (minus counted truncated-search skips), analyses nonempty, frames shared with player records |
 | 6 | `python -m training.selftest t6` | minutes | equal-length identical-prompt true GPU batch vs solo; variable-length via the VERIFIED LEFT-PAD workaround vs solo (must byte-match AND must actually take the padded path, not the cohort fallback) |
-| 7 | `python -m training.selftest t7` | minutes | t5's traces through `GameTraceSource` + `AnalystTraceSource` and real train steps (RL weights + KD-vs-base analyst anchor, mixed CE/KD buckets, per-run noised frames, finite losses; the tiny epoch is drained so the KD bucket is guaranteed to train) |
+| 7 | `python -m training.selftest t7` | minutes | t5's traces through `GameTraceSource` + `PlayerAnchorSource` + `AnalystTraceSource` and real train steps (RL weights + player trust region + KD-vs-base analyst anchor, mixed ce/kd/kd_anchor buckets, per-run noised frames, finite losses; the tiny epoch is drained so every KD bucket is guaranteed to train) |
 | 8 | `python -m training.selftest t8` | ~15–40 min | REAL serial datagen timing: the shared workload (3 games × 4 moves, `--parallel 1`) through the actual session harness with the model pre-loaded/warmed (startup excluded); reports `seconds_per_generation` and the serial wall-clock a default epoch (3000 gens) implies. Its `generation_stats.json` is t9's baseline (t9 checks the game count and refuses a stale one) |
 | 9 | `python -m training.selftest t9` | ~10–25 min | t8's EXACT workload at `--parallel 3` (run t8 first — its stats file is the serial baseline), compared on `seconds_per_generation`; asserts parallel is not ≫ slower, REPORTS the speedup (expect a real one now: phase-locking dispatcher + verified left-pad batching) |
-| 10 | `python -m training.selftest t10` | ~20–30 min | 4 timed train micro-batches from EVERY loss category (player CE/RL, analyst-anchor KD incl. teacher forward, each manifest source) on the real overnight corpus (`data_game/overnight_iter1`, override `T10_DATAGEN_LABEL`); per-category peak VRAM (asserts < 88 GiB — the 2026-07-31 OOM tripwire) and a whole-epoch train-time estimate; saves NO checkpoint |
+| 10 | `python -m training.selftest t10` | ~20–30 min | 4 timed train micro-batches from EVERY loss category (player CE/RL, player-anchor kd_anchor, analyst-anchor KD — both incl. the teacher forward — each manifest source) on the real overnight corpus (`data_game/overnight_iter1`, override `T10_DATAGEN_LABEL`); per-category peak VRAM (asserts < 88 GiB — the 2026-07-31 OOM tripwire) and a whole-epoch train-time estimate; saves NO checkpoint |
 
 (`python -m training.selftest all` runs everything in order; the exit code
 is the number of failures.)
@@ -152,22 +152,52 @@ batch-1 parity), then t10. A `logits_to_keep` rename in a future
 transformers fails loudly as TypeError in t3/t4/t10 — never silently
 fall back to full-sequence logits.
 
+Collapse-proofing note (2026-08-03, after the weekend collapse — full
+postmortem in TRAINING_GAME_TRACES.md): the retest run carries five
+interlocking changes, most covered by the stages above (t1 = mapping +
+anchor source units, t3 = kd_anchor fallback, t4 = baseline eval + hard
+rollback, t7 = kd_anchor through real steps). Two things the selftests
+canNOT prove and the retest run itself must:
+
+* **The anchor adapter on a REAL parent checkpoint.** t3/t7 only exercise
+  the no-anchor base fallback. Epoch 2 of the retest is the first time
+  `model.load_adapter(<parent ckpt>, adapter_name="anchor",
+  is_trainable=False)` + `set_adapter("anchor")` runs with
+  `modules_to_save` (the embed_vision projector copy) in play — a PEFT
+  API assumption verified only from docs, not on the box (remote-
+  environment rule). It fails loudly if wrong; if train2 crashes at
+  startup around `anchor_loaded`, this is the suspect. A quick manual
+  check on the box: watch train2's log for the `anchor_loaded` event and
+  a normal first-step loss on the `player_anchor_*` source (~teacher
+  entropy, low single digits — NOT ~0: the student has drifted from the
+  parent by then).
+* **The fuse + stop-on-poison end to end** only fires against an actually
+  collapsed checkpoint; it was designed against the weekend logs. If the
+  retest stays healthy the fuse should remain silent
+  (`degenerate_generations` ≈ 0 in generation_stats.json).
+
 Weekend rehearsal (before launching `training/run_weekend.py` for
 real): with NAMS up and external data downloaded, run
 
     python -m training.run_weekend --prefix smoke --epochs 2 \
         --games 2 --max-generations 8 --train-max-steps 25
 
-(~30–60 min). Verify: (1) it runs datagen → train → datagen → train with
-each stage in its own subprocess; (2) epoch 2's datagen logs
-`--checkpoint smoke_iter1_step<N>` — the checkpoint hand-off is the whole
-point; (3) `data_game/smoke_state.json` records the stages, and re-running
+(~30–60 min; NOTE the confusing name collision: `--prefix smoke` is the
+rehearsal label, while a `smoke<k>` STAGE now also runs after every train
+stage — the post-train smoke eval). Verify: (1) it runs datagen → train →
+smoke eval → datagen → train → smoke eval with each stage in its own
+subprocess; (2) epoch 2's datagen logs `--checkpoint smoke_iter1_step<N>`
+— the checkpoint hand-off is the whole point; (3)
+`data_game/smoke_state.json` records the stages, a `smoke` dict with a
+per-epoch performance summary (games/wins/ratings/degeneracy/distance
+deltas — the same line greps as `smoke_eval` in the log), and re-running
 the same command immediately exits after "already complete" skips; (4)
 checkpoints exist under `weights/<arch>/smoke_iter1_step*` and
-`smoke_iter2_step*`; (5) `data_game/smoke_vram.jsonl` has stage-tagged
-samples from BOTH stage kinds and the log ends with a `VRAM summary`
-line (peak + per-stage means) and a `stage time:` line — that's the
-monitoring you'll read Monday morning. Then delete `data_game/smoke_iter*`,
+`smoke_iter2_step*` (including the new `_step0` baselines); (5)
+`data_game/smoke_vram.jsonl` has stage-tagged samples from BOTH stage
+kinds and the log ends with a `VRAM summary` line (peak + per-stage
+means) and a `stage time:` line — that's the monitoring you'll read
+Monday morning. Then delete `data_game/smoke_iter*`, `data_game/smoke_smoke*`,
 `data_game/smoke_state.json`, `data_game/smoke_vram.jsonl`, and
 `weights/<arch>/smoke_iter*` before the real run. Kill-resume is worth one extra check if time permits: Ctrl-C
 mid-datagen, rerun, and confirm it resumes with `--append` and the
