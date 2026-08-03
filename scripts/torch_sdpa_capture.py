@@ -60,6 +60,12 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gemma4_pad_batch_repro import encode, left_pad, make_image  # noqa: E402
 
+# Repo-root .env -> os.environ (HF_TOKEN for the model download; see the
+# env-secrets .cursor rule). python-dotenv is in requirements.txt.
+from dotenv import load_dotenv  # noqa: E402
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
 #: A call counts as corrupted only if its live output disagrees with the
 #: live forced-MATH recompute this much in absolute terms AND this many
 #: times worse than the same-index control call. bf16 backend wobble on

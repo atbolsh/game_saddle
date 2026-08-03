@@ -39,6 +39,16 @@ import torch
 from PIL import Image, ImageDraw
 from transformers import AutoModelForMultimodalLM, AutoProcessor
 
+# When run inside the game_saddle repo, pick up HF_TOKEN from the
+# repo-root .env (see the env-secrets .cursor rule). The guard keeps the
+# script standalone for the upstream bug report: without python-dotenv it
+# simply runs unauthenticated, and transformers warns about that itself.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+except ImportError:
+    pass
+
 SHORT_Q = "In one short sentence, what colors do you see?"
 LONG_Q = ("Answer briefly: is the grid mostly empty? Explain in one "
           "sentence why you think so.")
