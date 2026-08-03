@@ -1,38 +1,44 @@
 """Stage 1 of the torch MRE for transformers#47651: capture the failing
-SDPA call from a real Gemma 4 prefill.
+SDPA call from a real Gemma 4 prefill, WITH ITS EXACT MEMORY LAYOUT.
 
 Background (https://github.com/huggingface/transformers/issues/47651):
 left-padded Gemma 4 prefill corrupts next-token logits whenever the padded
-total length is 1 mod 32. zucchini-nlp bisected it to torch's SDPA
-EFFICIENT_ATTENTION backend (eager and SDPA-MATH are clean; images
-irrelevant) and found that dummy-initialized weights do NOT reproduce --
-the corruption depends on the actual tensor values. A synthetic
-random-tensor MRE therefore cannot fire; the MRE must ship the REAL
-tensors.
+total length is 1 mod 32. Maintainer triage bisected it to a non-MATH SDPA
+backend (forcing MATH fixes it) and found dummy weights do NOT reproduce.
 
-This script (GPU box, needs transformers + the model):
+Lessons from two failed capture attempts on 2026-08-03, baked in here:
 
-  1. sanity-checks zucchini-nlp's backend claim at the model level
-     (poisoned prefill under MATH vs default backend selection);
-  2. intercepts every torch.nn.functional.scaled_dot_product_attention
-     call during one poisoned prefill (total length 1 mod 32) and one
-     control prefill (total length 2 mod 32), recording args on CPU;
-  3. finds the guilty call by comparing each call's CAPTURED ORIGINAL
-     OUTPUT against an fp32-MATH recomputation on the same captured
-     inputs (ground truth: only the corrupted call disagrees with its own
-     reference), then replays that call under every SDPA backend (MATH /
-     EFFICIENT / CUDNN / FLASH) to identify WHICH backend reproduces the
-     corruption. Lesson from the first run of this script (2026-08-03):
-     ranking EFFICIENT-vs-MATH replay disagreement found nothing, because
-     the backend the model actually used was neither -- on Blackwell +
-     head_dim 512 the default selector can pick the cuDNN backend, which
-     the EFFICIENT/MATH comparison never exercises;
-  4. saves the guilty poisoned call + the same-index control call into a
-     weights_only-loadable bundle (sdpa_repro.pt) for the standalone,
-     torch-only replay script (torch_sdpa_repro.py) that gets attached to
-     the pytorch issue. If the corruption cannot be reproduced by ANY
-     backend replay on the captured inputs (i.e. it is stateful, not a
-     pure function of the inputs), the script says so LOUDLY and exits 2.
+  * v1 ranked calls by EFFICIENT-vs-MATH replay disagreement -> nothing.
+  * v2 ranked by captured-output-vs-fp32 reference -> found corrupted
+    calls (max|d| ~ 15-19, controls ~0.09) BUT no backend replay of the
+    CPU-round-tripped tensors reproduced the corruption. Meanwhile the
+    replay warnings proved cuDNN (head_dim > 128) and FLASH (non-null
+    attn_mask) are ineligible for these inputs, so the original run can
+    only have used EFFICIENT -- whose replay on the same VALUES is clean.
+    Conclusion: the bug depends on the tensors' MEMORY LAYOUT (storage
+    offsets, strides, buffers shared between k/v views), which
+    ``.to("cpu").clone()`` silently normalizes.
+
+So this version:
+
+  1. sanity-checks the backend claim at model level (poisoned prefill
+     under forced MATH must be clean);
+  2. spies on every torch.nn.functional.scaled_dot_product_attention call
+     during a poisoned prefill (total length 1 mod 32) and a control
+     prefill (one pad token longer). The spy computes ``d_live`` -- the
+     call's real output vs a forced-MATH recompute on the LIVE, in-place
+     GPU tensors -- which is the round-trip-free guilty-call detector.
+     It also packs each argument's ENTIRE underlying storage as raw
+     bytes (shared storages saved once, preserving k/v adjacency) plus
+     (shape, stride, storage_offset), so the replay can rebuild
+     bit-identical views via ``Tensor.set_``;
+  3. replays the guiltiest call from the packed storages under every
+     backend, printing each backend's delta vs an fp32-MATH reference
+     and vs the captured (corrupted) original output;
+  4. writes sdpa_repro.pt (weights_only-loadable) for the standalone
+     torch_sdpa_repro.py IF a backend replay reproduces the corruption;
+     otherwise explains LOUDLY what was and wasn't established (the
+     d_live numbers alone are already reportable evidence) and exits 2.
 
 Usage:
     python scripts/torch_sdpa_capture.py \
@@ -44,6 +50,7 @@ from __future__ import annotations
 import argparse
 import sys
 import tempfile
+import warnings
 from pathlib import Path
 
 import torch
@@ -53,18 +60,13 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gemma4_pad_batch_repro import encode, left_pad, make_image  # noqa: E402
 
-#: A call counts as "materially corrupted" only if its captured output
-#: disagrees with the fp32-MATH reference this much in absolute terms AND
-#: this many times worse than the same-index control call. bf16 backend
-#: wobble is ~1e-1 on these attention outputs; the bug's logit-level
-#: effect was ~40.
+#: A call counts as corrupted only if its live output disagrees with the
+#: live forced-MATH recompute this much in absolute terms AND this many
+#: times worse than the same-index control call. bf16 backend wobble on
+#: these attention outputs is ~1e-1; the observed corruption is ~15-20.
 ABS_THRESHOLD = 0.5
 REL_THRESHOLD = 50.0
 
-#: Every selectable SDPA backend; the guilty one is whichever reproduces
-#: the captured (corrupted) output. Backends that reject these inputs
-#: (e.g. FLASH with an arbitrary mask / head_dim 512) are reported as
-#: unsupported and skipped.
 BACKENDS = [
     ("MATH", SDPBackend.MATH),
     ("EFFICIENT", SDPBackend.EFFICIENT_ATTENTION),
@@ -72,6 +74,82 @@ BACKENDS = [
     ("FLASH", SDPBackend.FLASH_ATTENTION),
 ]
 
+
+# ==================================================== layout-exact packing
+
+def pack_call(args: tuple, kwargs: dict) -> dict:
+    """Pack SDPA call arguments preserving EXACT memory layout.
+
+    Each distinct underlying storage is dumped ONCE as raw bytes (so
+    tensors that are views into the same buffer -- e.g. k and v sliced
+    from one fused projection -- stay adjacent on rebuild), and every
+    tensor is recorded as (storage id, dtype, shape, stride, offset).
+    Everything is weights_only-serializable.
+    """
+    storages: dict[str, torch.Tensor] = {}
+
+    def pack(v):
+        if not isinstance(v, torch.Tensor):
+            return v
+        stor = v.untyped_storage()
+        sid = str(stor.data_ptr())
+        if sid not in storages:
+            u8 = torch.empty(0, dtype=torch.uint8, device=v.device)
+            u8.set_(stor)  # 1-D uint8 view of the WHOLE storage
+            storages[sid] = u8.cpu().clone()
+        return {
+            "__packed__": True,
+            "sid": sid,
+            "dtype": str(v.dtype).split(".")[-1],
+            "shape": tuple(v.shape),
+            "stride": tuple(v.stride()),
+            "offset": v.storage_offset(),
+        }
+
+    return {
+        "storages": storages,
+        "args": [pack(a) for a in args],
+        "kwargs": {k: pack(v) for k, v in kwargs.items()},
+    }
+
+
+def unpack_call(packed: dict, device: str = "cuda") -> tuple[list, dict]:
+    """Rebuild the call's tensors with their original layout (offsets,
+    strides, shared storages) on ``device``."""
+    live = {sid: u8.to(device) for sid, u8 in packed["storages"].items()}
+
+    def unpack(p):
+        if not (isinstance(p, dict) and p.get("__packed__")):
+            return p
+        t = torch.empty(0, dtype=getattr(torch, p["dtype"]), device=device)
+        t.set_(live[p["sid"]].untyped_storage(),
+               p["offset"], p["shape"], p["stride"])
+        return t
+
+    return ([unpack(a) for a in packed["args"]],
+            {k: unpack(v) for k, v in packed["kwargs"].items()})
+
+
+def layout_lines(packed: dict) -> list[str]:
+    out = []
+    names = [f"arg{i}" for i in range(len(packed["args"]))]
+    items = list(zip(names, packed["args"]))
+    items += [(k, v) for k, v in packed["kwargs"].items()]
+    for name, p in items:
+        if isinstance(p, dict) and p.get("__packed__"):
+            contig = torch.empty(p["shape"]).stride() == tuple(p["stride"])
+            out.append(
+                f"  {name:<10s} {p['dtype']:<9s} shape {p['shape']} "
+                f"stride {p['stride']} storage_offset {p['offset']} "
+                f"contiguous={bool(contig)} "
+                f"storage_bytes={packed['storages'][p['sid']].numel()}"
+            )
+        else:
+            out.append(f"  {name:<10s} = {p!r}")
+    return out
+
+
+# ========================================================== capture + replay
 
 def build_inputs(model, enc: dict) -> dict:
     """Mirror gemma4_pad_batch_repro.last_logits's input prep (device,
@@ -88,22 +166,25 @@ def build_inputs(model, enc: dict) -> dict:
     return inputs
 
 
-def _to_cpu(v):
-    return v.detach().to("cpu").clone() if isinstance(v, torch.Tensor) else v
-
-
 def capture_calls(model, inputs: dict) -> tuple[torch.Tensor, list[dict]]:
-    """One prefill with F.scaled_dot_product_attention spied on. Returns
-    (last-position logits, list of captured calls in execution order)."""
+    """One prefill with F.scaled_dot_product_attention spied on.
+
+    Per call the spy records: the packed (layout-exact) arguments, the
+    original output, and ``d_live`` = max|original output - forced-MATH
+    recompute on the SAME live tensors| -- computed before anything is
+    moved or copied, so it cannot be fooled by layout normalization.
+    """
     calls: list[dict] = []
     real = F.scaled_dot_product_attention
 
     def spy(*args, **kwargs):
         out = real(*args, **kwargs)
+        with sdpa_kernel([SDPBackend.MATH]):
+            out_math = real(*args, **kwargs)
         calls.append({
-            "args": [_to_cpu(a) for a in args],
-            "kwargs": {k: _to_cpu(v) for k, v in kwargs.items()},
-            "out": _to_cpu(out),
+            "packed": pack_call(args, kwargs),
+            "out": out.detach().cpu().clone(),
+            "d_live": float((out - out_math).abs().max()),
         })
         return out
 
@@ -117,52 +198,26 @@ def capture_calls(model, inputs: dict) -> tuple[torch.Tensor, list[dict]]:
         raise RuntimeError(
             "prefill ran but ZERO scaled_dot_product_attention calls were "
             "intercepted -- this transformers version reaches the kernel "
-            "through a different symbol than "
-            "torch.nn.functional.scaled_dot_product_attention, and the "
-            "capture hook must be moved there. Do NOT trust any output "
-            "of this script until that is fixed."
+            "through a different symbol; move the capture hook there. Do "
+            "NOT trust any output of this script until that is fixed."
         )
     return logits, calls
 
 
-def replay(call: dict, backend: SDPBackend, fp32: bool = False):
-    """Re-run one captured call in isolation under a forced backend."""
-    def prep(v):
-        if not isinstance(v, torch.Tensor):
-            return v
-        v = v.to("cuda")
-        return v.float() if (fp32 and v.dtype.is_floating_point) else v
-
-    args = [prep(a) for a in call["args"]]
-    kwargs = {k: prep(v) for k, v in call["kwargs"].items()}
-    with torch.inference_mode(), sdpa_kernel([backend]):
+def replay(packed: dict, backend: SDPBackend, fp32: bool = False):
+    """Re-run one packed call in isolation under a forced backend, from
+    layout-faithful rebuilt tensors."""
+    args, kwargs = unpack_call(packed)
+    if fp32:
+        args = [a.float() if isinstance(a, torch.Tensor)
+                and a.dtype.is_floating_point else a for a in args]
+        kwargs = {k: (v.float() if isinstance(v, torch.Tensor)
+                      and v.dtype.is_floating_point else v)
+                  for k, v in kwargs.items()}
+    with torch.inference_mode(), sdpa_kernel([backend]), \
+            warnings.catch_warnings():
+        warnings.simplefilter("ignore")
         return F.scaled_dot_product_attention(*args, **kwargs).float().cpu()
-
-
-def corruption(call: dict) -> float:
-    """max|captured original output - fp32-MATH recomputation on the SAME
-    captured inputs|. Ground truth for 'this call went wrong in the real
-    run', regardless of which backend the run's selector picked."""
-    ref = replay(call, SDPBackend.MATH, fp32=True)
-    return float((call["out"].float() - ref).abs().max())
-
-
-def backend_table(call: dict) -> dict[str, dict[str, float] | None]:
-    """Replay one call under every backend; per backend, max|d| vs the
-    fp32-MATH reference and vs the captured original output (a backend
-    matching the corrupted original IS the guilty backend)."""
-    ref = replay(call, SDPBackend.MATH, fp32=True)
-    orig = call["out"].float()
-    table: dict[str, dict[str, float] | None] = {}
-    for name, be in BACKENDS:
-        try:
-            out = replay(call, be)
-        except Exception:
-            table[name] = None  # backend rejects these inputs
-            continue
-        table[name] = {"vs_fp32_ref": float((out - ref).abs().max()),
-                       "vs_original": float((out - orig).abs().max())}
-    return table
 
 
 def main() -> int:
@@ -196,7 +251,7 @@ def main() -> int:
           f"(total {length + poison_pad}), control pad {control_pad} "
           f"(total {length + control_pad})")
 
-    # ---- step 1: model-level backend check (zucchini-nlp's finding)
+    # ---- step 1: model-level backend check
     solo = build_inputs(model, enc)
     poisoned = build_inputs(model, left_pad(enc, poison_pad, pad_id))
     with torch.inference_mode():
@@ -207,7 +262,7 @@ def main() -> int:
           f"max|dLogit| vs solo = {float((math_logits - ref).abs().max()):.4f} "
           "(expect <~1: MATH is clean, confirming a backend bug)")
 
-    # ---- step 2: capture both prefills
+    # ---- step 2: capture both prefills (d_live computed in-flight)
     poisoned_logits, poison_calls = capture_calls(model, poisoned)
     d = float((poisoned_logits[0] - ref).abs().max())
     print(f"[capture] poisoned prefill (default backend): max|dLogit| "
@@ -218,72 +273,72 @@ def main() -> int:
         len(poison_calls), len(control_calls))
     print(f"[capture] {len(poison_calls)} SDPA calls per prefill")
 
-    # ---- step 3: find the guilty call by ORIGINAL-OUTPUT corruption
-    # (not by backend-vs-backend replay disagreement: the 2026-08-03 run
-    # proved the guilty backend can be one the replay pair didn't cover)
-    ranked = sorted(
-        ((corruption(c), i) for i, c in enumerate(poison_calls)),
-        reverse=True,
-    )
-    print("\ntop 5 corrupted calls (captured output vs fp32-MATH "
-          "reference, poisoned prefill):")
+    # ---- step 3: rank by d_live (live output vs live forced-MATH; no
+    # round trip involved, so layout games cannot hide the guilty call)
+    ranked = sorted(((c["d_live"], i) for i, c in enumerate(poison_calls)),
+                    reverse=True)
+    print("\ntop 5 live divergences (default backend vs forced MATH on "
+          "the LIVE tensors, poisoned prefill):")
     for dv, i in ranked[:5]:
-        q = poison_calls[i]["args"][0]
-        print(f"  call {i:3d}  max|d|={dv:10.4f}  q shape "
-              f"{tuple(q.shape)} dtype {q.dtype}")
-
+        print(f"  call {i:3d}  d_live={dv:10.4f}")
     worst_d, worst_i = ranked[0]
-    control_d = corruption(control_calls[worst_i])
-    print(f"\nworst call {worst_i}: poisoned max|d|={worst_d:.4f}, "
-          f"same-index control max|d|={control_d:.4f}")
+    control_d = control_calls[worst_i]["d_live"]
+    print(f"\nworst call {worst_i}: poisoned d_live={worst_d:.4f}, "
+          f"same-index control d_live={control_d:.4f}")
     if not (worst_d > ABS_THRESHOLD
             and worst_d > REL_THRESHOLD * max(control_d, 1e-6)):
         print(
-            "\n*** NO CORRUPTED CALL FOUND: every captured SDPA output "
-            "matches its own fp32-MATH recomputation, yet the "
-            "model-level logits diverge under the default backend and "
-            "not under forced MATH. That should be impossible if the "
-            "corruption lives inside F.scaled_dot_product_attention on "
-            "these inputs -- suspect the capture is not faithful (a "
-            "different kernel symbol?) or the bug is stateful. NOT "
-            "writing a bundle. ***"
+            "\n*** NO GUILTY CALL EVEN ON LIVE TENSORS: the default and "
+            "forced-MATH backends agree inside every call, yet the "
+            "model-level logits diverge. The corruption then happens "
+            "OUTSIDE F.scaled_dot_product_attention (or forcing MATH "
+            "changes something else entirely). NOT writing a bundle; "
+            "bring this output back for a rethink. ***"
         )
         return 2
 
-    # ---- step 3b: which backend reproduces the corrupted output?
-    print(f"\nper-backend replay of call {worst_i} (poisoned):")
-    table = backend_table(poison_calls[worst_i])
+    print(f"\nmemory layout of call {worst_i}'s arguments (the part a "
+          "CPU round trip would normalize):")
+    for line in layout_lines(poison_calls[worst_i]["packed"]):
+        print(line)
+
+    # ---- step 4: layout-faithful replay under every backend
+    packed = poison_calls[worst_i]["packed"]
+    fp32_ref = replay(packed, SDPBackend.MATH, fp32=True)
+    orig = poison_calls[worst_i]["out"].float()
+    print(f"\nper-backend replay of call {worst_i} from packed storages "
+          "(layout-exact):")
     guilty = []
-    for name, row in table.items():
-        if row is None:
+    for name, be in BACKENDS:
+        try:
+            out = replay(packed, be)
+        except Exception:
             print(f"  {name:<10s} unsupported on these inputs")
             continue
-        print(f"  {name:<10s} vs fp32 ref: {row['vs_fp32_ref']:10.4f}   "
-              f"vs captured original: {row['vs_original']:10.4f}")
-        # Guilty = wrong vs the reference AND matching the corrupted
-        # original run (i.e. this backend is what the run executed).
-        if (row["vs_fp32_ref"] > ABS_THRESHOLD
-                and row["vs_original"] < row["vs_fp32_ref"] / REL_THRESHOLD):
+        d_ref = float((out - fp32_ref).abs().max())
+        d_orig = float((out - orig).abs().max())
+        print(f"  {name:<10s} vs fp32 ref: {d_ref:10.4f}   "
+              f"vs captured original: {d_orig:10.4f}")
+        if d_ref > ABS_THRESHOLD and d_orig < d_ref / REL_THRESHOLD:
             guilty.append(name)
     if not guilty:
         print(
-            "\n*** CORRUPTED CALL FOUND BUT NOT REPRODUCIBLE: call "
-            f"{worst_i}'s captured output is wrong, yet NO backend "
-            "replay on the captured inputs reproduces it. The corruption "
-            "is not a pure function of the SDPA inputs (stateful kernel "
-            "bug / workspace reuse?) -- a .pt bundle alone will not "
-            "serve as an MRE. Report this finding on the torch issue "
-            "verbatim instead. NOT writing a bundle. ***"
+            "\n*** STILL NOT REPRODUCIBLE IN ISOLATION: the guilty call "
+            f"is real (d_live={worst_d:.2f} on live tensors, control "
+            f"{control_d:.2f}) but even a layout-exact single-call "
+            "replay is clean. Remaining suspects: allocator state / "
+            "adjacent-memory contents (an out-of-bounds read would pick "
+            "up different neighbors in replay) or some stream/workspace "
+            "state. The d_live evidence + the layout dump above are "
+            "still reportable: torch devs can be told the corruption "
+            "fires in-place during the model forward but not on rebuilt "
+            "tensors. NOT writing a bundle. ***"
         )
         return 2
     print(f"\nGUILTY BACKEND(S): {guilty} -- corrupted vs the fp32 "
-          "reference AND bit-matching the captured original run")
+          "reference AND matching the captured original run")
 
-    # ---- step 4: save the weights_only-loadable bundle
-    def pack(call):
-        return {"args": call["args"], "kwargs": call["kwargs"],
-                "out_original_run": call["out"]}
-
+    # ---- step 5: save the weights_only-loadable bundle
     bundle = {
         "meta": {
             "source": "https://github.com/huggingface/transformers/"
@@ -298,10 +353,14 @@ def main() -> int:
             "control_kv_len": length + control_pad,
             "guilty_backends": guilty,
             "note": "poisoned kv_len % 32 == 1; control differs by ONE "
-                    "left-pad token, same layer, same prompt",
+                    "left-pad token, same layer, same prompt. Tensors "
+                    "are packed as raw storages + (shape, stride, "
+                    "offset) because the bug is layout-sensitive.",
         },
-        "poisoned": pack(poison_calls[worst_i]),
-        "control": pack(control_calls[worst_i]),
+        "poisoned": {"packed": packed,
+                     "out_original_run": poison_calls[worst_i]["out"]},
+        "control": {"packed": control_calls[worst_i]["packed"],
+                    "out_original_run": control_calls[worst_i]["out"]},
     }
     torch.save(bundle, args.out)
     size_mb = Path(args.out).stat().st_size / 1e6
