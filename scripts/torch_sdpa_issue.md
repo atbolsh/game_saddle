@@ -4,8 +4,10 @@ Status: **fill the two `<<< >>>` blocks from a remote run, then file.**
 
 - Where to file: <https://github.com/pytorch/pytorch/issues/new?template=bug-report.yml>
   (the "Bug report" form; sections below map onto its fields)
-- Suggested title:
-  `SDPA EFFICIENT_ATTENTION returns wrong output when kv sequence length % 32 == 1 (bf16 + attn_mask, CUDA Blackwell; MATH backend correct on identical tensors)`
+- Suggested title (replace `<BACKEND>` with the guilty backend the capture
+  script names -- likely CUDNN on Blackwell, not the EFFICIENT backend the
+  transformers triage guessed from other hardware):
+  `SDPA <BACKEND> backend returns wrong output when kv sequence length % 32 == 1 (bf16 + attn_mask, CUDA Blackwell; MATH backend correct on identical tensors)`
 - Attach: `sdpa_repro.zip` containing `sdpa_repro.pt` + `torch_sdpa_repro.py`
   (GitHub takes zips up to 25 MB; the bundle is two SDPA calls' worth of
   bf16 tensors, well under that)
@@ -14,12 +16,14 @@ Status: **fill the two `<<< >>>` blocks from a remote run, then file.**
 
 ## 🐛 Describe the bug
 
-`F.scaled_dot_product_attention` with the **EFFICIENT_ATTENTION** backend
-returns badly corrupted output for a specific real-world input whose **kv
+`F.scaled_dot_product_attention` with the **`<BACKEND>`** backend returns
+badly corrupted output for a specific real-world input whose **kv
 sequence length is ≡ 1 mod 32** (bf16, CUDA, batch 1, with a 4-D
 `attn_mask`). The **MATH** backend on the *identical* tensors is correct
 (matches an fp32 reference to bf16 wobble), and the *same* tensors with
 **one extra kv position** (kv_len ≡ 2 mod 32) are clean on every backend.
+The attached repro replays all four selectable backends so the comparison
+is complete on any hardware.
 
 Found via Gemma 4 batched generation in transformers
 (huggingface/transformers#47651): left-padding a prompt so the padded
@@ -38,9 +42,9 @@ unzip sdpa_repro.zip
 python torch_sdpa_repro.py sdpa_repro.pt
 ```
 
-The script replays both captured calls under EFFICIENT_ATTENTION,
-MATH (bf16), and MATH (fp32 reference) and prints max abs differences.
-Output on the reporting machine:
+The script replays both captured calls under every selectable backend
+(MATH bf16, EFFICIENT, CUDNN, FLASH) against an fp32-MATH reference and
+prints max abs differences. Output on the reporting machine:
 
 ```
 <<< PASTE torch_sdpa_repro.py OUTPUT HERE >>>
@@ -54,10 +58,10 @@ pattern across many lengths) is in the transformers issue linked above.
 
 ### Expected behavior
 
-EFFICIENT_ATTENTION matches MATH to numerical wobble at every sequence
-length, as it already does for the control case and for every other
-length in the sweeps on the transformers side (the pattern held across
-prompt lengths ~280–2900: corruption iff total kv_len % 32 == 1).
+Every backend matches MATH to numerical wobble at every sequence length,
+as they already do for the control case and for every other length in
+the sweeps on the transformers side (the pattern held across prompt
+lengths ~280–2900: corruption iff total kv_len % 32 == 1).
 
 ## Versions
 
@@ -80,12 +84,16 @@ cc @drisspg (SDPA / attention)
 >
 > Since dummy weights don't reproduce (the corruption is
 > value-dependent), the MRE captures the exact q/k/v/attn_mask tensors
-> from the worst-diverging SDPA call of the failing prefill (kv_len 289 =
+> from the corrupted SDPA call of the failing prefill (kv_len 289 =
 > 1 mod 32) plus the same-layer call from a control prefill one pad token
 > longer (kv_len 290), and replays them through bare
-> `F.scaled_dot_product_attention` — no transformers code involved.
-> EFFICIENT_ATTENTION vs MATH diverges by ~`<max|d|>` on the poisoned
-> length and stays at bf16 wobble (~`<control>`) on the control. Tensor
+> `F.scaled_dot_product_attention` under all four backends — no
+> transformers code involved. On my hardware the guilty backend is
+> `<BACKEND>` (diverges by ~`<max|d|>` from an fp32-MATH reference on the
+> poisoned length, bf16 wobble ~`<control>` on the control; all other
+> backends clean on both). `<IF CUDNN:>` Note that's the cuDNN backend,
+> not mem-efficient — backend selection differs by GPU (mine is
+> Blackwell), which may explain differences from your machine. Tensor
 > bundle + replay script are attached on the torch issue.
 >
 > @chavalasantosh in light of @zucchini-nlp's triage (kernel bug, not
