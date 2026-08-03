@@ -129,6 +129,15 @@ Workstation Edition, bf16, single GPU. Not yet tried on non-Blackwell
 hardware (the transformers maintainer who reproduced the pattern can
 confirm their hardware in the linked issue).
 
+**AI disclosure** (per this repo's AI policy): the repro scripts and the
+first draft of this report were written with AI assistance (Claude, via
+Cursor). I ran every experiment myself on the hardware above — all
+numbers in this report are from my own runs — and the
+layout-sensitivity finding came from iterating on two earlier capture
+designs whose replays failed to reproduce the corruption until the
+exact storages/strides were preserved. I have reviewed the scripts and
+the analysis, understand them, and take responsibility for the report.
+
 cc @drisspg (SDPA / attention)
 
 ---
