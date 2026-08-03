@@ -1,6 +1,7 @@
 # DRAFT: pytorch/pytorch issue (SDPA mem-efficient kernel, kv_len % 32 == 1)
 
-Status: **fill the two `<<< >>>` blocks from a remote run, then file.**
+Status: **READY TO FILE** (both output blocks filled from the 2026-08-03
+remote run; fix the issue number in the follow-up comment after filing).
 
 - Where to file: <https://github.com/pytorch/pytorch/issues/new?template=bug-report.yml>
   (the "Bug report" form; sections below map onto its fields)
@@ -32,6 +33,7 @@ non-null mask).
 q         bf16 shape (1, 16, 289, 512) stride (2367488, 512, 8192, 1)  # non-contiguous [B,S,H,D] permute
 k, v      bf16 shape (1, 16, 289, 512) stride (0, 0, 512, 1)           # ONE kv head expand()ed to 16 heads
 attn_mask bool shape (1, 1, 289, 289)  contiguous
+dropout_p=0.0  scale=1.0  is_causal=False
 ```
 
 Materializing the same values contiguously (a `.cpu().clone()` round
@@ -63,7 +65,24 @@ The script replays both captured calls under every selectable backend
 prints max abs differences. Output on the reporting machine:
 
 ```
-<<< PASTE torch_sdpa_repro.py OUTPUT HERE >>>
+torch==2.12.0+cu130  cuda=13.0  gpu=NVIDIA RTX PRO 6000 Blackwell Workstation Edition
+bundle meta: {'source': 'https://github.com/huggingface/transformers/issues/47651', 'model': 'google/gemma-4-12B-it', 'torch': '2.12.0+cu130', 'transformers': '5.14.1', 'gpu': 'NVIDIA RTX PRO 6000 Blackwell Workstation Edition', 'call_index': 41, 'n_calls_per_prefill': 48, 'poison_kv_len': 289, 'control_kv_len': 290, 'guilty_backends': ['EFFICIENT'], 'note': 'poisoned kv_len % 32 == 1; control differs by ONE left-pad token, same layer, same prompt. Tensors are packed as raw storages + (shape, stride, offset) because the bug is layout-sensitive.'} 
+
+[poisoned] q shape (1, 16, 289, 512) kv_len 289 (% 32 = 1) dtype bfloat16
+  captured original run vs fp32 ref:    19.5110
+  MATH_bf16  vs fp32 ref:     0.0625
+  EFFICIENT  vs fp32 ref:    19.5110
+  CUDNN      unsupported on these inputs (RuntimeError)
+  FLASH      unsupported on these inputs (RuntimeError)
+
+[control] q shape (1, 16, 290, 512) kv_len 290 (% 32 = 2) dtype bfloat16
+  captured original run vs fp32 ref:     0.0865
+  MATH_bf16  vs fp32 ref:     0.0625
+  EFFICIENT  vs fp32 ref:     0.0865
+  CUDNN      unsupported on these inputs (RuntimeError)
+  FLASH      unsupported on these inputs (RuntimeError)
+
+Expected: every backend matches the fp32-MATH reference to bf16 wobble (the MATH_bf16 row) on both cases. BUG: on the poisoned case (kv_len % 32 == 1) at least one backend diverges orders of magnitude past wobble -- matching the 'captured original run' row, which is what the full model forward produced -- while the control (ONE extra kv position, otherwise the same tensors) is clean everywhere.
 ```
 
 The two calls come from the same attention layer of the same prompt and
@@ -81,9 +100,29 @@ lengths ~280–2900: corruption iff total kv_len % 32 == 1).
 
 ## Versions
 
+```                      
+PyTorch version: 2.12.0+cu130             
+Is debug build: False                        
+CUDA used to build PyTorch: 13.0                     
+ROCM used to build PyTorch: N/A                      
+                                                             
+OS: Ubuntu 24.04.4 LTS (x86_64)                      
+GCC version: (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0 
+Clang version: Could not collect                     
+CMake version: version 3.28.3                        
+Libc version: glibc-2.39                             
+                                                             
+Python version: 3.12.13 | packaged by conda-forge | (main, Mar  5 2026, 16:50:00) [GCC 14.3.0] (64-bit runtime)
+Python platform: Linux-6.17.0-35-generic-x86_64-with-glibc2.39
+Is CUDA available: True                                                                                                   
+CUDA runtime version: 13.0.88                                                                                             
+CUDA_MODULE_LOADING set to:                                                                                               
+GPU models and configuration: GPU 0: NVIDIA RTX PRO 6000 Blackwell Workstation Edition                                                                                                                                                              
+Nvidia driver version: 580.159.03                    
 ```
-<<< PASTE `python -m torch.utils.collect_env` OUTPUT HERE >>>
-```
+
+(collect_env output trimmed for length; full printout available on
+request.)
 
 Observed on: torch 2.12.0+cu130, NVIDIA RTX PRO 6000 Blackwell
 Workstation Edition, bf16, single GPU. Not yet tried on non-Blackwell
