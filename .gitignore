@@ -12,6 +12,7 @@ memory_images/
 neo4j_data/
 neo4j_logs/
 brain_checkpoints/
+*.tar.gz
 
 # Trained LoRA adapter checkpoints (weights/<architecture>/<name>/); on the
 # local editing box "weights" is a symlink onto removable storage, so the
