@@ -350,8 +350,10 @@ def main() -> int:
             "source": "https://github.com/huggingface/transformers/"
                       "issues/47651",
             "model": args.model,
-            "torch": torch.__version__,
-            "transformers": transformers.__version__,
+            # str(): torch.__version__ is a TorchVersion object, which a
+            # strict weights_only=True load rejects.
+            "torch": str(torch.__version__),
+            "transformers": str(transformers.__version__),
             "gpu": torch.cuda.get_device_name(0),
             "call_index": worst_i,
             "n_calls_per_prefill": len(poison_calls),

@@ -4,10 +4,8 @@ Status: **fill the two `<<< >>>` blocks from a remote run, then file.**
 
 - Where to file: <https://github.com/pytorch/pytorch/issues/new?template=bug-report.yml>
   (the "Bug report" form; sections below map onto its fields)
-- Suggested title (replace `<BACKEND>` with the guilty backend the capture
-  script names -- likely CUDNN on Blackwell, not the EFFICIENT backend the
-  transformers triage guessed from other hardware):
-  `SDPA <BACKEND> backend returns wrong output when kv sequence length % 32 == 1 (bf16 + attn_mask, CUDA Blackwell; MATH backend correct on identical tensors)`
+- Suggested title:
+  `SDPA EFFICIENT_ATTENTION returns wrong output for broadcasted (stride-0) k/v when kv length % 32 == 1 (bf16 + attn_mask, CUDA; MATH correct on identical tensors)`
 - Attach: `sdpa_repro.zip` containing `sdpa_repro.pt` + `torch_sdpa_repro.py`
   (GitHub takes zips up to 25 MB; the bundle is two SDPA calls' worth of
   bf16 tensors, well under that)
@@ -16,24 +14,42 @@ Status: **fill the two `<<< >>>` blocks from a remote run, then file.**
 
 ## 🐛 Describe the bug
 
-`F.scaled_dot_product_attention` with the **`<BACKEND>`** backend returns
-badly corrupted output for a specific real-world input whose **kv
-sequence length is ≡ 1 mod 32** (bf16, CUDA, batch 1, with a 4-D
-`attn_mask`). The **MATH** backend on the *identical* tensors is correct
-(matches an fp32 reference to bf16 wobble), and the *same* tensors with
-**one extra kv position** (kv_len ≡ 2 mod 32) are clean on every backend.
-The attached repro replays all four selectable backends so the comparison
-is complete on any hardware.
+`F.scaled_dot_product_attention` with the **EFFICIENT_ATTENTION** backend
+returns badly corrupted output (max abs error ~19.5, vs ~0.09 honest bf16
+wobble) for a specific real-world input whose **kv sequence length is
+≡ 1 mod 32** (bf16, CUDA, batch 1, 4-D boolean `attn_mask`). The **MATH**
+backend on the *identical* tensors is correct (matches an fp32 reference
+to bf16 wobble), and the *same* tensors with **one extra kv position**
+(kv_len ≡ 2 mod 32) are clean on every backend. The attached repro
+replays all four selectable backends, so the comparison is complete on
+any hardware (CUDNN and FLASH decline these inputs: head_dim 512,
+non-null mask).
+
+**The memory layout matters as much as the values.** The failing call
+(a Gemma 4 KV-shared/GQA attention layer) looks like:
+
+```
+q         bf16 shape (1, 16, 289, 512) stride (2367488, 512, 8192, 1)  # non-contiguous [B,S,H,D] permute
+k, v      bf16 shape (1, 16, 289, 512) stride (0, 0, 512, 1)           # ONE kv head expand()ed to 16 heads
+attn_mask bool shape (1, 1, 289, 289)  contiguous
+```
+
+Materializing the same values contiguously (a `.cpu().clone()` round
+trip) makes EFFICIENT_ATTENTION **correct** — the bug requires the
+broadcasted stride-0 k/v (and/or the strided q). It is also
+value-dependent: randomly initialized weights did not reproduce during
+transformers-side triage. The repro therefore ships the exact captured
+tensors as raw storages + `(shape, stride, storage_offset)` and rebuilds
+the precise views with `Tensor.set_`; this layout-exact replay reproduces
+the corrupted full-model output **bit-exactly** (max abs diff 0.0 vs the
+captured forward).
 
 Found via Gemma 4 batched generation in transformers
 (huggingface/transformers#47651): left-padding a prompt so the padded
 total hits 1 mod 32 flips the next-token argmax to an unrelated special
 token (logit deltas ~40). Maintainer triage there ruled transformers out:
-eager attention and SDPA-with-MATH are clean, the presence of images is
-irrelevant, and — important for reproduction — **the bug does not fire
-with randomly initialized weights of the same architecture**. The
-corruption is value-dependent, so this MRE ships the exact q/k/v/mask
-tensors captured from the failing forward instead of synthetic ones.
+eager attention and SDPA-with-MATH are clean and the presence of images
+is irrelevant.
 
 Repro (only `torch` imported; the `.pt` loads with `weights_only=True`):
 
@@ -88,13 +104,20 @@ cc @drisspg (SDPA / attention)
 > 1 mod 32) plus the same-layer call from a control prefill one pad token
 > longer (kv_len 290), and replays them through bare
 > `F.scaled_dot_product_attention` under all four backends — no
-> transformers code involved. On my hardware the guilty backend is
-> `<BACKEND>` (diverges by ~`<max|d|>` from an fp32-MATH reference on the
-> poisoned length, bf16 wobble ~`<control>` on the control; all other
-> backends clean on both). `<IF CUDNN:>` Note that's the cuDNN backend,
-> not mem-efficient — backend selection differs by GPU (mine is
-> Blackwell), which may explain differences from your machine. Tensor
-> bundle + replay script are attached on the torch issue.
+> transformers code involved. The guilty backend is EFFICIENT_ATTENTION,
+> confirming @zucchini-nlp's mem-efficient diagnosis: it diverges ~19.5
+> from an fp32-MATH reference on the poisoned length and reproduces the
+> captured model forward bit-exactly, while MATH stays at bf16 wobble
+> (~0.06) and the control length is clean everywhere.
+>
+> One extra finding worth recording: the corruption is LAYOUT-dependent,
+> not just value-dependent. The failing call has GQA-broadcast k/v
+> (`stride (0, 0, 512, 1)` — one kv head `expand()`ed to 16) and a
+> non-contiguous q; materializing the same values contiguously makes the
+> EFFICIENT backend correct. That's presumably (part of) why dummy-weight
+> repro attempts and naive tensor-dump replays came back clean. Tensor
+> bundle (raw storages + shape/stride/offset, rebuilt via `Tensor.set_`)
+> and the replay script are attached on the torch issue.
 >
 > @chavalasantosh in light of @zucchini-nlp's triage (kernel bug, not
 > mask construction), please don't ship a transformers-side mask change
