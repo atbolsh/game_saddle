@@ -22,6 +22,11 @@ Deliberately EXCLUDED (not label-safe): flips and rotations -- they invert
 the clock/bearing semantics that the OBS line and the move token are graded
 on.
 
+10% of frames (:data:`_SKIP_PROB`) skip ALL of the above and pass through
+completely clean: the network must also see uncorrupted boards, or it ends
+up miscalibrated on the un-noised frames it meets outside the datagen
+harness.
+
 Used in two places with different strengths:
 
   * datagen inference (:data:`INFERENCE_STRENGTH`, milder): installed as the
@@ -72,6 +77,13 @@ _DRIFT_ALPHA = (0.04, 0.10)
 #: even harsher than this, but model perception is more fragile, so the
 #: rest of the magnitudes stay at their first-guess values.
 _SPECKLE_SIGMA = (0.025, 0.1)
+#: Probability that a frame skips ALL degradations and passes through
+#: clean (2026-08-04): the network must also see uncorrupted frames --
+#: at inference outside datagen there is no noiser at all, and a model
+#: that has only ever seen degraded boards is miscalibrated on clean
+#: ones. Applies per noise_image call, i.e. independently at datagen
+#: (clean stored frame) and at training (no re-noise on top).
+_SKIP_PROB = 0.1
 
 
 def noise_image(img, rng: random.Random, strength: float = TRAINING_STRENGTH,
@@ -83,11 +95,13 @@ def noise_image(img, rng: random.Random, strength: float = TRAINING_STRENGTH,
     magnitude (0 = identity); geometry stays fixed so labels stay true.
 
     The keyword ranges override the module constants (same meaning) -- they
-    exist for notebooks/noise_tuner.ipynb. Every random draw happens
-    UNCONDITIONALLY and magnitudes only scale afterwards, so under a fixed
-    seed the same patches/tints/noise fields appear at every magnitude --
-    that is what makes the tuner's sliders rescale a frozen scene instead
-    of redrawing it."""
+    exist for notebooks/noise_tuner.ipynb. After the up-front _SKIP_PROB
+    pass-through draw, every random draw happens UNCONDITIONALLY and
+    magnitudes only scale afterwards, so under a fixed seed the same
+    patches/tints/noise fields appear at every magnitude -- that is what
+    makes the tuner's sliders rescale a frozen scene instead of redrawing
+    it (a skipped seed shows the clean frame at every slider setting;
+    regenerate to draw a new scene)."""
     import numpy as np
     from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
 
@@ -98,6 +112,12 @@ def noise_image(img, rng: random.Random, strength: float = TRAINING_STRENGTH,
     img = img.convert("RGB")
     w, h = img.size
     if strength <= 0:
+        return img
+
+    # -- 10% pass-through: completely uncorrupted frames (see _SKIP_PROB).
+    #    Drawn FIRST so a skipped frame consumes exactly one rng draw and
+    #    the seeded stream stays reproducible either way.
+    if rng.random() < _SKIP_PROB:
         return img
 
     # -- slight crop + rescale back (usually on, never more than _MAX_CROP)

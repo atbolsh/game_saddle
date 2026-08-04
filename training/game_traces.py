@@ -30,18 +30,19 @@ postmortem above :func:`build_span_weights`), in order:
   3. boost   = ``win_boost * win_gamma ** moves_from_end`` added UNIFORMLY
      to every token of the message when the game was won (the win is the
      one ground-truth signal, so it softens even verified mistakes). The
-     boost is DELIBERATELY LARGE (1.0, decaying by 0.95/round): near a win
-     it saturates every token to full weight, overriding whatever the
-     analyst said -- real-game success must be clamped onto and kept, not
-     re-litigated by a hackable analyst;
-  4. clamp to [0, 1];
-  5. action balance (TEMPORARY HACK, see the screaming block above
+     boost is DELIBERATELY LARGE (1.0, decaying by 0.95/round) and there
+     is NO upper clamp: near a win every token weighs ``base + ~1.0`` (up
+     to ~2.0), so real-game success OUTWEIGHS anything the analyst can
+     award elsewhere -- wins must be clamped onto and kept, not
+     re-litigated by a hackable analyst. Non-negativity is the only hard
+     bound (the collapse postmortem);
+  4. action balance (TEMPORARY HACK, see the screaming block above
      :func:`action_balance_multipliers`): each move record is scaled by
      ``mean_count / count(its action)`` over the same corpus (capped at
      4x), so every move TYPE carries equal total cloning mass -- weights
      may exceed 1.0 (still non-negative, so the collapse-proofing is
      untouched);
-  6. novelty decay (WORK IN PROGRESS, :class:`NoveltyTracker`): the whole
+  5. novelty decay (WORK IN PROGRESS, :class:`NoveltyTracker`): the whole
      record's weights are multiplied by ``max(0.1, 0.9 ** k)`` where ``k``
      counts consecutive identical moves -- repeating the same move over and
      over earns less and less cloning weight ("boredom").
@@ -80,10 +81,6 @@ from training.image_noise import TRAINING_STRENGTH, noise_file
 from training.train import DataSource, TrainingExample
 
 logger = logging.getLogger("train.game_traces")
-
-
-def _clamp01(x: float) -> float:
-    return max(0.0, min(1.0, x))
 
 
 # =====================================================================
@@ -132,14 +129,17 @@ def build_span_weights(
     """The reward mapping (module-level so tests and TRAINING_TRACE_EXTRAS
     tooling can reuse it verbatim). Returns Collator-ready
     ``(char_start, char_end, weight)`` spans; later spans override earlier
-    ones, so the whole-reply base span comes first. All outputs are in
-    [0, 1] -- the loud block above explains why nothing may go negative."""
+    ones, so the whole-reply base span comes first. All outputs are
+    NON-NEGATIVE (the loud block above explains why that is the one hard
+    invariant); there is deliberately NO upper clamp -- near a win,
+    ``base + boost`` reaches ~2.0, so real-game success outweighs even a
+    perfectly analyst-rated move in a lost game."""
     boost = 0.0
     if game_won and moves_from_end is not None:
         boost = win_boost * (win_gamma ** moves_from_end)
 
     def final(w: float) -> float:
-        return _clamp01(w + boost)
+        return max(0.0, w + boost)
 
     base = max(0.0, (float(rating) + 0.5) / 1.5) * rating_scale
     spans: list[tuple[int, int, float]] = [

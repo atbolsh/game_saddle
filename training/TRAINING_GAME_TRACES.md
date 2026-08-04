@@ -181,14 +181,15 @@ Per token of the player reply, `GameTraceSource` builds the weight as
    the winning move) is added UNIFORMLY to every token of the message —
    including WRONG spans (they become `0.0 + b`). The win is the loop's
    ONLY ground-truth signal, and the boost is deliberately sized to
-   dominate it: at and near the winning move every token saturates to
-   full weight after the clamp, overriding whatever the analyst said. The
-   analyst is a hackable proxy (see the spin-bot below); real-game
-   success must be clamped onto and kept. The decay's ~13.5-round
-   half-life still means long wandering prefixes of a lucky game earn
-   much less than the closing approach;
-4. **clamp to [0, 1]**;
-5. **action balance — TEMPORARY HACK** (`action_balance_multipliers`,
+   dominate it: there is NO upper clamp, so at and near the winning move
+   every token weighs `base + ~1.0` (up to ~2.0) — real-game success
+   OUTWEIGHS even a perfectly analyst-rated move in a lost game. The
+   analyst is a hackable proxy (see the spin-bot below); wins must be
+   clamped onto and kept, not re-litigated. The only hard bound on
+   weights is non-negativity (the collapse postmortem below). The decay's
+   ~13.5-round half-life still means long wandering prefixes of a lucky
+   game earn much less than the closing approach;
+4. **action balance — TEMPORARY HACK** (`action_balance_multipliers`,
    screaming block in [game_traces.py](game_traces.py)): each move
    record's weights are scaled by `mean_count / count(its action)`,
    counted over the same corpus at source load (logged at INFO), clamped
@@ -203,7 +204,7 @@ Per token of the player reply, `GameTraceSource` builds the weight as
    per-move signal exists — it cannot survive into environments where
    move types genuinely differ in importance. Perception records
    (`action: null`) are untouched;
-6. **novelty ("boredom") decay — WORK IN PROGRESS** (`NoveltyTracker`):
+5. **novelty ("boredom") decay — WORK IN PROGRESS** (`NoveltyTracker`):
    the whole record's weights are multiplied by `max(0.1, 0.9^k)` where
    `k` counts consecutive identical moves within one game (perception
    rounds are skipped, not reset). Repeating the same move over and over
@@ -397,6 +398,13 @@ analyst / training all see the same bytes) and again at training time
   weaker than the patches);
 - slight random crops / rescales (≤4% per edge — small enough not to cut
   off the agent or the gold).
+
+**10% of frames skip everything** (`_SKIP_PROB`, 2026-08-04) and pass
+through completely clean, independently at each end: the network must also
+see uncorrupted boards, or it ends up miscalibrated on the un-noised
+frames it meets outside the datagen harness. (So ~10% of stored snapshots
+are pristine, ~10% of training copies add nothing on top of the stored
+frame, and ~1% of training images are pristine end to end.)
 
 Magnitudes are tuned by eye in `notebooks/noise_tuner.ipynb` (sliders over a
 live board frame; a "Regenerate" button rerolls the board and every random

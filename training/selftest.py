@@ -266,9 +266,10 @@ def t1_pure() -> str:
     assert spans[1][2] == 0.0 and tgt[spans[1][0]:spans[1][1]].startswith("WRONG"), spans[1]
     win = build_span_weights(tgt, rating=0.9, wrong_spans=["WRONG: gold is right"],
                              game_won=True, moves_from_end=0)
-    assert abs(win[0][2] - 1.0) < 1e-9, win[0]   # saturated: clamp01(1.4/1.5 + 1.0)
-    # win_boost=1.0 at d=0 saturates even the masked WRONG span: on the
-    # winning move the ground-truth win overrides the analyst entirely
+    # NO upper clamp: base + boost = 1.4/1.5 + 1.0 -- near a win the
+    # ground-truth signal OUTWEIGHS any analyst-rated move elsewhere
+    assert abs(win[0][2] - (1.4 / 1.5 + 1.0)) < 1e-9, win[0]
+    # even the masked WRONG span gets the full boost (0.0 + 1.0)
     assert abs(win[1][2] - 1.0) < 1e-9, win[1]
     # decay precision away from the win: base 0 (worst rating), d=8 ->
     # weight is exactly the boost, 1.0 * 0.95^8
@@ -358,7 +359,15 @@ def t1_pure() -> str:
     assert a != png_bytes(base_img), "noise_image(strength=1) changed nothing"
     ident = png_bytes(noise_image(base_img, random.Random(3), 0.0))
     assert ident == png_bytes(base_img.convert("RGB")), "strength 0 not identity"
-    checks += 3
+    # 10% clean pass-through (_SKIP_PROB, 2026-08-04): seed 31's first
+    # draw lands inside the gate, so the frame must come back untouched
+    # even at full strength (the network must also see uncorrupted boards)
+    assert random.Random(31).random() < 0.1, "seed 31 no longer skips"
+    skipped = png_bytes(noise_image(base_img, random.Random(31), 1.0))
+    assert skipped == png_bytes(base_img.convert("RGB")), (
+        "the _SKIP_PROB pass-through did not return a clean frame"
+    )
+    checks += 4
 
     with tempfile.TemporaryDirectory(prefix="selftest_t1_") as tmp:
         tmp_dir = Path(tmp)
@@ -442,9 +451,9 @@ def t1_pure() -> str:
             "image url not resolved against the trace dir"
         )
         base_w = ex.span_weights[0][2]
-        # (0.5 + 0.5) / 1.5 mapped base + 1.0 win boost at moves_from_end=0,
-        # clamped: the winning move saturates to full weight
-        assert abs(base_w - 1.0) < 1e-9, (
+        # (0.5 + 0.5) / 1.5 mapped base + 1.0 win boost at moves_from_end=0
+        # (no upper clamp)
+        assert abs(base_w - (1.0 / 1.5 + 1.0)) < 1e-9, (
             f"mapped base + win boost wrong: {base_w}"
         )
         checks += 4
