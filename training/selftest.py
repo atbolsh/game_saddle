@@ -217,11 +217,12 @@ def t1_pure() -> str:
 
     from agent.modes import parse_rating
     from training.game_traces import (
-        FORWARD_BONUS,
+        ACTION_BALANCE_CAP,
         AnalystTraceSource,
         GameTraceSource,
         NoveltyTracker,
         PlayerAnchorSource,
+        action_balance_multipliers,
         build_span_weights,
     )
     from training.generate_game_traces import (
@@ -265,45 +266,49 @@ def t1_pure() -> str:
     assert spans[1][2] == 0.0 and tgt[spans[1][0]:spans[1][1]].startswith("WRONG"), spans[1]
     win = build_span_weights(tgt, rating=0.9, wrong_spans=["WRONG: gold is right"],
                              game_won=True, moves_from_end=0)
-    assert abs(win[0][2] - 1.0) < 1e-9, win[0]   # clamp01(1.4/1.5 + 0.2)
-    assert abs(win[1][2] - 0.2) < 1e-9, win[1]   # masked WRONG + win boost
+    assert abs(win[0][2] - 1.0) < 1e-9, win[0]   # saturated: clamp01(1.4/1.5 + 1.0)
+    # win_boost=1.0 at d=0 saturates even the masked WRONG span: on the
+    # winning move the ground-truth win overrides the analyst entirely
+    assert abs(win[1][2] - 1.0) < 1e-9, win[1]
+    # decay precision away from the win: base 0 (worst rating), d=8 ->
+    # weight is exactly the boost, 1.0 * 0.95^8
+    decay = build_span_weights(tgt, rating=-1.0, wrong_spans=[],
+                               game_won=True, moves_from_end=8)
+    assert abs(decay[0][2] - 0.95 ** 8) < 1e-9, decay[0]
     floor = build_span_weights(tgt, rating=-0.5, wrong_spans=[],
                                game_won=False, moves_from_end=None)
     assert floor[0][2] == 0.0, floor[0]          # cutoff hits 0 exactly
     worst = build_span_weights(tgt, rating=-1.0, wrong_spans=[],
                                game_won=False, moves_from_end=None)
     assert worst[0][2] == 0.0, worst[0]          # NEVER negative
-    checks += 6
+    checks += 7
 
-    # ---- FORWARD bonus (TEMPORARY HACK -- the screaming block above
-    # FORWARD_BONUS in training/game_traces.py): flat additive bonus on
-    # [FORWARD] of positively-rated replies, skipped inside WRONG spans
-    # and on non-positive ratings; bonus spans may exceed 1.0.
-    ftgt = "I will advance. [FORWARD] done"
-    fw = build_span_weights(ftgt, rating=0.5, wrong_spans=[],
-                            game_won=False, moves_from_end=None,
-                            forward_bonus=0.4)
-    fstart = ftgt.find("[FORWARD]")
-    fspan = [s for s in fw if (s[0], s[1]) == (fstart, fstart + 9)]
-    assert len(fspan) == 1, fw
-    assert abs(fspan[0][2] - (1.0 / 1.5 + 0.4)) < 1e-9, fspan  # base + bonus
-    # inside a WRONG span -> no bonus, WRONG override wins
-    fw2 = build_span_weights(ftgt, rating=0.5, wrong_spans=["[FORWARD] done"],
-                             game_won=False, moves_from_end=None,
-                             forward_bonus=0.4)
-    assert not any(abs(s[2] - (1.0 / 1.5 + 0.4)) < 1e-9 for s in fw2), fw2
-    assert fw2[-1][2] == 0.0, fw2                # the WRONG span, last = wins
-    # non-positive rating -> no bonus span at all
-    fw3 = build_span_weights(ftgt, rating=0.0, wrong_spans=[],
-                             game_won=False, moves_from_end=None,
-                             forward_bonus=0.4)
-    assert len(fw3) == 1, fw3
-    # default is OFF (only GameTraceSource opts in, with FORWARD_BONUS)
-    fw4 = build_span_weights(ftgt, rating=0.5, wrong_spans=[],
-                             game_won=False, moves_from_end=None)
-    assert len(fw4) == 1, fw4
-    assert FORWARD_BONUS == 0.4, FORWARD_BONUS   # sizing rationale in situ
-    checks += 5
+    # ---- action balance (TEMPORARY HACK -- the screaming block above
+    # action_balance_multipliers in training/game_traces.py): inverse
+    # frequency mean/count, mass-preserving, capped at 4x either way.
+    assert action_balance_multipliers({}) == {}
+    eq = action_balance_multipliers({"A": 7, "B": 7, "C": 7})
+    assert all(abs(m - 1.0) < 1e-9 for m in eq.values()), eq
+    # the 2026-08-04 retest's real iter2 mix
+    bal = action_balance_multipliers(
+        {"ANTICLOCK": 1194, "CLOCK": 806, "FORWARD": 471}
+    )
+    mean = (1194 + 806 + 471) / 3
+    assert abs(bal["ANTICLOCK"] - mean / 1194) < 1e-9, bal
+    assert abs(bal["FORWARD"] - mean / 471) < 1e-9, bal
+    assert bal["ANTICLOCK"] < 1.0 < bal["FORWARD"], bal
+    # mass preservation: sum(count * mult) == total count (no cap engaged)
+    assert abs(sum(n * bal[a] for a, n in
+                   {"ANTICLOCK": 1194, "CLOCK": 806, "FORWARD": 471}.items())
+               - 2471) < 1e-6, bal
+    # degenerate mixes -> cap engages (both directions)
+    capped = action_balance_multipliers({"A": 1000, "B": 5})
+    assert capped["B"] == ACTION_BALANCE_CAP, capped     # not ~100x
+    assert abs(capped["A"] - 502.5 / 1000) < 1e-9, capped  # under mean: no cap
+    lo = action_balance_multipliers({"A": 100, "B": 1, "C": 1, "D": 1, "E": 1})
+    assert lo["A"] == 1.0 / ACTION_BALANCE_CAP, lo       # dominant: floored
+    assert lo["B"] == ACTION_BALANCE_CAP, lo
+    checks += 6
 
     # ---- NoveltyTracker (WORK IN PROGRESS -- "boredom" decay, block above
     # the class in training/game_traces.py): 0.9^k on consecutive identical
@@ -437,20 +442,12 @@ def t1_pure() -> str:
             "image url not resolved against the trace dir"
         )
         base_w = ex.span_weights[0][2]
-        # (0.5 + 0.5) / 1.5 mapped base + 0.2 win boost at moves_from_end=0
-        assert abs(base_w - (1.0 / 1.5 + 0.2)) < 1e-9, (
+        # (0.5 + 0.5) / 1.5 mapped base + 1.0 win boost at moves_from_end=0,
+        # clamped: the winning move saturates to full weight
+        assert abs(base_w - 1.0) < 1e-9, (
             f"mapped base + win boost wrong: {base_w}"
         )
-        # the FORWARD bonus (TEMPORARY HACK) flows through the source path:
-        # rating positive, [FORWARD] outside the WRONG span -> the boosted
-        # base (1/1.5 + 0.2 win boost) + 0.4 bonus; may exceed 1.0.
-        fb = [s for s in ex.span_weights
-              if ex.target_text[s[0]:s[1]] == "[FORWARD]"]
-        assert len(fb) == 1 and abs(fb[0][2] - (1.0 / 1.5 + 0.2 + 0.4)) < 1e-9, (
-            f"FORWARD bonus missing/wrong through GameTraceSource: "
-            f"{ex.span_weights}"
-        )
-        checks += 5
+        checks += 4
 
         # ---- novelty decay through GameTraceSource (WIP): three identical
         # consecutive moves in one game -> whole-record weights scaled by
@@ -483,12 +480,47 @@ def t1_pure() -> str:
             for r in nov_records:
                 f.write(json.dumps(r) + "\n")
         nsrc = GameTraceSource(nov_dir / "traces.jsonl", noise_strength=0.0)
+        # single-action corpus -> balance multiplier exactly 1.0, so this
+        # measures the novelty decay alone
+        assert nsrc.action_balance == {"ANTICLOCK": 1.0}, nsrc.action_balance
         nexs = list(nsrc.examples())
         assert len(nexs) == 4, nexs
         nbases = [x.span_weights[0][2] for x in nexs]
         assert all(abs(w - e) < 1e-9
                    for w, e in zip(nbases, [1.0, 0.9, 0.81, 1.0])), (
             f"novelty decay wrong through GameTraceSource: {nbases}"
+        )
+        checks += 3
+
+        # ---- action balance x novelty through GameTraceSource: mixed
+        # actions (3 ANTICLOCK, 1 FORWARD -> mean 2 -> x2/3 and x2), last
+        # ANTICLOCK also consecutive-repeated (novelty 0.9); multipliers
+        # compose.
+        bal_dir = tmp_dir / "traces_balance"
+        bal_dir.mkdir()
+        bal_actions = ["ANTICLOCK", "FORWARD", "ANTICLOCK", "ANTICLOCK"]
+        with open(bal_dir / "traces.jsonl", "w", encoding="utf-8") as f:
+            for i, action in enumerate(bal_actions):
+                f.write(json.dumps({
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": "move?"},
+                    ]}],
+                    "target_text": f"[{action}]",
+                    "meta": {"rating": 1.0, "wrong_spans": [],
+                             "game_won": False, "moves_from_end": None,
+                             "session_id": "sB", "game_index": 0,
+                             "move_index": i, "action": action},
+                }) + "\n")
+        bsrc = GameTraceSource(bal_dir / "traces.jsonl", noise_strength=0.0)
+        assert (abs(bsrc.action_balance["ANTICLOCK"] - 2 / 3) < 1e-9
+                and abs(bsrc.action_balance["FORWARD"] - 2.0) < 1e-9), (
+            bsrc.action_balance
+        )
+        bbases = [x.span_weights[0][2] for x in bsrc.examples()]
+        # base 1.0 x balance, last record additionally x0.9 novelty
+        expect = [2 / 3, 2.0, 2 / 3, 0.9 * 2 / 3]
+        assert all(abs(w - e) < 1e-9 for w, e in zip(bbases, expect)), (
+            f"balance x novelty composition wrong: {bbases} != {expect}"
         )
         checks += 2
 

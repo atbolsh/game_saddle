@@ -95,9 +95,10 @@ A first, deliberately crude cut ships in `training/game_traces.py`
 (`NoveltyTracker`, marked WORK IN PROGRESS): the k-th consecutive
 identical move keeps only `0.9^k` of its cloning weight (floored at 0.1,
 "unrewarded" rather than "unlearned"), so a repeated-move loop stops
-feeding on itself. Its companion `FORWARD_BONUS` is an explicitly
-TEMPORARY hack (screaming comments in situ) and is NOT part of this goal
-— it must be removed, not refined.
+feeding on itself. Its companion `ACTION_BALANCE` (per-action
+inverse-frequency reweighting) is an explicitly TEMPORARY hack
+(screaming comments in situ) and is NOT part of this goal — it must be
+removed, not refined.
 
 The biological framing worth building toward: animals carry a general
 **arousal** mechanism — vagus-nerve-mediated fear responses, and the
@@ -123,6 +124,8 @@ loop, not just the decay:
   shapes what enters the corpus at all — a natural companion to the
   analyst revamp's arousal axis (goal 4), which would let the rater judge
   novelty from inside the trace;
-* **rare-move rewards**: a mild bonus for actions underrepresented in the
-  current corpus, replacing hand-tuned per-action hacks (this is the
-  principled successor to `FORWARD_BONUS`).
+* **rare-move rewards**: a graded, novelty-integrated bonus for actions
+  underrepresented in the current corpus — the principled successor to
+  the blunt equal-mass `ACTION_BALANCE` reweighting, which assumes all
+  move types deserve identical total mass and cannot survive into
+  environments where they genuinely differ in importance.

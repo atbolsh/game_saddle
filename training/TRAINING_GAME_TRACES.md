@@ -177,21 +177,32 @@ Per token of the player reply, `GameTraceSource` builds the weight as
    of all-good moves must not have its best moves relatively punished;
 2. **verified `WRONG:` spans override the base with 0.0** — masked out of
    cloning, not "unlearned"; unverified spans never reach training;
-3. **win boost, won games only:** `b = 0.2 * 0.9^d` (`d` = rounds from the
-   winning move) is added UNIFORMLY to every token of the message —
-   including WRONG spans (they become `0.0 + b`). The win is the loop's one
-   ground-truth signal; on a won trajectory even flagged text gets a little
-   weight back. Magnitudes: the boost peaks at 0.2 on the winning move and
-   fades with ~10-round half-life, so analyst grades stay the dominant
-   signal and long wandering prefixes of a lucky game get almost nothing;
+3. **win boost, won games only:** `b = 1.0 * 0.95^d` (`d` = rounds from
+   the winning move) is added UNIFORMLY to every token of the message —
+   including WRONG spans (they become `0.0 + b`). The win is the loop's
+   ONLY ground-truth signal, and the boost is deliberately sized to
+   dominate it: at and near the winning move every token saturates to
+   full weight after the clamp, overriding whatever the analyst said. The
+   analyst is a hackable proxy (see the spin-bot below); real-game
+   success must be clamped onto and kept. The decay's ~13.5-round
+   half-life still means long wandering prefixes of a lucky game earn
+   much less than the closing approach;
 4. **clamp to [0, 1]**;
-5. **FORWARD bonus — TEMPORARY HACK** (`FORWARD_BONUS = 0.4`, screaming
-   block in [game_traces.py](game_traces.py)): on positively-rated replies,
-   the `[FORWARD]` token span (outside any WRONG span) gets a flat +0.4 —
-   these spans may exceed 1.0, which is fine (non-negativity is the
-   property the collapse-proofing needs, not a cap). Exists only to break
-   the 2026-08-04 spin-bot pattern (below); REMOVE once the action mix
-   rebalances or a principled novelty/analyst signal replaces it;
+5. **action balance — TEMPORARY HACK** (`action_balance_multipliers`,
+   screaming block in [game_traces.py](game_traces.py)): each move
+   record's weights are scaled by `mean_count / count(its action)`,
+   counted over the same corpus at source load (logged at INFO), clamped
+   to `[1/4, 4]` (a binding cap logs a WARNING — it means the corpus mix
+   is degenerate). Every move TYPE thus carries equal total cloning mass
+   per epoch; weights may exceed 1.0, which is fine (non-negativity is
+   the property the collapse-proofing needs, not a cap). Closed-loop by
+   construction — an over-represented action is automatically damped —
+   unlike the flat FORWARD bonus it replaced, which would have pushed a
+   FORWARD-heavy corpus even further. Exists only to break the
+   2026-08-04 spin-bot pattern (below); REMOVE once a principled
+   per-move signal exists — it cannot survive into environments where
+   move types genuinely differ in importance. Perception records
+   (`action: null`) are untouched;
 6. **novelty ("boredom") decay — WORK IN PROGRESS** (`NoveltyTracker`):
    the whole record's weights are multiplied by `max(0.1, 0.9^k)` where
    `k` counts consecutive identical moves within one game (perception
@@ -215,10 +226,10 @@ reward-weighted regression degenerated into plain behavior cloning of the
 corpus action mix, which was already turn-heavy; each epoch amplified it
 (smoke evals: 28% FORWARD / 40% ANTICLOCK → 6.5% / 69%, mean rating
 0.785 → 0.348, a bot that spins in place forever). The novelty decay
-drains weight out of repeated-move runs; the FORWARD bonus tilts the mass
-back toward the one action that changes distance-to-gold. Only the smoke
-eval caught this — every offline held-out loss improved while the policy
-degraded.
+drains weight out of repeated-move runs; the action balancing equalizes
+the total cloning mass per move type, so a turn-heavy corpus can no
+longer amplify itself epoch over epoch. Only the smoke eval caught this —
+every offline held-out loss improved while the policy degraded.
 
 ### Postmortem: the 2026-08-01 collapse (why nothing may go negative)
 

@@ -29,12 +29,18 @@ postmortem above :func:`build_span_weights`), in order:
      cloning, never "unlearned" with a negative weight;
   3. boost   = ``win_boost * win_gamma ** moves_from_end`` added UNIFORMLY
      to every token of the message when the game was won (the win is the
-     one ground-truth signal, so it softens even verified mistakes);
+     one ground-truth signal, so it softens even verified mistakes). The
+     boost is DELIBERATELY LARGE (1.0, decaying by 0.95/round): near a win
+     it saturates every token to full weight, overriding whatever the
+     analyst said -- real-game success must be clamped onto and kept, not
+     re-litigated by a hackable analyst;
   4. clamp to [0, 1];
-  5. FORWARD bonus (TEMPORARY HACK, see the screaming block above
-     :data:`FORWARD_BONUS`): flat additive bonus on ``[FORWARD]`` tokens of
-     positively-rated replies outside WRONG spans -- these spans may exceed
-     1.0 (still non-negative, so the collapse-proofing is untouched);
+  5. action balance (TEMPORARY HACK, see the screaming block above
+     :func:`action_balance_multipliers`): each move record is scaled by
+     ``mean_count / count(its action)`` over the same corpus (capped at
+     4x), so every move TYPE carries equal total cloning mass -- weights
+     may exceed 1.0 (still non-negative, so the collapse-proofing is
+     untouched);
   6. novelty decay (WORK IN PROGRESS, :class:`NoveltyTracker`): the whole
      record's weights are multiplied by ``max(0.1, 0.9 ** k)`` where ``k``
      counts consecutive identical moves -- repeating the same move over and
@@ -112,41 +118,6 @@ def _clamp01(x: float) -> float:
 # construction) -- see the class below.
 # =====================================================================
 
-# =====================================================================
-# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-# !!  TEMPORARY HACK -- FORWARD BONUS -- REMOVE WHEN NO LONGER NEEDED !!
-# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-# The 2026-08-04 retest showed the self-training loop collapsing onto
-# turning: reward-weighted regression with a near-saturated analyst
-# (77% of iter2 moves rated exactly +1.0) degenerates into behavior
-# cloning of the corpus action mix, and the corpus was already
-# turn-heavy, so each epoch amplified turns (smoke evals went from 28%
-# FORWARD / 40% ANTICLOCK to 6.5% FORWARD / 69% ANTICLOCK -- a spin-bot
-# that never approaches the gold).
-#
-# THIS IS NOT A PRINCIPLED FIX. It is a flat additive bonus on the
-# ``[FORWARD]`` token span of positively-rated replies (outside WRONG
-# spans), tilting the cloning mass back toward the one action that
-# actually changes distance-to-gold. Sizing (from the iter2 corpus):
-# turn:FORWARD action-token gradient mass was ~3.4:1 (turns ~2000 moves
-# x 0.65 mean weight vs FORWARD 471 x 0.82); a bonus b rescales FORWARD
-# mass by (0.82+b)/0.82, so b=0.4 brings the ratio to ~2.3:1 -- a gentle
-# nudge, with the novelty decay below simultaneously shrinking the
-# turn-side mass.
-#
-# REMOVE THIS once the novelty/arousal scoring or the analyst revamp
-# (per-span ratings, CORRECT spans -- FUTURE_GOALS.md) gives a
-# principled reason for the policy to move, or once smoke evals show the
-# action mix has rebalanced. Anyone reading this in 2027: if it is still
-# here, it has overstayed its welcome.
-# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-FORWARD_BONUS = 0.4
-
-#: The literal the player harness parses as the forward move; the bonus
-#: targets exactly what the policy samples.
-_FORWARD_LITERAL = "[FORWARD]"
-
-
 def build_span_weights(
     target_text: str,
     rating: float,
@@ -155,17 +126,14 @@ def build_span_weights(
     moves_from_end: int | None,
     rating_scale: float = 1.0,
     wrong_weight: float = 0.0,
-    win_boost: float = 0.2,
-    win_gamma: float = 0.9,
-    forward_bonus: float = 0.0,
+    win_boost: float = 1.0,
+    win_gamma: float = 0.95,
 ) -> list[tuple[int, int, float]]:
     """The reward mapping (module-level so tests and TRAINING_TRACE_EXTRAS
     tooling can reuse it verbatim). Returns Collator-ready
     ``(char_start, char_end, weight)`` spans; later spans override earlier
     ones, so the whole-reply base span comes first. All outputs are in
-    [0, 1] EXCEPT the FORWARD-bonus spans, which may reach
-    ``1 + forward_bonus`` -- still non-negative, which is the property the
-    collapse postmortem above actually requires."""
+    [0, 1] -- the loud block above explains why nothing may go negative."""
     boost = 0.0
     if game_won and moves_from_end is not None:
         boost = win_boost * (win_gamma ** moves_from_end)
@@ -177,33 +145,76 @@ def build_span_weights(
     spans: list[tuple[int, int, float]] = [
         (0, len(target_text), final(base))
     ]
-
-    wrong_ranges: list[tuple[int, int]] = []
     for span_text in wrong_spans:
         if not span_text:
             continue
         start = target_text.find(span_text)
         while start != -1:
-            wrong_ranges.append((start, start + len(span_text)))
+            spans.append((start, start + len(span_text), final(wrong_weight)))
             start = target_text.find(span_text, start + 1)
-
-    # TEMPORARY HACK (FORWARD_BONUS block above): flat bonus on [FORWARD]
-    # occurrences of positively-rated replies that do not overlap any
-    # verified WRONG span. Emitted BEFORE the WRONG overrides so a WRONG
-    # span always wins any partial overlap.
-    if forward_bonus > 0.0 and float(rating) > 0.0:
-        start = target_text.find(_FORWARD_LITERAL)
-        while start != -1:
-            end = start + len(_FORWARD_LITERAL)
-            in_wrong = any(start < we and ws < end
-                           for ws, we in wrong_ranges)
-            if not in_wrong:
-                spans.append((start, end, final(base) + forward_bonus))
-            start = target_text.find(_FORWARD_LITERAL, start + 1)
-
-    for ws, we in wrong_ranges:
-        spans.append((ws, we, final(wrong_weight)))
     return spans
+
+
+# =====================================================================
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !!  TEMPORARY HACK -- ACTION BALANCE -- REMOVE WHEN NO LONGER NEEDED !!
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# The 2026-08-04 retest showed the self-training loop collapsing onto
+# turning: reward-weighted regression with a near-saturated analyst
+# (77% of iter2 moves rated exactly +1.0) degenerates into behavior
+# cloning of the corpus ACTION MIX, and the corpus was already
+# turn-heavy, so each epoch amplified turns (smoke evals went from 28%
+# FORWARD / 40% ANTICLOCK to 6.5% FORWARD / 69% ANTICLOCK -- a spin-bot
+# that never approaches the gold).
+#
+# THIS IS NOT A PRINCIPLED FIX. Every move record's weights are scaled by
+# mean_count / count(its action), computed over the SAME corpus being
+# loaded, so every move TYPE carries equal total cloning mass per epoch.
+# It replaced an earlier flat FORWARD bonus, which was open-loop: it
+# pushed FORWARD up regardless of how much FORWARD the corpus already
+# had, so a future FORWARD-heavy corpus would have been pushed further --
+# the spin-bot runaway pointed the other way. Balancing is closed-loop:
+# an over-represented action is automatically damped below 1.0, and the
+# only equilibrium is a balanced mix.
+#
+# WHY THE CAP: uncapped inverse frequency explodes on a near-collapsed
+# corpus -- 5 FORWARD records out of ~2500 moves would each get ~165x
+# weight, amplifying a handful of possibly-bad examples into a third of
+# the epoch's signal. Multipliers clamp to [1/CAP, CAP]; a binding cap is
+# logged at WARNING because it means the corpus itself is degenerate.
+#
+# REMOVE THIS once a principled per-move signal exists (analyst revamp
+# with per-span ratings / an arousal axis, or distance-based rewards --
+# FUTURE_GOALS.md). It CANNOT survive into richer environments where move
+# types genuinely differ in importance or legitimate frequency: "equal
+# mass per move type" is only defensible when every move type is roughly
+# equally load-bearing, as in this 3-move game. Anyone reading this in
+# 2027: if it is still here, it has overstayed its welcome.
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+ACTION_BALANCE_CAP = 4.0
+
+
+def action_balance_multipliers(counts: dict[str, int]) -> dict[str, float]:
+    """Per-action inverse-frequency multipliers (TEMPORARY HACK -- the
+    screaming block above): ``mean(counts) / counts[a]``, clamped to
+    ``[1/ACTION_BALANCE_CAP, ACTION_BALANCE_CAP]``. Total mass is roughly
+    preserved by construction (sum of count x multiplier = n_actions x
+    mean, before clamping)."""
+    if not counts:
+        return {}
+    mean_count = sum(counts.values()) / len(counts)
+    out: dict[str, float] = {}
+    for action, n in counts.items():
+        raw = mean_count / n
+        clamped = max(1.0 / ACTION_BALANCE_CAP, min(ACTION_BALANCE_CAP, raw))
+        if clamped != raw:
+            logger.warning(
+                "action balance CAP engaged for %r: raw x%.2f clamped to "
+                "x%.2f -- the corpus action mix is degenerate (counts %s)",
+                action, raw, clamped, counts,
+            )
+        out[action] = clamped
+    return out
 
 
 # =====================================================================
@@ -336,9 +347,8 @@ class GameTraceSource(_TraceFileSource):
         weight: float = 1.0,
         rating_scale: float = 1.0,
         wrong_weight: float = 0.0,
-        win_boost: float = 0.2,
-        win_gamma: float = 0.9,
-        forward_bonus: float = FORWARD_BONUS,
+        win_boost: float = 1.0,
+        win_gamma: float = 0.95,
         noise_strength: float = TRAINING_STRENGTH,
         noise_seed: int | None = None,
     ):
@@ -349,7 +359,21 @@ class GameTraceSource(_TraceFileSource):
         self.wrong_weight = wrong_weight
         self.win_boost = win_boost
         self.win_gamma = win_gamma
-        self.forward_bonus = forward_bonus
+        # ACTION BALANCE (TEMPORARY HACK -- screaming block above): one
+        # counting pre-pass over the records that will actually train
+        # (rated move records), so each move type gets equal total mass.
+        counts: dict[str, int] = {}
+        for _, _, _, meta in self._iter_records():
+            action = meta.get("action")
+            if action is not None and meta.get("rating") is not None:
+                counts[action] = counts.get(action, 0) + 1
+        self.action_balance = action_balance_multipliers(counts)
+        if self.action_balance:
+            logger.info(
+                "%s: action balance multipliers %s (counts %s)", self.name,
+                {a: round(m, 3) for a, m in self.action_balance.items()},
+                counts,
+            )
 
     def examples(self) -> Iterator[TrainingExample]:
         # Fresh noise every run: an unseeded Random gives a new degradation
@@ -384,15 +408,19 @@ class GameTraceSource(_TraceFileSource):
                 wrong_weight=self.wrong_weight,
                 win_boost=self.win_boost,
                 win_gamma=self.win_gamma,
-                forward_bonus=self.forward_bonus,
             )
-            # Novelty decay (WIP, NoveltyTracker): scales the WHOLE record
-            # -- the reply is a rationalization of the repeated move --
-            # including any FORWARD bonus (a FORWARD spammed 10 times in a
-            # row should not keep collecting its bonus). Zero weights
-            # (WRONG spans, floored ratings) stay zero.
-            if novelty_mult < 1.0:
-                spans = [(s, e, w * novelty_mult) for s, e, w in spans]
+            # Two whole-record multipliers compose here (the reply is a
+            # rationalization of its move; zero weights -- WRONG spans,
+            # floored ratings -- stay zero; results may exceed 1.0, which
+            # is fine: NON-NEGATIVITY is the collapse-proofing property):
+            #   * novelty decay (WIP, NoveltyTracker above);
+            #   * action balance (TEMPORARY HACK, screaming block above)
+            #     -- perception records (action None) are untouched.
+            mult = novelty_mult * self.action_balance.get(
+                meta.get("action"), 1.0
+            )
+            if mult != 1.0:
+                spans = [(s, e, w * mult) for s, e, w in spans]
 
             yield TrainingExample(
                 messages=messages,
