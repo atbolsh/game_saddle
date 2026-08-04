@@ -146,11 +146,14 @@ Design decisions, recorded:
 - **Quota, not proportion:** `examples_per_epoch` (default 150, the same
   convention as the manifest sets) — the per-epoch mix stays fixed while
   the trace corpus grows across datagen runs.
-- **The gate is the standard one:** `run_training` auto-guards
+- **The gate is ceiling-only** (2026-08-04): `run_training` auto-guards
   `heldout_loss/analyst_<label>`, and for a KD source that held-out loss
   *is* drift-from-base on analyst contexts — an analyst-drift meter logged
   to `eval_log.jsonl` at every save alongside the other per-source
-  metrics, with the usual rollback on a >10% relative regression.
+  metrics. As a drift meter it starts at its floor and only rises, so the
+  guard skips the best-ever multiplier (`guard_relative = False`) and
+  hard-fires only past the absolute ceiling of 5.0 (healthy ≈ 1, the
+  2026-08-01 collapse hit 63).
 - **Relation to the planted-error probe** ([TRAINING_TRACE_EXTRAS.md](TRAINING_TRACE_EXTRAS.md)):
   the probe is *measurement*, this anchor is *prevention*; the probe's
   corrupted replies must never enter training, or the tripwire stops
@@ -207,8 +210,11 @@ Probe set (planned additions, next stages):
 
 Each guarded metric carries a soft threshold (relative, default 10% —
 WARNING only) and a hard one (2x worse than best, an absolute ceiling
-where declared — the analyst anchor's is 5.0 — or 3 consecutive soft
-breaches); a hard breach triggers `train.py`'s regression path —
+where declared, or 3 consecutive soft breaches) — EXCEPT the KD-anchor
+drift meters (analyst 5.0, player anchor 1.0), which are ceiling-only
+(`guard_relative = False`: their best-ever is pinned to the step-0 floor
+by construction, so a relative bound reads any learning as regression);
+a hard breach triggers `train.py`'s regression path —
 ERROR-level logging and, by default, rollback to the last GOOD checkpoint
 (`--on-regression warn|rollback|abort`; details in
 TRAINING_OVERVIEW.md's rollback section). The analyst miss-rate probe is

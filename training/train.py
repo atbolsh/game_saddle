@@ -214,11 +214,16 @@ class DataSource(ABC):
     ``guard_ceiling``: optional ABSOLUTE bound for this source's held-out
     loss guard (see :class:`MetricGuard`) -- a source that knows its own
     catastrophic threshold (e.g. the analyst KD anchor) declares it here,
-    so the generic trainer never hardcodes source names."""
+    so the generic trainer never hardcodes source names.
+
+    ``guard_relative``: set False for DRIFT-METER sources (KD anchors)
+    whose held-out loss starts at its floor and only rises -- their guard
+    becomes ceiling-only (MetricGuard.relative rationale)."""
 
     name: str = "source"
     weight: float = 1.0
     guard_ceiling: float | None = None
+    guard_relative: bool = True
 
     @abstractmethod
     def examples(self) -> Iterator[TrainingExample]:
@@ -1068,15 +1073,32 @@ class MetricGuard:
     ``ceiling`` when one is set (for lower-is-better metrics the ceiling
     is an upper bound; for higher-is-better it acts as a floor) -- this is
     the tier that triggers rollback/abort. The trainer escalates a
-    persistent soft streak to hard on its own (``soft_streak_limit``)."""
+    persistent soft streak to hard on its own (``soft_streak_limit``).
+
+    ``relative=False`` (CEILING-ONLY MODE) exists for DRIFT METERS: a
+    KD-anchor held-out loss starts at its minimum possible value (teacher
+    entropy, because student == teacher at step 0) and can ONLY go up as
+    the model learns -- that is what it measures. Best-ever is therefore
+    pinned at the step-0 floor forever, and "2x best" means "at most one
+    entropy's worth of drift for the whole run": a straitjacket, not a
+    catastrophe bound. (2026-08-04 retest: this exact guard hard-rolled
+    train1 back to base at 0.15 nats/token of drift -- comfortably inside
+    the healthy RLHF band -- discarding a step-200 checkpoint with
+    navigation exact-match 0.91.) In ceiling-only mode the soft tier is
+    off and hard fires only past the source-declared absolute ceiling."""
 
     metric: str
     higher_is_better: bool
     rel_tolerance: float
     hard_multiplier: float = 2.0
     ceiling: float | None = None
+    #: False = ceiling-only drift meter (see class docstring); the
+    #: best-ever multiplier and the soft tier are both skipped.
+    relative: bool = True
 
     def is_soft_regression(self, value: float, best: float) -> bool:
+        if not self.relative:
+            return False
         if self.higher_is_better:
             return value < best * (1.0 - self.rel_tolerance)
         return value > best * (1.0 + self.rel_tolerance)
@@ -1085,10 +1107,10 @@ class MetricGuard:
         if self.higher_is_better:
             if self.ceiling is not None and value < self.ceiling:
                 return True
-            return value < best / self.hard_multiplier
+            return self.relative and value < best / self.hard_multiplier
         if self.ceiling is not None and value > self.ceiling:
             return True
-        return value > best * self.hard_multiplier
+        return self.relative and value > best * self.hard_multiplier
 
     def is_improvement(self, value: float, best: float | None) -> bool:
         if best is None:
@@ -1422,8 +1444,11 @@ def run_training(
     # per-source held-out KD loss is the drift-from-base measure), then any
     # run-script guards (probes) on top. A source that declares its own
     # absolute catastrophe bound (DataSource.guard_ceiling -- e.g. the
-    # analyst anchor's 5.0) gets it wired into its guard here.
+    # analyst anchor's 5.0) gets it wired into its guard here; anchor-style
+    # sources also set guard_relative=False so their guard is ceiling-only
+    # (drift meters can only rise from their step-0 floor -- MetricGuard).
     ceilings = {s.name: s.guard_ceiling for s in sources}
+    relatives = {s.name: s.guard_relative for s in sources}
     guards = {
         "heldout_loss": MetricGuard(
             "heldout_loss", higher_is_better=False,
@@ -1438,6 +1463,7 @@ def run_training(
             rel_tolerance=cfg.regression_tolerance,
             hard_multiplier=cfg.hard_multiplier,
             ceiling=ceilings.get(src_name),
+            relative=relatives.get(src_name, True),
         )
     guards.update(extra_guards or {})
     best_metrics: dict[str, float] = {}

@@ -28,7 +28,13 @@ crashed stage must not take the whole weekend down with it.
 WEIGHTS SURVIVE EVERY EPOCH by construction: each train stage saves PEFT
 adapters under ``weights/<arch>/<prefix>_iter<k>_step<N>/`` (periodic
 save_steps saves plus a final save), and later epochs use fresh labels, so
-nothing ever overwrites an earlier epoch's checkpoints.
+nothing ever overwrites an earlier epoch's checkpoints. The checkpoint the
+next epoch RESUMES FROM is the ``last_good_checkpoint`` from the train
+stage's ``done`` event -- NOT the highest-step directory on disk: train.py
+saves the final checkpoint BEFORE the final eval, so when that eval
+hard-regresses and rolls back, the rejected save is the highest step on
+disk (the 2026-08-04 retest handed exactly such a rejected checkpoint to
+epoch 2; ``_train_result_checkpoint``).
 
 Crash policy -- the run must survive an unattended weekend:
 
@@ -82,7 +88,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import re
 import subprocess
 import sys
 import threading
@@ -259,26 +264,54 @@ def _count_lines(path: Path) -> int:
         return sum(1 for line in f if line.strip())
 
 
-def _latest_checkpoint(label: str) -> str | None:
-    """Newest (highest-step) adapter checkpoint saved for ``label``.
+def _train_result_checkpoint(label: str) -> str | None:
+    """The checkpoint a finished train stage actually stands behind: the
+    ``last_good_checkpoint`` field of the ``done`` event in the newest
+    ``logs/train_<label>_*/events.jsonl``.
 
-    Exact, label-scoped lookup under ``weights/<arch>/``: train.py names
-    every save ``<label>_step<N>`` and the final save is always the highest
-    step, so max-N IS the run's final checkpoint (post-rollback if the
-    guard machinery fired).
-    """
-    from agent.config import CONFIG  # torch-free
+    WHY NOT the highest-step directory under weights/: train.py saves the
+    final checkpoint BEFORE the final eval. When that eval hard-regresses,
+    the guard rolls the in-memory weights back to last_good, but the
+    rejected save stays on disk as the highest step -- the 2026-08-04
+    retest promoted exactly such a rejected checkpoint into epoch 2's
+    datagen. The done event is the trainer's verdict; a healthy final
+    eval makes ``last_good_checkpoint`` the final save anyway.
 
-    root = Path(CONFIG.weights_dir) / CONFIG.model_key
-    pattern = re.compile(rf"{re.escape(label)}_step(\d+)$")
-    best_step, best_name = -1, None
-    if root.is_dir():
-        for d in root.iterdir():
-            m = pattern.fullmatch(d.name)
-            if m and (d / "adapter_config.json").is_file():
-                if int(m.group(1)) > best_step:
-                    best_step, best_name = int(m.group(1)), d.name
-    return best_name
+    A missing run dir / events file / done event / checkpoint field
+    returns None (the caller logs and treats the stage as failed) --
+    never fall back to a highest-step guess (no-fuzzy-fallbacks)."""
+    # Timestamp suffixes (%Y-%m-%d_%H-%M-%S) sort lexicographically ==
+    # chronologically, so the last glob match is the newest attempt.
+    run_dirs = sorted((REPO_ROOT / "logs").glob(f"train_{label}_*"))
+    if not run_dirs:
+        logger.error("no logs/train_%s_* run directory found -- cannot "
+                     "read the train stage's verdict", label)
+        return None
+    events_path = run_dirs[-1] / "events.jsonl"
+    done: dict | None = None
+    try:
+        with open(events_path, encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                if record.get("kind") == "done":
+                    done = record
+    except (OSError, json.JSONDecodeError) as exc:
+        # A stage failure (loud, retried/carried by the caller), never an
+        # orchestrator crash -- the weekend must survive a mangled log.
+        logger.error("cannot read %s (%s)", events_path, exc)
+        return None
+    if done is None:
+        logger.error("%s has no 'done' event -- the train stage never "
+                     "finished cleanly", events_path)
+        return None
+    ckpt = done.get("last_good_checkpoint")
+    if not ckpt or ckpt == "None":
+        logger.error("done event in %s has no usable last_good_checkpoint "
+                     "(got %r)", events_path, ckpt)
+        return None
+    return Path(ckpt).name
 
 
 def _run_stage(cmd: list[str], stage: str) -> int:
@@ -463,16 +496,17 @@ def _train(k: int, resume: str | None, args: argparse.Namespace) -> str | None:
         cmd += ["--train-max-steps", str(args.train_max_steps)]
     for attempt in range(1, MAX_ATTEMPTS + 1):
         if _run_stage(cmd, f"train{k} attempt {attempt}") == 0:
-            ckpt = _latest_checkpoint(label)
+            ckpt = _train_result_checkpoint(label)
             if ckpt:
-                logger.info("[train%d] checkpoint: %s", k, ckpt)
+                logger.info("[train%d] checkpoint (last good per the "
+                            "trainer's done event): %s", k, ckpt)
                 return ckpt
-            # Exit 0 with no checkpoint on disk would mean train.py's save
-            # contract broke -- do not paper over it, but do not stop the
-            # weekend either.
-            logger.error("[train%d] exited 0 but no %s_step* checkpoint "
-                         "found under weights/ -- treating as failure",
-                         k, label)
+            # Exit 0 with no readable done-event verdict would mean
+            # train.py's logging contract broke -- do not paper over it,
+            # but do not stop the weekend either.
+            logger.error("[train%d] exited 0 but no last_good_checkpoint "
+                         "verdict could be read for label %s -- treating "
+                         "as failure", k, label)
     logger.error("[train%d] gave up after %d attempts -- next epoch will "
                  "reuse checkpoint %r", k, MAX_ATTEMPTS, resume)
     return None

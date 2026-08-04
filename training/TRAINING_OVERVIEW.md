@@ -281,13 +281,22 @@ unless the same metric stays soft-regressed 3 evals in a row
 (`--soft-streak-limit`), which is persistent drift and escalates; a HARD
 regression (worse by `--hard-multiplier`, default 2x, or past a guard's
 absolute ceiling — the analyst KD anchor's is 5.0) triggers
-`--on-regression {warn,rollback,abort}` (default `rollback`). Rollback
-restores `last_good_ckpt` — the newest checkpoint whose own eval had no
-hard regression — never the save that just regressed. Rollbacks are
-capped by `--max-rollbacks` (default 3): rollback restores weights but not
-the schedule position, so a persistently regressing run would otherwise
-oscillate silently — past the cap the run aborts naming the last good
-checkpoint. The real probe suite — per-capability benchmarks, planted-error
+`--on-regression {warn,rollback,abort}` (default `rollback`). Exception
+(2026-08-04): the KD-anchor sources' guards are **ceiling-only**
+(`guard_relative = False` — player anchor ceiling 1.0, analyst 5.0),
+because an anchor's held-out loss is a drift meter pinned to its step-0
+floor: the best-ever multiplier read "any learning at all" as a hard
+regression and rolled a healthy retest back to base twice
+(TRAINING_GAME_TRACES.md). Rollback restores `last_good_ckpt` — the
+newest checkpoint whose own eval had no hard regression — never the save
+that just regressed; `run_weekend` likewise hands the NEXT epoch the
+`last_good_checkpoint` from the trainer's `done` event, not the
+highest-step directory (the final save lands BEFORE the final eval, so
+after a terminal rollback the newest directory is exactly the rejected
+one). Rollbacks are capped by `--max-rollbacks` (default 3): rollback
+restores weights but not the schedule position, so a persistently
+regressing run would otherwise oscillate silently — past the cap the run
+aborts naming the last good checkpoint. The real probe suite — per-capability benchmarks, planted-error
 analyst miss rate — is specified in
 [TRAINING_EXTRA_DATASETS.md](TRAINING_EXTRA_DATASETS.md) and lands in
 stage 3.

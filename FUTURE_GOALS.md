@@ -73,7 +73,14 @@ surgical:
 * a `CORRECT:` span mark beside `WRONG:` (praise specific reasoning, not
   just flag mistakes);
 * per-span ratings instead of (or refining) the single message-level
-  rating.
+  rating;
+* an **arousal / novelty axis** beside quality (see goal 5): the analyst
+  rates "how surprising or consequential was this moment?" separately
+  from "was this a good move?", so a locally-sensible step inside an
+  endless loop stops earning full marks. The 2026-08-04 retest showed
+  exactly this failure: each individual "rotate toward the gold" move
+  looked reasonable to a per-move rater, so a spin-loop was rated +1.0
+  move after move.
 
 Deferred as a multi-day project (new analyst prompt, new parser, new
 verification harness, new weight mapping, regenerated data). **Trigger to
@@ -81,3 +88,41 @@ pick it up:** perception/move quality stalls across training iterations
 while analyst ratings stay high — the signature of the message-level
 rating being too blunt (see the reward-scheme section of
 `training/TRAINING_GAME_TRACES.md`).
+
+## 5. Novelty / arousal reward shaping — *Exploring*
+
+A first, deliberately crude cut ships in `training/game_traces.py`
+(`NoveltyTracker`, marked WORK IN PROGRESS): the k-th consecutive
+identical move keeps only `0.9^k` of its cloning weight (floored at 0.1,
+"unrewarded" rather than "unlearned"), so a repeated-move loop stops
+feeding on itself. Its companion `FORWARD_BONUS` is an explicitly
+TEMPORARY hack (screaming comments in situ) and is NOT part of this goal
+— it must be removed, not refined.
+
+The biological framing worth building toward: animals carry a general
+**arousal** mechanism — vagus-nerve-mediated fear responses, and the
+analogous surge after large positive rewards — that sharpens learning for
+whatever happened *shortly before* a highly surprising, threatening, or
+rewarding event. A survived near-miss or a big find is consolidated far
+more thoroughly than a routine step; conversely, "boredom" keeps us from
+getting excited about every step we take. Both directions belong in the
+loop, not just the decay:
+
+* **positive arousal**: upweight the moves leading into gold pickups,
+  wins, and narrow escapes (the win boost in `build_span_weights` is a
+  primitive version of this — it could become event-triggered and
+  magnitude-scaled);
+* **state-aware repeat detection**: the current tracker only catches
+  identical *consecutive* moves; alternating CLOCK/ANTICLOCK oscillation
+  or a revisited `(position, heading)` sails through — hash the state,
+  not just the last action;
+* **per-game action-entropy bonuses** as a softer alternative to streak
+  decay;
+* **data-sampling side**: rather than (only) reweighting after the fact,
+  datagen-time rejection sampling / deduplication of low-novelty records
+  shapes what enters the corpus at all — a natural companion to the
+  analyst revamp's arousal axis (goal 4), which would let the rater judge
+  novelty from inside the trace;
+* **rare-move rewards**: a mild bonus for actions underrepresented in the
+  current corpus, replacing hand-tuned per-action hacks (this is the
+  principled successor to `FORWARD_BONUS`).

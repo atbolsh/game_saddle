@@ -184,11 +184,41 @@ Per token of the player reply, `GameTraceSource` builds the weight as
    weight back. Magnitudes: the boost peaks at 0.2 on the winning move and
    fades with ~10-round half-life, so analyst grades stay the dominant
    signal and long wandering prefixes of a lucky game get almost nothing;
-4. **clamp to [0, 1]**.
+4. **clamp to [0, 1]**;
+5. **FORWARD bonus — TEMPORARY HACK** (`FORWARD_BONUS = 0.4`, screaming
+   block in [game_traces.py](game_traces.py)): on positively-rated replies,
+   the `[FORWARD]` token span (outside any WRONG span) gets a flat +0.4 —
+   these spans may exceed 1.0, which is fine (non-negativity is the
+   property the collapse-proofing needs, not a cap). Exists only to break
+   the 2026-08-04 spin-bot pattern (below); REMOVE once the action mix
+   rebalances or a principled novelty/analyst signal replaces it;
+6. **novelty ("boredom") decay — WORK IN PROGRESS** (`NoveltyTracker`):
+   the whole record's weights are multiplied by `max(0.1, 0.9^k)` where
+   `k` counts consecutive identical moves within one game (perception
+   rounds are skipped, not reset). Repeating the same move over and over
+   earns less and less cloning weight; the floor means "unrewarded",
+   never "unlearned". Known gap: alternating CLOCK/ANTICLOCK loops and
+   revisited positions sail through — refinements (state hashes, arousal
+   upweighting, datagen-time sampling) live in
+   [FUTURE_GOALS.md](../FUTURE_GOALS.md).
 
 What negative weights were meant to buy — suppressing bad behavior — is
 provided instead by the **player trust region** (below), which is bounded
 by construction.
+
+### The 2026-08-04 spin-bot (why steps 5–6 exist)
+
+The first collapse-proofed retest produced no gibberish — but got WORSE at
+the game each epoch. The analyst rated 77% of iter2's moves exactly +1.0
+(each individual "rotate toward the gold" step looks locally sensible), so
+reward-weighted regression degenerated into plain behavior cloning of the
+corpus action mix, which was already turn-heavy; each epoch amplified it
+(smoke evals: 28% FORWARD / 40% ANTICLOCK → 6.5% / 69%, mean rating
+0.785 → 0.348, a bot that spins in place forever). The novelty decay
+drains weight out of repeated-move runs; the FORWARD bonus tilts the mass
+back toward the one action that changes distance-to-gold. Only the smoke
+eval caught this — every offline held-out loss improved while the policy
+degraded.
 
 ### Postmortem: the 2026-08-01 collapse (why nothing may go negative)
 
@@ -231,9 +261,17 @@ you started".
   collapse escapes through.
 - **Mass:** `PLAYER_ANCHOR_WEIGHT = 0.25` — a quarter of the player corpus
   per epoch, ~half an hour of the train stage.
-- The analyst KD anchor is unchanged and stays pinned to the FROZEN BASE
-  (it must never chase its own drift); its held-out KD guard now also has
-  an absolute ceiling of 5.0 (healthy ≈ 1; the collapse hit 63).
+- **Ceiling-only guards for BOTH anchors** (`guard_relative = False`,
+  2026-08-04 fix): an anchor's held-out KD loss is a drift meter — it
+  starts at its minimum (student == teacher at step 0) and can only rise,
+  so a best-ever multiplier guard means "at most one entropy of drift
+  ever" and hard-rolled a healthy retest back to base at 0.15 nats/token
+  (normal RLHF territory: healthy fine-tuning sits at 0.05–0.3 nats/token;
+  outputs go weird past ~1–2). The player anchor's absolute ceiling is
+  `PLAYER_ANCHOR_CEILING = 1.0` (an order of magnitude above healthy
+  drift, ~6x below the observed collapse at ~6 nats/token); the analyst
+  anchor — unchanged, still pinned to the FROZEN BASE, never chasing its
+  own drift — keeps its ceiling of 5.0 (healthy ≈ 1; the collapse hit 63).
 
 ### Deferred: the analyst revamp
 

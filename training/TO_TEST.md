@@ -11,7 +11,7 @@ lines back for review. On a FAIL, also paste the traceback that precedes it.
 | # | Command | Cost | What it proves |
 |---|---------|------|----------------|
 | 0 | `python -m training.selftest t0` | seconds | imports; transformers >= 5.10; CUDA visible; bitsandbytes loads |
-| 1 | `python -m training.selftest t1` | seconds | pure units: `parse_rating` (incl. bold variants), `build_span_weights` (NON-NEGATIVE mapping `max(0,(r+0.5)/1.5)`, WRONG spans masked to 0, win boost, hard floor at r ≤ -0.5 — the 2026-08-01 collapse fix), image-noise determinism/identity, analyst-leak tripwire (incl. multi-line), `_rewrite_image_urls`, `GameTraceSource` on a fabricated trace dir, `PlayerAnchorSource` on the same dir (kd_anchor loss, rating-null KEPT, uniform weights, 0.25 weight), micro-batch bucketing, planted-error scrambler (seed determinism, all three move-token modes, clock-shift tolerance labeling, direction swap incl. the "right move" guard, inert-text fallthrough), perception-question sampling (rate honored, groups and mirrored variants balanced), `AnalystTraceSource` on a fabricated file (KD loss kind, rating-null kept, unverified-span record dropped, quota weight), `stack_equal_length` (equal-length rows stack, mixed lengths hard-error) |
+| 1 | `python -m training.selftest t1` | seconds | pure units: `parse_rating` (incl. bold variants), `build_span_weights` (NON-NEGATIVE mapping `max(0,(r+0.5)/1.5)`, WRONG spans masked to 0, win boost, hard floor at r ≤ -0.5 — the 2026-08-01 collapse fix; PLUS the TEMPORARY `FORWARD_BONUS=0.4` hack: bonus span on positively-rated `[FORWARD]` outside WRONG spans, off by default and inside WRONG spans), `NoveltyTracker` (WIP boredom decay: 0.9^k on consecutive identical moves, floor 0.1, reset on a different move, perception rounds skipped WITHOUT resetting, per-game keys) both standalone and through `GameTraceSource`, `MetricGuard` ceiling-only mode (`relative=False`: best-ever multiplier + soft tier OFF, ceiling fires — the 2026-08-04 anchor-guard fix), image-noise determinism/identity, analyst-leak tripwire (incl. multi-line), `_rewrite_image_urls`, `GameTraceSource` on a fabricated trace dir, `PlayerAnchorSource` on the same dir (kd_anchor loss, rating-null KEPT, uniform weights, 0.25 weight, ceiling-only guard at 1.0), micro-batch bucketing, planted-error scrambler (seed determinism, all three move-token modes, clock-shift tolerance labeling, direction swap incl. the "right move" guard, inert-text fallthrough), perception-question sampling (rate honored, groups and mirrored variants balanced), `AnalystTraceSource` on a fabricated file (KD loss kind, rating-null kept, unverified-span record dropped, quota weight, ceiling-only guard at 5.0), `stack_equal_length` (equal-length rows stack, mixed lengths hard-error) |
 | 2 | `python -m training.selftest t2` | seconds | every enabled manifest entry materialized; `data.jsonl` row counts match `meta.json`; probe files present |
 | 3 | `python -m training.selftest t3` | minutes | 4-bit QLoRA load; LoRA target discovery + projector resolution; terminator id; one collated forward+backward per loss kind (image example included); fresh-adapter KD loss equals teacher entropy (the `disable_adapter()` teacher path); kd_anchor with NO anchor adapter loaded equals kd (the epoch-1 base fallback) |
 | 4 | `python -m training.selftest t4` | ~15–30 min | batch-4 vs batch-1 per-example loss parity (mixed CE/KD/image/negative-span buckets); CLI smoke train lands a checkpoint + `eval_log.jsonl` rows (INCLUDING the new step-0 baseline eval); destructive-LR variant fires the rollback path via the HARD tier (`--hard-multiplier 1.0` pins any regression to hard) |
@@ -175,6 +175,35 @@ canNOT prove and the retest run itself must:
   collapsed checkpoint; it was designed against the weekend logs. If the
   retest stays healthy the fuse should remain silent
   (`degenerate_generations` ≈ 0 in generation_stats.json).
+
+Spin-bot follow-ups (2026-08-04, after the retest run — full story in
+TRAINING_GAME_TRACES.md "The 2026-08-04 spin-bot"): four changes, three
+of them covered by a t1 RERUN (pure python, seconds — the mandatory
+verification for this batch):
+
+* **Ceiling-only anchor guards** (`MetricGuard.relative=False`,
+  `guard_relative` on both anchor sources; player ceiling 1.0, analyst
+  5.0). The retest's train1 hard-rolled back to base TWICE because the
+  player-anchor drift meter was guarded against its own step-0 floor.
+  t1 units cover the guard logic and the source attributes; the next
+  real train run should show NO `HARD REGRESSION on
+  heldout_loss/player_anchor_*` at healthy drift (~0.1–0.3 nats/token
+  above the step-0 baseline is normal).
+* **Novelty decay + FORWARD bonus** (t1 units, standalone and through
+  `GameTraceSource`). Watch the next run's smoke evals for the action
+  mix rebalancing (the retest degraded to 6.5% FORWARD / 69% ANTICLOCK);
+  the FORWARD bonus is a marked TEMPORARY hack to be removed once it has
+  done its job.
+* **Checkpoint hand-off honors the trainer's verdict**: `run_weekend`
+  now reads `last_good_checkpoint` from the train stage's `done` event
+  (newest `logs/train_<label>_*/events.jsonl`) instead of taking the
+  highest-step directory — the retest promoted a checkpoint its own
+  final eval had just rejected. NOT covered by any selftest stage (it
+  needs a full orchestrated epoch): verify during the weekend rehearsal
+  below — the log line is now `[trainN] checkpoint (last good per the
+  trainer's done event): ...`, and after a run whose FINAL eval
+  hard-regresses, the next epoch must resume from the earlier good save,
+  not the newest directory under weights/.
 
 Weekend rehearsal (before launching `training/run_weekend.py` for
 real): with NAMS up and external data downloaded, run

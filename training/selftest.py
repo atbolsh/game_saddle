@@ -217,8 +217,10 @@ def t1_pure() -> str:
 
     from agent.modes import parse_rating
     from training.game_traces import (
+        FORWARD_BONUS,
         AnalystTraceSource,
         GameTraceSource,
+        NoveltyTracker,
         PlayerAnchorSource,
         build_span_weights,
     )
@@ -235,7 +237,7 @@ def t1_pure() -> str:
         scramble_move_token,
         scramble_player_reply,
     )
-    from training.train import TrainingExample, epoch_batches
+    from training.train import MetricGuard, TrainingExample, epoch_batches
 
     checks = 0
 
@@ -272,6 +274,72 @@ def t1_pure() -> str:
                                game_won=False, moves_from_end=None)
     assert worst[0][2] == 0.0, worst[0]          # NEVER negative
     checks += 6
+
+    # ---- FORWARD bonus (TEMPORARY HACK -- the screaming block above
+    # FORWARD_BONUS in training/game_traces.py): flat additive bonus on
+    # [FORWARD] of positively-rated replies, skipped inside WRONG spans
+    # and on non-positive ratings; bonus spans may exceed 1.0.
+    ftgt = "I will advance. [FORWARD] done"
+    fw = build_span_weights(ftgt, rating=0.5, wrong_spans=[],
+                            game_won=False, moves_from_end=None,
+                            forward_bonus=0.4)
+    fstart = ftgt.find("[FORWARD]")
+    fspan = [s for s in fw if (s[0], s[1]) == (fstart, fstart + 9)]
+    assert len(fspan) == 1, fw
+    assert abs(fspan[0][2] - (1.0 / 1.5 + 0.4)) < 1e-9, fspan  # base + bonus
+    # inside a WRONG span -> no bonus, WRONG override wins
+    fw2 = build_span_weights(ftgt, rating=0.5, wrong_spans=["[FORWARD] done"],
+                             game_won=False, moves_from_end=None,
+                             forward_bonus=0.4)
+    assert not any(abs(s[2] - (1.0 / 1.5 + 0.4)) < 1e-9 for s in fw2), fw2
+    assert fw2[-1][2] == 0.0, fw2                # the WRONG span, last = wins
+    # non-positive rating -> no bonus span at all
+    fw3 = build_span_weights(ftgt, rating=0.0, wrong_spans=[],
+                             game_won=False, moves_from_end=None,
+                             forward_bonus=0.4)
+    assert len(fw3) == 1, fw3
+    # default is OFF (only GameTraceSource opts in, with FORWARD_BONUS)
+    fw4 = build_span_weights(ftgt, rating=0.5, wrong_spans=[],
+                             game_won=False, moves_from_end=None)
+    assert len(fw4) == 1, fw4
+    assert FORWARD_BONUS == 0.4, FORWARD_BONUS   # sizing rationale in situ
+    checks += 5
+
+    # ---- NoveltyTracker (WORK IN PROGRESS -- "boredom" decay, block above
+    # the class in training/game_traces.py): 0.9^k on consecutive identical
+    # moves, floor 0.1, reset on a different move, perception (action None)
+    # skipped WITHOUT resetting, independent per (session, game) key.
+    nt = NoveltyTracker()
+    seq = [nt.multiplier("s", 0, "ANTICLOCK") for _ in range(3)]
+    assert all(abs(m - e) < 1e-9 for m, e in zip(seq, [1.0, 0.9, 0.81])), seq
+    assert nt.multiplier("s", 0, None) == 1.0            # perception: skip...
+    assert abs(nt.multiplier("s", 0, "ANTICLOCK") - 0.9 ** 3) < 1e-9, (
+        "perception round RESET the streak (must skip, not reset)"
+    )
+    assert nt.multiplier("s", 0, "FORWARD") == 1.0       # different move
+    assert abs(nt.multiplier("s", 0, "ANTICLOCK") - 1.0) < 1e-9  # streak reset
+    assert nt.multiplier("s", 1, "ANTICLOCK") == 1.0     # other game: fresh
+    for _ in range(40):
+        floor = nt.multiplier("s2", 0, "CLOCK")
+    assert abs(floor - 0.1) < 1e-9, f"floor not enforced: {floor}"
+    checks += 6
+
+    # ---- MetricGuard relative=False (ceiling-only drift meters -- the
+    # 2026-08-04 retest fix): the best-ever multiplier and the soft tier
+    # are OFF; only the absolute ceiling fires. relative=True unchanged.
+    drift = MetricGuard("m", higher_is_better=False, rel_tolerance=0.1,
+                        hard_multiplier=2.0, ceiling=1.0, relative=False)
+    assert not drift.is_hard_regression(0.5, best=0.08), (
+        "ceiling-only guard fired below its ceiling (the exact failure "
+        "that rolled back the 2026-08-04 retest)"
+    )
+    assert drift.is_hard_regression(1.5, best=0.08), "ceiling did not fire"
+    assert not drift.is_soft_regression(0.5, best=0.08), "soft tier not off"
+    rel = MetricGuard("m", higher_is_better=False, rel_tolerance=0.1,
+                      hard_multiplier=2.0)
+    assert rel.is_hard_regression(0.5, best=0.08), "relative guard broken"
+    assert rel.is_soft_regression(0.1, best=0.08), "soft tier broken"
+    checks += 5
 
     # ---- image noise: deterministic per seed, identity at strength 0
     base_img = Image.new("RGB", (64, 64), (120, 40, 40))
@@ -373,7 +441,56 @@ def t1_pure() -> str:
         assert abs(base_w - (1.0 / 1.5 + 0.2)) < 1e-9, (
             f"mapped base + win boost wrong: {base_w}"
         )
-        checks += 4
+        # the FORWARD bonus (TEMPORARY HACK) flows through the source path:
+        # rating positive, [FORWARD] outside the WRONG span -> the boosted
+        # base (1/1.5 + 0.2 win boost) + 0.4 bonus; may exceed 1.0.
+        fb = [s for s in ex.span_weights
+              if ex.target_text[s[0]:s[1]] == "[FORWARD]"]
+        assert len(fb) == 1 and abs(fb[0][2] - (1.0 / 1.5 + 0.2 + 0.4)) < 1e-9, (
+            f"FORWARD bonus missing/wrong through GameTraceSource: "
+            f"{ex.span_weights}"
+        )
+        checks += 5
+
+        # ---- novelty decay through GameTraceSource (WIP): three identical
+        # consecutive moves in one game -> whole-record weights scaled by
+        # 1.0 / 0.9 / 0.81; the parallel game is unaffected.
+        nov_dir = tmp_dir / "traces_novelty"
+        nov_dir.mkdir()
+        nov_records = []
+        for i in range(3):
+            nov_records.append({
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "move?"},
+                ]}],
+                "target_text": "turning again [ANTICLOCK]",
+                "meta": {"rating": 1.0, "wrong_spans": [], "game_won": False,
+                         "moves_from_end": None, "session_id": "sA",
+                         "game_index": 0, "move_index": i,
+                         "action": "ANTICLOCK"},
+            })
+        nov_records.append({   # same action, DIFFERENT game: fresh streak
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "move?"},
+            ]}],
+            "target_text": "turning again [ANTICLOCK]",
+            "meta": {"rating": 1.0, "wrong_spans": [], "game_won": False,
+                     "moves_from_end": None, "session_id": "sA",
+                     "game_index": 1, "move_index": 0,
+                     "action": "ANTICLOCK"},
+        })
+        with open(nov_dir / "traces.jsonl", "w", encoding="utf-8") as f:
+            for r in nov_records:
+                f.write(json.dumps(r) + "\n")
+        nsrc = GameTraceSource(nov_dir / "traces.jsonl", noise_strength=0.0)
+        nexs = list(nsrc.examples())
+        assert len(nexs) == 4, nexs
+        nbases = [x.span_weights[0][2] for x in nexs]
+        assert all(abs(w - e) < 1e-9
+                   for w, e in zip(nbases, [1.0, 0.9, 0.81, 1.0])), (
+            f"novelty decay wrong through GameTraceSource: {nbases}"
+        )
+        checks += 2
 
         # ---- PlayerAnchorSource on the same fabricated dir: trust-region
         # semantics -- EVERY parseable record kept (rating-null included),
@@ -387,7 +504,12 @@ def t1_pure() -> str:
         assert all(x.loss == "kd_anchor" and x.span_weights is None
                    for x in pexs), pexs
         assert abs(psrc.weight - 0.25) < 1e-9, psrc.weight
-        checks += 3
+        # Ceiling-only drift guards (2026-08-04 retest fix): both anchors
+        # opt out of the best-ever multiplier and declare absolute bounds.
+        assert psrc.guard_relative is False and psrc.guard_ceiling == 1.0, (
+            psrc.guard_relative, psrc.guard_ceiling,
+        )
+        checks += 4
 
         # ---- AnalystTraceSource: KD anchor semantics on a fabricated file
         analyst_fixtures = [
@@ -434,7 +556,10 @@ def t1_pure() -> str:
         assert abs(asrc.weight - 100 / 2) < 1e-9, (
             f"quota weight wrong: {asrc.weight}"
         )
-        checks += 1
+        assert asrc.guard_relative is False and asrc.guard_ceiling == 5.0, (
+            asrc.guard_relative, asrc.guard_ceiling,
+        )
+        checks += 2
 
     # ---- epoch_batches: bucketing separates loss kinds / image counts,
     #      batch sizes bounded, nothing lost

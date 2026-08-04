@@ -30,7 +30,15 @@ postmortem above :func:`build_span_weights`), in order:
   3. boost   = ``win_boost * win_gamma ** moves_from_end`` added UNIFORMLY
      to every token of the message when the game was won (the win is the
      one ground-truth signal, so it softens even verified mistakes);
-  4. clamp to [0, 1].
+  4. clamp to [0, 1];
+  5. FORWARD bonus (TEMPORARY HACK, see the screaming block above
+     :data:`FORWARD_BONUS`): flat additive bonus on ``[FORWARD]`` tokens of
+     positively-rated replies outside WRONG spans -- these spans may exceed
+     1.0 (still non-negative, so the collapse-proofing is untouched);
+  6. novelty decay (WORK IN PROGRESS, :class:`NoveltyTracker`): the whole
+     record's weights are multiplied by ``max(0.1, 0.9 ** k)`` where ``k``
+     counts consecutive identical moves -- repeating the same move over and
+     over earns less and less cloning weight ("boredom").
 
 Records whose analyst forgot the RATING line are DROPPED with a warning
 count -- never trained with a guessed reward (no-fuzzy-fallbacks).
@@ -103,6 +111,42 @@ def _clamp01(x: float) -> float:
 # instead provided by the PlayerAnchorSource trust region (bounded by
 # construction) -- see the class below.
 # =====================================================================
+
+# =====================================================================
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !!  TEMPORARY HACK -- FORWARD BONUS -- REMOVE WHEN NO LONGER NEEDED !!
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# The 2026-08-04 retest showed the self-training loop collapsing onto
+# turning: reward-weighted regression with a near-saturated analyst
+# (77% of iter2 moves rated exactly +1.0) degenerates into behavior
+# cloning of the corpus action mix, and the corpus was already
+# turn-heavy, so each epoch amplified turns (smoke evals went from 28%
+# FORWARD / 40% ANTICLOCK to 6.5% FORWARD / 69% ANTICLOCK -- a spin-bot
+# that never approaches the gold).
+#
+# THIS IS NOT A PRINCIPLED FIX. It is a flat additive bonus on the
+# ``[FORWARD]`` token span of positively-rated replies (outside WRONG
+# spans), tilting the cloning mass back toward the one action that
+# actually changes distance-to-gold. Sizing (from the iter2 corpus):
+# turn:FORWARD action-token gradient mass was ~3.4:1 (turns ~2000 moves
+# x 0.65 mean weight vs FORWARD 471 x 0.82); a bonus b rescales FORWARD
+# mass by (0.82+b)/0.82, so b=0.4 brings the ratio to ~2.3:1 -- a gentle
+# nudge, with the novelty decay below simultaneously shrinking the
+# turn-side mass.
+#
+# REMOVE THIS once the novelty/arousal scoring or the analyst revamp
+# (per-span ratings, CORRECT spans -- FUTURE_GOALS.md) gives a
+# principled reason for the policy to move, or once smoke evals show the
+# action mix has rebalanced. Anyone reading this in 2027: if it is still
+# here, it has overstayed its welcome.
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+FORWARD_BONUS = 0.4
+
+#: The literal the player harness parses as the forward move; the bonus
+#: targets exactly what the policy samples.
+_FORWARD_LITERAL = "[FORWARD]"
+
+
 def build_span_weights(
     target_text: str,
     rating: float,
@@ -113,12 +157,15 @@ def build_span_weights(
     wrong_weight: float = 0.0,
     win_boost: float = 0.2,
     win_gamma: float = 0.9,
+    forward_bonus: float = 0.0,
 ) -> list[tuple[int, int, float]]:
     """The reward mapping (module-level so tests and TRAINING_TRACE_EXTRAS
     tooling can reuse it verbatim). Returns Collator-ready
     ``(char_start, char_end, weight)`` spans; later spans override earlier
     ones, so the whole-reply base span comes first. All outputs are in
-    [0, 1] -- the loud block above explains why nothing may go negative."""
+    [0, 1] EXCEPT the FORWARD-bonus spans, which may reach
+    ``1 + forward_bonus`` -- still non-negative, which is the property the
+    collapse postmortem above actually requires."""
     boost = 0.0
     if game_won and moves_from_end is not None:
         boost = win_boost * (win_gamma ** moves_from_end)
@@ -130,14 +177,88 @@ def build_span_weights(
     spans: list[tuple[int, int, float]] = [
         (0, len(target_text), final(base))
     ]
+
+    wrong_ranges: list[tuple[int, int]] = []
     for span_text in wrong_spans:
         if not span_text:
             continue
         start = target_text.find(span_text)
         while start != -1:
-            spans.append((start, start + len(span_text), final(wrong_weight)))
+            wrong_ranges.append((start, start + len(span_text)))
             start = target_text.find(span_text, start + 1)
+
+    # TEMPORARY HACK (FORWARD_BONUS block above): flat bonus on [FORWARD]
+    # occurrences of positively-rated replies that do not overlap any
+    # verified WRONG span. Emitted BEFORE the WRONG overrides so a WRONG
+    # span always wins any partial overlap.
+    if forward_bonus > 0.0 and float(rating) > 0.0:
+        start = target_text.find(_FORWARD_LITERAL)
+        while start != -1:
+            end = start + len(_FORWARD_LITERAL)
+            in_wrong = any(start < we and ws < end
+                           for ws, we in wrong_ranges)
+            if not in_wrong:
+                spans.append((start, end, final(base) + forward_bonus))
+            start = target_text.find(_FORWARD_LITERAL, start + 1)
+
+    for ws, we in wrong_ranges:
+        spans.append((ws, we, final(wrong_weight)))
     return spans
+
+
+# =====================================================================
+# WORK IN PROGRESS -- NOVELTY ("BOREDOM") DECAY
+# =====================================================================
+# Biological feedback loops do not reward every step equally: repeating
+# the same action over and over stops being exciting ("boredom"), while
+# novel or highly consequential moments are consolidated more thoroughly.
+# This is the first, deliberately crude cut at that idea: the k-th
+# consecutive identical move earns only NOVELTY_DECAY**k of its cloning
+# weight (floored at NOVELTY_FLOOR ~= "unrewarded"), so the 2026-08-04
+# spin-bot pattern (dozens of consecutive ANTICLOCKs) stops feeding on
+# itself, while a *varied* move sequence keeps full weight.
+#
+# KNOWN GAPS (future refinements live in FUTURE_GOALS.md):
+#   * only catches IDENTICAL CONSECUTIVE moves -- an alternating
+#     CLOCK/ANTICLOCK oscillation or a revisited position sails through;
+#     repeat detection on (position, heading, action) state hashes would
+#     catch those;
+#   * decay-only: there is no positive arousal side yet (upweighting the
+#     moves leading into gold pickups / wins / near-misses);
+#   * operates on training weights after the fact; datagen-time rejection
+#     sampling or an analyst "novelty/arousal" axis would shape the data
+#     itself.
+# =====================================================================
+NOVELTY_DECAY = 0.9   #: per-repeat multiplier on cloning weight (WIP)
+NOVELTY_FLOOR = 0.1   #: never below this -- "unrewarded", not "unlearned"
+
+
+class NoveltyTracker:
+    """Streaming repeat-streak tracker (WORK IN PROGRESS -- rationale and
+    known gaps in the block above).
+
+    Call :meth:`multiplier` once per trace record IN FILE ORDER. Records
+    are keyed by ``(session_id, game_index)`` (worker files are merged by
+    concatenation, so within one game the ``move_index`` order is the file
+    order). Perception records (``action is None``) return 1.0 and are
+    SKIPPED, NOT RESET: a turn-loop interrupted by a perception question
+    is still a loop."""
+
+    def __init__(self, decay: float = NOVELTY_DECAY,
+                 floor: float = NOVELTY_FLOOR):
+        self.decay = decay
+        self.floor = floor
+        #: (session_id, game_index) -> (last_action, streak_length)
+        self._state: dict[tuple, tuple[str, int]] = {}
+
+    def multiplier(self, session_id, game_index, action) -> float:
+        if action is None:
+            return 1.0
+        key = (session_id, game_index)
+        last_action, streak = self._state.get(key, (None, 0))
+        streak = streak + 1 if action == last_action else 0
+        self._state[key] = (action, streak)
+        return max(self.floor, self.decay ** streak)
 
 
 class _TraceFileSource(DataSource):
@@ -217,6 +338,7 @@ class GameTraceSource(_TraceFileSource):
         wrong_weight: float = 0.0,
         win_boost: float = 0.2,
         win_gamma: float = 0.9,
+        forward_bonus: float = FORWARD_BONUS,
         noise_strength: float = TRAINING_STRENGTH,
         noise_seed: int | None = None,
     ):
@@ -227,6 +349,7 @@ class GameTraceSource(_TraceFileSource):
         self.wrong_weight = wrong_weight
         self.win_boost = win_boost
         self.win_gamma = win_gamma
+        self.forward_bonus = forward_bonus
 
     def examples(self) -> Iterator[TrainingExample]:
         # Fresh noise every run: an unseeded Random gives a new degradation
@@ -234,29 +357,47 @@ class GameTraceSource(_TraceFileSource):
         # dir lives for the run and is left to OS tmp cleanup.
         rng = random.Random(self.noise_seed)
         noise_dir = Path(tempfile.mkdtemp(prefix=f"{self.name}_noise_"))
+        novelty = NoveltyTracker()
         n_dropped = 0
         n_yielded = 0
         for lineno, messages, target_text, meta in self._iter_records():
+            # The streak advances on EVERY move record -- even ones dropped
+            # below for a missing rating -- because the move still happened
+            # in the game; only the training weight is per-record.
+            novelty_mult = novelty.multiplier(
+                meta.get("session_id"), meta.get("game_index"),
+                meta.get("action"),
+            )
             if meta.get("rating") is None:
                 n_dropped += 1
                 continue
 
             self._rewrite_frames(messages, rng, noise_dir, lineno)
 
+            spans = build_span_weights(
+                target_text,
+                rating=float(meta["rating"]),
+                wrong_spans=list(meta.get("wrong_spans") or []),
+                game_won=bool(meta.get("game_won")),
+                moves_from_end=meta.get("moves_from_end"),
+                rating_scale=self.rating_scale,
+                wrong_weight=self.wrong_weight,
+                win_boost=self.win_boost,
+                win_gamma=self.win_gamma,
+                forward_bonus=self.forward_bonus,
+            )
+            # Novelty decay (WIP, NoveltyTracker): scales the WHOLE record
+            # -- the reply is a rationalization of the repeated move --
+            # including any FORWARD bonus (a FORWARD spammed 10 times in a
+            # row should not keep collecting its bonus). Zero weights
+            # (WRONG spans, floored ratings) stay zero.
+            if novelty_mult < 1.0:
+                spans = [(s, e, w * novelty_mult) for s, e, w in spans]
+
             yield TrainingExample(
                 messages=messages,
                 target_text=target_text,
-                span_weights=build_span_weights(
-                    target_text,
-                    rating=float(meta["rating"]),
-                    wrong_spans=list(meta.get("wrong_spans") or []),
-                    game_won=bool(meta.get("game_won")),
-                    moves_from_end=meta.get("moves_from_end"),
-                    rating_scale=self.rating_scale,
-                    wrong_weight=self.wrong_weight,
-                    win_boost=self.win_boost,
-                    win_gamma=self.win_gamma,
-                ),
+                span_weights=spans,
                 loss="ce",
                 source=self.name,
                 meta=meta,
@@ -293,6 +434,12 @@ class AnalystTraceSource(_TraceFileSource):
     #: collapse pushed it to 63 -- anything past 5.0 is a destroyed
     #: analyst, not noise, regardless of the best-seen value.
     guard_ceiling = 5.0
+    #: Ceiling-only guard (train.py MetricGuard.relative rationale): this
+    #: metric starts at its floor (student == teacher at step 0) and can
+    #: only rise, so best-ever multipliers measure "any drift at all",
+    #: not catastrophe. The 2026-08-04 retest soft-warned at 1.37x of the
+    #: entropy floor -- pure noise.
+    guard_relative = False
 
     def __init__(
         self,
@@ -358,6 +505,20 @@ class AnalystTraceSource(_TraceFileSource):
 #: enough to cost only ~half an hour per train stage.
 PLAYER_ANCHOR_WEIGHT = 0.25
 
+#: Absolute catastrophe bound for the player anchor's held-out KD guard.
+#: The metric is soft cross-entropy vs the parent = parent entropy
+#: (~0.06-0.08, the step-0 floor) + per-token KL(parent||student), so 1.0
+#: allows ~0.9 nats/token of drift. Calibration: healthy RLHF fine-tuning
+#: lives at 0.05-0.3 nats/token (trl's adaptive KL controller targets ~6
+#: nats per whole response; Stiennon et al. 2020 saw quality decay past
+#: ~20-25 nats/sequence), outputs go visibly weird past ~1-2 nats/token,
+#: and the 2026-08-01 collapse measured ~6 nats/token. 1.0 sits an order
+#: of magnitude above healthy drift and well below collapse. The
+#: 2026-08-04 retest showed why a RELATIVE bound cannot work here: best-
+#: ever pins to the step-0 entropy floor, so "2x best" rolled back a
+#: healthy run at 0.15 nats/token of drift (see MetricGuard docstring).
+PLAYER_ANCHOR_CEILING = 1.0
+
 
 class PlayerAnchorSource(_TraceFileSource):
     """RLHF-style trust region: pin the player's distribution to the PARENT
@@ -379,6 +540,11 @@ class PlayerAnchorSource(_TraceFileSource):
     collapse lived in tokens nothing was pulling on). Uniform weight,
     no reward: this is a leash, not a lesson.
     """
+
+    #: Ceiling-only drift guard -- see PLAYER_ANCHOR_CEILING above and
+    #: MetricGuard.relative in train.py for the full rationale.
+    guard_ceiling = PLAYER_ANCHOR_CEILING
+    guard_relative = False
 
     def __init__(
         self,
