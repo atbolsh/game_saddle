@@ -110,7 +110,7 @@ getting excited about every step we take. Both directions belong in the
 loop, not just the decay:
 
 * **positive arousal**: upweight the moves leading into gold pickups,
-  wins, and narrow escapes (the win boost in `build_span_weights` is a
+  wins, and narrow escapes (the win boost in `example_scale` is a
   primitive version of this — it could become event-triggered and
   magnitude-scaled);
 * **state-aware repeat detection**: the current tracker only catches
@@ -129,3 +129,47 @@ loop, not just the decay:
   the blunt equal-mass `ACTION_BALANCE` reweighting, which assumes all
   move types deserve identical total mass and cannot survive into
   environments where they genuinely differ in importance.
+
+## 6. Trust region as a CONSTRAINT: additive per-token KL — *Not started*
+
+Today the trust region is a *dataset*: `PlayerAnchorSource` replays player
+traces at weight 0.25 with `loss="kd_anchor"` (teacher = the parent
+checkpoint). That bounds drift only as strongly as its share of the
+gradient mass — it competes with the task loss instead of constraining it.
+The industry-standard form is an **additive per-token KL penalty computed
+on the same batch**:
+
+    loss = task_loss + lambda * KL(student || parent)
+
+evaluated on the game batch's own tokens via the existing
+`_base_model_logits(teacher="anchor")` machinery — no extra data pass, and
+the anchor becomes a constraint on *every* update. Start at
+`lambda ≈ 0.05–0.1`, or use an adaptive controller targeting a KL budget
+(trl's adaptive KL targets a few nats per response). Two cautions,
+recorded when this was deferred (2026-08-05): the CARE-style result that
+KL anchors can *backfire* by pinning the model to whatever the parent
+already does (checkpoint selection — already in place — is the
+complementary defense), and lambda interacts with the LR (retune after
+the 3e-6 drop, not before).
+
+## 7. GRPO / group-relative on-policy RL — *Not started*
+
+The current trainer is single-sample offline REINFORCE: one graded reply
+per position, weights = shaped advantage, no importance correction, one
+epoch per batch. The natural upgrade once the loop is stable is
+**GRPO-style group sampling**: generate K replies per position, compute
+advantages *relative to the group* (no learned critic needed — the group
+mean is the baseline), and update with ratio clipping. What it buys here:
+
+* the group baseline solves analyst saturation *structurally* — even if
+  every reply gets 0.9+, the within-group ranking still carries signal
+  (the exp-advantage-vs-corpus-mean mapping in `game_traces.py` is the
+  poor man's version of exactly this);
+* on-policy sampling kills the off-policy staleness caveat entirely;
+* published Gemma-family recipes exist to copy (Google Tunix GRPO at
+  lr 3e-6 — the same scale the trainer now uses).
+
+Cost: K× the datagen per position and a harness rework (the dispatcher
+already batches, but the trace format assumes one reply per round).
+Prerequisite: a reward cheaper than the full analyst call per sample, or
+K analyst calls accepted as the price.

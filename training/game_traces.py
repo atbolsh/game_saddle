@@ -18,34 +18,48 @@ meter (TRAINING_EXTRA_DATASETS.md). The teacher is always the frozen base
 regardless of which checkpoint generated the trace, so the anchor never
 chases its own drift.
 
-Per-token weight construction (ALL WEIGHTS NON-NEGATIVE -- see the collapse
-postmortem above :func:`build_span_weights`), in order:
+Reward construction (2026-08-05 SHAPE/SCALE SPLIT -- train.py
+``weighted_loss`` SHAPE VS SCALE explains the bug that forced it: the
+per-example loss normalization cancels any uniform factor on span weights,
+so every reply-wide reward knob must ride ``example_weight`` instead).
 
-  1. base    = ``max(0, (rating + 0.5) / 1.5) * rating_scale`` over the
-     whole player reply (every player token in a reply is the same "move"):
-     0 at rating <= -0.5, rising continuously to 1.0 at rating +1.0;
-  2. WRONG   = ``wrong_weight`` (default 0.0) overrides the base on every
-     occurrence of every harness-verified WRONG span -- masked out of
-     cloning, never "unlearned" with a negative weight;
-  3. boost   = ``win_boost * win_gamma ** moves_from_end`` added UNIFORMLY
-     to every token of the message when the game was won (the win is the
-     one ground-truth signal, so it softens even verified mistakes). The
-     boost is DELIBERATELY LARGE (1.0, decaying by 0.95/round) and there
-     is NO upper clamp: near a win every token weighs ``base + ~1.0`` (up
-     to ~2.0), so real-game success OUTWEIGHS anything the analyst can
-     award elsewhere -- wins must be clamped onto and kept, not
-     re-litigated by a hackable analyst. Non-negativity is the only hard
-     bound (the collapse postmortem);
-  4. action balance (TEMPORARY HACK, see the screaming block above
-     :func:`action_balance_multipliers`): each move record is scaled by
-     ``mean_count / count(its action)`` over the same corpus (capped at
-     4x), so every move TYPE carries equal total cloning mass -- weights
-     may exceed 1.0 (still non-negative, so the collapse-proofing is
-     untouched);
-  5. novelty decay (WORK IN PROGRESS, :class:`NoveltyTracker`): the whole
-     record's weights are multiplied by ``max(0.1, 0.9 ** k)`` where ``k``
-     counts consecutive identical moves -- repeating the same move over and
-     over earns less and less cloning weight ("boredom").
+SCALE -- ``TrainingExample.example_weight``, "how much this reply matters":
+
+  1. base = 0 if rating <= -0.5 (hard floor: confirmed-bad replies teach
+     nothing) else ``min(ADV_CAP, exp((rating - r_bar) / ADV_BETA))`` --
+     EXPONENTIAL ADVANTAGE against the corpus mean rating ``r_bar``
+     (:func:`rating_advantage`; a pre-pass computes r_bar per corpus).
+     The analyst's *ranking* is the usable signal, not its absolute
+     numbers: with a saturated analyst (aug4: 77% of iter2 moves rated
+     exactly +1.0) any affine mapping puts nearly all weights in one
+     band, and reward-weighted regression with near-uniform weights is
+     just behavior cloning. The exp restores contrast (~2x per 0.2 of
+     rating around the mean) however compressed the ratings are;
+  2. + win boost ``win_boost * win_gamma ** moves_from_end`` (ADDITIVE:
+     ground truth, so it rescues even an analyst-floored reply near a
+     win; 1.0 decaying by 0.95/round -- sized to outweigh anything the
+     analyst can award, wins must be clamped onto and kept);
+  3. x action balance (TEMPORARY HACK, screaming block above
+     :func:`action_balance_multipliers`): equal total cloning mass per
+     move TYPE, capped at 4x;
+  4. x novelty decay -- OFF BY DEFAULT behind ``GameTraceSource(...,
+     novelty=True)`` (WORK IN PROGRESS, :class:`NoveltyTracker`);
+  5. x ``ORACLE_WRONG_SCALE`` (0.25) when the engine oracle says the move
+     contradicted ground truth (crutch block above :func:`oracle_verdict`).
+
+  A scale of exactly 0 (floored rating, no win boost) SKIPS the record.
+
+SHAPE -- ``span_weights``, relative emphasis WITHIN the reply
+(:func:`build_span_weights`):
+
+  * base 1.0 over the whole reply (every token of a reply is the same
+    "move");
+  * harness-verified WRONG spans -> ``WRONG_SPAN_WEIGHT`` (-0.5): bounded
+    UNLIKELIHOOD in the loss (train.py NEGATIVE WEIGHTS) -- actively
+    suppressed with a floored objective, not just masked;
+  * the move token gets ``ORACLE_MATCH_SPAN`` (1.5) when it matches the
+    engine oracle and ``ORACLE_WRONG_SPAN`` (-0.5) when it contradicts it
+    (neutral / no oracle meta: no modifier).
 
 Records whose analyst forgot the RATING line are DROPPED with a warning
 count -- never trained with a guessed reward (no-fuzzy-fallbacks).
@@ -68,6 +82,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import random
 import sys
 import tempfile
@@ -84,75 +99,178 @@ logger = logging.getLogger("train.game_traces")
 
 
 # =====================================================================
-# WHY EVERY WEIGHT IS NON-NEGATIVE -- THE 2026-08-01 COLLAPSE POSTMORTEM
+# NEGATIVE SIGNAL -- THE 2026-08-01 COLLAPSE POSTMORTEM, CORRECTED
 # =====================================================================
-# The original mapping used the analyst rating directly (weights in
-# [-1, 1]). Weighted cross-entropy with NEGATIVE weights is UNBOUNDED
-# BELOW: the model is paid to make negatively-weighted tokens arbitrarily
-# unlikely, and the cheapest way to do that is to destroy the language
-# model itself. The 2026-08-01 weekend run did exactly that -- epoch 2's
-# corpus skewed negative, training loss fell 0.11 -> -37.5 in ~300 steps,
-# and the checkpoint fled into `<unused...>` token gibberish, burning the
-# remaining ~15h of datagen on unparseable output.
+# The original mapping used the analyst rating directly as a CE weight
+# (weights in [-1, 1]). Negative-weight CROSS-ENTROPY (w * -log p) is
+# UNBOUNDED BELOW with a gradient that GROWS as p -> 0: the model is paid
+# ever more to make those tokens ever less likely, and the cheapest
+# descent direction is to destroy the whole distribution. The 2026-08-01
+# weekend run did exactly that -- epoch 2's corpus skewed negative,
+# training loss fell 0.11 -> -37.5 in ~300 steps, and the checkpoint fled
+# into `<unused...>` token gibberish.
 #
-# The fix is this mapping: max(0, (rating + 0.5) / 1.5).
-#   * BOUNDED OBJECTIVE: no weight is ever negative, so weighted CE is an
-#     ordinary (reward-weighted) cloning loss -- minimizing it can never
-#     profit from wrecking the LM. This is the collapse fix.
-#   * CONTINUOUS AT THE CUTOFF: weight hits 0 exactly at rating -0.5 and
-#     rises linearly to 1.0 at rating +1.0 -- no jump where a tiny rating
-#     difference flips a move between "clone fully" and "ignore".
-#   * FLOOR, NOT PUNISHMENT: moves rated at or below -0.5 (confirmed bad)
-#     teach NOTHING rather than being unlearned; gradation is preserved
-#     everywhere above the floor, so the analyst's dense per-move signal
-#     still shapes what gets cloned hardest.
-#   * NO BATCH-RELATIVE NORMALIZATION: the analyst's zero is semantically
-#     absolute ("neither helps nor hurts"), so scores are shifted by the
-#     FIXED offset +0.5, not by a per-batch mean -- a batch of all-good
-#     moves must not have its best moves relatively punished.
-# What negative weights were meant to buy (suppressing bad behavior) is
-# instead provided by the PlayerAnchorSource trust region (bounded by
-# construction) -- see the class below.
+# THE REAL DICHOTOMY (2026-08-05 correction): the problem was never
+# "negative signal" per se, it was the UNBOUNDED FORM of it. Bounded
+# unlikelihood, -log(1 - p), also pushes a bad token's probability down,
+# but the loss floors at 0 and its gradient VANISHES as p -> 0 -- there
+# is no collapse well to dive into. train.py's weighted_loss now treats
+# every negative span weight as unlikelihood with |w| emphasis, which is
+# why WRONG spans and oracle-contradicted move tokens below carry -0.5
+# instead of a 0.0 mask: verified-bad text gets actively suppressed
+# again, safely. (An earlier note here claimed the PlayerAnchorSource
+# trust region "provides what negative weights bought" -- wrong: a trust
+# region only bounds drift from the parent; it suppresses nothing.)
+#
+# The reply-wide reward itself lives on example_weight (module docstring,
+# SCALE) as an EXPONENTIAL ADVANTAGE against the corpus mean rating.
+# The analyst's RANKING is the signal we trust; its absolute calibration
+# drifts with the checkpoint (aug4's analyst saturated at +1.0), so a
+# baseline-relative mapping stays informative where any fixed affine one
+# degenerates into uniform cloning. The floor stays absolute: at or below
+# rating -0.5 ("confirmed bad") a reply teaches nothing at all.
 # =====================================================================
 
-def build_span_weights(
-    target_text: str,
-    rating: float,
-    wrong_spans: list[str],
-    game_won: bool,
-    moves_from_end: int | None,
-    rating_scale: float = 1.0,
-    wrong_weight: float = 0.0,
-    win_boost: float = 1.0,
-    win_gamma: float = 0.95,
-) -> list[tuple[int, int, float]]:
-    """The reward mapping (module-level so tests and TRAINING_TRACE_EXTRAS
-    tooling can reuse it verbatim). Returns Collator-ready
-    ``(char_start, char_end, weight)`` spans; later spans override earlier
-    ones, so the whole-reply base span comes first. All outputs are
-    NON-NEGATIVE (the loud block above explains why that is the one hard
-    invariant); there is deliberately NO upper clamp -- near a win,
-    ``base + boost`` reaches ~2.0, so real-game success outweighs even a
-    perfectly analyst-rated move in a lost game."""
+ADV_BETA = 0.3    #: rating units per e-fold of example weight
+ADV_CAP = 3.0     #: max example-weight base (one reply must not own a batch)
+RATING_FLOOR = -0.5   #: at/below this rating the reply teaches NOTHING
+WRONG_SPAN_WEIGHT = -0.5  #: unlikelihood emphasis on verified WRONG spans
+
+
+def rating_advantage(rating: float, baseline: float,
+                     beta: float = ADV_BETA, cap: float = ADV_CAP) -> float:
+    """Exponential-advantage base for ``example_weight`` (postmortem block
+    above): 0 at/below the RATING_FLOOR, else ``exp((rating - baseline) /
+    beta)`` capped at ``cap``. Equal to 1.0 for a corpus-average reply;
+    ~2x per +0.2 of rating above the mean, symmetric below."""
+    if float(rating) <= RATING_FLOOR:
+        return 0.0
+    return min(cap, math.exp((float(rating) - baseline) / beta))
+
+
+def example_scale(rating: float, baseline: float, game_won: bool,
+                  moves_from_end: int | None,
+                  win_boost: float = 1.0,
+                  win_gamma: float = 0.95) -> float:
+    """Reply-wide reward scale (module docstring, SCALE steps 1-2):
+    exp-advantage base plus the additive win boost. Action balance,
+    novelty, and the oracle penalty multiply on top in GameTraceSource
+    (they need corpus / stream / oracle state a pure function can't
+    carry)."""
     boost = 0.0
     if game_won and moves_from_end is not None:
         boost = win_boost * (win_gamma ** moves_from_end)
+    return rating_advantage(rating, baseline) + boost
 
-    def final(w: float) -> float:
-        return max(0.0, w + boost)
 
-    base = max(0.0, (float(rating) + 0.5) / 1.5) * rating_scale
-    spans: list[tuple[int, int, float]] = [
-        (0, len(target_text), final(base))
-    ]
+def build_span_weights(
+    target_text: str,
+    wrong_spans: list[str],
+    action: str | None = None,
+    verdict: str = "unknown",
+    wrong_weight: float = WRONG_SPAN_WEIGHT,
+) -> list[tuple[int, int, float]]:
+    """WITHIN-reply SHAPE only (module docstring, SHAPE; the reply-wide
+    reward is :func:`example_scale` -- train.py's SHAPE VS SCALE explains
+    why a uniform factor here would silently cancel). Returns
+    Collator-ready ``(char_start, char_end, weight)`` spans; later spans
+    override earlier ones, so: whole-reply base 1.0 first, then verified
+    WRONG spans at ``wrong_weight`` (negative = bounded unlikelihood),
+    then the oracle's move-token modifier LAST -- ground truth outranks
+    the analyst even where the spans overlap."""
+    spans: list[tuple[int, int, float]] = [(0, len(target_text), 1.0)]
     for span_text in wrong_spans:
         if not span_text:
             continue
         start = target_text.find(span_text)
         while start != -1:
-            spans.append((start, start + len(span_text), final(wrong_weight)))
+            spans.append((start, start + len(span_text), wrong_weight))
             start = target_text.find(span_text, start + 1)
+    if action and verdict in ("correct", "wrong"):
+        token = f"[{action}]"
+        start = target_text.rfind(token)
+        if start != -1:
+            spans.append((
+                start, start + len(token),
+                ORACLE_MATCH_SPAN if verdict == "correct"
+                else ORACLE_WRONG_SPAN,
+            ))
     return spans
+
+
+# =====================================================================
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !!  CRUTCH -- ENGINE ORACLE -- ACTIVATED 2026-08-05                 !!
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# This is crutch #1 from TRAINING_GAME_TRACES.md's disagree-and-commit
+# section ("engine-derived baselines"), previously rejected and now
+# DELIBERATELY activated after two failed runs: the analyst's ratings
+# saturated (aug4: 77% at +1.0) and stopped carrying enough contrast to
+# steer anything, so the one incorruptible judge -- the game engine
+# itself -- now grades the MOVE TOKEN directly. Datagen stamps the raw
+# oracle facts per move (generate_game_traces._oracle_meta: rel bearing
+# to the nearest gold, whether the facing ray hits any gold, and the
+# resulting correct move -- EXACT, because the arena has no internal
+# walls to route around); this block classifies a recorded move against
+# them at train time:
+#
+#   "correct" -- matches the oracle move (or turns when the gold is
+#                nearly behind, |bearing| >= 170 deg, where either turn
+#                is a correct move): move-token span ORACLE_MATCH_SPAN;
+#   "neutral" -- defensible under the 45-degree aim tolerance the player
+#                is INSTRUCTED to use (FORWARD inside the cone without a
+#                ray hit; fine-tuning turn toward the gold despite a ray
+#                hit): no modifier, the analyst's rating stands;
+#   "wrong"   -- contradicts ground truth (turn away from the shorter
+#                rotation, FORWARD outside the cone): move-token span
+#                ORACLE_WRONG_SPAN (bounded unlikelihood) AND the whole
+#                reply's example_weight is multiplied by
+#                ORACLE_WRONG_SCALE -- the rationalization of a wrong
+#                move is not worth cloning at full strength either;
+#   "unknown" -- no oracle meta (pre-2026-08-05 corpora) or no move:
+#                neutral, counted and logged once per source.
+#
+# WHY THIS CANNOT STAY: it hard-wires "good play == greedy geodesic to
+# the nearest gold", which is only true because the current game is a
+# featureless arena. The moment the environment grows internal walls,
+# multiple competing goals, or moves whose value is strategic rather
+# than geometric, this oracle becomes actively WRONG and must be removed
+# or demoted to a feature the analyst sees (FUTURE_GOALS.md, analyst
+# revamp). It also further concentrates reward on the move token --
+# fine for a 3-move game, wrong for free-form action spaces. Anyone
+# reading this in 2027: if it is still here, it has overstayed its
+# welcome.
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+ORACLE_MATCH_SPAN = 1.5    #: move-token span weight when oracle agrees
+ORACLE_WRONG_SPAN = -0.5   #: move-token unlikelihood when oracle disagrees
+ORACLE_WRONG_SCALE = 0.25  #: example_weight multiplier on oracle-wrong moves
+ORACLE_CONE_RAD = math.pi / 4          #: the player's instructed tolerance
+ORACLE_EITHER_TURN_RAD = math.radians(170.0)  #: behind you: any turn is fine
+
+
+def oracle_verdict(action: str | None, oracle_move: str | None,
+                   rel_bearing: float | None,
+                   ray_hit: bool | None) -> str:
+    """Classify a recorded move against the stamped oracle facts (crutch
+    block above): "correct" | "neutral" | "wrong" | "unknown". Pure so t1
+    can enumerate the geometry; thresholds live here (train side), the
+    raw facts in the trace meta -- retuning never requires regenerating
+    data."""
+    if action is None or oracle_move is None or rel_bearing is None:
+        return "unknown"
+    rel = float(rel_bearing)
+    if action == oracle_move:
+        return "correct"
+    if (action in ("CLOCK", "ANTICLOCK")
+            and abs(rel) >= ORACLE_EITHER_TURN_RAD):
+        return "correct"   # gold ~behind: either rotation is the move
+    if action == "FORWARD" and not ray_hit and abs(rel) <= ORACLE_CONE_RAD:
+        return "neutral"   # inside the instructed cone; analyst decides
+    toward = (action == "CLOCK" and rel > 0) or \
+             (action == "ANTICLOCK" and rel < 0)
+    if toward and ray_hit:
+        return "neutral"   # fine-tuning aim past "good enough"
+    return "wrong"
 
 
 # =====================================================================
@@ -218,7 +336,7 @@ def action_balance_multipliers(counts: dict[str, int]) -> dict[str, float]:
 
 
 # =====================================================================
-# WORK IN PROGRESS -- NOVELTY ("BOREDOM") DECAY
+# WORK IN PROGRESS -- NOVELTY ("BOREDOM") DECAY -- OFF BY DEFAULT
 # =====================================================================
 # Biological feedback loops do not reward every step equally: repeating
 # the same action over and over stops being exciting ("boredom"), while
@@ -228,6 +346,15 @@ def action_balance_multipliers(counts: dict[str, int]) -> dict[str, float]:
 # weight (floored at NOVELTY_FLOOR ~= "unrewarded"), so the 2026-08-04
 # spin-bot pattern (dozens of consecutive ANTICLOCKs) stops feeding on
 # itself, while a *varied* move sequence keeps full weight.
+#
+# OFF BY DEFAULT (2026-08-05, ``GameTraceSource(..., novelty=True)`` to
+# enable): with the RL-scale LR, the exp-advantage contrast, and the
+# oracle penalty on wrong-way turns, the spin-bot should be starved
+# without it -- and now that example scaling actually reaches the
+# gradient (train.py SHAPE VS SCALE; it used to be a near-no-op), an
+# untuned x0.1 decay is a much sharper knife than it ever was in a live
+# run. Turn it on only if a run shows repetition degeneracy despite the
+# new reward shape. The tracker and its t1 units stay regardless.
 #
 # KNOWN GAPS (future refinements live in FUTURE_GOALS.md):
 #   * only catches IDENTICAL CONSECUTIVE moves -- an alternating
@@ -338,39 +465,53 @@ class _TraceFileSource(DataSource):
 
 class GameTraceSource(_TraceFileSource):
     """One materialized datagen run as a DataSource. ``weight`` is the usual
-    epoch-mixture knob; the reward knobs are documented above and in
-    TRAINING_GAME_TRACES.md."""
+    epoch-mixture knob; the reward knobs are documented above (SHAPE/SCALE)
+    and in TRAINING_GAME_TRACES.md. ``novelty`` gates the WIP boredom decay
+    (off by default -- WIP block above)."""
 
     def __init__(
         self,
         path: str | Path,
         weight: float = 1.0,
-        rating_scale: float = 1.0,
-        wrong_weight: float = 0.0,
+        wrong_weight: float = WRONG_SPAN_WEIGHT,
         win_boost: float = 1.0,
         win_gamma: float = 0.95,
+        novelty: bool = False,
         noise_strength: float = TRAINING_STRENGTH,
         noise_seed: int | None = None,
     ):
         super().__init__(path, noise_strength, noise_seed)
         self.name = f"game_{self.trace_dir.name}"
         self.weight = weight
-        self.rating_scale = rating_scale
         self.wrong_weight = wrong_weight
         self.win_boost = win_boost
         self.win_gamma = win_gamma
-        # ACTION BALANCE (TEMPORARY HACK -- screaming block above): one
-        # counting pre-pass over the records that will actually train
-        # (rated move records), so each move type gets equal total mass.
+        self.novelty = novelty
+        # One pre-pass over the records that will actually train (rated
+        # records) feeds two corpus statistics:
+        #   * ACTION BALANCE counts (TEMPORARY HACK -- screaming block
+        #     above): equal total mass per move type;
+        #   * the mean rating r_bar, the baseline of the exp-advantage
+        #     scale (rating_advantage) -- "advantage" is only meaningful
+        #     relative to what this corpus considers average.
         counts: dict[str, int] = {}
+        rating_sum = 0.0
+        n_rated = 0
         for _, _, _, meta in self._iter_records():
+            if meta.get("rating") is None:
+                continue
+            rating_sum += float(meta["rating"])
+            n_rated += 1
             action = meta.get("action")
-            if action is not None and meta.get("rating") is not None:
+            if action is not None:
                 counts[action] = counts.get(action, 0) + 1
+        self.rating_baseline = rating_sum / n_rated if n_rated else 0.0
         self.action_balance = action_balance_multipliers(counts)
-        if self.action_balance:
+        if n_rated:
             logger.info(
-                "%s: action balance multipliers %s (counts %s)", self.name,
+                "%s: rating baseline (r_bar) %.3f over %d rated record(s); "
+                "action balance multipliers %s (counts %s)", self.name,
+                self.rating_baseline, n_rated,
                 {a: round(m, 3) for a, m in self.action_balance.items()},
                 counts,
             )
@@ -381,46 +522,61 @@ class GameTraceSource(_TraceFileSource):
         # dir lives for the run and is left to OS tmp cleanup.
         rng = random.Random(self.noise_seed)
         noise_dir = Path(tempfile.mkdtemp(prefix=f"{self.name}_noise_"))
-        novelty = NoveltyTracker()
+        novelty = NoveltyTracker() if self.novelty else None
         n_dropped = 0
+        n_floored = 0
         n_yielded = 0
+        verdicts = {"correct": 0, "neutral": 0, "wrong": 0, "unknown": 0}
         for lineno, messages, target_text, meta in self._iter_records():
             # The streak advances on EVERY move record -- even ones dropped
-            # below for a missing rating -- because the move still happened
-            # in the game; only the training weight is per-record.
+            # below -- because the move still happened in the game; only
+            # the training weight is per-record.
             novelty_mult = novelty.multiplier(
                 meta.get("session_id"), meta.get("game_index"),
                 meta.get("action"),
-            )
+            ) if novelty else 1.0
             if meta.get("rating") is None:
                 n_dropped += 1
                 continue
 
+            action = meta.get("action")
+            verdict = oracle_verdict(
+                action, meta.get("oracle_move"),
+                meta.get("oracle_rel_bearing"), meta.get("oracle_ray_hit"),
+            )
+            verdicts[verdict] += 1
+
+            # SCALE (module docstring): reply-wide reward on
+            # example_weight -- per-example normalization would cancel it
+            # on the span weights (train.py, SHAPE VS SCALE).
+            scale = example_scale(
+                float(meta["rating"]), self.rating_baseline,
+                bool(meta.get("game_won")), meta.get("moves_from_end"),
+                self.win_boost, self.win_gamma,
+            )
+            scale *= self.action_balance.get(action, 1.0)
+            scale *= novelty_mult
+            if verdict == "wrong":
+                # The rationalization of an oracle-wrong move is suspect
+                # end to end -- damp its cloning AND its suppression.
+                scale *= ORACLE_WRONG_SCALE
+            if scale == 0.0:
+                # Floored rating, no win boost: teaches NOTHING -- skip
+                # the forward pass entirely rather than burn it on a
+                # zero-scaled loss.
+                n_floored += 1
+                continue
+
             self._rewrite_frames(messages, rng, noise_dir, lineno)
 
+            # SHAPE (module docstring): within-reply emphasis only.
             spans = build_span_weights(
                 target_text,
-                rating=float(meta["rating"]),
                 wrong_spans=list(meta.get("wrong_spans") or []),
-                game_won=bool(meta.get("game_won")),
-                moves_from_end=meta.get("moves_from_end"),
-                rating_scale=self.rating_scale,
+                action=action,
+                verdict=verdict,
                 wrong_weight=self.wrong_weight,
-                win_boost=self.win_boost,
-                win_gamma=self.win_gamma,
             )
-            # Two whole-record multipliers compose here (the reply is a
-            # rationalization of its move; zero weights -- WRONG spans,
-            # floored ratings -- stay zero; results may exceed 1.0, which
-            # is fine: NON-NEGATIVITY is the collapse-proofing property):
-            #   * novelty decay (WIP, NoveltyTracker above);
-            #   * action balance (TEMPORARY HACK, screaming block above)
-            #     -- perception records (action None) are untouched.
-            mult = novelty_mult * self.action_balance.get(
-                meta.get("action"), 1.0
-            )
-            if mult != 1.0:
-                spans = [(s, e, w * mult) for s, e, w in spans]
 
             yield TrainingExample(
                 messages=messages,
@@ -429,13 +585,30 @@ class GameTraceSource(_TraceFileSource):
                 loss="ce",
                 source=self.name,
                 meta=meta,
+                example_weight=scale,
             )
             n_yielded += 1
+        logger.info(
+            "%s: oracle verdicts %s over %d rated record(s)",
+            self.name, verdicts, sum(verdicts.values()),
+        )
+        if verdicts["unknown"] == sum(verdicts.values()) and n_yielded:
+            logger.info(
+                "%s: no oracle meta anywhere -- pre-2026-08-05 corpus, "
+                "move tokens graded by the analyst alone", self.name,
+            )
+        if n_floored:
+            logger.info(
+                "%s: SKIPPED %d/%d record(s) at zero example weight "
+                "(rating at/below the %.1f floor, no win boost).",
+                self.name, n_floored, n_floored + n_yielded + n_dropped,
+                RATING_FLOOR,
+            )
         if n_dropped:
             logger.warning(
                 "%s: DROPPED %d/%d record(s) with no parseable RATING "
                 "(never train on a guessed reward).",
-                self.name, n_dropped, n_dropped + n_yielded,
+                self.name, n_dropped, n_dropped + n_floored + n_yielded,
             )
 
 

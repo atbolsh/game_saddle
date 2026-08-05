@@ -32,6 +32,11 @@ failure signal that would justify revisiting it. See
    The grading signal is the analyst itself. This is the "springboard"
    principle: in the environments this repo is meant to grow into, no oracle
    engine will be available, so the loop must not learn to depend on one.
+   **PARTIALLY SUSPENDED 2026-08-05:** after two failed runs the
+   engine-oracle crutch was activated for move tokens (see "Disagree and
+   commit: engine-derived baselines" below, and the crutch block in
+   [game_traces.py](game_traces.py)). The principle stands as the end
+   state; the crutch is explicitly temporary.
 
 The exact mapping from analyst verdict to per-token weights lives in the
 game-trace `DataSource` ([game_traces.py](game_traces.py)), not in
@@ -164,61 +169,77 @@ clipping — which is also why each batch is trained for a SINGLE epoch
 (after one gradient step the data is off-policy and this estimator has no
 correction for that).
 
-Per token of the player reply, `GameTraceSource` builds the weight as
-(**every output non-negative** — see the collapse postmortem below):
+**The 2026-08-05 shape/scale split.** A real bug forced a restructuring:
+`weighted_loss` normalizes each example by its own sum of |weights|, which
+makes the loss **scale-invariant in the span weights** — any uniform
+reward multiplier on a reply's weights cancels top and bottom (only the
+terminator's fixed 1.0 kept it from cancelling exactly; a ×0.1 novelty
+"downweight" changed the gradient ~8%, not 10×). Every reply-wide reward
+knob of the aug4 runs — rating base, win boost, action balance, novelty —
+was therefore a near-no-op, and the run cloned its corpus at effectively
+uniform strength. The reward now splits into two carriers:
 
-1. **base = `max(0, (r + 0.5) / 1.5)`** from the analyst rating
-   `r ∈ [-1, 1]`, over the whole reply — every token of a reply is the same
-   "move", so they share its reward. The mapping is 0 at `r ≤ -0.5`
-   (confirmed-bad moves teach nothing) and rises linearly to 1.0 at
-   `r = +1.0`, so the analyst's gradation is preserved everywhere above the
-   floor. The offset is FIXED (+0.5), never batch-relative: the analyst's
-   zero is semantically absolute ("neither helps nor hurts"), and a batch
-   of all-good moves must not have its best moves relatively punished;
-2. **verified `WRONG:` spans override the base with 0.0** — masked out of
-   cloning, not "unlearned"; unverified spans never reach training;
-3. **win boost, won games only:** `b = 1.0 * 0.95^d` (`d` = rounds from
-   the winning move) is added UNIFORMLY to every token of the message —
-   including WRONG spans (they become `0.0 + b`). The win is the loop's
-   ONLY ground-truth signal, and the boost is deliberately sized to
-   dominate it: there is NO upper clamp, so at and near the winning move
-   every token weighs `base + ~1.0` (up to ~2.0) — real-game success
-   OUTWEIGHS even a perfectly analyst-rated move in a lost game. The
-   analyst is a hackable proxy (see the spin-bot below); wins must be
-   clamped onto and kept, not re-litigated. The only hard bound on
-   weights is non-negativity (the collapse postmortem below). The decay's
-   ~13.5-round half-life still means long wandering prefixes of a lucky
-   game earn much less than the closing approach;
-4. **action balance — TEMPORARY HACK** (`action_balance_multipliers`,
-   screaming block in [game_traces.py](game_traces.py)): each move
-   record's weights are scaled by `mean_count / count(its action)`,
-   counted over the same corpus at source load (logged at INFO), clamped
-   to `[1/4, 4]` (a binding cap logs a WARNING — it means the corpus mix
-   is degenerate). Every move TYPE thus carries equal total cloning mass
-   per epoch; weights may exceed 1.0, which is fine (non-negativity is
-   the property the collapse-proofing needs, not a cap). Closed-loop by
-   construction — an over-represented action is automatically damped —
-   unlike the flat FORWARD bonus it replaced, which would have pushed a
-   FORWARD-heavy corpus even further. Exists only to break the
-   2026-08-04 spin-bot pattern (below); REMOVE once a principled
-   per-move signal exists — it cannot survive into environments where
-   move types genuinely differ in importance. Perception records
-   (`action: null`) are untouched;
-5. **novelty ("boredom") decay — WORK IN PROGRESS** (`NoveltyTracker`):
-   the whole record's weights are multiplied by `max(0.1, 0.9^k)` where
-   `k` counts consecutive identical moves within one game (perception
-   rounds are skipped, not reset). Repeating the same move over and over
-   earns less and less cloning weight; the floor means "unrewarded",
-   never "unlearned". Known gap: alternating CLOCK/ANTICLOCK loops and
-   revisited positions sail through — refinements (state hashes, arousal
-   upweighting, datagen-time sampling) live in
-   [FUTURE_GOALS.md](../FUTURE_GOALS.md).
+**SCALE — `TrainingExample.example_weight`** ("how much this reply
+matters"), applied by the loss AFTER normalization, so it actually
+reaches the gradient. Multiplicative chain, per reply:
 
-What negative weights were meant to buy — suppressing bad behavior — is
-provided instead by the **player trust region** (below), which is bounded
-by construction.
+1. **base = exp-advantage** (`rating_advantage`): 0 at `r ≤ -0.5` (hard
+   floor: confirmed-bad replies teach *nothing*), else
+   `min(3.0, exp((r - r_bar) / 0.3))` where `r_bar` is the corpus mean
+   rating (pre-pass at source load, logged). The analyst's **ranking** is
+   the signal we trust — its absolute calibration drifts and saturates
+   (aug4: 77% of iter2 moves rated exactly +1.0), and under any fixed
+   affine mapping a saturated corpus trains as uniform behavior cloning.
+   The exponential restores contrast wherever the ratings sit: ~2× per
+   +0.2 of rating above the mean, symmetric below, capped at 3.0 so one
+   reply cannot own its batch;
+2. **+ win boost, won games only:** `1.0 * 0.95^d` (`d` = rounds from the
+   winning move), ADDED to the base. The win is the loop's ONLY
+   ground-truth reward and is sized to dominate the analyst — it even
+   rescues an analyst-floored reply near a win. The ~13.5-round half-life
+   still pays the closing approach far more than a lucky game's wandering
+   prefix;
+3. **× action balance — TEMPORARY HACK** (`action_balance_multipliers`,
+   screaming block in [game_traces.py](game_traces.py)):
+   `mean_count / count(action)` over the same corpus, clamped to
+   `[1/4, 4]` (a binding cap logs a WARNING — the corpus mix is
+   degenerate). Equal total cloning mass per move TYPE; closed-loop, so a
+   turn-heavy corpus can no longer amplify itself. REMOVE once a
+   principled per-move signal exists;
+4. **× novelty ("boredom") decay — WORK IN PROGRESS, OFF BY DEFAULT**
+   (`NoveltyTracker`; enable with `GameTraceSource(..., novelty=True)`):
+   `max(0.1, 0.9^k)` on the k-th consecutive identical move (perception
+   rounds skipped, not reset). Off since 2026-08-05: with the RL-scale
+   LR, the exp-advantage contrast, and the oracle penalty the spin-bot
+   should be starved without it, and now that example scaling actually
+   bites, an untuned ×0.1 is a much sharper knife than it was. Re-enable
+   only on observed repetition degeneracy;
+5. **× 0.25 when the engine oracle contradicts the move**
+   (`ORACLE_WRONG_SCALE`, crutch below) — the rationalization of a wrong
+   move is suspect end to end.
 
-### The 2026-08-04 spin-bot (why steps 5–6 exist)
+A scale of exactly 0 (floored rating, no win boost) **skips the record**
+(logged) — zero-scaled forwards teach nothing and cost real GPU time.
+
+**SHAPE — `span_weights`** (relative emphasis WITHIN the reply,
+`build_span_weights`):
+
+1. **base 1.0** over the whole reply — every token of a reply is the same
+   "move", so they share its reward;
+2. **verified `WRONG:` spans → −0.5** (`WRONG_SPAN_WEIGHT`): **bounded
+   unlikelihood** in the loss (`-log(1 - p)`, |w| as emphasis — train.py,
+   NEGATIVE WEIGHTS) — verified-bad text is actively suppressed again,
+   with a floored objective this time (postmortem below). Unverified
+   spans never reach training. The win boost does NOT soften these
+   anymore: a verified-wrong claim stays wrong in a won game;
+3. **the move token gets the oracle's verdict** (crutch block in
+   [game_traces.py](game_traces.py)): `[MOVE]` span → **1.5** when it
+   matches the engine oracle, **−0.5** (unlikelihood) when it contradicts
+   it, untouched on "neutral" (defensible under the instructed 45° cone)
+   or "unknown" (no oracle meta — pre-2026-08-05 corpora; counted and
+   logged).
+
+### The 2026-08-04 spin-bot (why the balance, oracle, and contrast exist)
 
 The first collapse-proofed retest produced no gibberish — but got WORSE at
 the game each epoch. The analyst rated 77% of iter2's moves exactly +1.0
@@ -226,31 +247,45 @@ the game each epoch. The analyst rated 77% of iter2's moves exactly +1.0
 reward-weighted regression degenerated into plain behavior cloning of the
 corpus action mix, which was already turn-heavy; each epoch amplified it
 (smoke evals: 28% FORWARD / 40% ANTICLOCK → 6.5% / 69%, mean rating
-0.785 → 0.348, a bot that spins in place forever). The novelty decay
-drains weight out of repeated-move runs; the action balancing equalizes
-the total cloning mass per move type, so a turn-heavy corpus can no
-longer amplify itself epoch over epoch. Only the smoke eval caught this —
-every offline held-out loss improved while the policy degraded.
+0.785 → 0.348, a bot that spins in place forever). The 2026-08-05 defense
+stack: the exp-advantage base restores contrast among the saturated
+ratings; the action balance equalizes total cloning mass per move type,
+so a turn-heavy corpus can no longer amplify itself; the engine oracle
+punishes wrong-way turns directly; and the RL-scale LR (3e-6, clip 0.1 —
+TRAINING_OVERVIEW recipe) shrinks how far any one epoch can push. The
+novelty decay stays available behind its toggle if repetition degeneracy
+survives all of that. Only the smoke eval caught this failure — every
+offline held-out loss improved while the policy degraded.
 
-### Postmortem: the 2026-08-01 collapse (why nothing may go negative)
+### Postmortem: the 2026-08-01 collapse (the unbounded objective)
 
 The original mapping used the rating directly (weights in `[-1, 1]`, with a
-`negative_scale` knob defaulting to symmetric REINFORCE). Weighted CE with
-negative weights is **unbounded below**: the model is paid to make
-negatively-weighted tokens arbitrarily unlikely, and the cheapest way to do
-that is to destroy the language model itself. The first weekend run did
-exactly that: epoch 2's corpus skewed negative, training loss fell
-0.11 → -37.5 in ~300 steps, the checkpoint fled into `<unused...>` token
-gibberish, and epochs 3–7 burned ~15h of datagen on unparseable output.
-The guards missed it because (a) no eval ran before step 200, so the first
-post-collapse eval BECAME the baseline, and (b) the rollback target tracked
-the newest checkpoint with ANY improving metric — i.e. the regressed save
-itself. The full defense stack is now: this non-negative mapping (bounded
-objective), the step-0 baseline eval + two-tier guards + `last_good_ckpt`
-rollback (train.py), the player trust region (below), the datagen
-degeneracy fuse (`DEGENERACY_FUSE` in the generator: 25 consecutive
-rating-less AND move-less generations → exit 3), and the orchestrator's
-stop-on-poison (run_weekend.py).
+`negative_scale` knob defaulting to symmetric REINFORCE). Negative-weight
+CE (`w * -log p`) is **unbounded below with a gradient that GROWS as
+p → 0**: the model is paid ever more to make those tokens ever less
+likely, and the cheapest descent direction is to destroy the whole
+distribution. The first weekend run did exactly that: epoch 2's corpus
+skewed negative, training loss fell 0.11 → -37.5 in ~300 steps, the
+checkpoint fled into `<unused...>` token gibberish, and epochs 3–7 burned
+~15h of datagen on unparseable output. The guards missed it because (a) no
+eval ran before step 200, so the first post-collapse eval BECAME the
+baseline, and (b) the rollback target tracked the newest checkpoint with
+ANY improving metric — i.e. the regressed save itself.
+
+**The corrected lesson (2026-08-05):** the problem was never negative
+signal per se — it was the unbounded FORM. Bounded unlikelihood
+(`-log(1 - p)`) also pushes a bad token's probability down, but the loss
+floors at 0 and its gradient **vanishes** as p → 0: there is no collapse
+well. The interim all-non-negative mapping (`max(0, (r+0.5)/1.5)`) was
+safe but overcorrected — masking verified-bad text to 0 suppresses
+nothing, and pairing it with a saturated analyst produced the aug4
+uniform-cloning failure. The current scheme (above) restores negative
+signal in the bounded form. The rest of the defense stack: the step-0
+baseline eval + two-tier guards + `last_good_ckpt` rollback (train.py),
+the player trust region (below), the datagen degeneracy fuse
+(`DEGENERACY_FUSE` in the generator: 25 consecutive rating-less AND
+move-less generations → exit 3), and the orchestrator's stop-on-poison
+(run_weekend.py).
 
 ### The player trust region (kd_anchor)
 
@@ -333,7 +368,7 @@ analyst *improve* rather than merely not degrade.
 verification (springboard principle). Recorded as the pre-approved mechanism
 for a later "train the analyst" stage if one happens.
 
-### Disagree and commit: engine-derived baselines for player data
+### Disagree and commit: engine-derived baselines for player data — **ACTIVATED 2026-08-05**
 
 **Recommended:** the engine's settings admit trivial oracles — a
 settings-to-optimal-move function (compute relative bearing, threshold into
@@ -343,11 +378,31 @@ down-weight player examples whose move contradicts the oracle) they are
 invisible at inference and cost nothing at runtime; used as *metrics* they
 give an analyst-independent measure of player progress.
 
-**Committed instead:** the analyst is the only grader (springboard
-principle: no oracle in future environments). Recorded as the first crutch
-to add if training on analyst-graded data alone fails to move the fixed
-eval — an oracle filter cleanly separates "the data was bad" from "the
-training didn't take".
+**Originally committed instead:** the analyst as the only grader
+(springboard principle), with this recorded as the first crutch to add if
+training on analyst-graded data alone failed to move the fixed eval.
+
+**That failure signal arrived** (two runs: the 2026-08-01 collapse, then
+the aug4 spin-bot under a saturated analyst), so the crutch is now LIVE —
+deliberately, and marked ULTRAVIOLET in the code. Datagen stamps the raw
+facts per move (`_oracle_meta`: `oracle_rel_bearing`, `oracle_ray_hit`,
+`oracle_move` — exact, since bare levels have no internal walls);
+`game_traces.oracle_verdict` classifies at train time:
+
+| verdict | geometry | effect |
+|---|---|---|
+| `correct` | matches `oracle_move` (or any turn when the gold is ≥170° behind) | move-token span **1.5** |
+| `neutral` | defensible under the instructed 45° cone (FORWARD in-cone without a ray hit; toward-gold turn despite a ray hit) | none — the analyst's rating stands |
+| `wrong` | turn away from the shorter rotation; FORWARD outside the cone | move-token span **−0.5** (unlikelihood) + example scale **×0.25** |
+| `unknown` | no oracle meta (old corpora) / no move | none; counted + logged |
+
+Facts live in the data, thresholds live train-side — retuning never
+requires regenerating traces. The springboard principle still holds as the
+end state: this oracle hard-wires "good play = greedy geodesic to the
+nearest gold", which future environments (internal walls, competing goals)
+will make actively wrong — remove it or demote it to an analyst-visible
+feature by then (crutch block in [game_traces.py](game_traces.py),
+[FUTURE_GOALS.md](../FUTURE_GOALS.md)).
 
 ### Disagree and commit: supervised perception data from the engine
 

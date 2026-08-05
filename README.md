@@ -385,14 +385,16 @@ shared weights learn to play. Each player record stores the exact player
 prompt, the raw reply
 (the only trainable tokens — analyst text never enters player records),
 and raw
-annotations (rating, verified `WRONG:` spans, outcome). At training time
-`GameTraceSource` turns those into per-token weights — **single-sample
-offline REINFORCE with a shaped per-token advantage (reward-weighted
-regression)**: the analyst rating mapped to a non-negative reply-wide
-base, verified `WRONG:` spans masked to 0, and a discounted `1.0 * 0.95^d`
-win boost added uniformly on won games (sized to dominate the analyst near
-a win — the game's one ground-truth signal) — and re-noises the frames per
-run. Details and knobs in
+annotations (rating, verified `WRONG:` spans, outcome, engine-oracle
+facts). At training time `GameTraceSource` turns those into a per-reply
+scale plus per-token shape — **single-sample offline REINFORCE with a
+shaped per-token advantage (reward-weighted regression)**: the reply-wide
+`example_weight` carries an exponential advantage over the corpus mean
+rating plus a discounted `1.0 * 0.95^d` win boost (ground truth, sized to
+dominate the analyst near a win), while span weights mark verified
+`WRONG:` spans and oracle-contradicted move tokens at −0.5 (bounded
+unlikelihood — active suppression with a floored objective) — and
+re-noises the frames per run. Details and knobs in
 [training/TRAINING_GAME_TRACES.md](training/TRAINING_GAME_TRACES.md).
 The recorded long-term direction (staged, not scheduled) is **prompt
 internalization**: context-distill the system prompt and then the

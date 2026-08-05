@@ -24,14 +24,19 @@ new dependencies -- plain asserts.
 Stage map (rationale in the Intermission plan):
 
   * t0-env      imports + versions + CUDA + bitsandbytes
-  * t1-pure     parse_rating, build_span_weights (non-negative mapping),
-                image noise, tripwire, _rewrite_image_urls, Game/Player-
-                Anchor/Analyst sources on a fabricated dir, epoch_batches
-                bucketing, stack_equal_length
+  * t1-pure     parse_rating, the shape/scale reward split
+                (rating_advantage / example_scale / build_span_weights),
+                oracle_verdict + _oracle_meta geometry, image noise,
+                tripwire, _rewrite_image_urls, Game/PlayerAnchor/Analyst
+                sources on fabricated dirs (example_weight, oracle
+                modifiers, novelty toggle), epoch_batches bucketing,
+                stack_equal_length
   * t2-data     manifest loads, per-source counts vs meta.json, probes exist
   * t3-model    4-bit QLoRA load, terminator, CE/KD forward+backward
                 (image example included), teacher-path sanity, kd_anchor
-                base-fallback parity
+                base-fallback parity, example_weight exact-scaling
+                regression, bounded-unlikelihood loss finite/non-negative,
+                kd rejects negative weights
   * t4-train    batch-4 vs batch-1 loss parity, CLI smoke train (CE + KD +
                 negative span + image), forced-rollback variant (hard tier)
   * t5-datagen  2 games x 5 moves at --parallel 2: traces, images, stats,
@@ -210,6 +215,7 @@ def t0_env() -> str:
 def t1_pure() -> str:
     """The pure-python units -- no GPU, no NAMS, no downloads."""
     import io
+    import math
     import random
     from collections import Counter
 
@@ -218,16 +224,25 @@ def t1_pure() -> str:
     from agent.modes import parse_rating
     from training.game_traces import (
         ACTION_BALANCE_CAP,
+        ADV_CAP,
+        ORACLE_MATCH_SPAN,
+        ORACLE_WRONG_SCALE,
+        ORACLE_WRONG_SPAN,
+        WRONG_SPAN_WEIGHT,
         AnalystTraceSource,
         GameTraceSource,
         NoveltyTracker,
         PlayerAnchorSource,
         action_balance_multipliers,
         build_span_weights,
+        example_scale,
+        oracle_verdict,
+        rating_advantage,
     )
     from training.generate_game_traces import (
         PERCEPTION_QUESTION_GROUPS,
         _assert_no_analyst_leak,
+        _oracle_meta,
         _rewrite_image_urls,
         _sample_perception_question,
     )
@@ -260,34 +275,85 @@ def t1_pure() -> str:
         assert got == expected, f"parse_rating({text!r}) = {got}, want {expected}"
         checks += 1
 
-    # ---- build_span_weights: non-negative mapping max(0, (r+0.5)/1.5),
-    # WRONG spans masked to 0, win boost, hard floor (2026-08-01 collapse
-    # fix -- rationale above the function in training/game_traces.py)
-    tgt = "go left WRONG: gold is right done"
-    spans = build_span_weights(tgt, rating=0.5, wrong_spans=["WRONG: gold is right"],
-                               game_won=False, moves_from_end=None)
-    assert abs(spans[0][2] - (1.0 / 1.5)) < 1e-9, spans[0]  # (0.5+0.5)/1.5
-    assert (spans[0][0], spans[0][1]) == (0, len(tgt)), spans[0]
-    assert spans[1][2] == 0.0 and tgt[spans[1][0]:spans[1][1]].startswith("WRONG"), spans[1]
-    win = build_span_weights(tgt, rating=0.9, wrong_spans=["WRONG: gold is right"],
-                             game_won=True, moves_from_end=0)
-    # NO upper clamp: base + boost = 1.4/1.5 + 1.0 -- near a win the
-    # ground-truth signal OUTWEIGHS any analyst-rated move elsewhere
-    assert abs(win[0][2] - (1.4 / 1.5 + 1.0)) < 1e-9, win[0]
-    # even the masked WRONG span gets the full boost (0.0 + 1.0)
-    assert abs(win[1][2] - 1.0) < 1e-9, win[1]
-    # decay precision away from the win: base 0 (worst rating), d=8 ->
-    # weight is exactly the boost, 1.0 * 0.95^8
-    decay = build_span_weights(tgt, rating=-1.0, wrong_spans=[],
-                               game_won=True, moves_from_end=8)
-    assert abs(decay[0][2] - 0.95 ** 8) < 1e-9, decay[0]
-    floor = build_span_weights(tgt, rating=-0.5, wrong_spans=[],
-                               game_won=False, moves_from_end=None)
-    assert floor[0][2] == 0.0, floor[0]          # cutoff hits 0 exactly
-    worst = build_span_weights(tgt, rating=-1.0, wrong_spans=[],
-                               game_won=False, moves_from_end=None)
-    assert worst[0][2] == 0.0, worst[0]          # NEVER negative
-    checks += 7
+    # ---- rating_advantage / example_scale: the reply-wide SCALE half of
+    # the 2026-08-05 shape/scale split (module docstring + postmortem in
+    # training/game_traces.py). Exp-advantage vs the corpus mean, hard
+    # floor at -0.5, cap at ADV_CAP, ADDITIVE win boost 1.0 * 0.95^d.
+    assert abs(rating_advantage(0.6, baseline=0.6) - 1.0) < 1e-9
+    assert abs(rating_advantage(0.8, baseline=0.6)
+               - math.exp(0.2 / 0.3)) < 1e-9      # ~2x per +0.2 of rating
+    assert rating_advantage(-0.5, baseline=0.6) == 0.0   # floor: exactly 0
+    assert rating_advantage(-1.0, baseline=0.6) == 0.0   # NEVER negative
+    assert rating_advantage(1.0, baseline=-0.4) == ADV_CAP  # capped at 3.0
+    # win boost is additive on the scale: rescues even a floored reply
+    assert abs(example_scale(0.6, 0.6, game_won=True, moves_from_end=0)
+               - 2.0) < 1e-9                      # 1.0 base + 1.0 boost
+    assert abs(example_scale(-1.0, 0.6, game_won=True, moves_from_end=8)
+               - 0.95 ** 8) < 1e-9                # floored base, boost only
+    assert example_scale(-0.5, 0.6, game_won=False,
+                         moves_from_end=None) == 0.0     # floor, no rescue
+    checks += 8
+
+    # ---- build_span_weights: the within-reply SHAPE half -- base 1.0,
+    # verified WRONG spans at WRONG_SPAN_WEIGHT (-0.5 = bounded
+    # unlikelihood, train.py NEGATIVE WEIGHTS), the oracle's move-token
+    # modifier LAST (ground truth outranks the analyst on overlap).
+    tgt = "go left WRONG: gold is right [CLOCK]"
+    spans = build_span_weights(tgt, wrong_spans=["WRONG: gold is right"])
+    assert spans[0] == (0, len(tgt), 1.0), spans[0]
+    assert spans[1][2] == WRONG_SPAN_WEIGHT and \
+        tgt[spans[1][0]:spans[1][1]].startswith("WRONG"), spans[1]
+    ok = build_span_weights(tgt, wrong_spans=[], action="CLOCK",
+                            verdict="correct")
+    assert ok[-1] == (tgt.rfind("[CLOCK]"), len(tgt), ORACLE_MATCH_SPAN), ok
+    bad = build_span_weights(tgt, wrong_spans=[], action="CLOCK",
+                             verdict="wrong")
+    assert bad[-1][2] == ORACLE_WRONG_SPAN, bad
+    # neutral / unknown verdicts add NO modifier; missing token is skipped
+    assert len(build_span_weights(tgt, wrong_spans=[], action="CLOCK",
+                                  verdict="neutral")) == 1
+    assert len(build_span_weights(tgt, wrong_spans=[], action="FORWARD",
+                                  verdict="correct")) == 1
+    checks += 6
+
+    # ---- oracle_verdict geometry (crutch block in game_traces.py):
+    # compass convention, positive rel_bearing = gold clockwise of facing
+    for args, want in [
+        (("FORWARD", "FORWARD", 0.0, True), "correct"),   # exact match
+        (("CLOCK", "CLOCK", 0.7, False), "correct"),
+        (("ANTICLOCK", "CLOCK", 3.05, False), "correct"),  # ~behind: either
+        (("FORWARD", "CLOCK", 0.5, False), "neutral"),    # inside 45deg cone
+        (("CLOCK", "FORWARD", 0.3, True), "neutral"),     # fine-tuning aim
+        (("FORWARD", "CLOCK", 1.2, False), "wrong"),      # outside the cone
+        (("CLOCK", "ANTICLOCK", -0.8, False), "wrong"),   # away from gold
+        (("ANTICLOCK", "FORWARD", 0.3, True), "wrong"),   # wrong-way turn
+        ((None, "FORWARD", 0.0, True), "unknown"),        # perception round
+        (("CLOCK", None, None, None), "unknown"),         # pre-oracle corpus
+    ]:
+        got = oracle_verdict(*args)
+        assert got == want, f"oracle_verdict{args} = {got}, want {want}"
+        checks += 1
+
+    # ---- _oracle_meta: raw facts from a settings dict (datagen side).
+    # Agent center-board facing 12 o'clock (theta=0, facing (sin,cos)).
+    base_settings = {"agent_x": 0.5, "agent_y": 0.5, "direction": 0.0,
+                     "agent_r": 0.05, "gold_r": 0.03}
+    north = _oracle_meta({**base_settings, "gold": [[0.5, 0.8]]})
+    assert north["oracle_move"] == "FORWARD" and north["oracle_ray_hit"], north
+    assert abs(north["oracle_rel_bearing"]) < 1e-9, north
+    east = _oracle_meta({**base_settings, "gold": [[0.8, 0.5]]})
+    assert east["oracle_move"] == "CLOCK" and not east["oracle_ray_hit"], east
+    assert abs(east["oracle_rel_bearing"] - math.pi / 2) < 1e-9, east
+    west = _oracle_meta({**base_settings, "gold": [[0.2, 0.5]]})
+    assert west["oracle_move"] == "ANTICLOCK", west
+    # nearest gold sets the bearing; a second, farther gold on the ray
+    # still counts for ray_hit
+    two = _oracle_meta({**base_settings, "gold": [[0.5, 0.9], [0.52, 0.6]]})
+    assert two["oracle_ray_hit"], two          # 0.02 perp < 0.08 reach
+    assert abs(two["oracle_rel_bearing"]
+               - math.atan2(0.02, 0.1)) < 1e-6, two  # nearest = (0.52, 0.6)
+    assert _oracle_meta({**base_settings, "gold": []}) == {}  # game won
+    checks += 8
 
     # ---- action balance (TEMPORARY HACK -- the screaming block above
     # action_balance_multipliers in training/game_traces.py): inverse
@@ -466,17 +532,21 @@ def t1_pure() -> str:
         assert ex.messages[0]["content"][0]["url"] == str(img), (
             "image url not resolved against the trace dir"
         )
-        base_w = ex.span_weights[0][2]
-        # (0.5 + 0.5) / 1.5 mapped base + 1.0 win boost at moves_from_end=0
-        # (no upper clamp)
-        assert abs(base_w - (1.0 / 1.5 + 1.0)) < 1e-9, (
-            f"mapped base + win boost wrong: {base_w}"
-        )
-        checks += 4
+        # SHAPE: base 1.0, WRONG span at -0.5 (unlikelihood) -- the
+        # reply-wide reward must NOT appear here (it would cancel under
+        # per-example normalization, train.py SHAPE VS SCALE)
+        assert ex.span_weights[0][2] == 1.0, ex.span_weights
+        assert ex.span_weights[1][2] == WRONG_SPAN_WEIGHT, ex.span_weights
+        # SCALE: single rated record, so r_bar == its own rating 0.5 ->
+        # exp(0) = 1.0 base, + 1.0 win boost at moves_from_end=0
+        assert abs(src.rating_baseline - 0.5) < 1e-9, src.rating_baseline
+        assert abs(ex.example_weight - 2.0) < 1e-9, ex.example_weight
+        checks += 6
 
-        # ---- novelty decay through GameTraceSource (WIP): three identical
-        # consecutive moves in one game -> whole-record weights scaled by
-        # 1.0 / 0.9 / 0.81; the parallel game is unaffected.
+        # ---- novelty decay through GameTraceSource (WIP, OFF by default
+        # -- novelty=True to enable): three identical consecutive moves in
+        # one game -> example_weight scaled by 1.0 / 0.9 / 0.81; the
+        # parallel game is unaffected.
         nov_dir = tmp_dir / "traces_novelty"
         nov_dir.mkdir()
         nov_records = []
@@ -504,18 +574,29 @@ def t1_pure() -> str:
         with open(nov_dir / "traces.jsonl", "w", encoding="utf-8") as f:
             for r in nov_records:
                 f.write(json.dumps(r) + "\n")
-        nsrc = GameTraceSource(nov_dir / "traces.jsonl", noise_strength=0.0)
-        # single-action corpus -> balance multiplier exactly 1.0, so this
-        # measures the novelty decay alone
+        nsrc = GameTraceSource(nov_dir / "traces.jsonl", novelty=True,
+                               noise_strength=0.0)
+        # single-action corpus -> balance multiplier exactly 1.0 and
+        # r_bar == 1.0 (exp(0) base 1.0), so this measures the decay alone
         assert nsrc.action_balance == {"ANTICLOCK": 1.0}, nsrc.action_balance
         nexs = list(nsrc.examples())
         assert len(nexs) == 4, nexs
-        nbases = [x.span_weights[0][2] for x in nexs]
+        nscales = [x.example_weight for x in nexs]
         assert all(abs(w - e) < 1e-9
-                   for w, e in zip(nbases, [1.0, 0.9, 0.81, 1.0])), (
-            f"novelty decay wrong through GameTraceSource: {nbases}"
+                   for w, e in zip(nscales, [1.0, 0.9, 0.81, 1.0])), (
+            f"novelty decay wrong through GameTraceSource: {nscales}"
         )
-        checks += 3
+        # span weights stay pure shape (uniform 1.0) -- the decay must
+        # ride example_weight or it cancels in the loss
+        assert all(x.span_weights[0][2] == 1.0 for x in nexs), nexs
+        # OFF BY DEFAULT: the same corpus without the toggle decays nothing
+        noff = [x.example_weight
+                for x in GameTraceSource(nov_dir / "traces.jsonl",
+                                         noise_strength=0.0).examples()]
+        assert all(abs(w - 1.0) < 1e-9 for w in noff), (
+            f"novelty leaked into a default (novelty=False) source: {noff}"
+        )
+        checks += 5
 
         # ---- action balance x novelty through GameTraceSource: mixed
         # actions (3 ANTICLOCK, 1 FORWARD -> mean 2 -> x2/3 and x2), last
@@ -536,18 +617,70 @@ def t1_pure() -> str:
                              "session_id": "sB", "game_index": 0,
                              "move_index": i, "action": action},
                 }) + "\n")
-        bsrc = GameTraceSource(bal_dir / "traces.jsonl", noise_strength=0.0)
+        bsrc = GameTraceSource(bal_dir / "traces.jsonl", novelty=True,
+                               noise_strength=0.0)
         assert (abs(bsrc.action_balance["ANTICLOCK"] - 2 / 3) < 1e-9
                 and abs(bsrc.action_balance["FORWARD"] - 2.0) < 1e-9), (
             bsrc.action_balance
         )
-        bbases = [x.span_weights[0][2] for x in bsrc.examples()]
-        # base 1.0 x balance, last record additionally x0.9 novelty
+        bscales = [x.example_weight for x in bsrc.examples()]
+        # exp-advantage base 1.0 (uniform ratings) x balance, last record
+        # additionally x0.9 novelty -- all on example_weight
         expect = [2 / 3, 2.0, 2 / 3, 0.9 * 2 / 3]
-        assert all(abs(w - e) < 1e-9 for w, e in zip(bbases, expect)), (
-            f"balance x novelty composition wrong: {bbases} != {expect}"
+        assert all(abs(w - e) < 1e-9 for w, e in zip(bscales, expect)), (
+            f"balance x novelty composition wrong: {bscales} != {expect}"
         )
         checks += 2
+
+        # ---- oracle through GameTraceSource: stamped meta -> move-token
+        # span modifier + the x0.25 example-scale penalty on "wrong"
+        # (crutch block in game_traces.py); floored ratings are SKIPPED.
+        orc_dir = tmp_dir / "traces_oracle"
+        orc_dir.mkdir()
+        orc_records = [
+            # matches the oracle -> [FORWARD] span at ORACLE_MATCH_SPAN
+            {"action": "FORWARD", "oracle_move": "FORWARD",
+             "oracle_rel_bearing": 0.05, "oracle_ray_hit": True,
+             "rating": 0.0},
+            # contradicts it (turn away) -> [CLOCK] span at
+            # ORACLE_WRONG_SPAN and example_weight x ORACLE_WRONG_SCALE
+            {"action": "CLOCK", "oracle_move": "ANTICLOCK",
+             "oracle_rel_bearing": -0.9, "oracle_ray_hit": False,
+             "rating": 0.0},
+            # floored rating, no win -> zero scale -> record SKIPPED
+            {"action": "FORWARD", "oracle_move": "FORWARD",
+             "oracle_rel_bearing": 0.0, "oracle_ray_hit": True,
+             "rating": -1.0},
+        ]
+        with open(orc_dir / "traces.jsonl", "w", encoding="utf-8") as f:
+            for i, m in enumerate(orc_records):
+                f.write(json.dumps({
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": "move?"},
+                    ]}],
+                    "target_text": f"reasoning [{m['action']}]",
+                    "meta": {**m, "wrong_spans": [], "game_won": False,
+                             "moves_from_end": None, "session_id": "sC",
+                             "game_index": 0, "move_index": i},
+                }) + "\n")
+        osrc = GameTraceSource(orc_dir / "traces.jsonl", noise_strength=0.0)
+        oexs = list(osrc.examples())
+        assert len(oexs) == 2, f"floored record not skipped: {len(oexs)}"
+        # r_bar = (0 + 0 - 1)/3 (the floored record still counts in the
+        # pre-pass -- it happened); survivors share rating 0.0, so with
+        # the balance factored out the scales isolate the oracle penalty
+        adv = rating_advantage(0.0, osrc.rating_baseline)
+        bal = osrc.action_balance
+        assert abs(oexs[0].example_weight - adv * bal["FORWARD"]) < 1e-9, (
+            oexs[0].example_weight, adv, bal,
+        )
+        assert abs(oexs[1].example_weight - adv * bal["CLOCK"]
+                   * ORACLE_WRONG_SCALE) < 1e-9, (
+            oexs[1].example_weight, adv, bal,
+        )
+        assert oexs[0].span_weights[-1][2] == ORACLE_MATCH_SPAN, oexs[0]
+        assert oexs[1].span_weights[-1][2] == ORACLE_WRONG_SPAN, oexs[1]
+        checks += 5
 
         # ---- PlayerAnchorSource on the same fabricated dir: trust-region
         # semantics -- EVERY parseable record kept (rating-null included),
@@ -916,12 +1049,63 @@ def t3_model() -> str:
                 f"kd_anchor without an anchor adapter gave {kda_loss:.4f} "
                 f"vs kd {kd_loss:.4f} -- the base fallback is broken"
             )
+
+            # SHAPE VS SCALE regression (2026-08-05, weighted_loss
+            # docstring): an example_weight of 0.1 must scale the loss by
+            # EXACTLY 0.1. The old code carried reply-wide reward on the
+            # span weights, where per-example normalization cancelled it
+            # -- every reward knob was a near-no-op.
+            ex = by_kind["ce_text"]
+            built = collator.build(ex)
+            base_loss = weighted_loss(
+                model, built["model_inputs"], built["weights"],
+                loss_kind="ce", example_weight=built["example_weight"],
+            )
+            scaled_loss = weighted_loss(
+                model, built["model_inputs"], built["weights"],
+                loss_kind="ce",
+                example_weight=built["example_weight"] * 0.1,
+            )
+            assert abs(float(scaled_loss) - 0.1 * float(base_loss)) < 1e-4, (
+                f"example_weight x0.1 gave {float(scaled_loss):.5f}, want "
+                f"{0.1 * float(base_loss):.5f} -- the scale is being "
+                "normalized away again"
+            )
+
+            # Bounded unlikelihood (weighted_loss NEGATIVE WEIGHTS): the
+            # smoke set's negative-span example must produce a FINITE,
+            # NON-NEGATIVE loss (negative-weight CE -- the 2026-08-01
+            # collapse objective -- goes negative immediately), and KD
+            # kinds must refuse negative weights outright.
+            neg_built = collator.build(by_kind["neg_span"])
+            assert float((neg_built["weights"] < 0).sum()) > 0, (
+                "smoke neg_span example lost its negative weights"
+            )
+            neg_loss = float(weighted_loss(
+                model, neg_built["model_inputs"], neg_built["weights"],
+                loss_kind="ce", example_weight=neg_built["example_weight"],
+            ).detach())
+            assert neg_loss == neg_loss and neg_loss >= 0.0, (
+                f"unlikelihood loss {neg_loss} -- negative or NaN means "
+                "the bounded -log(1-p) branch regressed to negative CE"
+            )
+            try:
+                weighted_loss(model, neg_built["model_inputs"],
+                              neg_built["weights"], loss_kind="kd")
+                raise AssertionError(
+                    "kd accepted negative span weights -- must ValueError"
+                )
+            except ValueError:
+                pass
+
             peak = torch.cuda.max_memory_allocated() / 2**30
             return (
                 f"{len(lora_targets)} LoRA targets, {len(projector)} projector "
                 f"module(s), terminator {terminator}; losses "
                 + ", ".join(f"{k}={v:.3f}" for k, v in losses.items())
                 + f"; KD==teacher-entropy ok; kd_anchor fallback ok; "
+                f"example_weight x0.1 scales exactly; unlikelihood "
+                f"{neg_loss:.3f} finite/non-negative; kd rejects negatives; "
                 f"peak {peak:.1f} GiB"
             )
     finally:

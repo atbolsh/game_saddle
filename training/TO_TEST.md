@@ -11,9 +11,9 @@ lines back for review. On a FAIL, also paste the traceback that precedes it.
 | # | Command | Cost | What it proves |
 |---|---------|------|----------------|
 | 0 | `python -m training.selftest t0` | seconds | imports; transformers >= 5.10; CUDA visible; bitsandbytes loads |
-| 1 | `python -m training.selftest t1` | seconds | pure units: `parse_rating` (incl. bold variants), `build_span_weights` (NON-NEGATIVE mapping `max(0,(r+0.5)/1.5)`, WRONG spans masked to 0, hard floor at r ≤ -0.5 — the 2026-08-01 collapse fix; win boost `1.0 * 0.95^d` with NO upper clamp: winning-move tokens reach base+1.0, incl. on masked WRONG spans, plus a decay-precision check at d=8), `action_balance_multipliers` (TEMPORARY hack: inverse-frequency mean/count per action, mass-preserving, cap 4x both ways on degenerate mixes; composed with novelty through `GameTraceSource` on a mixed-action fabricated corpus), `NoveltyTracker` (WIP boredom decay: 0.9^k on consecutive identical moves, floor 0.1, reset on a different move, perception rounds skipped WITHOUT resetting, per-game keys) both standalone and through `GameTraceSource`, `MetricGuard` ceiling-only mode (`relative=False`: best-ever multiplier + soft tier OFF, ceiling fires — the 2026-08-04 anchor-guard fix) and `warn_only` (detection unchanged, authority stripped in the trainer; defaults False — the 2026-08-05 KD-replay fix), image-noise determinism/identity + the 10% clean pass-through (`_SKIP_PROB`: a gate-landing seed must return the untouched frame), analyst-leak tripwire (incl. multi-line), `_rewrite_image_urls`, `GameTraceSource` on a fabricated trace dir, `PlayerAnchorSource` on the same dir (kd_anchor loss, rating-null KEPT, uniform weights, 0.25 weight, ceiling-only guard at 1.0), micro-batch bucketing, planted-error scrambler (seed determinism, all three move-token modes, clock-shift tolerance labeling, direction swap incl. the "right move" guard, inert-text fallthrough), perception-question sampling (rate honored, groups and mirrored variants balanced), `AnalystTraceSource` on a fabricated file (KD loss kind, rating-null kept, unverified-span record dropped, quota weight, ceiling-only guard at 5.0), `stack_equal_length` (equal-length rows stack, mixed lengths hard-error) |
+| 1 | `python -m training.selftest t1` | seconds | pure units: `parse_rating` (incl. bold variants), the 2026-08-05 SHAPE/SCALE reward split — `rating_advantage` (exp-advantage vs a baseline: 1.0 at the mean, ~2x per +0.2, hard floor 0 at r ≤ -0.5, cap `ADV_CAP` 3.0) and `example_scale` (ADDITIVE win boost `1.0 * 0.95^d`, rescues a floored reply, exact-0 floor otherwise) on the SCALE side; `build_span_weights` on the SHAPE side (base 1.0, WRONG spans at −0.5 = bounded unlikelihood, oracle move-token modifier LAST and only on correct/wrong verdicts); `oracle_verdict` geometry (10 cases: exact match, either-turn ≥170°, in-cone FORWARD neutral, fine-tuning-turn neutral, out-of-cone/away-turn/wrong-way wrong, unknown on missing meta or perception rounds) and `_oracle_meta` raw facts from fabricated settings (compass convention, nearest-gold bearing, any-gold ray hit, empty when won); `action_balance_multipliers` (TEMPORARY hack: inverse-frequency mean/count per action, mass-preserving, cap 4x both ways on degenerate mixes), `NoveltyTracker` (WIP boredom decay: 0.9^k, floor 0.1, reset on a different move, perception rounds skipped WITHOUT resetting, per-game keys) standalone AND through `GameTraceSource` with `novelty=True` (OFF by default — a default source must NOT decay); `GameTraceSource` integration on fabricated corpora: span weights stay pure shape while `example_weight` carries exp-advantage × balance × novelty × oracle penalty (r_bar pre-pass asserted, oracle-wrong record gets ×0.25 + a −0.5 move span, floored records SKIPPED, rating-null DROPPED), `MetricGuard` ceiling-only mode (`relative=False`) and `warn_only`, image-noise determinism/identity + the 10% clean pass-through (`_SKIP_PROB`), analyst-leak tripwire (incl. multi-line), `_rewrite_image_urls`, `PlayerAnchorSource` (kd_anchor loss, rating-null KEPT, uniform weights, 0.25 weight, ceiling-only guard at 1.0), micro-batch bucketing, planted-error scrambler, perception-question sampling, `AnalystTraceSource` (KD loss kind, rating-null kept, unverified-span record dropped, quota weight, ceiling-only guard at 5.0), `stack_equal_length` |
 | 2 | `python -m training.selftest t2` | seconds | every enabled manifest entry materialized; `data.jsonl` row counts match `meta.json`; probe files present |
-| 3 | `python -m training.selftest t3` | minutes | 4-bit QLoRA load; LoRA target discovery + projector resolution; terminator id; one collated forward+backward per loss kind (image example included); fresh-adapter KD loss equals teacher entropy (the `disable_adapter()` teacher path); kd_anchor with NO anchor adapter loaded equals kd (the epoch-1 base fallback) |
+| 3 | `python -m training.selftest t3` | minutes | 4-bit QLoRA load; LoRA target discovery + projector resolution; terminator id; one collated forward+backward per loss kind (image example included); fresh-adapter KD loss equals teacher entropy (the `disable_adapter()` teacher path); kd_anchor with NO anchor adapter loaded equals kd (the epoch-1 base fallback); `example_weight` ×0.1 scales the loss by EXACTLY 0.1 (the 2026-08-05 shape/scale regression — the old code normalized reply-wide reward away); the negative-span smoke example yields a FINITE NON-NEGATIVE loss (bounded unlikelihood, not negative CE); `kd` with negative span weights raises ValueError |
 | 4 | `python -m training.selftest t4` | ~15–30 min | batch-4 vs batch-1 per-example loss parity (mixed CE/KD/image/negative-span buckets); CLI smoke train lands a checkpoint + `eval_log.jsonl` rows (INCLUDING the new step-0 baseline eval); destructive-LR variant fires the rollback path via the HARD tier (`--hard-multiplier 1.0` pins any regression to hard) AND must now END EARLY on the second consecutive rollback (2026-08-05): asserts a `consecutive_rollback_stop` event, exit 0, and a `done` event carrying `ended_early` + a usable `last_good_checkpoint` (the orchestrator hand-off contract) |
 | 5 | `python -m training.selftest t5` | ~10–20 min | datagen 2 games x 5 moves at `--parallel 2`: traces + stored frames + stats + plots written, one record per generation, tripwire silent, ratings parsed; `analyst_traces.jsonl` has one record per round (minus counted truncated-search skips), analyses nonempty, frames shared with player records |
 | 6 | `python -m training.selftest t6` | minutes | equal-length identical-prompt true GPU batch vs solo; variable-length via the VERIFIED LEFT-PAD workaround vs solo (must byte-match AND must actually take the padded path, not the cohort fallback) |
@@ -231,6 +231,35 @@ three changes, covered by t1 + t4 RERUNS:
   0.054 → 0.175 nats — its guard stays STRICT by design, so the defense
   is corpus weight. No selftest coverage (manifest quotas aren't unit
   tested); on the next run watch `heldout_loss/navigation` stay flat.
+
+Anti-self-cloning rework follow-ups (2026-08-05 evening — full design in
+TRAINING_GAME_TRACES.md "The reward scheme" + the train.py SHAPE VS SCALE
+docstring): the reward now splits into span SHAPE × `example_weight`
+SCALE, negative weights are bounded unlikelihood, the engine oracle
+grades move tokens, and the LR dropped to RL scale (3e-6, clip 0.1).
+Verification order:
+
+* **Rerun t1 and t3 first** (this batch rewrote both), then **t4** (loss
+  parity — `weighted_loss` changed) and **t10** (per the standing rule:
+  any `weighted_loss`/collation change reruns t3+t4 before t10). t7 is a
+  cheap extra confidence pass (kd_anchor through real steps).
+* **Datagen stamps oracle meta now** — after the first real datagen, spot
+  a `traces.jsonl` record for `oracle_move`/`oracle_rel_bearing`/
+  `oracle_ray_hit`, and check the source-load log line
+  `game_<dir>: oracle verdicts {...}`: on a healthy corpus "unknown"
+  should be ~the perception-round count (old corpora are all-unknown by
+  design and log a one-time INFO).
+* **Reward contrast greps on the next train run:** the source-load INFO
+  line now logs `rating baseline (r_bar)`; the per-record scales are in
+  each example's meta only, so the honest check is behavioral — the
+  smoke evals' action mix and win rate, not offline loss. Expect
+  `DRIFT WARNING`s to stay rare at 3e-6 (the aug4 runs drifted at 1e-4;
+  if KD replay drift warnings vanish entirely AND game metrics move,
+  the LR drop did its job).
+* **Floored/zero-scale records** log `SKIPPED n/m record(s) at zero
+  example weight` at INFO — a large fraction there means the analyst
+  floored much of the corpus (read the rating histogram before burning
+  the train hours).
 
 Weekend rehearsal (before launching `training/run_weekend.py` for
 real): with NAMS up and external data downloaded, run

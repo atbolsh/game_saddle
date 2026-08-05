@@ -30,9 +30,12 @@ One record per player generation, in ``data_game/<label>/traces.jsonl``:
   * ``target_text`` -- the raw player reply (the ONLY trainable tokens);
   * ``meta``      -- rating, wrong spans, action, game/move indices, outcome,
     the round's agent-to-gold distances (``dist_to_gold_before/after``,
-    normalized units; the rating-independent quality cross-check), and the
-    exact ``question`` the round asked (perception rounds are the records
-    whose question differs from the default move request).
+    normalized units; the rating-independent quality cross-check), the raw
+    engine-oracle facts for the position the move was made from
+    (``oracle_move`` / ``oracle_rel_bearing`` / ``oracle_ray_hit`` --
+    ``_oracle_meta``; graded train-side by ``game_traces.oracle_verdict``),
+    and the exact ``question`` the round asked (perception rounds are the
+    records whose question differs from the default move request).
 
 Analyst text is stored to NAMS exactly as in the notebook and never enters
 any PLAYER record's ``messages``/``target_text`` -- it exists in player
@@ -197,6 +200,59 @@ def _dist_to_gold(settings: dict) -> float | None:
     return round(min(math.hypot(gx - ax, gy - ay) for gx, gy in gold), 4)
 
 
+def _oracle_meta(settings: dict) -> dict:
+    """Engine-oracle facts for the CURRENT position, stamped into each
+    move's meta (computed before the move executes, next to
+    dist_to_gold_before). Only RAW FACTS are stored -- classification into
+    correct/neutral/wrong lives train-side (game_traces.oracle_verdict,
+    with its own ULTRAVIOLET crutch block), so thresholds can be retuned
+    without regenerating data.
+
+      * oracle_rel_bearing: signed bearing (radians, wrapped to [-pi, pi))
+        from the agent's facing to the NEAREST gold. The game_io compass
+        convention: bearing = atan2(dx, dy), theta increases clockwise,
+        so POSITIVE = the gold is clockwise of the facing;
+      * oracle_ray_hit: whether stepping straight ahead intersects ANY
+        gold within pickup reach (agent_r + gold_r). EXACT, because bare
+        levels have no internal walls to route around;
+      * oracle_move: FORWARD on a ray hit, else the shorter rotation
+        toward the nearest gold.
+
+    Empty when no gold remains (game already won)."""
+    gold = settings.get("gold") or []
+    if not gold:
+        return {}
+    ax, ay = settings["agent_x"], settings["agent_y"]
+    theta = settings["direction"]
+    reach = settings["agent_r"] + settings["gold_r"]
+
+    _, gx, gy = min(
+        (math.hypot(gx - ax, gy - ay), gx, gy) for gx, gy in gold
+    )
+    rel = (math.atan2(gx - ax, gy - ay) - theta + math.pi) \
+        % (2 * math.pi) - math.pi
+
+    fx, fy = math.sin(theta), math.cos(theta)
+    ray_hit = False
+    for cx, cy in gold:
+        dx, dy = cx - ax, cy - ay
+        # positive projection along the facing ray, perpendicular
+        # miss distance within pickup reach
+        if dx * fx + dy * fy > 0 and abs(dx * fy - dy * fx) <= reach:
+            ray_hit = True
+            break
+
+    if ray_hit:
+        move = "FORWARD"
+    else:
+        move = "CLOCK" if rel > 0 else "ANTICLOCK"
+    return {
+        "oracle_move": move,
+        "oracle_rel_bearing": round(rel, 4),
+        "oracle_ray_hit": ray_hit,
+    }
+
+
 def _rewrite_image_urls(messages: list[dict], mapping: dict[str, str]) -> int:
     """Rewrite image part urls in place per ``mapping`` (absolute live path
     -> trace-relative path). Returns the number of rewrites; an image url
@@ -337,9 +393,11 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
     for move_idx in range(args.max_moves):
         if not shared.take_generation():
             break
-        dist_before = _dist_to_gold(
-            game_io.game_to_settings_dict(session.game)
-        )
+        settings_before = game_io.game_to_settings_dict(session.game)
+        dist_before = _dist_to_gold(settings_before)
+        # Engine-oracle facts for THIS position (before the move executes);
+        # raw facts only, classified train-side (_oracle_meta docstring).
+        oracle = _oracle_meta(settings_before)
         question = _sample_perception_question(qrng, args.question_rate)
         is_perception = question is not None
         if question is None:
@@ -379,6 +437,9 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
                 # after is None when the round's move ATE the gold.
                 "dist_to_gold_before": dist_before,
                 "dist_to_gold_after": dist_after,
+                # oracle_move / oracle_rel_bearing / oracle_ray_hit
+                # (raw engine-oracle facts, _oracle_meta docstring)
+                **oracle,
                 "game_index": game_idx,
                 "move_index": move_idx,
                 "session_id": player["session_id"],

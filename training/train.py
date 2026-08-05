@@ -12,11 +12,17 @@ video/audio sets, ...) are :class:`DataSource` objects; stage 1 ships only
 :class:`JsonlSource` so the loop is testable end to end.
 
 ONE LOSS FOR BOTH LABEL TYPES. Weighted token cross-entropy: prompt tokens
-weigh 0; target tokens weigh 1.0 unless a span says otherwise (negative
-weights suppress tokens). Plain SFT and RL-style per-token quality vectors
-are the same code path. Per-example loss is normalized by the sum of
-ABSOLUTE token weights so annotated and plain examples mix at comparable
-gradient scale.
+weigh 0; target tokens weigh 1.0 unless a span says otherwise. A NEGATIVE
+span weight means bounded UNLIKELIHOOD (``-log(1-p)``, |w| as emphasis) --
+active suppression with a floored objective, never negative CE (which is
+unbounded below and caused the 2026-08-01 collapse; see
+:func:`weighted_loss`, NEGATIVE WEIGHTS). Plain SFT and RL-style per-token
+quality vectors are the same code path. Per-example loss is normalized by
+the sum of ABSOLUTE token weights so annotated and plain examples mix at
+comparable gradient scale; because that normalization cancels any uniform
+factor on a reply's span weights, reply-wide reward scaling rides
+``TrainingExample.example_weight`` instead, applied AFTER normalization
+(:func:`weighted_loss`, SHAPE VS SCALE).
 
 THREE LOSS KINDS. ``TrainingExample.loss`` selects "ce" (above -- teach the
 dataset's targets; used where we want to STRENGTHEN, e.g. arithmetic replay),
@@ -59,13 +65,22 @@ rules that shape the loss live in :func:`weighted_loss`'s docstring.
 RECIPE (flags override): 4-bit NF4 + double quant + bf16 compute (QLoRA,
 Dettmers et al. 2023); LoRA r=32/alpha=64/dropout=0.05 on all language-model
 linears (all-linear beats attention-only in the QLoRA ablations); paged 8-bit
-AdamW; peak LR 1e-4 (LoRA wants ~10x the full-FT LR), cosine decay to 10% of
-peak with 3% warmup; weight decay 0.0 on LoRA params (decay fights the
-low-rank update); grad clip 1.0; NEFTune embedding noise alpha=5 on by
-default (Jain et al. 2023: consistently helps small-data SFT); fixed seed.
-Deliberately omitted: label smoothing (distorts move-token confidence),
-sequence packing (incompatible with per-example images + span weights),
-adapter EMA (overkill at this scale).
+AdamW; peak LR 3e-6 with grad clip 0.1, cosine decay to 10% of peak with 3%
+warmup. THE LR IS RL-SCALE, NOT SFT-SCALE (2026-08-05): the primary corpus
+is the model's own graded output, and the published Gemma-family online-RL
+recipes cluster at 3e-6..1e-5 with max_grad_norm ~0.1 (Google Tunix GRPO
+3e-6; HF/Unsloth GRPO 5e-6, clip 0.1). The previous 1e-4 was the QLoRA SFT
+reference ("LoRA wants ~10x the full-FT LR") -- correct for curated
+external datasets, ~30x too hot for self-generated data, where it drove
+per-epoch drift the guards then had to fight (aug4 postmortem). One LR for
+every source: all sources share one optimizer over the same LoRA params,
+and the game/replay mixture is set by per-epoch example counts and weights,
+not by LR. Weight decay 0.0 on LoRA params (decay fights the low-rank
+update); NEFTune embedding noise alpha=5 on by default (Jain et al. 2023:
+consistently helps small-data SFT); fixed seed. Deliberately omitted: label
+smoothing (distorts move-token confidence), sequence packing (incompatible
+with per-example images + span weights), adapter EMA (overkill at this
+scale).
 
 CHECKPOINTS. Periodic PEFT-adapter saves to
 ``weights/<architecture>/<label>_step<K>/`` plus ``train_meta.json``. A
@@ -199,7 +214,13 @@ class TrainingExample:
     None) caps the micro-batch this example may ride in -- for sources
     whose targets span nearly the whole sequence, where full micro-batches
     of kept logits would OOM (see weighted_loss; per-example loss
-    normalization means the cap changes memory, never results)."""
+    normalization means the cap changes memory, never results).
+
+    ``example_weight`` is the example's REWARD SCALE, applied to its
+    normalized loss (weighted_loss, SHAPE VS SCALE): span_weights carry
+    only *within-reply* emphasis -- per-example normalization deliberately
+    cancels any uniform factor on them -- so "this whole example matters
+    2x / 0.1x as much" must ride here to reach the gradient at all."""
 
     messages: list[dict]
     target_text: str
@@ -208,6 +229,7 @@ class TrainingExample:
     source: str = "unknown"
     meta: dict = field(default_factory=dict)
     batch_cap: int | None = None
+    example_weight: float = 1.0
 
     def declares_image(self) -> bool:
         for m in self.messages:
@@ -342,11 +364,19 @@ class TrainConfig:
     # schedule
     epochs: int = 1
     max_steps: int | None = None    #: optimizer-step cap (None = epochs decide)
-    lr: float = 1e-4
+    #: RL-scale peak LR (2026-08-05, module docstring RECIPE): the corpus
+    #: is the model's own graded output, and every published Gemma-family
+    #: online-RL recipe sits at 3e-6..1e-5 -- the old 1e-4 was the SFT
+    #: reference class and drove per-epoch drift/collapse.
+    lr: float = 3e-6
     scheduler: str = "cosine"       #: "cosine" (with floor) or "constant"
     warmup_ratio: float = 0.03
     lr_floor: float = 0.10          #: cosine decays to this fraction of peak
     weight_decay: float = 0.0
+    #: gradient-norm clip; RL recipes pair the low LR with a tight clip
+    #: (Unsloth/HF GRPO use 0.1) so a single noisy reward batch cannot
+    #: spike an update.
+    max_grad_norm: float = 0.1
     #: examples per forward pass (length-bucketed padding; see epoch_batches).
     #: Effective batch = micro_batch * grad_accum = 16 at the defaults.
     micro_batch: int = 4
@@ -568,7 +598,17 @@ class Collator:
         batch["attention_mask"] = torch.ones(
             1, n_total, dtype=torch.long, device=self.device
         )
-        return {"model_inputs": batch, "weights": weights.to(self.device)}
+        return {
+            "model_inputs": batch,
+            "weights": weights.to(self.device),
+            # Per-example reward scale (weighted_loss, SHAPE VS SCALE):
+            # kept separate from the span weights because per-example
+            # normalization would cancel it there.
+            "example_weight": torch.tensor(
+                [float(ex.example_weight)], dtype=torch.float32,
+                device=self.device,
+            ),
+        }
 
     def build_batch(self, exs: list[TrainingExample]) -> dict[str, Any]:
         """Micro-batch of examples -> one padded model input.
@@ -648,7 +688,9 @@ class Collator:
                 f"(shape {tuple(vals[0].shape)}, dtype {vals[0].dtype})"
             )
         weights = torch.cat([pad_to(b["weights"], 0.0) for b in builds])
-        return {"model_inputs": batch, "weights": weights}
+        example_weight = torch.cat([b["example_weight"] for b in builds])
+        return {"model_inputs": batch, "weights": weights,
+                "example_weight": example_weight}
 
 
 def resolve_terminator_id(model: Any, tokenizer: Any) -> int:
@@ -927,16 +969,46 @@ def _base_model_logits(model: Any, model_inputs: dict,
 
 
 def weighted_loss(model: Any, model_inputs: dict, weights: Any,
-                  loss_kind: str = "ce", return_per_example: bool = False):
+                  loss_kind: str = "ce", return_per_example: bool = False,
+                  example_weight: Any = None):
     """Per-token weighted loss over one collated micro-batch.
 
     Each example is normalized by ITS OWN sum of ABSOLUTE weights (so
-    plain-SFT and annotated/negative-weight examples arrive at comparable
-    gradient scale, and long examples don't dominate), then the batch is
-    the mean over examples. Key consequence, used throughout the trainer:
-    a micro-batch of B is EXACTLY equivalent to B batch-1 passes averaged
-    -- padding positions carry weight 0 and vanish, so batch composition
-    can never change results, only memory and speed.
+    plain-SFT and annotated examples arrive at comparable gradient scale,
+    and long examples don't dominate), then the batch is the mean over
+    examples. Key consequence, used throughout the trainer: a micro-batch
+    of B is EXACTLY equivalent to B batch-1 passes averaged -- padding
+    positions carry weight 0 and vanish, so batch composition can never
+    change results, only memory and speed.
+
+    SHAPE VS SCALE (2026-08-05 -- the fix for a real bug). The per-example
+    normalization above makes the loss SCALE-INVARIANT in the span
+    weights: sum(c*w*CE)/sum(|c*w|) == sum(w*CE)/sum(|w|), so a uniform
+    reward multiplier on a reply's weights cancels out (only the
+    terminator's fixed 1.0 stopped it from cancelling EXACTLY: for a
+    ~100-token reply a x0.1 "downweight" changed the gradient by ~8%, not
+    10x). Every aug4 reward knob -- rating base, novelty decay, action
+    balance, win boost -- rode the span weights and was therefore a
+    near-no-op: the run cloned its corpus at full uniform strength.
+    Hence the split: span ``weights`` carry only WITHIN-reply shape
+    (which tokens, relative emphasis, sign); ``example_weight`` ([B],
+    from TrainingExample.example_weight via the collator) carries "how
+    much this example matters" and is applied AFTER normalization:
+    ``loss = (example_weight * per_example).mean()``. The RETURNED
+    ``per_example`` stays UNSCALED -- held-out eval and per-source loss
+    logging measure model quality, not reward bookkeeping, and must stay
+    comparable across epochs. ``example_weight=None`` means all-ones.
+
+    NEGATIVE WEIGHTS (CE only) are BOUNDED UNLIKELIHOOD, never negative
+    CE. A ``w < 0`` position contributes ``|w| * -log(1 - p(label))``:
+    pushing the label's probability DOWN reduces the loss toward 0 with a
+    VANISHING gradient as p -> 0 -- a well with a floor. Negative-weight
+    CE (``w * -log p``) is the opposite: unbounded below with a GROWING
+    gradient as p -> 0, and the cheapest descent direction is to destroy
+    the whole distribution -- that is exactly the 2026-08-01 collapse
+    (loss 0.11 -> -37.5, checkpoint fled into ``<unused...>`` gibberish).
+    KD kinds refuse negative weights outright (a distillation target has
+    no meaningful "anti-token").
 
     ``loss_kind="ce"``: token cross-entropy against the example's targets.
     ``loss_kind="kd"``: soft cross-entropy against the frozen BASE model's
@@ -944,7 +1016,7 @@ def weighted_loss(model: Any, model_inputs: dict, weights: Any,
     don't teach). ``loss_kind="kd_anchor"``: the same soft cross-entropy,
     teacher = the PARENT checkpoint's adapter (trust region; module
     docstring, THREE LOSS KINDS). With ``return_per_example=True`` returns
-    ``(loss, per_example)``, the latter a detached [B] tensor of
+    ``(loss, per_example)``, the latter a detached [B] tensor of UNSCALED
     per-example losses (exact per-source logging from mixed batches).
 
     VRAM RULES. At Gemma 4's 262k vocab, ONE fp32 logit tensor for a
@@ -986,6 +1058,12 @@ def weighted_loss(model: Any, model_inputs: dict, weights: Any,
 
     if loss_kind not in VALID_LOSSES:
         raise ValueError(f"weighted_loss: bad loss_kind {loss_kind!r}")
+    if loss_kind != "ce" and bool((weights < 0).any()):
+        raise ValueError(
+            f"weighted_loss: negative span weights with loss_kind="
+            f"{loss_kind!r} -- unlikelihood only exists for CE targets "
+            "(docstring, NEGATIVE WEIGHTS)"
+        )
 
     input_ids = model_inputs["input_ids"]
     seq_len = int(input_ids.shape[1])
@@ -1049,21 +1127,38 @@ def weighted_loss(model: Any, model_inputs: dict, weights: Any,
     out = model(**model_inputs, logits_to_keep=tail + 1)
     student = out.logits[row_of, col_of].float()
 
+    wm = w[mask]
     if loss_kind == "ce":
         token_loss = F.cross_entropy(
             student, shift_labels.reshape(-1)[mask], reduction="none",
         )
+        neg = wm < 0
+        if bool(neg.any()):
+            # Bounded unlikelihood on negative-weight positions
+            # (docstring, NEGATIVE WEIGHTS): -log(1 - p), p = exp(-CE).
+            # The clamp bounds the loss at ~13.8 nats when the label is
+            # still near-certain; as p -> 0 both loss and gradient vanish.
+            p_bad = torch.exp(-token_loss[neg]).clamp(max=1.0 - 1e-6)
+            token_loss = token_loss.clone()
+            token_loss[neg] = -torch.log1p(-p_bad)
     else:
         token_loss = -(teacher_probs
                        * F.log_softmax(student, dim=-1)).sum(dim=-1)
 
     zeros = torch.zeros(n_rows, dtype=token_loss.dtype,
                         device=token_loss.device)
-    # out-of-place index_add keeps the autograd path to token_loss clean
-    numer = zeros.index_add(0, row_of, token_loss * w[mask])
-    denom = zeros.index_add(0, row_of, w[mask].abs())
+    # out-of-place index_add keeps the autograd path to token_loss clean.
+    # |w| in the numerator too: negative positions already carry the
+    # unlikelihood loss, so their magnitude is their emphasis -- a signed
+    # numerator would flip them back into the unbounded objective.
+    numer = zeros.index_add(0, row_of, token_loss * wm.abs())
+    denom = zeros.index_add(0, row_of, wm.abs())
     per_example = numer / denom.clamp(min=1e-8)
-    loss = per_example.mean()
+    if example_weight is not None:
+        scale = example_weight.to(per_example.device, per_example.dtype)
+        loss = (scale * per_example).mean()
+    else:
+        loss = per_example.mean()
     if return_per_example:
         return loss, per_example.detach()
     return loss
@@ -1193,6 +1288,10 @@ class HeldOutLossHook:
         with torch.no_grad():
             for exs in batches:
                 built = ctx.collator.build_batch(exs)
+                # DELIBERATELY no example_weight here: held-out loss is a
+                # model-quality metric and must stay comparable across
+                # epochs regardless of reward bookkeeping (weighted_loss,
+                # SHAPE VS SCALE). per_example is unscaled by contract.
                 _, per_example = weighted_loss(
                     model, built["model_inputs"], built["weights"],
                     loss_kind=exs[0].loss, return_per_example=True,
@@ -1719,13 +1818,16 @@ def run_training(
             for i, exs in enumerate(batches):
                 built = collator.build_batch(exs)
                 # weighted_loss means over the batch's per-example
-                # normalized losses, so each example's gradient
-                # contribution is 1/(micro_batch * grad_accum) --
-                # identical to batch-1 training at the same effective
-                # batch.
+                # normalized losses scaled by each example's reward
+                # (example_weight; SHAPE VS SCALE in its docstring), so
+                # each example's gradient contribution is
+                # scale/(micro_batch * grad_accum) -- identical to
+                # batch-1 training at the same effective batch. The
+                # logged per_example stays unscaled (model quality).
                 loss, per_example = weighted_loss(
                     model, built["model_inputs"], built["weights"],
                     loss_kind=exs[0].loss, return_per_example=True,
+                    example_weight=built["example_weight"],
                 )
                 (loss / cfg.grad_accum).backward()
                 for ex, lv in zip(exs, per_example.tolist()):
@@ -1733,7 +1835,8 @@ def run_training(
                     src_loss_n[ex.source] = src_loss_n.get(ex.source, 0) + 1
 
                 if (i + 1) % cfg.grad_accum == 0 or i == len(batches) - 1:
-                    grad_norm = float(torch.nn.utils.clip_grad_norm_(params, 1.0))
+                    grad_norm = float(torch.nn.utils.clip_grad_norm_(
+                        params, cfg.max_grad_norm))
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
@@ -1844,6 +1947,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lr-floor", type=float, default=d.lr_floor,
                    help="cosine decays to this fraction of peak LR")
     p.add_argument("--weight-decay", type=float, default=d.weight_decay)
+    p.add_argument("--max-grad-norm", type=float, default=d.max_grad_norm,
+                   help="gradient-norm clip (RL recipes pair low LR with "
+                        "a tight 0.1 clip)")
     p.add_argument("--micro-batch", type=int, default=d.micro_batch,
                    help="examples per forward pass (length-bucketed); "
                         "effective batch = micro_batch * grad_accum")

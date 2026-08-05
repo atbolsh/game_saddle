@@ -142,12 +142,12 @@ contribute nothing, and each target token contributes
 
 - Plain SFT is the special case where every target-token weight is 1.0.
 - RL-style annotation ("these tokens were good, these were bad") is the
-  general case: arbitrary per-token weights. The MECHANISM supports
-  negative weights (unlikelihood-flavored suppression), but the game
-  reward mapping deliberately never emits them — weighted CE with net-
-  negative weights is unbounded below and collapsed the 2026-08-01 run
-  (postmortem in TRAINING_GAME_TRACES.md); suppression now comes from the
-  bounded player trust region instead.
+  general case: arbitrary per-token weights. A NEGATIVE weight means
+  **bounded unlikelihood** — the token's loss becomes `-log(1 - p)` with
+  `|w|` as emphasis (2026-08-05): active suppression whose loss floors at
+  0 and whose gradient vanishes as `p → 0`. It is never negative CE, which
+  is unbounded below and collapsed the 2026-08-01 run (postmortem in
+  TRAINING_GAME_TRACES.md). KD loss kinds refuse negative weights.
 
 Sources express weights in *character* space over `target_text` (that is what
 annotators — the analyst's `WRONG:` spans, a rating, a programmatic checker —
@@ -155,6 +155,13 @@ naturally produce); the collator maps them onto tokens via the tokenizer's
 offset mapping. Per-example loss is normalized by the **sum of absolute token
 weights**, so a heavily-annotated example and a plain SFT example arrive at
 comparable gradient scale, and long examples do not dominate short ones.
+Because that normalization cancels any *uniform* factor on an example's
+span weights, "this whole reply matters more/less" cannot ride the spans:
+it rides **`TrainingExample.example_weight`**, applied AFTER normalization
+(`loss = (example_weight * per_example).mean()`; the shape/scale split,
+2026-08-05 — full arithmetic in `weighted_loss`'s docstring). Held-out
+eval and per-source logging stay unscaled, so guard metrics measure model
+quality, not reward bookkeeping.
 
 ### Sequence construction mirrors inference exactly
 
@@ -215,10 +222,10 @@ activations at our sequence lengths):
 | LoRA rank / alpha | r=32, alpha=64 | Literature range for narrow-domain adaptation is r=16–64 with diminishing returns above; alpha=2r is the common scaling |
 | LoRA dropout | 0.05 | QLoRA default for <13B models |
 | Optimizer | paged 8-bit AdamW | QLoRA default; the paging absorbs activation spikes |
-| Peak LR | 1e-4 | LoRA wants ~10x the full-fine-tune LR; 1e-4–2e-4 is the replicated sweet spot for 7–13B |
+| Peak LR | 3e-6 (2026-08-05: was 1e-4) | **RL scale, not SFT scale.** The primary corpus is the model's own graded output, and published Gemma-family online-RL recipes cluster at 3e-6–1e-5 (Google Tunix GRPO: 3e-6; HF/Unsloth GRPO: 5e-6). The old 1e-4 was the QLoRA *SFT* sweet spot ("LoRA wants ~10x the full-FT LR") — right for curated external data, ~30x too hot for self-training: it drove per-epoch drift the guards then had to fight (aug4 postmortem). One LR for all sources — the game/replay mixture is set by example counts and weights, not per-source LRs |
 | Schedule | cosine decay to ~10% of peak, ~3% warmup | Boring and robust; `--scheduler constant` kept as the ablation alternative |
 | Weight decay | 0.0 on LoRA params | QLoRA convention — decay fights the low-rank update; exposed as a flag for ablation |
-| Grad clip | max-norm 1.0 | Standard stabilization, matters with negative-weight tokens |
+| Grad clip | max-norm 0.1 (2026-08-05: was 1.0) | RL recipes pair the low LR with a tight clip (HF/Unsloth GRPO use 0.1) so one noisy reward batch cannot spike an update; matters extra with unlikelihood (negative-weight) tokens |
 | Effective batch | ~16 (micro-batch 4 x grad-accum 4) | Small-data SFT regime; smaller effective batches track the fresh on-policy data better; micro-batch 4 buys the GPU-utilization win without changing the math (bucketed padding, per-example normalization) |
 | Epochs per iteration | 1–2 | Self-generated data is only on-policy the first pass; re-epoching amplifies the model's own quirks; instruction-tuning literature sees memorization at 3+ |
 | NEFTune noise | alpha ~5, on by default | Jain et al. 2023: uniform embedding noise consistently improves small-data SFT; doubles as a mild regularizer against overfitting one visual domain |
