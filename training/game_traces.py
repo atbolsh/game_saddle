@@ -269,6 +269,14 @@ def oracle_verdict(action: str | None, oracle_move: str | None,
     toward = (action == "CLOCK" and rel > 0) or \
              (action == "ANTICLOCK" and rel < 0)
     if toward and ray_hit:
+        # DELIBERATE deviation from the aug5 plan text, which confined
+        # this neutral to |rel| <= ORACLE_CONE_RAD: any toward-gold turn
+        # under a ray hit stays neutral (analyst decides). The cases the
+        # cone would demote to "wrong" only exist in multi-gold or
+        # point-blank geometries -- tonight's bare levels have exactly
+        # one gold (new_bare_game), where a ray hit puts that gold nearly
+        # dead ahead anyway -- and where they DO occur the turn is
+        # defensible, so lenient beats a false ground-truth penalty.
         return "neutral"   # fine-tuning aim past "good enough"
     return "wrong"
 

@@ -473,7 +473,7 @@ class TrainLogger:
                   **record}
         self._append(self.jsonl, json.dumps(record, default=str) + "\n")
         parts = [f"step {record.get('step', '?'):>6}"]
-        for k in ("epoch", "loss", "lr", "grad_norm"):
+        for k in ("epoch", "loss", "scaled_loss", "lr", "grad_norm"):
             if k in record:
                 v = record[k]
                 parts.append(f"{k}={v:.3g}" if isinstance(v, float) else f"{k}={v}")
@@ -1002,7 +1002,11 @@ def weighted_loss(model: Any, model_inputs: dict, weights: Any,
     NEGATIVE WEIGHTS (CE only) are BOUNDED UNLIKELIHOOD, never negative
     CE. A ``w < 0`` position contributes ``|w| * -log(1 - p(label))``:
     pushing the label's probability DOWN reduces the loss toward 0 with a
-    VANISHING gradient as p -> 0 -- a well with a floor. Negative-weight
+    VANISHING gradient as p -> 0 -- a well with a floor. Computed as
+    ``-log(-expm1(-CE))`` so the p ~ 1 end (confident bad tokens, the
+    whole point of the branch) keeps an exact loss and live gradient in
+    fp32 -- the naive ``exp`` + clamp form went gradient-dead there (the
+    2026-08-05 sweep, item 3). Negative-weight
     CE (``w * -log p``) is the opposite: unbounded below with a GROWING
     gradient as p -> 0, and the cheapest descent direction is to destroy
     the whole distribution -- that is exactly the 2026-08-01 collapse
@@ -1135,12 +1139,20 @@ def weighted_loss(model: Any, model_inputs: dict, weights: Any,
         neg = wm < 0
         if bool(neg.any()):
             # Bounded unlikelihood on negative-weight positions
-            # (docstring, NEGATIVE WEIGHTS): -log(1 - p), p = exp(-CE).
-            # The clamp bounds the loss at ~13.8 nats when the label is
-            # still near-certain; as p -> 0 both loss and gradient vanish.
-            p_bad = torch.exp(-token_loss[neg]).clamp(max=1.0 - 1e-6)
+            # (docstring, NEGATIVE WEIGHTS): -log(1 - p) with p = exp(-CE),
+            # computed as -log(-expm1(-CE)). The naive exp-then-log1p form
+            # loses 1-p to fp32 rounding near p = 1 (exp(-CE) rounds INTO
+            # 1.0, gradients turn to noise, and its safety clamp cut the
+            # graph -- gradient-dead exactly on the confident bad tokens
+            # this branch exists to suppress); expm1 keeps 1 - e^-CE exact
+            # however small CE gets. The min-clamp sits at the fp32 noise
+            # floor of CE itself, bounding the loss at ~13.8 nats; as
+            # p -> 0 both loss and gradient still vanish (the floor of
+            # the well).
             token_loss = token_loss.clone()
-            token_loss[neg] = -torch.log1p(-p_bad)
+            token_loss[neg] = -torch.log(
+                -torch.expm1(-token_loss[neg].clamp(min=1e-6))
+            )
     else:
         token_loss = -(teacher_probs
                        * F.log_softmax(student, dim=-1)).sum(dim=-1)
@@ -1199,6 +1211,9 @@ class MetricGuard:
     is an upper bound; for higher-is-better it acts as a floor) -- this is
     the tier that triggers rollback/abort. The trainer escalates a
     persistent soft streak to hard on its own (``soft_streak_limit``).
+    The ceiling is checked UNCONDITIONALLY, before best-tracking
+    (:meth:`ceiling_breached`): a value past the bound fires even when it
+    "improves" on the best seen or is the first observation ever.
 
     ``relative=False`` (CEILING-ONLY MODE) exists for DRIFT METERS: a
     KD-anchor held-out loss starts at its minimum possible value (teacher
@@ -1239,13 +1254,24 @@ class MetricGuard:
             return value < best * (1.0 - self.rel_tolerance)
         return value > best * (1.0 + self.rel_tolerance)
 
-    def is_hard_regression(self, value: float, best: float) -> bool:
+    def ceiling_breached(self, value: float) -> bool:
+        """The absolute catastrophe bound alone (for higher-is-better
+        metrics the ceiling acts as a floor). Checked UNCONDITIONALLY by
+        run_hooks_and_guard, before best-tracking: an improving or
+        first-ever value past the bound must fire too (e.g. a run resumed
+        from an already-damaged checkpoint that declines slowly) -- until
+        2026-08-05 the improvement short-circuit silently swallowed it."""
+        if self.ceiling is None:
+            return False
         if self.higher_is_better:
-            if self.ceiling is not None and value < self.ceiling:
-                return True
-            return self.relative and value < best / self.hard_multiplier
-        if self.ceiling is not None and value > self.ceiling:
+            return value < self.ceiling
+        return value > self.ceiling
+
+    def is_hard_regression(self, value: float, best: float) -> bool:
+        if self.ceiling_breached(value):
             return True
+        if self.higher_is_better:
+            return self.relative and value < best / self.hard_multiplier
         return self.relative and value > best * self.hard_multiplier
 
     def is_improvement(self, value: float, best: float | None) -> bool:
@@ -1500,6 +1526,14 @@ def run_training(
                 n_hold = min(n_hold, cfg.holdout_cap)
             holdout.extend(exs[:n_hold])
             by_source[name] = exs[n_hold:]
+            if not by_source[name]:
+                # Without this, the crash is a bare IndexError from
+                # random.choices([]) deep inside epoch_order.
+                raise ValueError(
+                    f"source {name!r}: the held-out split consumed all "
+                    f"{n_hold} example(s), leaving nothing to train on -- "
+                    "shrink --holdout-fraction or grow the corpus"
+                )
     n_train = sum(len(v) for v in by_source.values())
     logger.info("train examples: %d   held out: %d", n_train, len(holdout))
 
@@ -1665,7 +1699,7 @@ def run_training(
 
         hard_hits: list[str] = []
 
-        def hard_hit(guard, mname: str, value: float, best: float,
+        def hard_hit(guard, mname: str, value: float, best: float | None,
                      tier: str, detail: str) -> None:
             """Route one would-be hard regression: warn_only guards get a
             loud WARNING and no authority; everything else joins
@@ -1690,6 +1724,19 @@ def run_training(
             if guard is None:
                 continue
             best = best_metrics.get(mname)
+            # The absolute ceiling outranks best-tracking (MetricGuard.
+            # ceiling_breached): it must fire even on an "improving" or
+            # first-ever value -- the improvement short-circuit below used
+            # to swallow exactly that (a run resumed above the ceiling
+            # could decline slowly forever without tripping). A breached
+            # value also never becomes best.
+            if guard.ceiling_breached(value):
+                soft_streaks[mname] = 0
+                hard_hit(guard, mname, value, best, tier="ceiling",
+                         detail=f"past absolute ceiling {guard.ceiling:g}"
+                                + ("" if best is None
+                                   else f" (best {best:.5g})"))
+                continue
             if guard.is_improvement(value, best):
                 best_metrics[mname] = value
                 soft_streaks[mname] = 0
@@ -1805,6 +1852,12 @@ def run_training(
     step = 0
     src_loss_sum: dict[str, float] = {}
     src_loss_n: dict[str, int] = {}
+    #: The loss that actually drives the gradient (example_weight applied),
+    #: logged as scaled_loss beside the unscaled per-example mean: 'loss'
+    #: tracks model quality across epochs, 'scaled_loss' shows how hard the
+    #: reward weighting is pushing (weighted_loss, SHAPE VS SCALE).
+    scaled_loss_sum = 0.0
+    scaled_loss_n = 0
     done = False
     ended_early: str | None = None
 
@@ -1830,6 +1883,8 @@ def run_training(
                     example_weight=built["example_weight"],
                 )
                 (loss / cfg.grad_accum).backward()
+                scaled_loss_sum += float(loss.detach())
+                scaled_loss_n += 1
                 for ex, lv in zip(exs, per_example.tolist()):
                     src_loss_sum[ex.source] = src_loss_sum.get(ex.source, 0.0) + lv
                     src_loss_n[ex.source] = src_loss_n.get(ex.source, 0) + 1
@@ -1851,12 +1906,16 @@ def run_training(
                             "step": step, "epoch": epoch,
                             "loss": sum(src_loss_sum.values())
                                     / max(1, sum(src_loss_n.values())),
+                            "scaled_loss": scaled_loss_sum
+                                           / max(1, scaled_loss_n),
                             "lr": scheduler.get_last_lr()[0],
                             "grad_norm": grad_norm,
                             "source_loss": per_src,
                         })
                         src_loss_sum.clear()
                         src_loss_n.clear()
+                        scaled_loss_sum = 0.0
+                        scaled_loss_n = 0
 
                     if step % cfg.save_steps == 0:
                         last_ckpt = save_checkpoint(

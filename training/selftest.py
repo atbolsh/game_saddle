@@ -343,15 +343,19 @@ def t1_pure() -> str:
     assert abs(north["oracle_rel_bearing"]) < 1e-9, north
     east = _oracle_meta({**base_settings, "gold": [[0.8, 0.5]]})
     assert east["oracle_move"] == "CLOCK" and not east["oracle_ray_hit"], east
-    assert abs(east["oracle_rel_bearing"] - math.pi / 2) < 1e-9, east
+    # the stamped bearing is round(rel, 4), so compare against the SAME
+    # rounding -- pi/2 differs from 1.5708 by ~3.7e-6, far over any "exact"
+    # tolerance (this assert failed at 1e-9 before the 2026-08-05 sweep)
+    assert east["oracle_rel_bearing"] == round(math.pi / 2, 4), east
     west = _oracle_meta({**base_settings, "gold": [[0.2, 0.5]]})
     assert west["oracle_move"] == "ANTICLOCK", west
     # nearest gold sets the bearing; a second, farther gold on the ray
     # still counts for ray_hit
     two = _oracle_meta({**base_settings, "gold": [[0.5, 0.9], [0.52, 0.6]]})
     assert two["oracle_ray_hit"], two          # 0.02 perp < 0.08 reach
-    assert abs(two["oracle_rel_bearing"]
-               - math.atan2(0.02, 0.1)) < 1e-6, two  # nearest = (0.52, 0.6)
+    assert two["oracle_rel_bearing"] == round(
+        math.atan2(0.02, 0.1), 4
+    ), two  # nearest = (0.52, 0.6); stamped bearing is round(rel, 4)
     assert _oracle_meta({**base_settings, "gold": []}) == {}  # game won
     checks += 8
 
@@ -427,7 +431,23 @@ def t1_pure() -> str:
     )
     assert not rel.warn_only and not drift.warn_only, "warn_only default"
     assert DataSource.guard_warn_only is False, "DataSource default"
-    checks += 8
+    # ceiling_breached (2026-08-05 sweep fix): the absolute bound is
+    # independent of best-tracking, so the trainer can check it BEFORE the
+    # improvement short-circuit -- a first eval already past the ceiling,
+    # or a value improving on best while still past it, must both fire
+    # (both used to sail through run_hooks_and_guard silently).
+    assert drift.ceiling_breached(1.5), "first-eval-above-ceiling missed"
+    assert drift.ceiling_breached(1.2), (
+        "improving (1.5 -> 1.2) but still above ceiling 1.0 -- must fire"
+    )
+    assert not drift.ceiling_breached(0.9), "below ceiling must not fire"
+    assert not rel.ceiling_breached(99.0), "no ceiling declared: never fires"
+    hib = MetricGuard("m", higher_is_better=True, rel_tolerance=0.1,
+                      ceiling=0.5)
+    assert hib.ceiling_breached(0.4) and not hib.ceiling_breached(0.6), (
+        "higher-is-better ceiling must act as a floor"
+    )
+    checks += 13
 
     # ---- image noise: deterministic per seed, identity at strength 0
     base_img = Image.new("RGB", (64, 64), (120, 40, 40))
@@ -1054,18 +1074,23 @@ def t3_model() -> str:
             # docstring): an example_weight of 0.1 must scale the loss by
             # EXACTLY 0.1. The old code carried reply-wide reward on the
             # span weights, where per-example normalization cancelled it
-            # -- every reward knob was a near-no-op.
+            # -- every reward knob was a near-no-op. eval() + no_grad like
+            # the t4 parity check: the two forwards must differ ONLY in
+            # example_weight, never in dropout/NEFTune noise, and neither
+            # needs an autograd graph.
+            model.eval()
             ex = by_kind["ce_text"]
             built = collator.build(ex)
-            base_loss = weighted_loss(
-                model, built["model_inputs"], built["weights"],
-                loss_kind="ce", example_weight=built["example_weight"],
-            )
-            scaled_loss = weighted_loss(
-                model, built["model_inputs"], built["weights"],
-                loss_kind="ce",
-                example_weight=built["example_weight"] * 0.1,
-            )
+            with torch.no_grad():
+                base_loss = weighted_loss(
+                    model, built["model_inputs"], built["weights"],
+                    loss_kind="ce", example_weight=built["example_weight"],
+                )
+                scaled_loss = weighted_loss(
+                    model, built["model_inputs"], built["weights"],
+                    loss_kind="ce",
+                    example_weight=built["example_weight"] * 0.1,
+                )
             assert abs(float(scaled_loss) - 0.1 * float(base_loss)) < 1e-4, (
                 f"example_weight x0.1 gave {float(scaled_loss):.5f}, want "
                 f"{0.1 * float(base_loss):.5f} -- the scale is being "
@@ -1081,10 +1106,12 @@ def t3_model() -> str:
             assert float((neg_built["weights"] < 0).sum()) > 0, (
                 "smoke neg_span example lost its negative weights"
             )
-            neg_loss = float(weighted_loss(
-                model, neg_built["model_inputs"], neg_built["weights"],
-                loss_kind="ce", example_weight=neg_built["example_weight"],
-            ).detach())
+            with torch.no_grad():
+                neg_loss = float(weighted_loss(
+                    model, neg_built["model_inputs"], neg_built["weights"],
+                    loss_kind="ce",
+                    example_weight=neg_built["example_weight"],
+                ))
             assert neg_loss == neg_loss and neg_loss >= 0.0, (
                 f"unlikelihood loss {neg_loss} -- negative or NaN means "
                 "the bounded -log(1-p) branch regressed to negative CE"
