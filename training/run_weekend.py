@@ -311,6 +311,13 @@ def _train_result_checkpoint(label: str) -> str | None:
         logger.error("done event in %s has no usable last_good_checkpoint "
                      "(got %r)", events_path, ckpt)
         return None
+    if done.get("ended_early"):
+        # The trainer stopped itself (e.g. the consecutive-rollback stop,
+        # train.py ROLLBACK) and stands behind last_good -- a valid
+        # hand-off, but the weekend log must say so loudly.
+        logger.error("[%s] trainer ENDED EARLY: %s -- handing the next "
+                     "epoch its last good checkpoint %s",
+                     label, done["ended_early"], ckpt)
     return Path(ckpt).name
 
 

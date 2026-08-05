@@ -238,7 +238,12 @@ def t1_pure() -> str:
         scramble_move_token,
         scramble_player_reply,
     )
-    from training.train import MetricGuard, TrainingExample, epoch_batches
+    from training.train import (
+        DataSource,
+        MetricGuard,
+        TrainingExample,
+        epoch_batches,
+    )
 
     checks = 0
 
@@ -345,7 +350,18 @@ def t1_pure() -> str:
                       hard_multiplier=2.0)
     assert rel.is_hard_regression(0.5, best=0.08), "relative guard broken"
     assert rel.is_soft_regression(0.1, best=0.08), "soft tier broken"
-    checks += 5
+    # warn_only (2026-08-05 aug4 fix): DETECTION is unchanged -- the flag
+    # strips authority in run_hooks_and_guard (demote to drift_warning),
+    # not the predicates. Defaults must stay False so no source is
+    # silently demoted.
+    wo = MetricGuard("m", higher_is_better=False, rel_tolerance=0.1,
+                     hard_multiplier=2.0, warn_only=True)
+    assert wo.is_hard_regression(0.5, best=0.08), (
+        "warn_only must not change detection -- only authority"
+    )
+    assert not rel.warn_only and not drift.warn_only, "warn_only default"
+    assert DataSource.guard_warn_only is False, "DataSource default"
+    checks += 8
 
     # ---- image noise: deterministic per seed, identity at strength 0
     base_img = Image.new("RGB", (64, 64), (120, 40, 40))
@@ -913,7 +929,8 @@ def t3_model() -> str:
 
 
 def t4_train() -> str:
-    """Micro-batch parity + CLI smoke train + forced rollback."""
+    """Micro-batch parity + CLI smoke train + forced rollback and the
+    consecutive-rollback early stop."""
     import torch
 
     from agent.config import CONFIG
@@ -1013,10 +1030,13 @@ def t4_train() -> str:
         "no heldout_loss eval row in eval_log.jsonl"
     )
 
-    # ---- (c) forced rollback: a destructive LR regresses the holdout fast.
-    # --hard-multiplier 1.0 makes ANY worse-than-best eval a HARD regression
-    # (the two-tier guard only rolls back on the hard tier), so the rollback
-    # path fires deterministically without waiting for a 2x blowup.
+    # ---- (c) forced rollback + consecutive-rollback stop: a destructive
+    # LR regresses the holdout fast. --hard-multiplier 1.0 makes ANY
+    # worse-than-best eval a HARD regression, so a rollback fires at the
+    # first bad eval and the SECOND consecutive one must end the run
+    # early (2026-08-05 aug4 fix: rollback/re-regress loops burned both
+    # epochs) -- with exit 0 and a done event standing behind
+    # last_good_checkpoint, which is the orchestrator's hand-off contract.
     r2 = _run_cli([
         "training.train", "--data", str(smoke),
         "--label", "selftest_t4rb", "--epochs", "8",
@@ -1041,9 +1061,25 @@ def t4_train() -> str:
         "path untested (rerun; if it persists, inspect events.jsonl: "
         f"{rb_dir})"
     )
+    stops = [e for e in events if e["kind"] == "consecutive_rollback_stop"]
+    dones = [e for e in events if e["kind"] == "done"]
+    assert dones, f"no done event in {rb_dir} -- hand-off contract broken"
+    assert dones[-1].get("last_good_checkpoint") not in (None, "", "None"), (
+        f"done event has no last_good_checkpoint: {dones[-1]}"
+    )
+    assert stops, (
+        "no consecutive_rollback_stop despite a destructive LR and "
+        "hard-multiplier 1.0 -- either the run improved on consecutive "
+        "evals (rerun; unlikely at lr=0.05) or the early-stop path is "
+        f"broken (events.jsonl: {rb_dir})"
+    )
+    assert dones[-1].get("ended_early"), (
+        f"stop fired but done event lacks ended_early: {dones[-1]}"
+    )
     return (
         f"parity worst dev {worst:.2%}; smoke ckpt {ckpt.name} + "
-        f"{len(eval_rows)} eval row(s); rollback fired {len(rolled)}x"
+        f"{len(eval_rows)} eval row(s); rollback fired {len(rolled)}x, "
+        f"consecutive-rollback stop ended the run early"
     )
 
 

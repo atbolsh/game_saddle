@@ -479,6 +479,14 @@ class ExternalSource(JsonlSource):
         )
         self.name = entry.name
         self.entry = entry
+        # KD replay sources are drift-from-base meters: their held-out
+        # loss starts at the teacher's entropy (its minimum) and rises
+        # with ANY learning, so a relative guard is structurally
+        # guaranteed to fire (it discarded both aug4 epochs, 2026-08-05).
+        # We still WANT the drift watched -- against the base, exactly as
+        # measured -- just without rollback authority: warn-only.
+        # CE sources (ground-truth targets) keep the full guard.
+        self.guard_warn_only = entry.loss == "kd"
 
     def examples(self) -> Iterator[TrainingExample]:
         base = str(self.entry.data_dir)

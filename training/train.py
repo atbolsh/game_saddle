@@ -89,8 +89,22 @@ drift, not noise); a HARD regression (worse than best-ever by
 is set) triggers ``--on-regression warn|rollback|abort`` (default
 rollback). Rollback restores ``last_good_ckpt`` -- the newest checkpoint
 whose eval had NO hard/escalated regression -- never the checkpoint that
-just regressed. Hooks are callables ``hook(ctx: TrainContext) -> dict``
-so they can generate, not just score.
+just regressed. Two exceptions to that machinery (both 2026-08-05, the
+aug4 postmortem):
+
+* WARN-ONLY GUARDS (``DataSource.guard_warn_only``, set by the manifest
+  loader on every KD replay source): detection is unchanged but a hard
+  hit is demoted to a loud DRIFT WARNING + ``drift_warning`` event --
+  drift-from-base is worth watching, not worth discarding a run over.
+* CONSECUTIVE-ROLLBACK STOP: rollbacks at two consecutive evals mean the
+  regression is structural (rollback restores weights, not the data/LR
+  position, so the guard re-fires forever -- both aug4 epochs burned
+  their second half in that loop and could only end at step 0). The run
+  ends early, loudly, with a normal ``done`` event standing behind
+  ``last_good_checkpoint`` (``ended_early`` names the reason).
+
+Hooks are callables ``hook(ctx: TrainContext) -> dict`` so they can
+generate, not just score.
 
 LOGGING. ``logs/train_<label>_<stamp>/``: config.json (resolved config +
 seed + git rev + discovered LoRA target modules), train_log.jsonl + .txt
@@ -218,12 +232,19 @@ class DataSource(ABC):
 
     ``guard_relative``: set False for DRIFT-METER sources (KD anchors)
     whose held-out loss starts at its floor and only rises -- their guard
-    becomes ceiling-only (MetricGuard.relative rationale)."""
+    becomes ceiling-only (MetricGuard.relative rationale).
+
+    ``guard_warn_only``: this source's guard NEVER triggers rollback/abort
+    -- regressions are logged (loudly) and nothing else. For KD replay
+    sources: their metric is drift-from-base, which we WANT to watch but
+    which must not have weight-surgery authority (2026-08-05 postmortem:
+    relative guards on drift meters discarded two full epochs)."""
 
     name: str = "source"
     weight: float = 1.0
     guard_ceiling: float | None = None
     guard_relative: bool = True
+    guard_warn_only: bool = False
 
     @abstractmethod
     def examples(self) -> Iterator[TrainingExample]:
@@ -1064,6 +1085,15 @@ class TrainContext:
     device: str
 
 
+class _ConsecutiveRollbackStop(Exception):
+    """Raised by the guard when hard regressions trigger rollbacks at two
+    CONSECUTIVE evals -- a structural regression the run cannot train its
+    way out of (rollback restores weights, not the data/LR position).
+    run_training catches it and ends the run early with a normal ``done``
+    event, standing behind ``last_good_checkpoint``. Args: the metric
+    names that fired."""
+
+
 @dataclass
 class MetricGuard:
     """Guard one eval metric with TWO regression tiers (rationale in the
@@ -1085,7 +1115,15 @@ class MetricGuard:
     train1 back to base at 0.15 nats/token of drift -- comfortably inside
     the healthy RLHF band -- discarding a step-200 checkpoint with
     navigation exact-match 0.91.) In ceiling-only mode the soft tier is
-    off and hard fires only past the source-declared absolute ceiling."""
+    off and hard fires only past the source-declared absolute ceiling.
+
+    ``warn_only=True`` keeps ALL of the detection (relative and/or
+    ceiling, unchanged thresholds and reference) but strips the guard of
+    rollback/abort authority: the trainer logs a loud DRIFT WARNING and
+    moves on. For the manifest KD replay sources, whose 2x-over-step-0-
+    entropy trigger is a perfectly good "drift is getting notable" alarm
+    but a terrible reason to discard a run (2026-08-05: it discarded two
+    epochs -- the aug4 postmortem in TRAINING_OVERVIEW.md)."""
 
     metric: str
     higher_is_better: bool
@@ -1095,6 +1133,9 @@ class MetricGuard:
     #: False = ceiling-only drift meter (see class docstring); the
     #: best-ever multiplier and the soft tier are both skipped.
     relative: bool = True
+    #: True = detection only; a would-be hard regression is demoted to a
+    #: WARNING log + drift_warning event, never rollback/abort.
+    warn_only: bool = False
 
     def is_soft_regression(self, value: float, best: float) -> bool:
         if not self.relative:
@@ -1446,9 +1487,12 @@ def run_training(
     # absolute catastrophe bound (DataSource.guard_ceiling -- e.g. the
     # analyst anchor's 5.0) gets it wired into its guard here; anchor-style
     # sources also set guard_relative=False so their guard is ceiling-only
-    # (drift meters can only rise from their step-0 floor -- MetricGuard).
+    # (drift meters can only rise from their step-0 floor -- MetricGuard),
+    # and KD replay sources set guard_warn_only=True so theirs never has
+    # rollback authority at all (2026-08-05 -- MetricGuard docstring).
     ceilings = {s.name: s.guard_ceiling for s in sources}
     relatives = {s.name: s.guard_relative for s in sources}
+    warn_onlys = {s.name: s.guard_warn_only for s in sources}
     guards = {
         "heldout_loss": MetricGuard(
             "heldout_loss", higher_is_better=False,
@@ -1464,6 +1508,7 @@ def run_training(
             hard_multiplier=cfg.hard_multiplier,
             ceiling=ceilings.get(src_name),
             relative=relatives.get(src_name, True),
+            warn_only=warn_onlys.get(src_name, False),
         )
     guards.update(extra_guards or {})
     best_metrics: dict[str, float] = {}
@@ -1494,14 +1539,24 @@ def run_training(
     #: where the metric is not soft-regressed); at cfg.soft_streak_limit
     #: the streak escalates to a hard regression.
     soft_streaks: dict[str, int] = {}
+    #: True while the PREVIOUS eval ended in a rollback. Two rollbacks at
+    #: consecutive evals mean the regression is structural (the guard is
+    #: guaranteed to re-fire; rollback restores weights but not the data
+    #: or LR position), so the run ends early instead of churning --
+    #: 2026-08-05: both aug4 epochs burned their second half in exactly
+    #: that rollback/re-regress loop and could only ever end at step 0.
+    rolled_back_last_eval = False
 
     def run_hooks_and_guard(step: int, epoch: int) -> None:
         """After each save: run every probe, log one flat eval row, track
         bests, and apply the two-tier regression policy (module docstring,
         ROLLBACK): soft = warn only; hard (multiplier / ceiling / escalated
-        soft streak) = act per cfg.on_regression against last_good_ckpt.
-        An eval with no hard regression promotes last_good_ckpt."""
-        nonlocal last_good_ckpt, n_rollbacks
+        soft streak) = act per cfg.on_regression against last_good_ckpt --
+        except for warn_only guards, whose hard hits are demoted to loud
+        DRIFT WARNINGs. An eval with no hard regression promotes
+        last_good_ckpt; a second consecutive rollback raises
+        _ConsecutiveRollbackStop (structural, not noise)."""
+        nonlocal last_good_ckpt, n_rollbacks, rolled_back_last_eval
         all_metrics: dict[str, float] = {}
         for hook in eval_hooks:
             all_metrics.update(hook(ctx))
@@ -1510,6 +1565,27 @@ def run_training(
             tlog.eval_row(step, epoch, all_metrics)
 
         hard_hits: list[str] = []
+
+        def hard_hit(guard, mname: str, value: float, best: float,
+                     tier: str, detail: str) -> None:
+            """Route one would-be hard regression: warn_only guards get a
+            loud WARNING and no authority; everything else joins
+            hard_hits and acts per cfg.on_regression."""
+            if guard.warn_only:
+                logger.warning(
+                    "DRIFT WARNING on %s: %.5g (%s) -- warn-only guard, "
+                    "no rollback (drift meter; MetricGuard docstring)",
+                    mname, value, detail,
+                )
+                tlog.event("drift_warning", metric=mname, value=value,
+                           best=best, tier=tier)
+                return
+            hard_hits.append(mname)
+            logger.error("HARD REGRESSION on %s: %.5g (%s)",
+                         mname, value, detail)
+            tlog.event("REGRESSION", metric=mname, value=value,
+                       best=best, tier=tier, action=cfg.on_regression)
+
         for mname, value in all_metrics.items():
             guard = guards.get(mname)
             if guard is None:
@@ -1522,30 +1598,22 @@ def run_training(
             # best is not None from here (is_improvement is True on None).
             if guard.is_hard_regression(value, best):
                 soft_streaks[mname] = 0
-                hard_hits.append(mname)
-                logger.error(
-                    "HARD REGRESSION on %s: %.5g (best %.5g, hard bound "
-                    "%.1fx%s)", mname, value, best, guard.hard_multiplier,
-                    "" if guard.ceiling is None
-                    else f" / ceiling {guard.ceiling:g}",
-                )
-                tlog.event("REGRESSION", metric=mname, value=value,
-                           best=best, tier="hard", action=cfg.on_regression)
+                hard_hit(guard, mname, value, best, tier="hard",
+                         detail=f"best {best:.5g}, hard bound "
+                                f"{guard.hard_multiplier:.1f}x"
+                                + ("" if guard.ceiling is None
+                                   else f" / ceiling {guard.ceiling:g}"))
             elif guard.is_soft_regression(value, best):
                 streak = soft_streaks.get(mname, 0) + 1
                 soft_streaks[mname] = streak
                 if streak >= cfg.soft_streak_limit:
                     # Persistent drift, not noise: escalate.
                     soft_streaks[mname] = 0
-                    hard_hits.append(mname)
-                    logger.error(
-                        "HARD REGRESSION on %s: soft-regressed %d evals in "
-                        "a row (%.5g vs best %.5g) -- persistent drift",
-                        mname, streak, value, best,
-                    )
-                    tlog.event("REGRESSION", metric=mname, value=value,
-                               best=best, tier=f"soft_streak_{streak}",
-                               action=cfg.on_regression)
+                    hard_hit(guard, mname, value, best,
+                             tier=f"soft_streak_{streak}",
+                             detail=f"soft-regressed {streak} evals in a "
+                                    f"row vs best {best:.5g} -- "
+                                    "persistent drift")
                 else:
                     # Soft tier: a log line, nothing else -- noise on one
                     # dataset must never trigger weight surgery or freeze
@@ -1562,10 +1630,11 @@ def run_training(
                 soft_streaks[mname] = 0
 
         if not hard_hits:
-            # Healthy eval (soft wiggles included): this checkpoint becomes
-            # the rollback target.
+            # Healthy eval (soft wiggles and drift warnings included):
+            # this checkpoint becomes the rollback target.
             if last_ckpt is not None:
                 last_good_ckpt = last_ckpt
+            rolled_back_last_eval = False
             return
 
         if cfg.on_regression == "abort":
@@ -1581,6 +1650,25 @@ def run_training(
                              "exists yet; continuing WITHOUT rollback")
                 return
             n_rollbacks += 1
+            if rolled_back_last_eval:
+                # Two rollbacks at CONSECUTIVE evals: the regression is
+                # structural (see the flag's comment above) -- end the
+                # run now, loudly, standing behind last_good_ckpt. The
+                # caller turns this into a normal early 'done'.
+                logger.error(
+                    "SECOND CONSECUTIVE ROLLBACK (hard regression on %s "
+                    "at the eval right after a rollback): this is "
+                    "structural, not noise -- rollback restores weights "
+                    "but not the data/LR position, so the guard is "
+                    "guaranteed to re-fire and the rest of the run would "
+                    "be burned re-training into the same wall. ENDING "
+                    "THE RUN EARLY; last good checkpoint: %s",
+                    hard_hits, last_good_ckpt,
+                )
+                tlog.event("consecutive_rollback_stop", metrics=hard_hits,
+                           n_rollbacks=n_rollbacks,
+                           last_good_checkpoint=str(last_good_ckpt))
+                raise _ConsecutiveRollbackStop(hard_hits)
             # Rollback restores the weights but not the data or LR
             # position, so a persistently regressing run oscillates
             # (roll back, re-regress, ...) forever; cap it and hand back
@@ -1597,6 +1685,7 @@ def run_training(
             load_adapter_state(model, last_good_ckpt)
             tlog.event("rolled_back", to=str(last_good_ckpt),
                        n_rollbacks=n_rollbacks)
+            rolled_back_last_eval = True
 
     # ------------------------------------------------- baseline (step 0)
     # Save + eval BEFORE the first optimizer step: every guard gets a
@@ -1618,79 +1707,93 @@ def run_training(
     src_loss_sum: dict[str, float] = {}
     src_loss_n: dict[str, int] = {}
     done = False
+    ended_early: str | None = None
 
-    for epoch in range(cfg.epochs):
-        if done:
-            break
-        order = epoch_order(by_source, src_weights, rng)
-        batches = epoch_batches(order, cfg.micro_batch, rng)
-        optimizer.zero_grad(set_to_none=True)
-        for i, exs in enumerate(batches):
-            built = collator.build_batch(exs)
-            # weighted_loss means over the batch's per-example normalized
-            # losses, so each example's gradient contribution is
-            # 1/(micro_batch * grad_accum) -- identical to batch-1 training
-            # at the same effective batch.
-            loss, per_example = weighted_loss(
-                model, built["model_inputs"], built["weights"],
-                loss_kind=exs[0].loss, return_per_example=True,
+    try:
+        for epoch in range(cfg.epochs):
+            if done:
+                break
+            order = epoch_order(by_source, src_weights, rng)
+            batches = epoch_batches(order, cfg.micro_batch, rng)
+            optimizer.zero_grad(set_to_none=True)
+            for i, exs in enumerate(batches):
+                built = collator.build_batch(exs)
+                # weighted_loss means over the batch's per-example
+                # normalized losses, so each example's gradient
+                # contribution is 1/(micro_batch * grad_accum) --
+                # identical to batch-1 training at the same effective
+                # batch.
+                loss, per_example = weighted_loss(
+                    model, built["model_inputs"], built["weights"],
+                    loss_kind=exs[0].loss, return_per_example=True,
+                )
+                (loss / cfg.grad_accum).backward()
+                for ex, lv in zip(exs, per_example.tolist()):
+                    src_loss_sum[ex.source] = src_loss_sum.get(ex.source, 0.0) + lv
+                    src_loss_n[ex.source] = src_loss_n.get(ex.source, 0) + 1
+
+                if (i + 1) % cfg.grad_accum == 0 or i == len(batches) - 1:
+                    grad_norm = float(torch.nn.utils.clip_grad_norm_(params, 1.0))
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    step += 1
+
+                    if step % cfg.log_steps == 0:
+                        per_src = {
+                            n: round(src_loss_sum[n] / src_loss_n[n], 4)
+                            for n in src_loss_sum
+                        }
+                        tlog.step({
+                            "step": step, "epoch": epoch,
+                            "loss": sum(src_loss_sum.values())
+                                    / max(1, sum(src_loss_n.values())),
+                            "lr": scheduler.get_last_lr()[0],
+                            "grad_norm": grad_norm,
+                            "source_loss": per_src,
+                        })
+                        src_loss_sum.clear()
+                        src_loss_n.clear()
+
+                    if step % cfg.save_steps == 0:
+                        last_ckpt = save_checkpoint(
+                            model, ckpt_root / f"{cfg.label}_step{step}",
+                            {"step": step, "epoch": epoch,
+                             "git_rev": _git_rev(),
+                             "sources": {n: len(v)
+                                         for n, v in by_source.items()},
+                             "best_metrics": best_metrics},
+                            tlog,
+                        )
+                        run_hooks_and_guard(step, epoch)
+
+                    if cfg.max_steps and step >= cfg.max_steps:
+                        done = True
+                        break
+
+        # Final save (skip if the loop saved on the very last step).
+        if last_ckpt is None or not str(last_ckpt).endswith(f"step{step}"):
+            last_ckpt = save_checkpoint(
+                model, ckpt_root / f"{cfg.label}_step{step}",
+                {"step": step, "epoch": cfg.epochs, "git_rev": _git_rev(),
+                 "sources": {n: len(v) for n, v in by_source.items()},
+                 "best_metrics": best_metrics, "final": True},
+                tlog,
             )
-            (loss / cfg.grad_accum).backward()
-            for ex, lv in zip(exs, per_example.tolist()):
-                src_loss_sum[ex.source] = src_loss_sum.get(ex.source, 0.0) + lv
-                src_loss_n[ex.source] = src_loss_n.get(ex.source, 0) + 1
-
-            if (i + 1) % cfg.grad_accum == 0 or i == len(batches) - 1:
-                grad_norm = float(torch.nn.utils.clip_grad_norm_(params, 1.0))
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-                step += 1
-
-                if step % cfg.log_steps == 0:
-                    per_src = {
-                        n: round(src_loss_sum[n] / src_loss_n[n], 4)
-                        for n in src_loss_sum
-                    }
-                    tlog.step({
-                        "step": step, "epoch": epoch,
-                        "loss": sum(src_loss_sum.values())
-                                / max(1, sum(src_loss_n.values())),
-                        "lr": scheduler.get_last_lr()[0],
-                        "grad_norm": grad_norm,
-                        "source_loss": per_src,
-                    })
-                    src_loss_sum.clear()
-                    src_loss_n.clear()
-
-                if step % cfg.save_steps == 0:
-                    last_ckpt = save_checkpoint(
-                        model, ckpt_root / f"{cfg.label}_step{step}",
-                        {"step": step, "epoch": epoch, "git_rev": _git_rev(),
-                         "sources": {n: len(v) for n, v in by_source.items()},
-                         "best_metrics": best_metrics},
-                        tlog,
-                    )
-                    run_hooks_and_guard(step, epoch)
-
-                if cfg.max_steps and step >= cfg.max_steps:
-                    done = True
-                    break
-
-    # Final save (skip if the loop happened to save on the very last step).
-    if last_ckpt is None or not str(last_ckpt).endswith(f"step{step}"):
-        last_ckpt = save_checkpoint(
-            model, ckpt_root / f"{cfg.label}_step{step}",
-            {"step": step, "epoch": cfg.epochs, "git_rev": _git_rev(),
-             "sources": {n: len(v) for n, v in by_source.items()},
-             "best_metrics": best_metrics, "final": True},
-            tlog,
-        )
-        run_hooks_and_guard(step, cfg.epochs)
+            run_hooks_and_guard(step, cfg.epochs)
+    except _ConsecutiveRollbackStop as exc:
+        # Structural regression (guard already logged the full ERROR
+        # verdict and the consecutive_rollback_stop event): end the run
+        # as a normal, early 'done' standing behind last_good_ckpt, so
+        # the orchestrator hands the right weights to the next epoch.
+        ended_early = f"consecutive rollbacks (hard regression on {exc.args[0]})"
 
     tlog.event("done", steps=step, final_checkpoint=str(last_ckpt),
                last_good_checkpoint=str(last_good_ckpt),
-               best_metrics=best_metrics)
+               best_metrics=best_metrics,
+               **({"ended_early": ended_early} if ended_early else {}))
+    if ended_early:
+        print(f"ENDED EARLY at step {step}: {ended_early}")
     print(f"done. final checkpoint: {last_ckpt}")
     print(f"last good checkpoint (no hard regression at its eval): "
           f"{last_good_ckpt}")

@@ -281,22 +281,43 @@ unless the same metric stays soft-regressed 3 evals in a row
 (`--soft-streak-limit`), which is persistent drift and escalates; a HARD
 regression (worse by `--hard-multiplier`, default 2x, or past a guard's
 absolute ceiling — the analyst KD anchor's is 5.0) triggers
-`--on-regression {warn,rollback,abort}` (default `rollback`). Exception
-(2026-08-04): the KD-anchor sources' guards are **ceiling-only**
-(`guard_relative = False` — player anchor ceiling 1.0, analyst 5.0),
-because an anchor's held-out loss is a drift meter pinned to its step-0
-floor: the best-ever multiplier read "any learning at all" as a hard
-regression and rolled a healthy retest back to base twice
-(TRAINING_GAME_TRACES.md). Rollback restores `last_good_ckpt` — the
+`--on-regression {warn,rollback,abort}` (default `rollback`). Two
+classes of exception, both learned the hard way:
+
+- **Ceiling-only anchor guards** (2026-08-04): the KD-anchor sources'
+  guards skip the best-ever multiplier (`guard_relative = False` —
+  player anchor ceiling 1.0, analyst 5.0), because an anchor's held-out
+  loss is a drift meter pinned to its step-0 floor: the relative bound
+  read "any learning at all" as a hard regression and rolled a healthy
+  retest back to base twice (TRAINING_GAME_TRACES.md).
+- **Warn-only KD replay guards** (2026-08-05): the manifest KD sources
+  (cauldron, slimorca, openthoughts) are the same kind of drift meter —
+  soft-CE vs. the frozen base starts at the teacher's entropy and can
+  only rise — and their relative guards discarded BOTH aug4 epochs at
+  ordinary learning-drift levels. They keep their exact metric and
+  reference (drift from base Gemma is worth watching) but lose rollback
+  authority: a would-be hard hit logs a `DRIFT WARNING` + a
+  `drift_warning` event and nothing else (`DataSource.guard_warn_only`).
+  CE sources with ground-truth targets (navigation, the math sets) keep
+  full guard authority — navigation's near-perfect baseline is a
+  property we protect by corpus weight (`examples_per_epoch` 300→900),
+  not by loosening its guard.
+
+Rollback restores `last_good_ckpt` — the
 newest checkpoint whose own eval had no hard regression — never the save
 that just regressed; `run_weekend` likewise hands the NEXT epoch the
 `last_good_checkpoint` from the trainer's `done` event, not the
 highest-step directory (the final save lands BEFORE the final eval, so
 after a terminal rollback the newest directory is exactly the rejected
-one). Rollbacks are capped by `--max-rollbacks` (default 3): rollback
-restores weights but not the schedule position, so a persistently
-regressing run would otherwise oscillate silently — past the cap the run
-aborts naming the last good checkpoint. The real probe suite — per-capability benchmarks, planted-error
+one). **Rollbacks at two CONSECUTIVE evals end the run early**
+(2026-08-05): rollback restores weights but not the data/LR position, so
+a structurally-firing guard re-triggers forever — both aug4 epochs
+burned their second half in that loop and could only ever end at step 0.
+The early stop logs the verdict at ERROR and writes a normal `done`
+event (`ended_early` + `last_good_checkpoint`), so the orchestrator
+hand-off still works. `--max-rollbacks` (default 3) remains as a
+backstop for non-consecutive oscillation — past the cap the run aborts
+naming the last good checkpoint. The real probe suite — per-capability benchmarks, planted-error
 analyst miss rate — is specified in
 [TRAINING_EXTRA_DATASETS.md](TRAINING_EXTRA_DATASETS.md) and lands in
 stage 3.

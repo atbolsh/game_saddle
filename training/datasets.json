@@ -81,10 +81,10 @@
       "max_rows": 10000,
       "converter": null,
       "loss": "ce",
-      "examples_per_epoch": 300,
+      "examples_per_epoch": 900,
       "probe": {"n": 100, "kind": "exact_match"},
       "enabled": true,
-      "notes": "Generated locally (training/synth_navigation.py): clock hour <-> degrees <-> radians, compass point <-> bearing, bearing differences, shortest-rotation direction. Matches this repo's conventions (bearing clockwise from 12 o'clock, hour = 30 deg). Directly targets the geometry failure modes."
+      "notes": "Generated locally (training/synth_navigation.py): clock hour <-> degrees <-> radians, compass point <-> bearing, bearing differences, shortest-rotation direction. Matches this repo's conventions (bearing clockwise from 12 o'clock, hour = 30 deg). Directly targets the geometry failure modes. 300 -> 900 on 2026-08-05: the game corpus clones tolerated (+-2h) geometry errors, so the aug4 runs degraded this benchmark (0.054 -> 0.175 nats held-out by the final eval); tripling the quota (~5% -> ~14% of epoch gradient mass) counteracts that pressure directly, and its guard stays STRICT on purpose."
     },
     {
       "name": "openthoughts",

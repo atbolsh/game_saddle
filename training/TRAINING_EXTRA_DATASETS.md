@@ -210,15 +210,28 @@ Probe set (planned additions, next stages):
 
 Each guarded metric carries a soft threshold (relative, default 10% —
 WARNING only) and a hard one (2x worse than best, an absolute ceiling
-where declared, or 3 consecutive soft breaches) — EXCEPT the KD-anchor
-drift meters (analyst 5.0, player anchor 1.0), which are ceiling-only
-(`guard_relative = False`: their best-ever is pinned to the step-0 floor
-by construction, so a relative bound reads any learning as regression);
-a hard breach triggers `train.py`'s regression path —
-ERROR-level logging and, by default, rollback to the last GOOD checkpoint
-(`--on-regression warn|rollback|abort`; details in
-TRAINING_OVERVIEW.md's rollback section). The analyst miss-rate probe is
-the designated tripwire for the shared-network drift risk accepted in
+where declared, or 3 consecutive soft breaches); a hard breach triggers
+`train.py`'s regression path — ERROR-level logging and, by default,
+rollback to the last GOOD checkpoint (`--on-regression
+warn|rollback|abort`; details in TRAINING_OVERVIEW.md's rollback
+section). Two exceptions:
+
+- the KD-anchor drift meters (analyst 5.0, player anchor 1.0) are
+  ceiling-only (`guard_relative = False`: their best-ever is pinned to
+  the step-0 floor by construction, so a relative bound reads any
+  learning as regression);
+- **every KD replay source in this manifest is warn-only**
+  (`guard_warn_only`, set automatically for `loss: "kd"` entries,
+  2026-08-05): the same pinned-floor problem, and the relative 2x
+  trigger — "one teacher-entropy of drift" — discarded both aug4 epochs.
+  The metric itself is unchanged (held-out soft-CE vs. the frozen base:
+  drift-from-Gemma is exactly what we want on a meter) but a breach now
+  logs a `DRIFT WARNING` instead of rolling back. If a good training
+  run ever lands, consider deleting these warnings too.
+
+CE sources (ground-truth targets: navigation, the math sets) keep full
+guard authority. The analyst miss-rate probe is the designated tripwire
+for the shared-network drift risk accepted in
 [TRAINING_GAME_TRACES.md](TRAINING_GAME_TRACES.md).
 
 ## Memory (NAMS) hygiene during training epochs
