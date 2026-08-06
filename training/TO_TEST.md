@@ -261,6 +261,30 @@ Verification order:
   floored much of the corpus (read the rating histogram before burning
   the train hours).
 
+Run-hygiene follow-ups (2026-08-06, before the 11-epoch run): two
+orchestration-level changes, NOT covered by any selftest stage (both need
+a real epoch boundary):
+
+* **Run-start NAMS reset** (`generate_game_traces.run_generation`): every
+  non-`--append` datagen run now resets episodic memory to the seeded
+  semantic model before the first game (tips survive; the block-boundary
+  reset at `--reset-every` never fired on 60-game orchestrated epochs, so
+  memory grew across the whole weekend). Verify: each epoch's datagen log
+  opens with `NAMS hygiene: run-start reset ...`; an `--append` crash
+  resume must NOT log it. Note this also means every fresh datagen —
+  including t5/t8/t9 and smoke evals — wipes episodic memory at start;
+  that is intended (episodic memory is disposable by design).
+* **Post-train corpus pruning** (`run_weekend._prune_datagen`): after each
+  SUCCESSFUL train stage, `data_game/<prefix>_iter<k>` is tombstoned down
+  to one won game (if any) + one other random game; all other records in
+  both jsonl files become `{"pruned": true, "meta": ...}` and their frames
+  are deleted. Stats stay computable (`_summarize_traces` reads only
+  `meta`); a pruned corpus fed back to `GameTraceSource` fails loudly on
+  the missing `messages` key. Verify after epoch 1: `pruned` appears in
+  the state file with a sane `mib_freed`, `images/` shrank to the kept
+  games' frames, and `grep -c '"pruned": true' traces.jsonl` ≈ records −
+  kept. Smoke dirs and failed epochs' corpora are never pruned.
+
 Weekend rehearsal (before launching `training/run_weekend.py` for
 real): with NAMS up and external data downloaded, run
 

@@ -56,7 +56,10 @@ read by the same source.
 Housekeeping per the committed plan: frames are noised at inference
 (mild label-safe degradation, ``--no-noise`` to disable) and NAMS episodic
 memory is reset to the seeded semantic model (tips are ``Preference`` nodes
-and survive) every ``--reset-every`` games.
+and survive) every ``--reset-every`` games AND at run start (2026-08-06:
+orchestrated 60-game epochs never reach the 100-game block boundary, and
+nothing reset between epochs, so multi-day runs grew episodic memory
+unboundedly). An ``--append`` resume keeps the epoch's own memories.
 
 **Degeneracy fuse**: ``DEGENERACY_FUSE`` consecutive generations with no
 parseable RATING and no parseable move mean the checkpoint is collapsed,
@@ -633,6 +636,23 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
             # blocks (or workers) repeat the same question sequence.
             qrngs = [random.Random(args.seed * 1000 + i)
                      for i in range(n_workers)]
+            # NAMS hygiene at RUN START (2026-08-06): the block-boundary
+            # reset below never fires on orchestrated epochs (60-game
+            # epochs < --reset-every 100), and nothing resets BETWEEN
+            # epochs, so a multi-day run grew episodic memory unboundedly
+            # -- stale reasoning traces from obsolete checkpoints
+            # polluting analyst retrieval, and retrieval itself slowing
+            # down. A fresh run now starts from the seeded semantic model
+            # (tips are Preference nodes and SURVIVE, as everywhere).
+            # --append (mid-epoch crash resume) skips it: the epoch keeps
+            # its own memories.
+            if not args.append:
+                logger.info(
+                    "NAMS hygiene: run-start reset of episodic memory to "
+                    "the seeded semantic model (tips survive; --append "
+                    "would skip this)."
+                )
+                sessions[0].reset_memory_to_seed()
             for s in sessions:
                 s.restart()
             fresh = [True] * n_workers

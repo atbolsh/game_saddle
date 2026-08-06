@@ -19,6 +19,17 @@ One "epoch" here is one full expert-iteration cycle. For epoch k (1-based):
      every checkpoint gets a game-performance reading even when no
      further datagen follows it, and a poisoned checkpoint surfaces in
      ~15 min. ``grep smoke_eval`` on the run log for the morning review.
+  4. prune  after a SUCCESSFUL train, the consumed corpus is tombstoned
+     down to a keepsake sample (one won game if any, plus one other
+     random game): every other record in traces.jsonl /
+     analyst_traces.jsonl becomes ``{"pruned": true, "meta": ...}`` and
+     its frames are deleted, so win-rate/rating stats stay computable
+     forever while disk is reclaimed (``_prune_datagen``; summary under
+     ``pruned`` in the state file). Smoke dirs are never pruned. A
+     failed epoch keeps its full corpus for the retry-by-hand path.
+     ``--prune <label>`` (repeatable) runs the same pruning standalone
+     on any already-trained-on corpus and exits -- for dirs that predate
+     this step.
 
 Each stage is a SUBPROCESS, deliberately: the inference model is a
 process-wide singleton (agent/model.py) and training builds its own
@@ -88,6 +99,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import random
 import subprocess
 import sys
 import threading
@@ -395,6 +407,122 @@ def _summarize_traces(label: str) -> dict:
     }
 
 
+def _prune_datagen(label: str, seed: int) -> dict | None:
+    """Disk hygiene for a corpus that has been TRAINED ON (2026-08-06):
+    tombstone every game except a keepsake sample -- one WON game (when
+    any exist) plus one other game, both chosen deterministically from
+    ``seed``.
+
+    Kept games keep their full records (messages, target text, frames).
+    Every other record is replaced IN PLACE, in both ``traces.jsonl``
+    and ``analyst_traces.jsonl``, by ``{"pruned": true, "meta": <the
+    original meta>}``. meta is the only thing stats consumers read
+    (:func:`_summarize_traces`, the datagen plots), so win rates,
+    ratings, and distance deltas stay computable from a pruned corpus
+    forever; only the bulky contexts go. Frames under ``images/`` not
+    referenced by a kept record are deleted.
+
+    A pruned corpus can never be silently retrained: GameTraceSource
+    hard-fails on the first tombstone (no ``messages`` key), which is
+    the desired loud failure -- two games quietly posing as a full
+    corpus would be far worse. Each file is rewritten via a temp file +
+    atomic replace, so a crash mid-prune never loses records. Returns a
+    summary dict, or None when the corpus is missing or already pruned
+    (idempotent under manual re-runs)."""
+    out_dir = DATA_GAME_DIR / label
+    traces_path = out_dir / "traces.jsonl"
+    analyst_path = out_dir / "analyst_traces.jsonl"
+    if not traces_path.is_file():
+        logger.error("[prune %s] no traces.jsonl -- nothing to prune", label)
+        return None
+
+    # Pass 1: the game list and each game's won status. A game is one
+    # distinct (session_id, game_index) -- same keying as
+    # _summarize_traces (game_index alone repeats across --append
+    # resume attempts).
+    games: dict[tuple, bool] = {}
+    with open(traces_path, encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            obj = json.loads(line)
+            if obj.get("pruned"):
+                logger.info("[prune %s] already pruned; skipping", label)
+                return None
+            meta = obj["meta"]
+            key = (meta.get("session_id"), meta.get("game_index"))
+            games[key] = games.get(key, False) or bool(meta.get("game_won"))
+
+    rng = random.Random(seed)
+    won = sorted(k for k, w in games.items() if w)
+    keep: set[tuple] = set()
+    if won:
+        keep.add(rng.choice(won))
+    rest = sorted(k for k in games if k not in keep)
+    if rest:
+        keep.add(rng.choice(rest))
+
+    kept_images: set[str] = set()
+    counts = {"records_kept": 0, "records_pruned": 0}
+
+    def rewrite(path: Path) -> None:
+        if not path.is_file():
+            return
+        tmp = path.with_name(path.name + ".prune_tmp")
+        with open(path, encoding="utf-8") as src, \
+                open(tmp, "w", encoding="utf-8") as dst:
+            for line in src:
+                if not line.strip():
+                    continue
+                obj = json.loads(line)
+                meta = obj["meta"]
+                key = (meta.get("session_id"), meta.get("game_index"))
+                if key in keep:
+                    counts["records_kept"] += 1
+                    for m in obj.get("messages") or []:
+                        content = m.get("content")
+                        if not isinstance(content, list):
+                            continue
+                        for part in content:
+                            if (isinstance(part, dict)
+                                    and part.get("type") == "image"):
+                                kept_images.add(Path(part["url"]).name)
+                    dst.write(line if line.endswith("\n") else line + "\n")
+                else:
+                    counts["records_pruned"] += 1
+                    dst.write(json.dumps(
+                        {"pruned": True, "meta": meta}, ensure_ascii=False
+                    ) + "\n")
+        tmp.replace(path)
+
+    rewrite(traces_path)
+    rewrite(analyst_path)
+
+    images_dir = out_dir / "images"
+    n_deleted = 0
+    bytes_freed = 0
+    if images_dir.is_dir():
+        for img in images_dir.iterdir():
+            if not img.is_file() or img.name in kept_images:
+                continue
+            bytes_freed += img.stat().st_size
+            img.unlink()
+            n_deleted += 1
+
+    summary = {
+        "games_total": len(games),
+        "games_kept": [
+            {"session_id": sid, "game_index": gi, "won": games[(sid, gi)]}
+            for sid, gi in sorted(keep, key=str)
+        ],
+        **counts,
+        "images_deleted": n_deleted,
+        "mib_freed": round(bytes_freed / 2 ** 20, 1),
+    }
+    logger.info("[prune %s] %s", label, json.dumps(summary))
+    return summary
+
+
 # =================================================================== stages
 
 #: Post-train smoke eval size: 8 real games (~100-200 generations,
@@ -623,6 +751,27 @@ def orchestrate(args: argparse.Namespace) -> int:
         state["checkpoints"][str(k)] = new_ckpt
         _save_state(args.prefix, state)
 
+        # Disk hygiene (2026-08-06): the corpus has been consumed, so
+        # tombstone it down to a keepsake sample (one won game + one
+        # other; stats stay computable from the metas left behind).
+        # Only after a SUCCESSFUL train -- a failed epoch keeps its full
+        # corpus for the retry-by-hand path above. Smoke dirs are never
+        # pruned (tiny, and the user curates them). A pruning crash is
+        # not worth killing an unattended weekend over: log it loudly
+        # and move on.
+        if new_ckpt:
+            try:
+                pruned = _prune_datagen(f"{args.prefix}_iter{k}",
+                                        seed=args.seed + 9000 + k)
+            except Exception:
+                logger.exception("[prune iter%d] FAILED -- full corpus "
+                                 "left on disk; prune by hand if disk "
+                                 "runs low", k)
+            else:
+                if pruned:
+                    state.setdefault("pruned", {})[str(k)] = pruned
+                    _save_state(args.prefix, state)
+
         # Post-train smoke eval (STANDARD, every fresh checkpoint): 8 real
         # games -> win rate / ratings / degeneracy / distance deltas,
         # logged AND stored in the state file -- so even a run whose last
@@ -701,6 +850,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "(default: full pass); use a small N to smoke-test "
                         "the whole orchestration cheaply before the real "
                         "weekend")
+    p.add_argument("--prune", metavar="LABEL", action="append",
+                   default=None,
+                   help="STANDALONE tool mode: prune data_game/<LABEL> "
+                        "down to the keepsake sample (one won game if any "
+                        "+ one other; every other record tombstoned to "
+                        "its meta, unreferenced frames deleted) and exit "
+                        "-- no epochs run. Repeatable. Only for corpora "
+                        "that have ALREADY been trained on: a pruned "
+                        "corpus cannot be retrained. Does not touch the "
+                        "state file; idempotent on already-pruned dirs. "
+                        "The keepsake pick derives from --seed.")
     p.add_argument("--train-iter", type=int, default=None,
                    help="INTERNAL (child mode): run epoch k's train stage "
                         "in this process and exit")
@@ -720,6 +880,15 @@ def main(argv: list[str] | None = None) -> int:
         return train_one_epoch(args.train_iter, args.prefix,
                                args.resume_checkpoint,
                                max_steps=args.train_max_steps)
+    if args.prune:
+        # Standalone prune mode: exit code counts labels with no
+        # traces.jsonl (already-pruned dirs log INFO and are fine).
+        missing = 0
+        for label in args.prune:
+            if not (DATA_GAME_DIR / label / "traces.jsonl").is_file():
+                missing += 1
+            _prune_datagen(label, seed=args.seed)
+        return missing
     return orchestrate(args)
 
 
