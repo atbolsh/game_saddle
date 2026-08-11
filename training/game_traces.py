@@ -43,9 +43,15 @@ SCALE -- ``TrainingExample.example_weight``, "how much this reply matters":
      :func:`action_balance_multipliers`): equal total cloning mass per
      move TYPE, capped at 4x;
   4. x novelty decay -- OFF BY DEFAULT behind ``GameTraceSource(...,
-     novelty=True)`` (WORK IN PROGRESS, :class:`NoveltyTracker`);
+     novelty=True)``, ON at the run_weekend call site since 2026-08-11
+     (:class:`NoveltyTracker`);
   5. x ``ORACLE_WRONG_SCALE`` (0.25) when the engine oracle says the move
-     contradicted ground truth (crutch block above :func:`oracle_verdict`).
+     contradicted ground truth (crutch block above :func:`oracle_verdict`);
+  6. x ``TRANSITION_BOOST`` (2.0) on RAY-HIT rounds (2026-08-11): the
+     gold is dead ahead and FORWARD gates the win -- the decisive
+     transition moves are a handful per game and this keeps them from
+     drowning in continuation moves. Compounds with 5 on a missed
+     forward (0.25 x 2 = 0.5, with a sharpened -0.5 token span).
 
   A scale of exactly 0 (floored rating, no win boost) SKIPS the record.
 
@@ -221,16 +227,27 @@ def build_span_weights(
 #                is a correct move): move-token span ORACLE_MATCH_SPAN;
 #   "neutral" -- defensible under the 45-degree aim tolerance the player
 #                is INSTRUCTED to use (FORWARD inside the cone without a
-#                ray hit; fine-tuning turn toward the gold despite a ray
-#                hit): no modifier, the analyst's rating stands;
+#                ray hit): no modifier, the analyst's rating stands;
 #   "wrong"   -- contradicts ground truth (turn away from the shorter
-#                rotation, FORWARD outside the cone): move-token span
-#                ORACLE_WRONG_SPAN (bounded unlikelihood) AND the whole
-#                reply's example_weight is multiplied by
+#                rotation, FORWARD outside the cone, ANY turn under a
+#                ray hit -- the 2026-08-11 tightening below): move-token
+#                span ORACLE_WRONG_SPAN (bounded unlikelihood) AND the
+#                whole reply's example_weight is multiplied by
 #                ORACLE_WRONG_SCALE -- the rationalization of a wrong
 #                move is not worth cloning at full strength either;
 #   "unknown" -- no oracle meta (pre-2026-08-05 corpora) or no move:
 #                neutral, counted and logged once per source.
+#
+# 2026-08-11 TIGHTENING (after the aug6 11-epoch run): a turn under a
+# ray hit -- the gold dead ahead, FORWARD demanded -- is now "wrong",
+# not "fine-tuning neutral". The aug5 leniency let the run's biggest
+# leak through unpunished: 900 missed forwards whose only grader was
+# the analyst's coin-flip (42% rated >= +0.8), and FORWARD-on-ray-hit
+# compliance sat at ~50% for 11 epochs. Ray-hit rounds also get the
+# reply-wide TRANSITION_BOOST (below): they are the handful of decisive
+# transition moves per game, drowned in ~2.6k continuation moves.
+# Turns inside the 45-degree cone but OFF the ray keep their previous
+# grades (toward = matches oracle_move = correct; away = wrong).
 #
 # WHY THIS CANNOT STAY: it hard-wires "good play == greedy geodesic to
 # the nearest gold", which is only true because the current game is a
@@ -248,6 +265,13 @@ ORACLE_WRONG_SPAN = -0.5   #: move-token unlikelihood when oracle disagrees
 ORACLE_WRONG_SCALE = 0.25  #: example_weight multiplier on oracle-wrong moves
 ORACLE_CONE_RAD = math.pi / 4          #: the player's instructed tolerance
 ORACLE_EITHER_TURN_RAD = math.radians(170.0)  #: behind you: any turn is fine
+#: Reply-wide example_weight boost on RAY-HIT rounds (2026-08-11, the
+#: "arousal" first cut from FUTURE_GOALS goal 5): a ray hit is the
+#: transition moment that gates winning -- taking the FORWARD is cloned
+#: at double weight, and missing it compounds with ORACLE_WRONG_SCALE
+#: (0.25 x 2 = 0.5 net) while the boost sharpens the -0.5 unlikelihood
+#: span on the turn token.
+TRANSITION_BOOST = 2.0
 
 
 def oracle_verdict(action: str | None, oracle_move: str | None,
@@ -268,18 +292,9 @@ def oracle_verdict(action: str | None, oracle_move: str | None,
         return "correct"   # gold ~behind: either rotation is the move
     if action == "FORWARD" and not ray_hit and abs(rel) <= ORACLE_CONE_RAD:
         return "neutral"   # inside the instructed cone; analyst decides
-    toward = (action == "CLOCK" and rel > 0) or \
-             (action == "ANTICLOCK" and rel < 0)
-    if toward and ray_hit:
-        # DELIBERATE deviation from the aug5 plan text, which confined
-        # this neutral to |rel| <= ORACLE_CONE_RAD: any toward-gold turn
-        # under a ray hit stays neutral (analyst decides). The cases the
-        # cone would demote to "wrong" only exist in multi-gold or
-        # point-blank geometries -- tonight's bare levels have exactly
-        # one gold (new_bare_game), where a ray hit puts that gold nearly
-        # dead ahead anyway -- and where they DO occur the turn is
-        # defensible, so lenient beats a false ground-truth penalty.
-        return "neutral"   # fine-tuning aim past "good enough"
+    # A turn under a ray hit falls through to "wrong" (2026-08-11
+    # tightening in the crutch banner: the aug5 "fine-tuning neutral"
+    # here let missed forwards escape both reward halves).
     return "wrong"
 
 
@@ -365,6 +380,12 @@ def action_balance_multipliers(counts: dict[str, int]) -> dict[str, float]:
 # untuned x0.1 decay is a much sharper knife than it ever was in a live
 # run. Turn it on only if a run shows repetition degeneracy despite the
 # new reward shape. The tracker and its t1 units stay regardless.
+#
+# 2026-08-11: that condition fired -- the aug6 11-epoch run's turn runs
+# were 97% self-continuing and training DEEPENED the commitment (flip
+# rate 0.10 -> 0.03) -- so run_weekend.train_one_epoch now passes
+# novelty=True. The class default stays False (t1 asserts a default
+# source must not decay).
 #
 # KNOWN GAPS (future refinements live in FUTURE_GOALS.md):
 #   * only catches IDENTICAL CONSECUTIVE moves -- an alternating
@@ -586,6 +607,10 @@ class GameTraceSource(_TraceFileSource):
                 # The rationalization of an oracle-wrong move is suspect
                 # end to end -- damp its cloning AND its suppression.
                 scale *= ORACLE_WRONG_SCALE
+            if meta.get("oracle_ray_hit"):
+                # Transition moment (TRANSITION_BOOST comment): the
+                # gold is dead ahead and FORWARD gates the win.
+                scale *= TRANSITION_BOOST
             if scale == 0.0:
                 # Floored rating, no win boost: teaches NOTHING -- skip
                 # the forward pass entirely rather than burn it on a

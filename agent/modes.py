@@ -143,8 +143,12 @@ _BLOCK_AIM_TOLERANCE_REVIEW = (
 )
 
 # Grading calibration shared by every reviewer prompt (scene analyst +
-# debrief): how forgiving to be about verbal direction estimates, and the one
-# clear-cut case that must always be penalized.
+# debrief): how forgiving to be about verbal direction estimates, and the
+# clear-cut cases that must always be penalized. The two MUST-be-negative
+# rules and the consistency clause were added 2026-08-11 after the aug6
+# run's grading audit: the analyst computed the geometry correctly and
+# then rated the move by mood -- verbatim-identical wrong moves got +1.0
+# and -0.5 one move apart, and ~42% of missed forwards were rated >= +0.8.
 _BLOCK_GRADING_TOLERANCE = (
     "GRADING CALIBRATION: verbal direction estimates are approximate by "
     "nature. If the player's stated direction is within 2 clock hours "
@@ -155,10 +159,26 @@ _BLOCK_GRADING_TOLERANCE = (
     "within that tolerance AND the player chose the correct move, the "
     "direction words are simply correct -- do not mark them WRONG at all. "
     "If the chosen move was incorrect, DO mark the direction words that "
-    "led to it as wrong. One case IS clear-cut regardless: when the gold "
-    "lies within about 10 degrees of the facing direction, "
-    f"{_TOK_FORWARD} is unambiguously correct, and choosing to rotate "
-    "instead is a real mistake -- call it out and penalize it."
+    "led to it as wrong.\n"
+    "Two cases ARE clear-cut, and in both the overall RATING must be "
+    "NEGATIVE no matter how sound the rest of the reply reads:\n"
+    "  - MISSED FORWARD: the gold lies within about 10 degrees of the "
+    f"facing direction (essentially dead ahead) and the player rotated "
+    f"instead of stepping {_TOK_FORWARD}. {_TOK_FORWARD} is unambiguously "
+    "correct there; more aiming is a real mistake, not caution.\n"
+    "  - WRONG-DIRECTION TURN: the player rotated OPPOSITE to the shorter "
+    "rotation given by your own delta computation (ROTATION DIRECTION "
+    "recipe above) -- rotating clockwise when delta < 0, or "
+    "counter-clockwise when delta > 0. Exception: when the gold is nearly "
+    "behind (|delta| above about 2.97, i.e. 170 degrees), either "
+    "direction is fine.\n"
+    "Neither rule punishes gentle fine-tuning: a rotation toward the gold "
+    "that starts OUTSIDE that ~10-degree dead-ahead zone but inside the "
+    "45-degree aim tolerance is acceptable play -- do NOT penalize it. "
+    "And your RATING must FOLLOW your own geometry: if your delta "
+    "computation shows the move fell into one of the two cases above, "
+    "rate it negative -- never work out the correct answer and then "
+    "excuse the move anyway."
 )
 
 

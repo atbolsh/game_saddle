@@ -698,7 +698,12 @@ def train_one_epoch(k: int, prefix: str, resume: str | None,
     configure_logging()
     label = f"{prefix}_iter{k}"
     sources = [
-        GameTraceSource(f"data_game/{label}/traces.jsonl"),
+        # novelty=True (2026-08-11): the boredom decay taxes blind
+        # continuation -- the aug6 run's turn runs were 97%
+        # self-continuing and training DEEPENED the commitment (flip
+        # rate 0.10 -> 0.03 over 11 epochs). Class default stays False
+        # (t1 asserts a default source must not decay).
+        GameTraceSource(f"data_game/{label}/traces.jsonl", novelty=True),
         # Trust region over the SAME player traces: kd_anchor to the parent
         # checkpoint (= resume; falls back to the base when resume is None,
         # which IS epoch 1's parent). Rationale in game_traces.py.
