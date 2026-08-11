@@ -274,6 +274,18 @@ a real epoch boundary):
   resume must NOT log it. Note this also means every fresh datagen —
   including t5/t8/t9 and smoke evals — wipes episodic memory at start;
   that is intended (episodic memory is disposable by design).
+* **Reset now purges EXTRACTED entities too** (2026-08-11, found by the
+  post-aug6 census: 33k extraction-minted `Entity` nodes vs 5 seed ones
+  had survived every reset). `_reset_memory_to_seed` keeps only the
+  `_SEMANTIC_MODEL_ENTITIES` (by name) + all `Preference` nodes, and both
+  datagen reset sites now log the per-label deletion census. Verify on
+  the box BEFORE trusting it: `MATCH (e:Entity) WHERE e.name IN ['Agent',
+  'Gold','BoundaryWall','DiscreteGame','Direction'] RETURN e.name;` must
+  return all 5 (if NAMS entity resolution renamed them, the name match is
+  wrong — flag it). After the next run's first reset, `MATCH (e:Entity)
+  RETURN count(*)` should be ~5, and reset censuses in the datagen log
+  should stay ~one stage's worth (growth across epochs = a skipped
+  reset).
 * **Post-train corpus pruning** (`run_weekend._prune_datagen`): after each
   SUCCESSFUL train stage, `data_game/<prefix>_iter<k>` is tombstoned down
   to one won game (if any) + one other random game; all other records in
@@ -284,6 +296,14 @@ a real epoch boundary):
   the state file with a sane `mib_freed`, `images/` shrank to the kept
   games' frames, and `grep -c '"pruned": true' traces.jsonl` ≈ records −
   kept. Smoke dirs and failed epochs' corpora are never pruned.
+* **Noised-frame temp dir cleanup** (2026-08-11, after the aug6 run
+  leaked ~65 GiB into /tmp): `game_traces._make_noise_dir` registers
+  every noise dir for deletion at interpreter exit, and the orchestrator
+  sweeps stale `*_noise_*` dirs at each epoch boundary (hard-killed
+  stages). Verify: after any train stage exits, `/tmp` has no
+  `game_*_noise_*` / `player_anchor_*_noise_*` / `analyst_*_noise_*`
+  dirs left; the sweep logs `swept N stale noised-frame temp dir(s)`
+  when it finds crash leftovers.
 
 Weekend rehearsal (before launching `training/run_weekend.py` for
 real): with NAMS up and external data downloaded, run

@@ -411,8 +411,17 @@ class InteractiveSession:
 
     def reset_memory_to_seed(self) -> dict[str, int]:
         """Wipe all episodic memory (conversations, messages, game snapshots,
-        reasoning traces/steps) and keep ONLY the seeded semantic model
-        (``Entity`` + ``Preference`` nodes and their relationships).
+        reasoning traces/steps) and keep ONLY the seeded semantic model:
+        the ``_SEMANTIC_MODEL_ENTITIES`` (matched by name -- the same match
+        ``add_semantic_relationships`` relies on) plus every ``Preference``
+        node (seed prefs AND learned tips).
+
+        EXTRACTED entities are deleted too (2026-08-11): NAMS's entity
+        extraction mints ``Entity`` nodes from every stored message, and
+        the old blanket ``n:Entity`` exemption let them pile up through
+        every reset -- the aug6 11-epoch run accumulated ~33k junk
+        entities (vs 5 seed ones) that competed with the seed model in
+        semantic retrieval and never got cleared.
 
         This restores the graph to the "semantic seeding only" state -- the
         status quo ante of a fresh box right after ``seed`` + ``link``. Use it
@@ -426,10 +435,12 @@ class InteractiveSession:
         return self._run(self._reset_memory_to_seed())
 
     async def _reset_memory_to_seed(self) -> dict[str, int]:
+        seed_names = [name for name, _, _ in mem._SEMANTIC_MODEL_ENTITIES]
         rows = await self.client.graph.execute_write(
-            "MATCH (n) WHERE NOT (n:Entity OR n:Preference) "
+            "MATCH (n) "
+            "WHERE NOT ((n:Entity AND n.name IN $seed_names) OR n:Preference) "
             "WITH n, labels(n) AS l DETACH DELETE n RETURN l",
-            {},
+            {"seed_names": seed_names},
         )
         counts: Counter = Counter()
         for r in rows:

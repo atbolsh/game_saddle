@@ -130,6 +130,26 @@ loop, not just the decay:
   move types deserve identical total mass and cannot survive into
   environments where they genuinely differ in importance.
 
+**2026-08-11 finding (aug6 11-epoch run): the residual failure is
+TRANSITIONS, and it is measurable.** The move-repetition attractor
+survived the reward rework in a milder form: within-game turn direction
+is 97% self-continuing by the late epochs (flip rate fell 0.10 → 0.03
+across the run — training *deepened* the commitment; p90 same-direction
+runs of ~40 turns = full orbits), FORWARD runs are 83% self-continuing
+with ~90% of aborts geometrically justified, and both continuation
+behaviors are locally right. What the model gets wrong is *when to
+switch*: given a ray-hit (oracle says FORWARD), it starts walking only
+~50% of the time, spinning straight past the alignment it just earned —
+the single biggest leak between its ~10% win rate and actually winning.
+Those decisive transition moves are a handful per game, drowned in
+~2,600 correct-continuation moves per corpus. Concrete next cut:
+**up-weight transition moves** (first FORWARD of a run on a ray-hit
+round, first turn after aim is lost — the oracle meta already labels
+both) via `example_scale`, and switch the novelty decay ON so the k-th
+consecutive identical turn stops earning full cloning weight. This slots
+under the existing arousal framing: a transition IS the surprising,
+consequential moment worth consolidating.
+
 ## 6. Trust region as a CONSTRAINT: additive per-token KL — *Not started*
 
 Today the trust region is a *dataset*: `PlayerAnchorSource` replays player

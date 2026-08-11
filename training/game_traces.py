@@ -80,10 +80,12 @@ frame. ``noise_strength=0`` trains on the stored bytes directly.
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import math
 import random
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -407,6 +409,21 @@ class NoveltyTracker:
         return max(self.floor, self.decay ** streak)
 
 
+def _make_noise_dir(prefix: str) -> Path:
+    """A temp dir for this run's noised frame copies, DELETED AT
+    INTERPRETER EXIT (atexit). The copies must outlive ``examples()``
+    -- the collator re-opens the files at every training step -- so the
+    dir can only die with the process. It used to be "left to OS tmp
+    cleanup", which never runs on a long-lived box: the aug6 11-epoch
+    run leaked ~6 GiB per train stage (~8k frames x 0.7 MB x 3 sources)
+    into /tmp, ~65 GiB total. atexit covers normal exits and unhandled
+    exceptions; a hard kill (OOM, SIGKILL) still leaks, so run_weekend
+    additionally sweeps stale ``*_noise_*`` dirs between stages."""
+    d = Path(tempfile.mkdtemp(prefix=prefix))
+    atexit.register(shutil.rmtree, d, ignore_errors=True)
+    return d
+
+
 class _TraceFileSource(DataSource):
     """Shared plumbing for the two trace-file sources: path validation,
     record parsing, and per-run noised frame copies. Subclasses set
@@ -527,9 +544,10 @@ class GameTraceSource(_TraceFileSource):
     def examples(self) -> Iterator[TrainingExample]:
         # Fresh noise every run: an unseeded Random gives a new degradation
         # per training run; pass noise_seed for reproducibility. The temp
-        # dir lives for the run and is left to OS tmp cleanup.
+        # dir lives for the run and is removed at process exit
+        # (_make_noise_dir).
         rng = random.Random(self.noise_seed)
-        noise_dir = Path(tempfile.mkdtemp(prefix=f"{self.name}_noise_"))
+        noise_dir = _make_noise_dir(f"{self.name}_noise_")
         novelty = NoveltyTracker() if self.novelty else None
         n_dropped = 0
         n_floored = 0
@@ -680,7 +698,7 @@ class AnalystTraceSource(_TraceFileSource):
 
     def examples(self) -> Iterator[TrainingExample]:
         rng = random.Random(self.noise_seed)
-        noise_dir = Path(tempfile.mkdtemp(prefix=f"{self.name}_noise_"))
+        noise_dir = _make_noise_dir(f"{self.name}_noise_")
         n_dropped = 0
         n_yielded = 0
         for lineno, messages, target_text, meta in self._iter_records():
@@ -768,7 +786,7 @@ class PlayerAnchorSource(_TraceFileSource):
 
     def examples(self) -> Iterator[TrainingExample]:
         rng = random.Random(self.noise_seed)
-        noise_dir = Path(tempfile.mkdtemp(prefix=f"{self.name}_noise_"))
+        noise_dir = _make_noise_dir(f"{self.name}_noise_")
         for lineno, messages, target_text, meta in self._iter_records():
             self._rewrite_frames(messages, rng, noise_dir, lineno)
             yield TrainingExample(

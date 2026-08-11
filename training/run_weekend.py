@@ -100,8 +100,10 @@ import argparse
 import json
 import logging
 import random
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -405,6 +407,37 @@ def _summarize_traces(label: str) -> dict:
         "mean_dist_delta": (round(sum(deltas) / len(deltas), 4)
                             if deltas else None),
     }
+
+
+#: Noised-frame temp dirs created by training/game_traces.py
+#: (_make_noise_dir): game_<label>_noise_*, player_anchor_<label>_noise_*,
+#: analyst_<label>_noise_*.
+_NOISE_DIR_GLOBS = ("game_*_noise_*", "player_anchor_*_noise_*",
+                    "analyst_*_noise_*")
+
+
+def _sweep_noise_dirs() -> None:
+    """Delete leaked noised-frame temp dirs (2026-08-11): game_traces
+    removes its noise dirs at interpreter exit, but a train stage that
+    dies hard (OOM kill, box reboot) leaks ~6 GiB of frame copies per
+    stage into the system temp dir -- the aug6 run leaked ~65 GiB this
+    way. The orchestrator runs stages strictly sequentially, so at an
+    epoch boundary no train process is alive and every matching dir is
+    stale by construction."""
+    tmp = Path(tempfile.gettempdir())
+    n_dirs = 0
+    n_bytes = 0
+    for pattern in _NOISE_DIR_GLOBS:
+        for d in tmp.glob(pattern):
+            if not d.is_dir():
+                continue
+            n_bytes += sum(f.stat().st_size
+                           for f in d.rglob("*") if f.is_file())
+            shutil.rmtree(d, ignore_errors=True)
+            n_dirs += 1
+    if n_dirs:
+        logger.info("swept %d stale noised-frame temp dir(s), %.1f GiB, "
+                    "from %s", n_dirs, n_bytes / 2 ** 30, tmp)
 
 
 def _prune_datagen(label: str, seed: int) -> dict | None:
@@ -723,6 +756,7 @@ def orchestrate(args: argparse.Namespace) -> int:
 
         logger.info("=== epoch %d/%d (starting checkpoint %r) ===",
                     k, args.epochs, checkpoint)
+        _sweep_noise_dirs()
 
         if f"datagen{k}" in state["done"]:
             logger.info("[datagen%d] already complete; skipping", k)

@@ -652,7 +652,15 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
                     "the seeded semantic model (tips survive; --append "
                     "would skip this)."
                 )
-                sessions[0].reset_memory_to_seed()
+                # The deletion census is the clearing audit trail: it
+                # counts what the PREVIOUS stage left behind, so it
+                # should stay ~one stage's worth run over run -- counts
+                # growing across epochs mean a reset is being skipped.
+                deleted = sessions[0].reset_memory_to_seed()
+                logger.info(
+                    "NAMS hygiene: run-start reset deleted %d episodic "
+                    "node(s): %s", sum(deleted.values()), deleted,
+                )
             for s in sessions:
                 s.restart()
             fresh = [True] * n_workers
@@ -669,7 +677,11 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
                         "NAMS hygiene: resetting episodic memory to the "
                         "seeded semantic model (game %d).", block_start,
                     )
-                    sessions[0].reset_memory_to_seed()
+                    deleted = sessions[0].reset_memory_to_seed()
+                    logger.info(
+                        "NAMS hygiene: block reset deleted %d episodic "
+                        "node(s): %s", sum(deleted.values()), deleted,
+                    )
                     for i, s in enumerate(sessions):
                         s.restart()
                         analyses[i].clear()
