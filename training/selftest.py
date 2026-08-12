@@ -31,7 +31,8 @@ Stage map (rationale in the Intermission plan):
                 sources on fabricated dirs (example_weight, oracle
                 modifiers, novelty toggle), epoch_batches bucketing,
                 stack_equal_length, run_weekend --checkpoint (rejects
-                --start-checkpoint / --resume-checkpoint)
+                --start-checkpoint / --resume-checkpoint), boundary
+                openings / multi-gold / END_GAME parse
   * t2-data     manifest loads, per-source counts vs meta.json, probes exist
   * t3-model    4-bit QLoRA load, terminator, CE/KD forward+backward
                 (image example included), teacher-path sanity, kd_anchor
@@ -1038,9 +1039,87 @@ def t1_pure() -> str:
                 assert "renamed" in msg, msg
     checks += 1
 
+    # ---- boundary_openings + new_multi_gold_game (2026-08-12 multi-gold mode)
+    from agent.game_io import (
+        _SIDE_WALL_WIDTH,
+        boundary_openings,
+        new_multi_gold_game,
+    )
+    w = _SIDE_WALL_WIDTH
+    full = [
+        [0.0, 0.0, w, 1.0, 0.0],
+        [1.0 - w, 0.0, w, 1.0, 0.0],
+        [0.0, 0.0, 1.0, w, 0.0],
+        [0.0, 1.0 - w, 1.0, w, 0.0],
+    ]
+    assert boundary_openings({"walls": full}) == [], boundary_openings({"walls": full})
+    checks += 1
+
+    gapped = [
+        [0.0, 0.0, w, 1.0, 0.0],
+        [0.0, 0.0, 1.0, w, 0.0],
+        [0.0, 1.0 - w, 1.0, w, 0.0],
+        [1.0 - w, 0.0, w, 0.4, 0.0],
+        [1.0 - w, 0.6, w, 0.4, 0.0],
+    ]
+    ops = boundary_openings({"walls": gapped})
+    assert len(ops) == 1, ops
+    op = ops[0]
+    assert op["side"] == "right", op
+    assert abs(op["width"] - 0.2) < 1e-9, op
+    assert abs(op["center"][0] - 1.0) < 1e-9, op
+    assert abs(op["center"][1] - 0.5) < 1e-9, op
+    checks += 1
+
+    none = boundary_openings({"walls": []})
+    assert len(none) == 4, none
+    assert {o["side"] for o in none} == {"left", "right", "top", "bottom"}
+    assert all(abs(o["width"] - 1.0) < 1e-9 for o in none), none
+    checks += 1
+
+    rotated = [[0.0, 0.0, w, 1.0, 0.3]]
+    try:
+        boundary_openings({"walls": rotated})
+        raise AssertionError("rotated boundary wall did not raise")
+    except ValueError as exc:
+        assert "nonzero angle" in str(exc), exc
+    checks += 1
+
+    random.seed(20260812)
+    g0 = new_multi_gold_game(n_gold=0, opening="forbid")
+    assert len(g0.settings.gold) == 0, g0.settings.gold
+    assert boundary_openings(game_io_settings := {
+        "walls": [list(x) for x in g0.settings.walls]
+    }) == [], game_io_settings
+    checks += 1
+    g2 = new_multi_gold_game(n_gold=2, opening="require")
+    assert len(g2.settings.gold) == 2, g2.settings.gold
+    assert boundary_openings({"walls": [list(x) for x in g2.settings.walls]})
+    checks += 1
+    g3 = new_multi_gold_game(n_gold=3, opening="require")
+    assert len(g3.settings.gold) == 3, g3.settings.gold
+    checks += 1
+
+    from agent.multi_gold_session import MultiGoldSelfEvalSession
+    from agent.self_eval_session import InteractiveSelfEvalSession
+    stub = object.__new__(MultiGoldSelfEvalSession)
+    assert MultiGoldSelfEvalSession._parse_player_action(
+        stub, "TARGET: none\n[END_GAME]", "answer"
+    ) == "END_GAME"
+    assert MultiGoldSelfEvalSession._parse_player_action(
+        stub, "aiming [CLOCK]", "move"
+    ) == "CLOCK"
+    # base class never sees END_GAME as a move
+    base_stub = object.__new__(InteractiveSelfEvalSession)
+    assert InteractiveSelfEvalSession._parse_player_action(
+        base_stub, "TARGET: none\n[END_GAME]", "answer"
+    ) is None
+    checks += 1
+
     return (
         f"{checks} unit groups passed (ratings, rewards, noise, tripwire, "
-        "source, batching, scrambler, questions, stack-eq, weekend-ckpt)"
+        "source, batching, scrambler, questions, stack-eq, weekend-ckpt, "
+        "openings, multi-gold, end-game parse)"
     )
 
 

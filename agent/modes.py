@@ -44,6 +44,9 @@ _TOK_CLOCK = _TOK["CLOCK"]
 _TOK_ANTICLOCK = _TOK["ANTICLOCK"]
 _TOK_FORWARD = _TOK["FORWARD"]
 _TOK_TRIO = "/".join(_TOK.values())  # "[CLOCK]/[ANTICLOCK]/[FORWARD]"
+#: Variant-only token (multi-gold notebook). NOT in game_io.ACTIONS -- the
+#: existing parser, stop strings, and datagen path never see it.
+_TOK_END_GAME = "[END_GAME]"
 
 _SENT_GAME_INTRO = "You are an agent playing a 2D discrete game on a square board."
 _SENT_GAME_SCREEN = "You see the current game screen as an image."
@@ -58,6 +61,21 @@ _BLOCK_GAME_INTRO = " ".join([
     _SENT_GAME_SCREEN,
     _SENT_GAME_WORLD,
     "Your goal is to collect the gold.",
+])
+
+#: Multi-gold variant intro -- shared sentences, gold-count clause replaced
+#: (prompt-composition: do not fork the whole intro paragraph).
+_SENT_GAME_WORLD_MULTI = (
+    "The board is the unit square framed by four boundary walls, which may "
+    "have an opening; gold pieces (small yellow circles) may be present -- "
+    "several, one, or none. You are the green circle with a red eye showing "
+    "the direction you are facing."
+)
+_BLOCK_GAME_INTRO_MULTI = " ".join([
+    _SENT_GAME_INTRO,
+    _SENT_GAME_SCREEN,
+    _SENT_GAME_WORLD_MULTI,
+    "Your goal depends on what is in the room -- see the variant rules below.",
 ])
 
 _BLOCK_MOVE_TOKENS = (
@@ -1137,6 +1155,112 @@ _BLOCK_SCENE_SCOPE = (
     "token."
 )
 
+# ------------------------------------------------- multi-gold variant blocks
+# Used ONLY by SYSTEM_PROMPT_SCENE_PLAY_MULTI / _ANALYST_MULTI. The existing
+# scene prompts below are byte-identical to before this addition.
+
+_BLOCK_MULTI_GOLD_RULES = (
+    "THIS SESSION'S VARIANT RULES: "
+    "this room may contain SEVERAL golds (up to 3), or NONE at all. "
+    "Eating a gold does NOT end the session -- after you eat one, keep "
+    "playing and go for another gold if any remain. The boundary walls "
+    "may have an OPENING (a gap leading out of the room); if the room "
+    "has no gold left, or never had any, your goal is to find the "
+    "opening and walk out through it."
+)
+
+_BLOCK_TARGET_COMMIT = (
+    "PICK ONE TARGET AND COMMIT: when more than one gold is visible, "
+    "choose exactly ONE of them to eat first -- for example 'the left "
+    "one' (the leftmost gold on screen), 'the right one', or 'the near "
+    "one' (closest to you). Declare your choice on its own line, in this "
+    "exact, searchable form:\n"
+    "TARGET: <short description, e.g. 'the left gold, near the top wall'>\n"
+    "EVERY time you choose a move, FIRST check the recent conversation "
+    "for an earlier 'TARGET:' line from this run. If one exists and that "
+    "gold is still on the board, REPEAT the same TARGET: line verbatim "
+    "and keep pursuing that gold -- do NOT switch targets mid-chase, "
+    "even if another gold briefly looks closer. Only pick a new target "
+    "(declaring a fresh TARGET: line) after your current target has "
+    "been eaten or is gone from the screen."
+)
+
+_BLOCK_NO_GOLD_EXPLORE = (
+    "WHEN THE ROOM HAS NO GOLD: do not wander. Scan the boundary walls "
+    "for an opening -- a visible gap in one of the four walls -- and "
+    "declare it as your target in the same searchable form (e.g. "
+    "'TARGET: the opening in the right wall'). Then treat the middle of "
+    f"the gap exactly like a gold: use the same {_TOK_TRIO} moves to "
+    "rotate until the opening is roughly dead ahead, then go FORWARD "
+    "and walk out through it."
+)
+
+_BLOCK_END_GAME = (
+    "ENDING THE SESSION: you have one extra move in this variant: "
+    f"{_TOK_END_GAME}. Emit it exactly like a move token. Use it in "
+    "exactly two situations:\n"
+    "  - the room has NO gold left AND NO opening in any wall: there "
+    "is nothing left to do. Declare 'TARGET: none -- room is sealed "
+    f"and empty' and emit {_TOK_END_GAME}.\n"
+    "  - the question you were given EXPLICITLY asks you to end the "
+    f"game: emit {_TOK_END_GAME} regardless of what is on the board.\n"
+    "Do NOT end the session while a gold or an opening remains and "
+    "nobody asked you to stop -- finishing the job matters more than "
+    "finishing quickly."
+)
+
+_BLOCK_TARGET_GRADING = (
+    "WHICH GOLD IS THE PLAYER CHASING: this variant room can hold "
+    "several golds, so before grading any geometry decide which gold "
+    "the move should be measured against. Look for the player's "
+    "'TARGET:' line (declaring one is required). Map its words onto a "
+    "gold in the settings by comparing coordinates: 'the left one' is "
+    "the gold with the SMALLEST x, 'the right one' the LARGEST x, 'the "
+    "top one' the LARGEST y, 'the bottom one' the SMALLEST y, 'the "
+    "near one' the smallest distance to the agent. Then run your usual "
+    "geometry (bearing, delta, rotation direction) against THAT gold's "
+    "coordinates -- not the nearest gold, and not a vague average over "
+    "all of them. If the player declared no target, switched targets "
+    "while the old one was still on the board, or stated a target that "
+    "matches no gold in the settings, that is a real defect: say so "
+    "and LOWER the RATING, even if the move happens to be "
+    "geometrically fine."
+)
+
+_BLOCK_OPENINGS_PRIVILEGED = (
+    "OPENINGS: in this variant the settings JSON includes an 'openings' "
+    "key -- the continuous stretches of the room boundary NOT covered "
+    "by any wall, i.e. the exits. Each opening lists its side "
+    "('left'/'right'/'top'/'bottom'), its two endpoints ('from', 'to'), "
+    "its 'center' [x, y], and its 'width'. When NO gold remains in the "
+    "settings, the correct play is to leave through an opening: treat "
+    "the nearest opening's 'center' exactly as you would treat a "
+    "gold's coordinates -- compute the bearing to it with the same "
+    "atan2 recipe, decide the shorter rotation with the same delta "
+    "rule, and grade the player's move against that. A player that "
+    "rotates or walks away from every opening in an empty room is "
+    "making a real mistake; a player that aims at a gap and steps "
+    "FORWARD through it is playing correctly."
+)
+
+_BLOCK_END_GAME_GRADING = (
+    f"GRADING {_TOK_END_GAME}: in this variant the player may end the "
+    f"session by emitting {_TOK_END_GAME}. Judge it from the settings, "
+    "not from the player's story:\n"
+    "  - CORRECT when the settings show NO gold and the 'openings' "
+    "list is EMPTY (a sealed, empty room -- there is genuinely nothing "
+    "left to do), or when the player's question explicitly asked it to "
+    "end the game.\n"
+    "  - WRONG when any gold remains (it should have been chased), or "
+    "when the room is empty but an opening exists (it should have "
+    "walked out through it). Quitting early must get a negative "
+    "RATING.\n"
+    f"The omission is graded symmetrically: if the room is sealed and "
+    f"empty and the player keeps rotating or stepping instead of "
+    f"emitting {_TOK_END_GAME}, that is also a real mistake -- say so "
+    "and lower the RATING."
+)
+
 SYSTEM_PROMPT_SCENE_PLAY = "\n\n".join([
     _BLOCK_GAME_INTRO,
     _BLOCK_MOVE_TOKENS,
@@ -1176,6 +1300,36 @@ SYSTEM_PROMPT_SCENE_ANALYST = "\n\n".join([
     _BLOCK_RATING,
 ])
 
+SYSTEM_PROMPT_SCENE_PLAY_MULTI = "\n\n".join([
+    _BLOCK_GAME_INTRO_MULTI,
+    _BLOCK_MULTI_GOLD_RULES,
+    _BLOCK_MOVE_TOKENS,
+    _BLOCK_SCENE_SCOPE,
+    _BLOCK_HOW_TO_PLAY,
+    _BLOCK_TARGET_COMMIT,
+    _BLOCK_NO_GOLD_EXPLORE,
+    _BLOCK_END_GAME,
+    _BLOCK_AIM_TOLERANCE,
+    _BLOCK_CURRENT_SCREEN,
+    _search_tool_block(_SEARCH_SCOPE_PLAY),
+])
+
+SYSTEM_PROMPT_SCENE_ANALYST_MULTI = "\n\n".join([
+    "You are reviewing ONE RECORDED reply from a 2D discrete game. "
+    + _BLOCK_REVIEWER_STANCE,
+    _BLOCK_PRIVILEGED_VIEW,
+    _BLOCK_GEOMETRY_PRIVILEGED,
+    _BLOCK_TARGET_GRADING,
+    _BLOCK_OPENINGS_PRIVILEGED,
+    _BLOCK_END_GAME_GRADING,
+    _BLOCK_AIM_TOLERANCE_REVIEW,
+    _BLOCK_GRADING_TOLERANCE,
+    _BLOCK_SCENE_ANALYST_SCOPE,
+    _BLOCK_REVIEW_WHOLE_REPLY,
+    _search_tool_block(_SEARCH_SCOPE_FULL),
+    _BLOCK_RATING,
+])
+
 
 def build_scene_analyst_messages(
     player_question: str,
@@ -1186,6 +1340,7 @@ def build_scene_analyst_messages(
     recent: str,
     question: str,
     search_results: str | None = None,
+    system_prompt: str = SYSTEM_PROMPT_SCENE_ANALYST,
 ) -> list[dict]:
     """Assemble one scene-analyst generation's prompt, mirroring
     :func:`build_debrief_messages`' structure (pre-joined text blocks, then
@@ -1251,7 +1406,7 @@ def build_scene_analyst_messages(
     tail.append(question)
     user_content.append({"type": "text", "text": "\n\n".join(tail)})
     return [
-        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT_SCENE_ANALYST}]},
+        {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
         {"role": "user", "content": user_content},
     ]
 

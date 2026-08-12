@@ -98,6 +98,11 @@ class InteractiveSession:
         self.session_id: str = ""
         self.restart()
 
+    def _new_game(self) -> Any:
+        """Construct the board for this session. Subclasses override to
+        change the factory; the default is the one-gold bare room."""
+        return game_io.new_bare_game(gameSize=self.cfg.game_size)
+
     # ------------------------------------------------------------------ bridge
     def _run(self, coro: Any) -> Any:
         """Run a coroutine on the background loop and block for its result."""
@@ -108,7 +113,7 @@ class InteractiveSession:
         """Re-initialize the env (new bare game) and start a new conversation
         thread (new ``session_id``). Returns the new session id + the path to
         the freshly rendered starting frame."""
-        self.game = game_io.new_bare_game(gameSize=self.cfg.game_size)
+        self.game = self._new_game()
         self.session_id = mem.new_session_id()
         logger.info("Interactive session restarted: session_id=%s", self.session_id)
         return {

@@ -507,10 +507,13 @@ has the high-res frame on disk for re-feeding into the model.
 ## Notes / limitations
 
 * Only **bare levels** (4 boundary walls + 1 gold piece, via
-  `random_bare_settings`) are generated for now. Generalisation to
-  interior walls / multi-gold is tracked in `FUTURE_GOALS.md`.
-* Only **image + text** modalities of the Gemma 4 models are used. Audio
-  and video are tracked in `FUTURE_GOALS.md`.
+  `random_bare_settings`) are generated for **datagen**. A notebook-only
+  multi-gold / openings variant lives in `notebooks/multi_gold_eval.ipynb`
+  (see `FUTURE_GOALS.md` goal 2).
+* The agent loop uses **image + text**. Audio/video comprehension is
+  measurable with `python -m training.eval_av <checkpoint>` (LibriSpeech
+  WER + NExT-QA); training-side KD replay is still future
+  (`FUTURE_GOALS.md` goal 3).
 * **Automatic finetuning dataset generation** from mode 1 + mode 3 is a
   future objective, not implemented here; see `FUTURE_GOALS.md`.
 * The project is **local bolt-only by design**: there is no plan to add
@@ -527,11 +530,12 @@ agent/
   config.py          # env-driven AgentConfig
   model.py           # model registry + family adapters + VLModel wrapper (incl. generate_batch)
   parallel_gen.py    # cross-thread generation batching (dispatcher + session proxy)
-  game_io.py         # bare level gen, Settings <-> dict, render to PNG, apply_action
+  game_io.py         # bare level gen, Settings <-> dict, render to PNG, apply_action; multi-gold factory + openings oracle
   image_store.py     # disk PNG + 64x64 thumbnail b64 + GameSnapshot node + linking
   memory.py          # NAMS MemoryClient factory; context stripping; semantic-model seed; DB dump
   modes.py           # mode_game / mode_discuss / mode_self_eval
   interactive.py     # InteractiveSession: persistent-game mode-1 for notebooks
+  multi_gold_session.py  # MultiGoldSelfEvalSession (notebook-only; 0–3 golds, openings, [END_GAME])
   run_logging.py     # per-run LLM-call + DB-retrieval logs (on by default)
   runner.py          # CLI
 training/
@@ -543,6 +547,7 @@ training/
   synth_navigation.py       # seeded generator: clock/compass/bearing problems + probe
   probes.py          # exact-match capability probes (GSM8K, navigation) + guards
   generate_self_distill.py  # optional: regenerate replay targets with the base model
+  eval_av.py         # audio/video comprehension: named checkpoint vs frozen Gemma 4 12B base
   generate_game_traces.py   # headless self-eval datagen -> data_game/<label>/
   game_traces.py     # GameTraceSource (traces -> REINFORCE-weighted examples) + AnalystTraceSource (KD anchor)
   planted_errors.py  # planted-error scrambler (labeled corruptions; not hooked up)
@@ -560,6 +565,7 @@ data_game/           # generated self-eval game traces + frames (git-ignored; se
 notebooks/
   play.ipynb            # interactive mode-1 play (Ask + Restart conversation)
   interactive_self_eval.ipynb # player/analyst two-phase loop (mode 3)
+  multi_gold_eval.ipynb     # multi-gold / openings self-eval (notebook-only)
   debrief.ipynb         # privileged post-game debrief (mode 4)
   trace_viewer.ipynb    # step through recorded datagen traces (no GPU/NAMS)
   noise_tuner.ipynb     # tune image-noise magnitudes by eye (no GPU/NAMS)

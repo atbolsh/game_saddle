@@ -169,7 +169,7 @@
       "examples_per_epoch": 0,
       "probe": null,
       "enabled": false,
-      "notes": "PLACEHOLDER, no converter yet. Video comprehension replay -- sidelined by priority, not necessity (rationale in TRAINING_EXTRA_DATASETS.md: towers are LoRA-frozen so drift risk is low; enabling needs a converter, a micro_batch_cap, and a t10 re-profile -- many frames = long-sequence KD). The downloader refuses loudly if enabled without a converter."
+      "notes": "PLACEHOLDER, no converter yet -- stays enabled:false. The 12B is documented to accept video natively via the shared processor (standard {\"type\": \"video\", \"path\": ...} chat-template parts); measurable via training/eval_av.py on NExT-QA -- to be confirmed by that script's first remote run. What remains for TRAINING use is a converter + KD plumbing (micro_batch_cap, t10 re-profile: many frames = long-sequence KD). The downloader refuses loudly if enabled without a converter."
     },
     {
       "name": "audio_qa",
@@ -183,7 +183,7 @@
       "examples_per_epoch": 0,
       "probe": null,
       "enabled": false,
-      "notes": "PLACEHOLDER, no dataset chosen and no converter yet. Audio comprehension replay -- sidelined by priority, not necessity (rationale in TRAINING_EXTRA_DATASETS.md). Before writing any code, verify remotely that the deployed 12B checkpoint accepts audio input at all (docs only promise audio for Gemma 4 E4B)."
+      "notes": "PLACEHOLDER, no converter yet -- stays enabled:false. The 12B is documented to accept audio natively via the shared processor (standard {\"type\": \"audio\", \"path\": ...} chat-template parts); measurable via training/eval_av.py on LibriSpeech test-clean WER -- to be confirmed by that script's first remote run. What remains for TRAINING use is a dataset choice + converter + KD plumbing. The downloader refuses loudly if enabled without a converter."
     }
   ]
 }

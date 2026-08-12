@@ -103,6 +103,10 @@ class InteractiveSelfEvalSession(InteractiveSession):
 
     DEFAULT_PLAYER_QUESTION = DEFAULT_PLAYER_QUESTION
     DEFAULT_ANALYST_QUESTION = DEFAULT_ANALYST_QUESTION
+    PLAYER_SYSTEM_PROMPT = modes.SYSTEM_PROMPT_SCENE_PLAY
+    ANALYST_SYSTEM_PROMPT = modes.SYSTEM_PROMPT_SCENE_ANALYST
+    PLAYER_STOP_STRINGS = game_io.MOVE_STOP_STRINGS
+    END_ON_CLEAR = True
 
     def __init__(self, *args: Any, log_label: str | None = None, **kwargs: Any):
         super().__init__(*args, log_label=log_label or "self_eval", **kwargs)
@@ -140,7 +144,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
                 "Cannot reset the game mid-round: the analyst has not run "
                 "and a move may be pending. Finish the round first."
             )
-        self.game = game_io.new_bare_game(gameSize=self.cfg.game_size)
+        self.game = self._new_game()
         if record:
             self._run(
                 self.client.short_term.add_message(
@@ -160,6 +164,16 @@ class InteractiveSelfEvalSession(InteractiveSession):
             "frame_path": self.current_frame_path(),
             "gold_remaining": game_io.gold_remaining(self.game),
         }
+
+    def _analyst_settings_dict(self) -> dict[str, Any]:
+        """Privileged settings JSON the analyst sees. Subclasses may add
+        derived fields (openings); the default is the raw engine dump."""
+        return game_io.game_to_settings_dict(self.game)
+
+    def _parse_player_action(self, raw: str, kind: str) -> str | None:
+        """Reply -> pending action. Subclasses may recognise extra tokens
+        (e.g. [END_GAME]); the default is game_io.parse_action on a move."""
+        return game_io.parse_action(raw) if kind == "move" else None
 
     def ask(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         raise NotImplementedError(
@@ -183,7 +197,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
 
         # 1. Snapshot the current ('before') frame -> disk + GameSnapshot node.
         snapshot_before_id = image_store.snapshot_id()
-        settings_before = game_io.game_to_settings_dict(self.game)
+        settings_before = self._analyst_settings_dict()
         before_path, before_props = self._run(
             image_store.store_snapshot(
                 self.client, self.session_id, snapshot_before_id, self.game,
@@ -210,14 +224,14 @@ class InteractiveSelfEvalSession(InteractiveSession):
         searches: list[dict[str, str]] = []
         while True:
             messages = modes._build_game_messages(
-                modes.SYSTEM_PROMPT_SCENE_PLAY, before_path, ctx, question,
+                self.PLAYER_SYSTEM_PROMPT, before_path, ctx, question,
                 search_results="\n\n".join(search_notes) or None,
             )
             over_budget = len(searches) >= self.cfg.memory_search_max_calls
             raw = self.model.generate(
                 messages,
                 max_new_tokens=self.cfg.max_new_tokens,
-                stop_strings=game_io.MOVE_STOP_STRINGS,
+                stop_strings=self.PLAYER_STOP_STRINGS,
                 stop_regex=None if over_budget else modes.SEARCH_TOOL_PATTERN,
             )
             kind, payload, text = modes.classify_move_or_search(raw)
@@ -239,7 +253,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
             if len(searches) >= self.cfg.memory_search_max_calls:
                 search_notes.append(modes.SEARCH_BUDGET_NOTE)
             logger.info("player: [SEARCH %s]", payload)
-        action = game_io.parse_action(raw) if kind == "move" else None
+        action = self._parse_player_action(raw, kind)
 
         # 4. Persist the scene: user question + player reply, both anchored to
         #    the 'before' frame. NO 'after' snapshot yet -- the move has not
@@ -374,6 +388,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
                 pending["before_path"], pending["settings_json"],
                 recent, question,
                 search_results="\n\n".join(search_notes) or None,
+                system_prompt=self.ANALYST_SYSTEM_PROMPT,
             )
             over_budget = n_searches >= self.cfg.memory_search_max_calls
             raw = self.model.generate(
@@ -479,7 +494,9 @@ class InteractiveSelfEvalSession(InteractiveSession):
         after_path = None
         if action:
             snapshot_after_id = image_store.snapshot_id()
-            settings_after = game_io.game_to_settings_dict(self.game)
+            # Same hook as the 'before' snapshot, so subclass-added keys
+            # (e.g. openings) appear in BOTH stored settings dicts.
+            settings_after = self._analyst_settings_dict()
             after_path, _ = self._run(
                 image_store.store_snapshot(
                     self.client, self.session_id, snapshot_after_id, self.game,
@@ -506,7 +523,8 @@ class InteractiveSelfEvalSession(InteractiveSession):
         self._run(
             mem.complete_turn_trace(
                 self.client, trace, outcome=outcome,
-                success=(gold_remaining == 0) if action else True,
+                success=(self.END_ON_CLEAR and gold_remaining == 0) if action
+                else True,
             )
         )
 

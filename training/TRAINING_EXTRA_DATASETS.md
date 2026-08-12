@@ -54,22 +54,10 @@ remote TO_TEST item.
 | `cauldron_vqav2` | `HuggingFaceM4/the_cauldron` (vqav2) | 6k | 250 | KD | — | Broad non-game VQA |
 | `cauldron_cocoqa` | `HuggingFaceM4/the_cauldron` (cocoqa) | 6k | 200 | KD | — | Non-game vision |
 | `cauldron_ai2d` | `HuggingFaceM4/the_cauldron` (ai2d) | all 2.4k | 150 | KD | — | Diagram QA — closest proxy to board-like images |
-| `sharegpt4video` | placeholder, `enabled: false` | — | 0 | KD | — | Video replay — sidelined, see below |
-| `audio_qa` | placeholder, `enabled: false` | — | 0 | KD | — | Audio replay — sidelined, see below |
+| `sharegpt4video` | placeholder, `enabled: false` | — | 0 | KD | — | Video replay — converter still missing; input path measurable via `training/eval_av.py` (first run pending) |
+| `audio_qa` | placeholder, `enabled: false` | — | 0 | KD | — | Audio replay — converter still missing; input path measurable via `training/eval_av.py` (first run pending) |
 
-**Why video/audio replay is sidelined (2026-07).** A priority call, not a
-technical dependency — KD replay needs no connection to the game harness.
-The risk of drift is low because LoRA never touches the vision/audio towers
-(`train.build_model` excludes them from adapter placement), so those
-modalities can degrade only through the language side's handling of tower
-embeddings. Meanwhile the cost of enabling them now is real: both entries
-lack converters (and `audio_qa` lacks even a dataset choice; the downloader
-refuses loudly if enabled without a converter); video decodes to
-many-frames-per-example, i.e. long-sequence KD — the exact kept-logit OOM
-class profiled in selftest t10, so enabling it means a `micro_batch_cap`
-and a fresh t10 VRAM/time profile; and whether the deployed 12B checkpoint
-even accepts audio input needs a remote check (docs only promise audio for
-E4B). Revisit after the first full training round.
+**Why video/audio replay is sidelined (2026-07; measurement harness written 2026-08-12).** A priority call, not a technical dependency — KD replay needs no connection to the game harness. The 12B is documented to accept audio and video natively via the shared `AutoProcessor` (standard `{"type": "audio"|"video"}` chat-template parts); `training/eval_av.py` is the measurement harness (LibriSpeech WER + NExT-QA letter accuracy, checkpoint vs frozen base), to be confirmed by its first remote run. The risk of *training* drift is still low because LoRA never touches the vision/audio towers (`train.build_model` excludes them from adapter placement), so those modalities can degrade only through the language side's handling of tower embeddings. The cost of enabling them *in the train loop* is still real: both entries lack converters (and `audio_qa` lacks even a dataset choice; the downloader refuses loudly if enabled without a converter); video decodes to many-frames-per-example, i.e. long-sequence KD — the exact kept-logit OOM class profiled in selftest t10, so enabling it means a `micro_batch_cap` and a fresh t10 VRAM/time profile. Revisit after the first full training round; the eval script does not unblock KD.
 
 Replay volume with these counts: **~2,150 replay examples/epoch, of which
 arithmetic + navigation = 1,200 (~56% of replay)** — arithmetic-heavy on

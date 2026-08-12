@@ -26,7 +26,7 @@ Concrete first steps when picked up:
 * a quality filter that drops turns the mode-3 evaluator scored below a
   threshold.
 
-## 2. Interior walls and multi-gold levels — *Not started*
+## 2. Interior walls and multi-gold levels — *Exploring*
 
 Generalise the level generator past `random_bare_settings` (4 boundary
 walls + 1 gold piece). Targets:
@@ -42,10 +42,29 @@ machinery in `agent/game_io.py` and `agent/modes.py` already generalise;
 only the level-creation call and the stop condition
 (`gold_remaining == 0`) need widening.
 
-## 3. Audio and video modalities of Gemma 4 — *Not started*
+**2026-08-12 notebook-only cut:** `agent/game_io.new_multi_gold_game` +
+`boundary_openings` (non-AI oracle of boundary gaps) +
+`MultiGoldSelfEvalSession` (`notebooks/multi_gold_eval.ipynb`) exercise
+0–3 golds, sealed vs open rooms, target commitment (`TARGET:` line),
+walking out an opening, and `[END_GAME]` when the room is sealed and
+empty. The existing self-eval / datagen critical path is unchanged
+(`[END_GAME]` is not in `game_io.ACTIONS`). Candidate future datagen
+mode once the notebook behavior looks right — do not wire it into
+`generate_game_traces` until then.
 
-Gemma 4 E4B natively supports audio input, and the Gemma 4 family
-supports video. Future work:
+## 3. Audio and video modalities of Gemma 4 — *Exploring*
+
+**Measurement harness written (2026-08-12), first run pending.**
+`training/eval_av.py` scores a named checkpoint against the frozen
+Gemma 4 12B base on LibriSpeech test-clean (WER) and NExT-QA multiple
+choice (letter accuracy), using the standard processor chat-template
+parts `{"type": "audio", "path": ...}` / `{"type": "video", "path": ...}`
+(video via `num_frames` / `do_sample_frames`). Whether the 12B accepts
+both modalities through this path is settled by the script's first
+remote run — a processor rejection there is a finding, not something to
+route around.
+
+Still future work:
 
 * feed short audio instructions (e.g. a spoken "turn right") to the agent
   in mode 1, and record the audio as a message attachment;
@@ -59,9 +78,11 @@ supports video. Future work:
   no game-harness connection). Deliberately sidelined for the first
   training rounds: the vision/audio towers are LoRA-frozen, so drift risk
   is low, and enabling costs converters + a fresh VRAM profile (rationale
-  in `training/TRAINING_EXTRA_DATASETS.md`).
+  in `training/TRAINING_EXTRA_DATASETS.md`). The eval script does not
+  unblock that.
 
-Currently only image + text are used.
+Currently only image + text are used **in the agent loop**; audio/video
+comprehension is measurable off to the side.
 
 ## 4. Analyst revamp: CORRECT spans + per-span ratings — *Not started*
 
