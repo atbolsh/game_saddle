@@ -465,10 +465,12 @@ def materialize_video(n: int, seed: int, hf_id: str, force: bool) -> list[dict]:
 
 # ================================================================= generation
 
-def _encode(vl: Any, messages: list[dict], **template_kwargs: Any) -> dict:
-    """apply_chat_template through the loaded processor. Extra kwargs
-    (num_frames / do_sample_frames) are video-only; a rejection is a
-    hard error."""
+def _encode(vl: Any, messages: list[dict],
+            processor_kwargs: dict | None = None) -> dict:
+    """apply_chat_template through the loaded processor. Video frame
+    sampling (num_frames / do_sample_frames) goes in processor_kwargs
+    -- transformers 5.x rejects those as top-level **kwargs. A
+    processor rejection is a hard error."""
     norm = vl.adapter.prepare_messages(messages)
     inputs = vl.processor.apply_chat_template(
         norm,
@@ -476,7 +478,7 @@ def _encode(vl: Any, messages: list[dict], **template_kwargs: Any) -> dict:
         add_generation_prompt=True,
         return_dict=True,
         return_tensors="pt",
-        **template_kwargs,
+        processor_kwargs=processor_kwargs or {},
     )
     if "input_ids" not in inputs:
         raise RuntimeError(
@@ -529,10 +531,10 @@ def _video_messages(item: dict) -> list[dict]:
 
 
 def _run_pair(vl: Any, messages: list[dict], max_new_tokens: int,
-              template_kwargs: dict | None = None) -> tuple[str, str]:
+              processor_kwargs: dict | None = None) -> tuple[str, str]:
     """Encode once; generate with the adapter, then with the adapter
     disabled (the frozen base). Returns (base_reply, ckpt_reply)."""
-    inputs = _encode(vl, messages, **(template_kwargs or {}))
+    inputs = _encode(vl, messages, processor_kwargs=processor_kwargs)
     ckpt_reply = _generate(vl, inputs, max_new_tokens)
     with vl.model.disable_adapter():
         base_reply = _generate(vl, inputs, max_new_tokens)
@@ -569,6 +571,16 @@ def _summarize_video(rows: list[dict]) -> dict:
 
 def _print_table(audio: dict | None, video: dict | None,
                  audio_s: float, video_s: float) -> None:
+    print()
+    print("How to read this table")
+    print("  delta = ckpt − base. WER: lower is better (positive delta =")
+    print("  checkpoint transcribes worse). exact / accuracy: higher is")
+    print("  better (positive delta = checkpoint is better). unparse is")
+    print("  base/ckpt counts of video replies with no A–E letter; those")
+    print("  count as wrong. N is small (~40 audio, ~30 video); a 1–2")
+    print("  example swing is noise. This harness asks whether LoRA on")
+    print("  the language side degraded audio/video — a near-tie is the")
+    print("  healthy outcome.")
     print()
     print(f"{'modality':<10} {'metric':<12} {'base':>8} {'ckpt':>8} "
           f"{'delta':>8} {'N':>5} {'unparse':>8} {'sec':>8}")
@@ -662,11 +674,11 @@ def main(argv: list[str] | None = None) -> int:
 
         if video_items:
             t0 = time.time()
-            tmpl = {"num_frames": args.num_frames, "do_sample_frames": True}
+            proc_kw = {"num_frames": args.num_frames, "do_sample_frames": True}
             for i, item in enumerate(video_items, start=1):
                 messages = _video_messages(item)
                 base, ckpt = _run_pair(
-                    vl, messages, max_new_tokens=16, template_kwargs=tmpl)
+                    vl, messages, max_new_tokens=16, processor_kwargs=proc_kw)
                 base_letter = parse_mc_letter(base)
                 ckpt_letter = parse_mc_letter(ckpt)
                 rec = {
