@@ -1,9 +1,12 @@
 """Audio/video comprehension: named checkpoint vs the raw Gemma 4 12B base.
 
 Loads the full eval corpora once (LibriSpeech test-clean transcription +
-NExT-QA multiple-choice), draws a fixed-seed sample that should finish in
+NExT-QA multiple-choice), draws a seeded sample that should finish in
 ~20 minutes, and scores the adapter against the frozen base on the SAME
-encoded prompts. Input format is the standard HF chat-template path the
+encoded prompts. The seed is random unless ``--seed`` is passed; it is
+printed immediately so a run can be reproduced, and both the frozen base
+and the checkpoint see the same items and encodings. Input format is the
+standard HF chat-template path the
 Gemma 4 processor already uses for images::
 
     {"type": "audio", "path": "/abs/clip.wav"}
@@ -16,6 +19,7 @@ Usage (remote, after a checkpoint exists)::
 
     python -m training.eval_av aug12_iter1_step350
     python -m training.eval_av aug12_iter1_step350 --n-audio 5 --n-video 5
+    python -m training.eval_av aug12_iter1_step350 --seed 42
 """
 
 from __future__ import annotations
@@ -570,8 +574,9 @@ def _summarize_video(rows: list[dict]) -> dict:
 
 
 def _print_table(audio: dict | None, video: dict | None,
-                 audio_s: float, video_s: float) -> None:
+                 audio_s: float, video_s: float, seed: int) -> None:
     print()
+    print(f"seed={seed}  (rerun with --seed {seed})")
     print("How to read this table")
     print("  delta = ckpt − base. WER: lower is better (positive delta =")
     print("  checkpoint transcribes worse). exact / accuracy: higher is")
@@ -611,7 +616,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--n-video", type=int, default=30)
     parser.add_argument("--num-frames", type=int, default=8,
                         help="uniform video frame sample (Gemma 4 processor)")
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="item-sample seed (default: random; printed). Base and "
+             "checkpoint always share the same seed / encodings.",
+    )
     parser.add_argument("--skip-audio", action="store_true")
     parser.add_argument("--skip-video", action="store_true")
     parser.add_argument("--audio-hf-id", default=AUDIO_HF_ID)
@@ -624,6 +633,12 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+
+    if args.seed is None:
+        args.seed = random.SystemRandom().randrange(2**31)
+    print(f"seed={args.seed}  (rerun with --seed {args.seed})", flush=True)
+    logger.info("seed=%d (same item sample and encodings for base and ckpt)",
+                args.seed)
 
     audio_items = [] if args.skip_audio else materialize_audio(
         args.n_audio, args.seed, args.audio_hf_id, args.force)
@@ -639,6 +654,11 @@ def main(argv: list[str] | None = None) -> int:
             f"loaded model is {type(vl.model).__name__}, not a PEFT "
             f"wrapper -- disable_adapter() is required for the base pass"
         )
+    import torch
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_dir = REPO_ROOT / "logs" / f"av_eval_{args.checkpoint}_{ts}"
@@ -712,7 +732,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     (out_dir / "summary.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8")
-    _print_table(audio_sum, video_sum, audio_s, video_s)
+    _print_table(audio_sum, video_sum, audio_s, video_s, args.seed)
     logger.info("wrote %s", out_dir)
     return 0
 
