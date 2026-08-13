@@ -239,7 +239,7 @@ A scale of exactly 0 (floored rating, no win boost) **skips the record**
 3. **the move token gets the oracle's verdict** (crutch block in
    [game_traces.py](game_traces.py)): `[MOVE]` span → **1.5** when it
    matches the engine oracle, **−0.5** (unlikelihood) when it contradicts
-   it, untouched on "neutral" (defensible under the instructed 45° cone)
+   it, untouched on "neutral" (defensible under the instructed 20° cone)
    or "unknown" (no oracle meta — pre-2026-08-05 corpora; counted and
    logged).
 
@@ -396,7 +396,7 @@ facts per move (`_oracle_meta`: `oracle_rel_bearing`, `oracle_ray_hit`,
 | verdict | geometry | effect |
 |---|---|---|
 | `correct` | matches `oracle_move` (or any turn when the gold is ≥170° behind) | move-token span **1.5** |
-| `neutral` | defensible under the instructed 45° cone (FORWARD in-cone without a ray hit) | none — the analyst's rating stands |
+| `neutral` | defensible under the instructed 20° cone (FORWARD in-cone without a ray hit) | none — the analyst's rating stands |
 | `wrong` | turn away from the shorter rotation; FORWARD outside the cone; **any turn under a ray hit** (missed forward — tightened 2026-08-11) | move-token span **−0.5** (unlikelihood) + example scale **×0.25** |
 | `unknown` | no oracle meta (old corpora) / no move | none; counted + logged |
 

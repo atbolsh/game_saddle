@@ -48,7 +48,7 @@ remote TO_TEST item.
 | `metamathqa` | `meta-math/MetaMathQA` | 20k | 200 | CE | — | Augmented math word problems |
 | `orca_math` | `microsoft/orca-math-word-problems-200k` | 20k | 200 | CE | — | More arithmetic breadth |
 | `numinamath_cot` | `AI-MO/NuminaMath-CoT` | 20k | 150 | CE | — | Competition-style CoT depth |
-| `navigation` | `training/synth_navigation.py` (local, seeded) | 10k | 300 | CE | 100 items, exact-match | Clock/compass/bearing/shortest-rotation in THIS repo's conventions — the geometry failure modes, directly |
+| `navigation` | `training/synth_navigation.py` (local, seeded) | 10k | 450 | CE | 100 items, exact-match | Clock/compass/bearing/shortest-rotation in THIS repo's conventions — the geometry failure modes, directly |
 | `openthoughts` | `open-thoughts/OpenThoughts-114k` | 8k | 200 | KD | — | General reasoning retention |
 | `slimorca` | `Open-Orca/SlimOrca` | 20k | 150 | KD | — | Instruction following / English tone |
 | `cauldron_vqav2` | `HuggingFaceM4/the_cauldron` (vqav2) | 6k | 250 | KD | — | Broad non-game VQA |
@@ -71,10 +71,10 @@ and a fresh t10 VRAM/time profile; and whether the deployed 12B checkpoint
 even accepts audio input needs a remote check (docs only promise audio for
 E4B). Revisit after the first full training round.
 
-Replay volume with these counts: **~2,000 replay examples/epoch, of which
-arithmetic + navigation = 1,050 (~52% of replay)** — arithmetic-heavy on
+Replay volume with these counts: **~2,150 replay examples/epoch, of which
+arithmetic + navigation = 1,200 (~56% of replay)** — arithmetic-heavy on
 purpose (see above). When the ~2.5k-example game source joins, replay is
-~45% of a batch, inside the 20–50% band. Coverage note: LLaVA-OneVision
+~46% of a batch, inside the 20–50% band. Coverage note: LLaVA-OneVision
 data from the original candidate list is deliberately substituted by the
 Cauldron configs — same purpose (broad non-game VQA), one clean download
 code path instead of a multi-repo layout.

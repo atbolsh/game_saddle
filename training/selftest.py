@@ -323,12 +323,13 @@ def t1_pure() -> str:
         (("FORWARD", "FORWARD", 0.0, True), "correct"),   # exact match
         (("CLOCK", "CLOCK", 0.7, False), "correct"),
         (("ANTICLOCK", "CLOCK", 3.05, False), "correct"),  # ~behind: either
-        (("FORWARD", "CLOCK", 0.5, False), "neutral"),    # inside 45deg cone
+        (("FORWARD", "CLOCK", 0.25, False), "neutral"),   # inside 20deg cone
         # missed forward: ANY turn under a ray hit is wrong since the
         # 2026-08-11 tightening (was the "fine-tuning" neutral)
         (("CLOCK", "FORWARD", 0.3, True), "wrong"),
         (("ANTICLOCK", "FORWARD", 0.3, True), "wrong"),   # other direction
-        (("FORWARD", "CLOCK", 1.2, False), "wrong"),      # outside the cone
+        (("FORWARD", "CLOCK", 0.5, False), "wrong"),      # 28.6deg: outside 20deg cone (was neutral at 45deg)
+        (("FORWARD", "CLOCK", 1.2, False), "wrong"),      # well outside the cone
         (("CLOCK", "ANTICLOCK", -0.8, False), "wrong"),   # away from gold
         ((None, "FORWARD", 0.0, True), "unknown"),        # perception round
         (("CLOCK", None, None, None), "unknown"),         # pre-oracle corpus

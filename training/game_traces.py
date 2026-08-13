@@ -225,7 +225,7 @@ def build_span_weights(
 #   "correct" -- matches the oracle move (or turns when the gold is
 #                nearly behind, |bearing| >= 170 deg, where either turn
 #                is a correct move): move-token span ORACLE_MATCH_SPAN;
-#   "neutral" -- defensible under the 45-degree aim tolerance the player
+#   "neutral" -- defensible under the 20-degree aim tolerance the player
 #                is INSTRUCTED to use (FORWARD inside the cone without a
 #                ray hit): no modifier, the analyst's rating stands;
 #   "wrong"   -- contradicts ground truth (turn away from the shorter
@@ -246,7 +246,7 @@ def build_span_weights(
 # compliance sat at ~50% for 11 epochs. Ray-hit rounds also get the
 # reply-wide TRANSITION_BOOST (below): they are the handful of decisive
 # transition moves per game, drowned in ~2.6k continuation moves.
-# Turns inside the 45-degree cone but OFF the ray keep their previous
+# Turns inside the 20-degree cone but OFF the ray keep their previous
 # grades (toward = matches oracle_move = correct; away = wrong).
 #
 # WHY THIS CANNOT STAY: it hard-wires "good play == greedy geodesic to
@@ -263,7 +263,7 @@ def build_span_weights(
 ORACLE_MATCH_SPAN = 1.5    #: move-token span weight when oracle agrees
 ORACLE_WRONG_SPAN = -0.5   #: move-token unlikelihood when oracle disagrees
 ORACLE_WRONG_SCALE = 0.25  #: example_weight multiplier on oracle-wrong moves
-ORACLE_CONE_RAD = math.pi / 4          #: the player's instructed tolerance
+ORACLE_CONE_RAD = math.radians(20.0)   #: the player's instructed tolerance
 ORACLE_EITHER_TURN_RAD = math.radians(170.0)  #: behind you: any turn is fine
 #: Reply-wide example_weight boost on RAY-HIT rounds (2026-08-11, the
 #: "arousal" first cut from FUTURE_GOALS goal 5): a ray hit is the

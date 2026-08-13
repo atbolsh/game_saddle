@@ -58,8 +58,10 @@ previous epoch's adapter), trains on that epoch's traces (reward-weighted
 CE + the `PlayerAnchorSource` trust region anchored to the previous
 adapter — see TRAINING_GAME_TRACES.md) + the analyst anchor + the manifest
 replay sources, resumed from the previous adapter, and finishes with a
-**post-train smoke eval**: 8 real games with the fresh checkpoint (label
-`<prefix>_smoke<k>`, never trained on) whose win rate / mean rating /
+**post-train smoke eval**: 8 real games × 50 gens (~65 min healthy wall
+at measured 9.9 s/gen; a poisoned checkpoint still surfaces in ~15 min)
+with the fresh checkpoint (label `<prefix>_smoke<k>`, never trained on;
+perception-question rate halved vs datagen) whose win rate / mean rating /
 degeneracy fraction / gold-distance deltas are logged (`grep smoke_eval`)
 and stored under `smoke` in the state file — every checkpoint gets a
 game-performance reading even when nothing runs after it. Datagen is
@@ -76,6 +78,12 @@ Launch (remote box, NAMS up, external data downloaded, from repo root):
 ```bash
 nohup python -m training.run_weekend > weekend.log 2>&1 &
 ```
+
+Omit `--seed` for a fresh board stream: a random base seed is drawn,
+logged (`base seed N (...)`), and stored in `data_game/<prefix>_state.json`
+as `base_seed`. Pass that logged value as `--seed N` to replay; a mismatch
+with a stored `base_seed` is a hard error. Crash-resume of the same prefix
+reuses the stored seed so `--append` stays on one stream.
 
 **Fitting the window.** One epoch costs roughly
 `--max-generations x s/gen` of datagen (~6 h at default parallelism,
@@ -307,8 +315,9 @@ classes of exception, both learned the hard way:
   `drift_warning` event and nothing else (`DataSource.guard_warn_only`).
   CE sources with ground-truth targets (navigation, the math sets) keep
   full guard authority — navigation's near-perfect baseline is a
-  property we protect by corpus weight (`examples_per_epoch` 300→900),
-  not by loosening its guard.
+  property we protect by corpus weight (`examples_per_epoch` currently
+  450, halved 2026-08-13 after held-out recovered) and a STRICT guard,
+  not by loosening the guard.
 
 Rollback restores `last_good_ckpt` — the
 newest checkpoint whose own eval had no hard regression — never the save
