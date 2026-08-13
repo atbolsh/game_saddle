@@ -50,6 +50,14 @@ AUDIO_HF_ID = "openslr/librispeech_asr"
 AUDIO_HF_CONFIG = "clean"
 AUDIO_HF_SPLIT = "test"
 VIDEO_HF_ID = "lmms-lab/NExTQA"
+# lmms-eval nextqa_mc_test.yaml: dataset_name MC, test_split test.
+# The parquet `video` column is a VidOR id (int64), not bytes; clips live
+# in videos.zip and are resolved as NExTVideo/{id}.mp4 (lmms-eval
+# nextqa/utils.py get_cache_dir(..., "NExTVideo") + get_video).
+VIDEO_HF_CONFIG = "MC"
+VIDEO_HF_SPLIT = "test"
+VIDEO_ZIP_NAME = "videos.zip"
+VIDEO_CLIP_SUBDIR = "NExTVideo"
 
 # Google's canonical transcription prompt asks for digits ("write 3, not
 # three"), but LibriSpeech references spell numbers out as words, so that
@@ -274,11 +282,13 @@ def _nextqa_answer_letter(row: dict, options: list[tuple[str, str]]) -> str:
         raise KeyError(f"NExT-QA row has no answer; keys={sorted(row)}")
     if isinstance(raw, str) and raw.strip().upper()[:1] in "ABCDE":
         return raw.strip().upper()[:1]
-    if isinstance(raw, int):
-        if 0 <= raw < len(options):
-            return options[raw][0]
-        if 1 <= raw <= len(options):
-            return options[raw - 1][0]
+    # MC config: answer is int64 in 0..4 (lmms-eval OPTIONS[doc["answer"]]).
+    if isinstance(raw, (int, np.integer)):
+        idx = int(raw)
+        if 0 <= idx < len(options):
+            return options[idx][0]
+        if 1 <= idx <= len(options):
+            return options[idx - 1][0]
     text = str(raw).strip()
     for letter, opt in options:
         if opt.strip().lower() == text.lower():
@@ -288,11 +298,87 @@ def _nextqa_answer_letter(row: dict, options: list[tuple[str, str]]) -> str:
     )
 
 
-def _nextqa_video_src(row: dict) -> Any:
-    for key in ("video", "video_path", "path", "file"):
-        if key in row and row[key] not in (None, ""):
-            return row[key]
-    raise KeyError(f"NExT-QA row has no video field; keys={sorted(row)}")
+def _download_nextqa_zip(hf_id: str) -> Path:
+    from huggingface_hub import hf_hub_download
+
+    logger.info("downloading %s/%s (video archive; large, Hub-cached)",
+                hf_id, VIDEO_ZIP_NAME)
+    path = hf_hub_download(
+        repo_id=hf_id, filename=VIDEO_ZIP_NAME, repo_type="dataset",
+    )
+    return Path(path)
+
+
+def _extract_nextqa_clips(
+    zip_path: Path, video_dir: Path, video_ids: list[str],
+) -> None:
+    """Pull {id}.mp4 members out of videos.zip (any internal folder).
+
+    lmms-eval looks up ``NExTVideo/{id}.mp4`` after a full unzip; we extract
+    only the sampled ids, matching on filename stem so nested zip layouts
+    (``NExTVideo/<cat>/<id>.mp4``) still resolve.
+    """
+    import zipfile
+
+    needed = set(video_ids)
+    already = {p.stem for p in video_dir.glob("*.mp4")}
+    already |= {p.stem for p in video_dir.glob("*.MP4")}
+    still = needed - already
+    if not still:
+        return
+    logger.info("extracting %d/%d clips from %s",
+                len(still), len(needed), zip_path.name)
+    found: dict[str, str] = {}
+    with zipfile.ZipFile(zip_path) as zf:
+        for name in zf.namelist():
+            base = Path(name).name
+            if not base.lower().endswith(".mp4"):
+                continue
+            stem = Path(base).stem
+            if stem not in still:
+                continue
+            if stem in found:
+                raise RuntimeError(
+                    f"{zip_path.name} has multiple members for video id "
+                    f"{stem}: {found[stem]!r} and {name!r}"
+                )
+            found[stem] = name
+        missing = still - set(found)
+        if missing:
+            raise FileNotFoundError(
+                f"{zip_path} has no .mp4 whose filename stem matches "
+                f"{len(missing)} requested NExT-QA video id(s); "
+                f"e.g. {sorted(missing)[:8]}"
+            )
+        video_dir.mkdir(parents=True, exist_ok=True)
+        for stem, member in found.items():
+            dest_file = video_dir / f"{stem}.mp4"
+            with zf.open(member) as src, dest_file.open("wb") as out:
+                shutil.copyfileobj(src, out)
+
+
+def _nextqa_video_id(row: dict) -> str:
+    """MC `video` column is a VidOR id (int64); filename is `{id}.mp4`."""
+    if "video" not in row or row["video"] in (None, ""):
+        raise KeyError(f"NExT-QA row has no video field; keys={sorted(row)}")
+    vid = row["video"]
+    name = str(int(vid)) if isinstance(vid, (int, np.integer)) else str(vid)
+    if name.lower().endswith(".mp4"):
+        name = name[:-4]
+    return name
+
+
+def _nextqa_video_file(row: dict, video_dir: Path) -> Path:
+    """lmms-eval ``get_video(cache_dir, doc["video"])``: id -> {id}.mp4."""
+    name = _nextqa_video_id(row)
+    for ext in (".mp4", ".MP4"):
+        path = video_dir / f"{name}{ext}"
+        if path.is_file():
+            return path
+    raise FileNotFoundError(
+        f"NExT-QA video {name!r} not under {video_dir} "
+        f"(expected {name}.mp4; lmms-eval get_video layout)"
+    )
 
 
 def _save_video(src: Any, dest: Path) -> None:
@@ -330,38 +416,31 @@ def materialize_video(n: int, seed: int, hf_id: str, force: bool) -> list[dict]:
                 return [json.loads(l) for l in items_path.read_text(
                     encoding="utf-8").splitlines() if l.strip()]
     dest.mkdir(parents=True, exist_ok=True)
-    from datasets import load_dataset, get_dataset_split_names
+    from datasets import load_dataset
 
-    splits = list(get_dataset_split_names(hf_id))
-    split = None
-    for cand in ("validation", "val", "test", "MC"):
-        if cand in splits:
-            split = cand
-            break
-    if split is None:
-        raise RuntimeError(
-            f"{hf_id} has no validation/val/test/MC split; available: {splits}. "
-            "Pass --video-hf-id with a dataset that has a multiple-choice "
-            "held-out split."
-        )
-    logger.info("downloading %s split=%s (full, no streaming)", hf_id, split)
-    ds = load_dataset(hf_id, split=split)
+    logger.info("downloading %s config=%s split=%s (full, no streaming)",
+                hf_id, VIDEO_HF_CONFIG, VIDEO_HF_SPLIT)
+    ds = load_dataset(hf_id, VIDEO_HF_CONFIG, split=VIDEO_HF_SPLIT)
     if n > len(ds):
         raise ValueError(
-            f"--n-video {n} exceeds {hf_id} {split} size {len(ds)}"
+            f"--n-video {n} exceeds {hf_id} {VIDEO_HF_CONFIG}/"
+            f"{VIDEO_HF_SPLIT} size {len(ds)}"
         )
     rng = random.Random(seed)
     indices = rng.sample(range(len(ds)), n)
+    rows = [ds[idx] for idx in indices]
+    video_ids = [_nextqa_video_id(row) for row in rows]
+    video_dir = dest / VIDEO_CLIP_SUBDIR
+    _extract_nextqa_clips(_download_nextqa_zip(hf_id), video_dir, video_ids)
     items = []
-    for k, idx in enumerate(indices):
-        row = ds[idx]
+    for k, (idx, row) in enumerate(zip(indices, rows)):
         options = _nextqa_options(row)
         gold = _nextqa_answer_letter(row, options)
         question = str(row.get("question") or row.get("query") or "")
         if not question:
             raise KeyError(f"NExT-QA row has no question; keys={sorted(row)}")
         vid_path = dest / "clips" / f"{k:04d}.mp4"
-        _save_video(_nextqa_video_src(row), vid_path)
+        _save_video(_nextqa_video_file(row, video_dir), vid_path)
         item_id = str(row.get("video_id") or row.get("qid") or row.get("id")
                       or f"nq_{idx}")
         items.append({
@@ -377,8 +456,8 @@ def materialize_video(n: int, seed: int, hf_id: str, force: bool) -> list[dict]:
         encoding="utf-8",
     )
     meta_path.write_text(json.dumps({
-        "hf_id": hf_id, "split": split, "seed": seed, "n": n,
-        "item_ids": [it["id"] for it in items],
+        "hf_id": hf_id, "hf_config": VIDEO_HF_CONFIG, "split": VIDEO_HF_SPLIT,
+        "seed": seed, "n": n, "item_ids": [it["id"] for it in items],
     }, indent=2), encoding="utf-8")
     logger.info("materialized %d NExT-QA clips -> %s", n, dest)
     return items
