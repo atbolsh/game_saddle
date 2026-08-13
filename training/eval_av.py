@@ -133,12 +133,30 @@ def _write_wav(path: Path, array: np.ndarray, sr: int) -> None:
         w.writeframes(array.tobytes())
 
 
+def _array_and_rate_from_samples(samples: Any) -> tuple[np.ndarray, int]:
+    """torchcodec AudioSamples -> (mono float array, sample_rate).
+
+    Layout is ``(num_channels, num_samples)`` (HF audio_process docs,
+    transformers ``load_audio_torchcodec``). Downmix matches
+    ``datasets.features._torchcodec.AudioDecoder.__getitem__("array")``.
+    """
+    data = samples.data
+    if hasattr(data, "detach"):
+        data = data.detach().cpu().numpy()
+    else:
+        data = np.asarray(data)
+    if data.ndim > 1:
+        data = np.mean(data, axis=tuple(range(data.ndim - 1)))
+    return data, int(samples.sample_rate)
+
+
 def _audio_from_row(row: dict) -> tuple[np.ndarray, int]:
     audio = row.get("audio")
     if audio is None:
         raise KeyError(
             f"LibriSpeech row has no 'audio' key; keys={sorted(row)}"
         )
+    # datasets<4 Audio feature: {"array", "sampling_rate"}.
     if isinstance(audio, dict):
         arr = audio.get("array")
         sr = audio.get("sampling_rate")
@@ -148,9 +166,14 @@ def _audio_from_row(row: dict) -> tuple[np.ndarray, int]:
                 f"keys={sorted(audio)}"
             )
         return np.asarray(arr), int(sr)
+    # datasets>=4: torchcodec AudioDecoder (HF audio_process:
+    #   samples = audio.get_all_samples(); samples.data / samples.sample_rate).
+    get_all = getattr(audio, "get_all_samples", None)
+    if callable(get_all):
+        return _array_and_rate_from_samples(get_all())
     raise TypeError(
         f"LibriSpeech audio is {type(audio).__name__}, expected dict "
-        f"with array + sampling_rate"
+        f"with array + sampling_rate or a torchcodec AudioDecoder"
     )
 
 
