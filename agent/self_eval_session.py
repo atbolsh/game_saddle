@@ -130,6 +130,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
         # Everything the analyst needs about the player's latest reply, plus
         # the not-yet-applied move and the still-open turn trace.
         self._pending: dict[str, Any] | None = None
+        self._last_outcome: dict[str, Any] | None = None
         return super().restart()
 
     def reset_game(self, record: bool = True) -> dict[str, Any]:
@@ -158,6 +159,9 @@ class InteractiveSelfEvalSession(InteractiveSession):
                     metadata={"kind": "game_reset"},
                 )
             )
+        self.round_no = 0
+        self._last_outcome = None
+        self._run(mem.clear_session_notes(self.client, self.session_id))
         logger.info("Game reset (session %s kept).", self.session_id)
         return {
             "session_id": self.session_id,
@@ -201,6 +205,10 @@ class InteractiveSelfEvalSession(InteractiveSession):
                 "A player reply is already awaiting analysis; run "
                 "ask_analyst() first."
             )
+        if self._last_outcome is not None:
+            question = (
+                game_io.board_update_line(**self._last_outcome) + "\n\n" + question
+            )
 
         # 1. Snapshot the current ('before') frame -> disk + GameSnapshot node.
         snapshot_before_id = image_store.snapshot_id()
@@ -220,10 +228,14 @@ class InteractiveSelfEvalSession(InteractiveSession):
         ctx = self._run(
             mem.get_game_context(
                 self.client, self.session_id, query=query,
-                recent_window=self.cfg.recent_messages_window,
+                recent_window=self.cfg.player_recent_messages_window,
                 exclude_analyst=True,
             )
         )
+        notes = self._run(
+            mem.get_session_notes(self.client, self.session_id)
+        )
+        notepad = mem.format_notepad(notes)
 
         # 3. Single generation under the scene-play prompt, with the same
         #    [SEARCH] loop as play mode (semantic + reasoning tiers, scrubbed).
@@ -233,6 +245,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
         if human_reply is not None:
             messages = modes._build_game_messages(
                 self.PLAYER_SYSTEM_PROMPT, before_path, ctx, question,
+                notepad=notepad,
             )
             raw = game_io.truncate_at_first_move_token(human_reply)
             kind, _payload, _text = modes.classify_move_or_search(raw)
@@ -241,6 +254,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
                 messages = modes._build_game_messages(
                     self.PLAYER_SYSTEM_PROMPT, before_path, ctx, question,
                     search_results="\n\n".join(search_notes) or None,
+                    notepad=notepad,
                 )
                 over_budget = len(searches) >= self.cfg.memory_search_max_calls
                 raw = self.model.generate(
@@ -269,6 +283,13 @@ class InteractiveSelfEvalSession(InteractiveSession):
                     search_notes.append(modes.SEARCH_BUDGET_NOTE)
                 logger.info("player: [SEARCH %s]", payload)
         action = self._parse_player_action(raw, kind)
+        new_notes = game_io.parse_remember_notes(raw)
+        for k, v in new_notes:
+            self._run(
+                mem.set_session_note(
+                    self.client, self.session_id, k, v, self.round_no,
+                )
+            )
 
         # 4. Persist the scene: user question + player reply, both anchored to
         #    the 'before' frame. NO 'after' snapshot yet -- the move has not
@@ -321,6 +342,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
             "assistant_msg_id": str(assistant_msg.id),
             "trace": trace,
             "n_analyses": 0,
+            "notepad": notepad,
         }
         self.phase = "analyst"
         # A bare move word (e.g. 'ANTICLOCK' without brackets) is never
@@ -344,6 +366,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
             # memory context, accumulated search notes, image part) -- what
             # the training data must reproduce byte for byte.
             "messages": messages,
+            "notes": new_notes,
             "phase": self.phase,
         }
 
@@ -404,6 +427,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
                 recent, question,
                 search_results="\n\n".join(search_notes) or None,
                 system_prompt=self.ANALYST_SYSTEM_PROMPT,
+                player_notepad=pending.get("notepad"),
             )
             over_budget = n_searches >= self.cfg.memory_search_max_calls
             raw = self.model.generate(
@@ -528,6 +552,13 @@ class InteractiveSelfEvalSession(InteractiveSession):
             )
 
         gold_remaining = game_io.gold_remaining(self.game)
+        if action:
+            self._last_outcome = {
+                "action": action,
+                "gold_collected": gold_collected,
+                "gold_remaining": gold_remaining,
+            }
+        self.round_no += 1
         n_analyses = pending["n_analyses"]
         outcome = (
             f"scene round: action={action or 'none'}; "

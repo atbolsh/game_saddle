@@ -221,6 +221,13 @@ class AgentConfig:
     recent_messages_window: int = field(
         default_factory=lambda: _env_int("RECENT_MESSAGES_WINDOW", 7)
     )
+    # Player-only recency window (self-eval PLAYER path; the analyst keeps
+    # ``recent_messages_window``). Sized from measured aug11/aug12 traces:
+    # p99 example 9.4k chars, p90 message 317 chars -- 8 messages plus the
+    # notepad + Board update blocks stays far under train.py's 16k drop cap.
+    player_recent_messages_window: int = field(
+        default_factory=lambda: _env_int("PLAYER_RECENT_MESSAGES_WINDOW", 8)
+    )
 
     # Reflection (generative-agents style, arXiv:2304.03442). Every *applied*
     # move accrues ``reflection_points_per_move`` importance points; when the

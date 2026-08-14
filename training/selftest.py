@@ -1042,10 +1042,13 @@ def t1_pure() -> str:
     # ---- boundary_openings + new_multi_gold_game (2026-08-12 multi-gold mode)
     from agent.game_io import (
         _SIDE_WALL_WIDTH,
+        board_update_line,
         boundary_openings,
         new_multi_gold_game,
+        parse_remember_notes,
         truncate_at_first_move_token,
     )
+    from agent.memory import format_notepad
     # Notebook human-takeover: first bracketed move token ends the reply.
     assert (
         truncate_at_first_move_token("aim then [FORWARD]\njunk after")
@@ -1053,6 +1056,52 @@ def t1_pure() -> str:
     )
     checks += 1
     assert truncate_at_first_move_token("no token here") == "no token here"
+    checks += 1
+    # Session scratchpad: [REMEMBER key: value] parser, last-one-wins
+    # ordering, truncation interplay, board-update line, notepad render.
+    assert parse_remember_notes(
+        "[REMEMBER target: left gold] then [REMEMBER plan: hug the wall]"
+    ) == [("target", "left gold"), ("plan", "hug the wall")]
+    checks += 1
+    assert parse_remember_notes(
+        "[REMEMBER target: a] mid [REMEMBER target: b]"
+    ) == [("target", "a"), ("target", "b")]
+    checks += 1
+    assert parse_remember_notes("[REMEMBER Target: x]") == [("target", "x")]
+    checks += 1
+    assert parse_remember_notes(
+        "[REMEMBER no-colon] [REMEMBER bad key: x] [REMEMBER unclosed: y "
+        "[REMEMBER nl: a\nb]"
+    ) == []
+    checks += 1
+    assert parse_remember_notes("[REMEMBER k: keep]drop]") == [("k", "keep")]
+    checks += 1
+    assert parse_remember_notes("[REMEMBER k:   padded  ]") == [("k", "padded")]
+    checks += 1
+    assert parse_remember_notes(
+        truncate_at_first_move_token(
+            "[REMEMBER a: b]\n[FORWARD]\n[REMEMBER c: d]"
+        )
+    ) == [("a", "b")]
+    checks += 1
+    eaten = board_update_line("FORWARD", 1, 2)
+    assert "[FORWARD]" in eaten and "2 gold(s)" in eaten
+    assert "[REMEMBER target:" in eaten
+    checks += 1
+    uneaten = board_update_line("CLOCK", 0, 3)
+    assert "[CLOCK]" in uneaten and "3 gold(s)" in uneaten
+    assert "ATE" not in uneaten
+    checks += 1
+    empty_pad = format_notepad([])
+    assert "Your notepad is empty" in empty_pad
+    assert "[REMEMBER key: short note]" in empty_pad
+    checks += 1
+    filled_pad = format_notepad([
+        {"key": "target", "value": "the left gold, near the top wall",
+         "updated_round": 4},
+    ])
+    assert "target: the left gold, near the top wall" in filled_pad
+    assert "(updated round 4)" in filled_pad
     checks += 1
     w = _SIDE_WALL_WIDTH
     full = [

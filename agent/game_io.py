@@ -419,6 +419,36 @@ def truncate_at_first_move_token(text: str) -> str:
     return text[: m.end()] if m else text
 
 
+#: One scratchpad write: ``[REMEMBER key: free text]``. Key is a short
+#: identifier; the value runs to the first ``]`` on the same line.
+_REMEMBER_RE = re.compile(r"\[REMEMBER ([A-Za-z0-9_]+):\s*([^\]\n]+)\]")
+
+
+def parse_remember_notes(text: str) -> list[tuple[str, str]]:
+    """All ``[REMEMBER key: value]`` writes in ``text``, in order of
+    appearance. Keys are lowercased; values stripped. The caller applies
+    them in order, so a repeated key means last-one-wins."""
+    return [(m.group(1).lower(), m.group(2).strip())
+            for m in _REMEMBER_RE.finditer(text)]
+
+
+def board_update_line(action: str, gold_collected: int, gold_remaining: int) -> str:
+    """Engine-truth one-liner for the turn after an applied move (pure
+    function so t1 can cover it). ``action`` is the bare move word
+    (e.g. "FORWARD"); render it bracketed, ``[FORWARD]``."""
+    if gold_collected > 0:
+        return (
+            f"Board update: your last move ([{action}]) ATE a gold. "
+            f"{gold_remaining} gold(s) now remain. If the eaten gold was "
+            "your saved target, that gold no longer exists -- pick a new "
+            "target and save it with [REMEMBER target: ...] before you move."
+        )
+    return (
+        f"Board update: your last move ([{action}]) did not eat a gold. "
+        f"{gold_remaining} gold(s) remain on the board."
+    )
+
+
 def find_bare_move(text: str) -> str | None:
     """Return the LAST bare (unbracketed) move word in ``text`` -- e.g.
     'ANTICLOCK' without brackets -- or ``None``.

@@ -110,6 +110,7 @@ class MultiGoldSelfEvalSession(InteractiveSelfEvalSession):
                 self.client, trace, outcome=outcome, success=True,
             )
         )
+        self.round_no += 1
         self._pending = None
         self.phase = "player"
         self.session_state = "ended_by_player"

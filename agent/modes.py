@@ -131,6 +131,23 @@ _BLOCK_HOW_TO_PLAY = (
     "reasoning, then (only when asked) a single move, is how you decide well."
 )
 
+_BLOCK_NOTEPAD = (
+    "YOUR NOTEPAD: you have a small notepad that persists for THIS game "
+    "session only. To save a note, write a line of this exact form in your "
+    "reply, BEFORE your move token:\n"
+    "[REMEMBER key: short note]\n"
+    "  - 'key' is one short word (letters, digits, underscores); the note is "
+    "free text on one line (avoid ']' inside it).\n"
+    "  - Every saved note is shown back to you on EVERY future turn in the "
+    "'Your notepad' section.\n"
+    "  - Saving with a key you already used OVERWRITES that note. That is how "
+    "you change your mind on the record.\n"
+    "  - Anything written after your move token is LOST -- the move ends your "
+    "turn. Save first, then move.\n"
+    "Your notepad is the only memory that reliably survives between turns; "
+    "older messages scroll away. If a fact matters for future moves, save it."
+)
+
 _BLOCK_CURRENT_SCREEN = (
     "DO NOT just copy prior observations from your memories. Make sure you "
     "evaluate whether you are facing the gold *right now*. Your memories "
@@ -249,6 +266,7 @@ SYSTEM_PROMPT_GAME = "\n\n".join([
     _BLOCK_MOVE_TOKENS,
     _BLOCK_MULTI_MOVE_TURN,
     _BLOCK_HOW_TO_PLAY,
+    _BLOCK_NOTEPAD,
     _BLOCK_AIM_TOLERANCE,
     _BLOCK_CURRENT_SCREEN,
     _search_tool_block(_SEARCH_SCOPE_PLAY),
@@ -361,6 +379,7 @@ def _build_game_messages(
     question: str,
     reflection: str | None = None,
     search_results: str | None = None,
+    notepad: str | None = None,
 ) -> list[dict]:
     user_text = []
     if context:
@@ -386,6 +405,8 @@ def _build_game_messages(
                 ),
             }
         )
+    if notepad:
+        user_text.append({"type": "text", "text": notepad})
     user_text.append({"type": "image", "url": image_path})
     user_text.append(
         {
@@ -612,6 +633,8 @@ async def mode_game(
                 recent_window=cfg.recent_messages_window,
                 exclude_analyst=True,
             )
+            notes = await mem.get_session_notes(client, session_id)
+            notepad = mem.format_notepad(notes)
 
             # Inner [SEARCH] loop: the model may spend up to
             # cfg.memory_search_max_calls searches before this step's move /
@@ -625,6 +648,7 @@ async def mode_game(
                     SYSTEM_PROMPT_GAME, snapshot_before_path, ctx, question,
                     reflection=last_reflection,
                     search_results="\n\n".join(search_notes) or None,
+                    notepad=notepad,
                 )
                 over_budget = len(searches) >= cfg.memory_search_max_calls
                 raw = model.generate(
@@ -647,6 +671,8 @@ async def mode_game(
                 if len(searches) >= cfg.memory_search_max_calls:
                     search_notes.append(SEARCH_BUDGET_NOTE)
                 logger.info("step %d: [SEARCH %s]", steps, payload)
+            for k, v in game_io.parse_remember_notes(raw):
+                await mem.set_session_note(client, session_id, k, v, steps)
             action = game_io.parse_action(raw) if kind == "move" else None
 
             if action:
@@ -1173,26 +1199,30 @@ _BLOCK_TARGET_COMMIT = (
     "PICK ONE TARGET AND COMMIT: when more than one gold is visible, "
     "choose exactly ONE of them to eat first -- for example 'the left "
     "one' (the leftmost gold on screen), 'the right one', or 'the near "
-    "one' (closest to you). Declare your choice on its own line, in this "
-    "exact, searchable form:\n"
-    "TARGET: <short description, e.g. 'the left gold, near the top wall'>\n"
-    "EVERY time you choose a move, FIRST check the recent conversation "
-    "for an earlier 'TARGET:' line from this run. If one exists and that "
-    "gold is still on the board, REPEAT the same TARGET: line verbatim "
-    "and keep pursuing that gold -- do NOT switch targets mid-chase, "
-    "even if another gold briefly looks closer. Only pick a new target "
-    "(declaring a fresh TARGET: line) after your current target has "
-    "been eaten or is gone from the screen."
+    "one' (closest to you). Save your choice in your notepad under the "
+    "key 'target':\n"
+    "[REMEMBER target: the left gold, near the top wall]\n"
+    "Your notepad shows your current target every turn. Pursue THAT gold "
+    "and do NOT switch targets mid-chase, even if another gold briefly "
+    "looks closer. Overwrite the note (write a new [REMEMBER target: "
+    "...] line) in exactly two situations:\n"
+    "  - the Board update says a gold was EATEN. The eaten gold is "
+    "usually your target: check the screen, and if the gold your note "
+    "describes is gone, pick a NEW gold and save it before you move.\n"
+    "  - your target has disappeared from the screen for any other "
+    "reason.\n"
+    "If a gold is visible and your notepad has no 'target' note, your "
+    "FIRST job this turn is to pick one and save it."
 )
 
 _BLOCK_NO_GOLD_EXPLORE = (
     "WHEN THE ROOM HAS NO GOLD: do not wander. Scan the boundary walls "
     "for an opening -- a visible gap in one of the four walls -- and "
     "declare it as your target in the same searchable form (e.g. "
-    "'TARGET: the opening in the right wall'). Then treat the middle of "
-    f"the gap exactly like a gold: use the same {_TOK_TRIO} moves to "
-    "rotate until the opening is roughly dead ahead, then go FORWARD "
-    "and walk out through it."
+    "[REMEMBER target: the opening in the right wall]). Then treat the "
+    f"middle of the gap exactly like a gold: use the same {_TOK_TRIO} "
+    "moves to rotate until the opening is roughly dead ahead, then go "
+    "FORWARD and walk out through it."
 )
 
 _BLOCK_END_GAME = (
@@ -1200,8 +1230,8 @@ _BLOCK_END_GAME = (
     f"{_TOK_END_GAME}. Emit it exactly like a move token. Use it in "
     "exactly two situations:\n"
     "  - the room has NO gold left AND NO opening in any wall: there "
-    "is nothing left to do. Declare 'TARGET: none -- room is sealed "
-    f"and empty' and emit {_TOK_END_GAME}.\n"
+    "is nothing left to do. Save [REMEMBER target: none -- room is "
+    f"sealed and empty] and emit {_TOK_END_GAME}.\n"
     "  - the question you were given EXPLICITLY asks you to end the "
     f"game: emit {_TOK_END_GAME} regardless of what is on the board.\n"
     "Do NOT end the session while a gold or an opening remains and "
@@ -1212,19 +1242,30 @@ _BLOCK_END_GAME = (
 _BLOCK_TARGET_GRADING = (
     "WHICH GOLD IS THE PLAYER CHASING: this variant room can hold "
     "several golds, so before grading any geometry decide which gold "
-    "the move should be measured against. Look for the player's "
-    "'TARGET:' line (declaring one is required). Map its words onto a "
+    "the move should be measured against. The prompt includes THE "
+    "NOTEPAD THE PLAYER SAW while writing this reply; its 'target' "
+    "note names the player's committed target. A [REMEMBER target: "
+    "...] line inside the reply itself is a NEW commitment taking "
+    "effect on future turns. Map the committed target's words onto a "
     "gold in the settings by comparing coordinates: 'the left one' is "
     "the gold with the SMALLEST x, 'the right one' the LARGEST x, 'the "
     "top one' the LARGEST y, 'the bottom one' the SMALLEST y, 'the "
     "near one' the smallest distance to the agent. Then run your usual "
     "geometry (bearing, delta, rotation direction) against THAT gold's "
     "coordinates -- not the nearest gold, and not a vague average over "
-    "all of them. If the player declared no target, switched targets "
-    "while the old one was still on the board, or stated a target that "
-    "matches no gold in the settings, that is a real defect: say so "
-    "and LOWER the RATING, even if the move happens to be "
-    "geometrically fine."
+    "all of them. A target saved rounds ago and silently pursued since "
+    "is CORRECT play -- do not demand a fresh [REMEMBER] each turn. If "
+    "the notepad had no 'target' note and the reply saves one, that is "
+    "the required first commitment: grade the geometry against the "
+    "newly saved target. Real defects that must LOWER the RATING even "
+    "when the move happens to be geometrically fine:\n"
+    "  - golds are visible, the notepad has no 'target' note, and the "
+    "reply does not save one;\n"
+    "  - the reply overwrites the target note while the old target is "
+    "still on the board (overwriting is REQUIRED when the question's "
+    "Board update reports the target eaten, or the old target is gone "
+    "from the settings);\n"
+    "  - the committed target matches no gold in the settings."
 )
 
 _BLOCK_OPENINGS_PRIVILEGED = (
@@ -1266,6 +1307,7 @@ SYSTEM_PROMPT_SCENE_PLAY = "\n\n".join([
     _BLOCK_MOVE_TOKENS,
     _BLOCK_SCENE_SCOPE,
     _BLOCK_HOW_TO_PLAY,
+    _BLOCK_NOTEPAD,
     _BLOCK_AIM_TOLERANCE,
     _BLOCK_CURRENT_SCREEN,
     _search_tool_block(_SEARCH_SCOPE_PLAY),
@@ -1306,6 +1348,7 @@ SYSTEM_PROMPT_SCENE_PLAY_MULTI = "\n\n".join([
     _BLOCK_MOVE_TOKENS,
     _BLOCK_SCENE_SCOPE,
     _BLOCK_HOW_TO_PLAY,
+    _BLOCK_NOTEPAD,
     _BLOCK_TARGET_COMMIT,
     _BLOCK_NO_GOLD_EXPLORE,
     _BLOCK_END_GAME,
@@ -1341,6 +1384,7 @@ def build_scene_analyst_messages(
     question: str,
     search_results: str | None = None,
     system_prompt: str = SYSTEM_PROMPT_SCENE_ANALYST,
+    player_notepad: str | None = None,
 ) -> list[dict]:
     """Assemble one scene-analyst generation's prompt, mirroring
     :func:`build_debrief_messages`' structure (pre-joined text blocks, then
@@ -1352,6 +1396,13 @@ def build_scene_analyst_messages(
         "The player's reply under review (this EXACT reply -- the frame the "
         "player saw and its exact settings follow):\n" + player_reply,
     ]
+    if player_notepad:
+        scene.append(
+            "The notepad the player SAW while writing this reply (the harness "
+            "injects this block into the player's prompt every turn; [REMEMBER "
+            "...] lines inside the reply update it for FUTURE turns only):\n"
+            + player_notepad
+        )
     if pending_action:
         scene.append(
             f"The reply ends in the move token [{pending_action}]. That move "

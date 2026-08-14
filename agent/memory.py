@@ -444,7 +444,11 @@ async def get_game_context(
     if recent:
         parts.append(
             "Recent conversation (most recent last -- your latest questions and "
-            "moves this session, in order):\n" + recent
+            "moves this session, in order). These messages describe EARLIER "
+            "positions of the board: the attached image is the only CURRENT "
+            "view, and your notepad is the current state of your saved notes. "
+            "Where old messages disagree with the image or the notepad, trust "
+            "the image and the notepad:\n" + recent
         )
     if semantic and semantic.strip() not in ("", "{}", "[]"):
         parts.append(
@@ -700,6 +704,85 @@ async def add_tip(client: Any, tip: str, source_session: str | None = None) -> d
         result=info,
     )
     return info
+
+
+# ------------------------- session notes (scratchpad)
+
+async def set_session_note(
+    client: Any, session_id: str, key: str, value: str, round_no: int,
+) -> None:
+    """Write (or overwrite) one session-scoped scratchpad note.
+
+    Exact-keyed ``MERGE`` on ``(:SessionNote {session_id, key})`` -- no
+    embedding, so the note never enters ``get_context`` similarity recall.
+    Write failures log at WARNING and re-raise.
+    """
+    try:
+        await client.graph.execute_write(
+            "MERGE (n:SessionNote {session_id: $sid, key: $key}) "
+            "SET n.value = $value, n.updated_round = $round, "
+            "n.updated_at = timestamp()",
+            {"sid": session_id, "key": key, "value": value, "round": round_no},
+        )
+    except Exception as exc:
+        logger.warning("set_session_note failed: %s", exc)
+        raise
+    logger.info("notepad: [%s] %s", key, value)
+
+
+async def get_session_notes(client: Any, session_id: str) -> list[dict]:
+    """Return this session's scratchpad notes, ordered by key.
+
+    Exact ``MATCH`` by ``session_id``. Returns ``[]`` only when the query
+    genuinely returns no rows -- a query error raises.
+    """
+    rows = await client.query.cypher(
+        "MATCH (n:SessionNote {session_id: $sid}) "
+        "RETURN n.key AS key, n.value AS value, "
+        "n.updated_round AS updated_round ORDER BY n.key",
+        {"sid": session_id},
+    )
+    notes = [dict(r) for r in rows or []]
+    run_logging.log_db_retrieval(
+        function="get_session_notes",
+        arguments={"session_id": session_id},
+        result=notes,
+    )
+    return notes
+
+
+async def clear_session_notes(client: Any, session_id: str) -> None:
+    """Delete every ``SessionNote`` for ``session_id``. Write failures
+    log at WARNING and re-raise."""
+    try:
+        await client.graph.execute_write(
+            "MATCH (n:SessionNote {session_id: $sid}) DETACH DELETE n",
+            {"sid": session_id},
+        )
+    except Exception as exc:
+        logger.warning("clear_session_notes failed: %s", exc)
+        raise
+
+
+def format_notepad(notes: list[dict]) -> str:
+    """Render the complete notepad block injected into the player prompt.
+
+    Returns the header-included string; callers never wrap or prefix it.
+    """
+    if not notes:
+        return (
+            "Your notepad is empty. Save facts you will need later with\n"
+            "[REMEMBER key: short note]."
+        )
+    lines = [
+        "Your notepad (notes you saved with [REMEMBER key: ...]; "
+        "current values):"
+    ]
+    for n in notes:
+        lines.append(
+            f"  {n['key']}: {n['value']}   (updated round {n['updated_round']})"
+        )
+    return "\n".join(lines)
 
 
 async def get_semantic_model(client: Any) -> str:

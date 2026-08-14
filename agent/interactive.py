@@ -12,8 +12,10 @@ Each step:
   1. Render the *current* game frame to disk + a ``GameSnapshot`` node.
   2. Retrieve NAMS context with the Settings dict stripped out -- the mode-1
      privacy invariant is preserved: the model never sees exact coordinates.
-  3. Build the multimodal prompt (system + memory context + image + question)
-     and call the model (with a high ``max_new_tokens`` ceiling).
+     Fetch this session's notepad and inject it into the prompt; after the
+     reply, persist any ``[REMEMBER key: value]`` writes.
+  3. Build the multimodal prompt (system + memory context + notepad + image +
+     question) and call the model (with a high ``max_new_tokens`` ceiling).
   4. Generation is stopped early the instant a move token (``[FORWARD]`` etc.)
      appears; we apply that move, re-render, and loop back to step 1 feeding
      the *updated* view.
@@ -115,6 +117,7 @@ class InteractiveSession:
         the freshly rendered starting frame."""
         self.game = self._new_game()
         self.session_id = mem.new_session_id()
+        self.round_no = 0
         logger.info("Interactive session restarted: session_id=%s", self.session_id)
         return {
             "session_id": self.session_id,
@@ -182,6 +185,10 @@ class InteractiveSession:
                 exclude_analyst=True,
             )
         )
+        notes = self._run(
+            mem.get_session_notes(self.client, self.session_id)
+        )
+        notepad = mem.format_notepad(notes)
 
         # 3. Build the multimodal prompt and call the model (sync, on this
         #    thread -- the heavy GPU work does not need the async loop). On
@@ -207,6 +214,7 @@ class InteractiveSession:
                 modes.SYSTEM_PROMPT_GAME, before_path, ctx, prompt_text,
                 reflection=reflection,
                 search_results="\n\n".join(search_notes) or None,
+                notepad=notepad,
             )
             over_budget = len(searches) >= self.cfg.memory_search_max_calls
             # Stop generation the instant a move token appears; apply it, then
@@ -237,7 +245,18 @@ class InteractiveSession:
                 search_notes.append(modes.SEARCH_BUDGET_NOTE)
             logger.info("step %d: [SEARCH %s]", step, payload)
 
-        # 4. Parse the move (if any) and apply it to the persistent game.
+        # 4. Persist any [REMEMBER] writes from this reply, then parse the
+        #    move (if any) and apply it to the persistent game. Generation
+        #    already stops at the first move token, so raw cannot contain
+        #    post-move [REMEMBER] lines.
+        new_notes = game_io.parse_remember_notes(raw)
+        for k, v in new_notes:
+            self._run(
+                mem.set_session_note(
+                    self.client, self.session_id, k, v, self.round_no,
+                )
+            )
+        self.round_no += 1
         action = game_io.parse_action(raw) if kind == "move" else None
         gold_collected = game_io.apply_action(self.game, action) if action else 0
 
@@ -267,6 +286,7 @@ class InteractiveSession:
             "after_path": turn["snapshot_after_path"],
             "user_msg_id": turn["user_msg_id"],
             "searches": searches,
+            "notes": new_notes,
         }
 
     def _reflect(
