@@ -378,6 +378,13 @@ now uses the `[REMEMBER]` form. Prompt + interactive wiring only.
   intentional prompt edit. No additional t1 cases for the mode-1 wiring
   or `_BLOCK_END_GAME` wording (no new pure functions).
 
+Gold vs opening vocabulary (2026-08-14 follow-up): multi-gold player
+prompts (`_BLOCK_HOW_TO_PLAY_MULTI` / aim / current-screen, target-commit,
+no-gold-explore) and matching analyst blocks distinguish gold from
+opening/exit and treat calling an opening "the gold" as a naming defect.
+Prompt-only; `weighted_loss` / collation untouched, so t3/t4 do NOT
+trigger. Prompt byte-identity is NOT required. No new t1 cases.
+
 
 Weekend rehearsal (before launching `training/run_weekend.py` for
 real): with NAMS up and external data downloaded, run

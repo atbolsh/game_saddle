@@ -84,7 +84,8 @@ One record per player generation lands in `data_game/<label>/traces.jsonl`:
   contains a notepad block and (after the first applied move) a Board
   update line; replies may contain `[REMEMBER]` writes. Analyst prompts
   contain the notepad the player saw. Pre/post-change corpora have
-  different prompt shapes;
+  different prompt shapes. The multi-gold player prompt names gold and
+  openings as two distinct objectives (never call an opening "the gold").
 - `target_text` — the raw player reply, the ONLY trainable tokens;
 - `meta` — RAW annotations only: analyst rating, harness-verified `WRONG:`
   spans, action, game/move indices, the round's `question`, `game_won`,

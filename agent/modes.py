@@ -106,29 +106,48 @@ _BLOCK_MULTI_MOVE_TURN = (
     "unless it is very apparent that the user is asking you to play."
 )
 
-_BLOCK_HOW_TO_PLAY = (
-    "HOW TO PLAY -- take these steps in every reply. START your reply with "
-    "one structured observation line, read fresh off the CURRENT screen, in "
-    "exactly this form:\n"
-    "  OBS: I am at <where on the board>; my eye points toward <clock "
-    "direction, e.g. 4 o'clock>; the gold is at <where on the board>, toward "
-    "<clock direction> of me.\n"
-    "(Clock directions are as seen on screen: 12 o'clock is up-screen, 3 is "
-    "right, 6 is down, 9 is left.) Then REASON, in a sentence or two, about "
-    "where the gold is relative to your red eye: the eye points in the "
-    f"direction you face, and {_TOK_FORWARD} sends you straight that way.\n"
-    "IF (and only if) the user asked you to play or make a move, choose the "
-    "move from that reasoning:\n"
-    f"  - If your eye is pointing roughly at the gold, emit {_TOK_FORWARD}.\n"
-    f"  - Otherwise, aim your eye at the gold: emit {_TOK_CLOCK} or {_TOK_ANTICLOCK}, then "
-    "check the re-rendered screen to see which way your eye swung, and keep "
-    "rotating that way (or reverse if you overshoot) until your eye lines up with "
-    f"the gold -- then emit {_TOK_FORWARD}.\n"
-    "If the user instead asked a question (e.g. 'is the gold to your left?'), "
-    "answer it in prose after the observation and reasoning and STOP -- "
-    "emitting a move token nobody asked for is a format mistake.\n"
-    "Always state the observation and reasoning first; looking, then "
-    "reasoning, then (only when asked) a single move, is how you decide well."
+def _block_how_to_play(target: str, obs_object: str, question_example: str) -> str:
+    """HOW TO PLAY, parameterized by what the player is aiming at.
+
+    Single-gold prompts pass ``the gold`` (the only objective). The
+    multi-gold variant passes ``your current target`` so gold and
+    openings are not collapsed into one noun.
+    """
+    return (
+        "HOW TO PLAY -- take these steps in every reply. START your reply with "
+        "one structured observation line, read fresh off the CURRENT screen, in "
+        "exactly this form:\n"
+        "  OBS: I am at <where on the board>; my eye points toward <clock "
+        f"direction, e.g. 4 o'clock>; {obs_object}.\n"
+        "(Clock directions are as seen on screen: 12 o'clock is up-screen, 3 is "
+        "right, 6 is down, 9 is left.) Then REASON, in a sentence or two, about "
+        f"where {target} is relative to your red eye: the eye points in the "
+        f"direction you face, and {_TOK_FORWARD} sends you straight that way.\n"
+        "IF (and only if) the user asked you to play or make a move, choose the "
+        "move from that reasoning:\n"
+        f"  - If your eye is pointing roughly at {target}, emit {_TOK_FORWARD}.\n"
+        f"  - Otherwise, aim your eye at {target}: emit {_TOK_CLOCK} or {_TOK_ANTICLOCK}, then "
+        "check the re-rendered screen to see which way your eye swung, and keep "
+        "rotating that way (or reverse if you overshoot) until your eye lines up with "
+        f"{target} -- then emit {_TOK_FORWARD}.\n"
+        f"If the user instead asked a question (e.g. '{question_example}'), "
+        "answer it in prose after the observation and reasoning and STOP -- "
+        "emitting a move token nobody asked for is a format mistake.\n"
+        "Always state the observation and reasoning first; looking, then "
+        "reasoning, then (only when asked) a single move, is how you decide well."
+    )
+
+
+_BLOCK_HOW_TO_PLAY = _block_how_to_play(
+    "the gold",
+    "the gold is at <where on the board>, toward <clock direction> of me",
+    "is the gold to your left?",
+)
+_BLOCK_HOW_TO_PLAY_MULTI = _block_how_to_play(
+    "your current target",
+    "my target, <a remaining gold | an opening/exit>, is at <where on the "
+    "board>, toward <clock direction> of me",
+    "are you facing your target?",
 )
 
 _BLOCK_NOTEPAD = (
@@ -148,33 +167,55 @@ _BLOCK_NOTEPAD = (
     "older messages scroll away. If a fact matters for future moves, save it."
 )
 
-_BLOCK_CURRENT_SCREEN = (
-    "DO NOT just copy prior observations from your memories. Make sure you "
-    "evaluate whether you are facing the gold *right now*. Your memories "
-    "describe PAST screens; every move changes the screen, so re-derive where "
-    "your red eye points and where the gold is from the CURRENT image before "
-    "every single move."
-)
+def _block_current_screen(target: str) -> str:
+    return (
+        "DO NOT just copy prior observations from your memories. Make sure you "
+        f"evaluate whether you are facing {target} *right now*. Your memories "
+        "describe PAST screens; every move changes the screen, so re-derive where "
+        f"your red eye points and where {target} is from the CURRENT image before "
+        "every single move."
+    )
 
-# The one statement of the aim-tolerance rule. Shown verbatim to the player
-# (all player-prompt variants) and quoted verbatim to every reviewer via
-# _BLOCK_AIM_TOLERANCE_REVIEW, so player and judge always share one wording.
-_BLOCK_AIM_TOLERANCE = (
-    "AIM TOLERANCE: it can be hard to tell your exact facing direction from "
-    "the screen, so do not demand pixel-perfect aim. If your best estimate "
-    "is that the gold lies within about 20 degrees of your facing direction, "
-    f"{_TOK_FORWARD} is a good move -- step forward and re-assess on the new "
-    f"screen. Reserve {_TOK_CLOCK}/{_TOK_ANTICLOCK} fine-tuning for when the gold is "
-    "clearly off to one side or behind you."
-)
 
-_BLOCK_AIM_TOLERANCE_REVIEW = (
-    "The player's instructions included this aim-tolerance rule, quoted "
-    "verbatim:\n\"" + _BLOCK_AIM_TOLERANCE + "\"\n"
-    f"Judge the play against it: a {_TOK_FORWARD} emitted while the gold was "
-    "within roughly 20 degrees of the facing direction follows instructions "
-    "and must not be penalized as imprecise aim; conversely, long "
-    "rotate-only fine-tuning inside that tolerance goes against them."
+_BLOCK_CURRENT_SCREEN = _block_current_screen("the gold")
+_BLOCK_CURRENT_SCREEN_MULTI = _block_current_screen("your current target")
+
+
+def _block_aim_tolerance(target: str) -> str:
+    """The one statement of the aim-tolerance rule for a given aim object.
+    Shown verbatim to the matching player prompt and quoted verbatim to
+    that prompt's reviewer, so player and judge always share one wording.
+    """
+    return (
+        "AIM TOLERANCE: it can be hard to tell your exact facing direction from "
+        "the screen, so do not demand pixel-perfect aim. If your best estimate "
+        f"is that {target} lies within about 20 degrees of your facing direction, "
+        f"{_TOK_FORWARD} is a good move -- step forward and re-assess on the new "
+        f"screen. Reserve {_TOK_CLOCK}/{_TOK_ANTICLOCK} fine-tuning for when {target} is "
+        "clearly off to one side or behind you."
+    )
+
+
+_BLOCK_AIM_TOLERANCE = _block_aim_tolerance("the gold")
+_BLOCK_AIM_TOLERANCE_MULTI = _block_aim_tolerance("your current target")
+
+
+def _block_aim_tolerance_review(tolerance: str, target: str) -> str:
+    return (
+        "The player's instructions included this aim-tolerance rule, quoted "
+        "verbatim:\n\"" + tolerance + "\"\n"
+        f"Judge the play against it: a {_TOK_FORWARD} emitted while {target} was "
+        "within roughly 20 degrees of the facing direction follows instructions "
+        "and must not be penalized as imprecise aim; conversely, long "
+        "rotate-only fine-tuning inside that tolerance goes against them."
+    )
+
+
+_BLOCK_AIM_TOLERANCE_REVIEW = _block_aim_tolerance_review(
+    _BLOCK_AIM_TOLERANCE, "the gold",
+)
+_BLOCK_AIM_TOLERANCE_REVIEW_MULTI = _block_aim_tolerance_review(
+    _BLOCK_AIM_TOLERANCE_MULTI, "your current target",
 )
 
 # Grading calibration shared by every reviewer prompt (scene analyst +
@@ -1182,8 +1223,7 @@ _BLOCK_SCENE_SCOPE = (
 )
 
 # ------------------------------------------------- multi-gold variant blocks
-# Used ONLY by SYSTEM_PROMPT_SCENE_PLAY_MULTI / _ANALYST_MULTI. The existing
-# scene prompts below are byte-identical to before this addition.
+# Used ONLY by SYSTEM_PROMPT_SCENE_PLAY_MULTI / _ANALYST_MULTI.
 
 _BLOCK_MULTI_GOLD_RULES = (
     "THIS SESSION'S VARIANT RULES: "
@@ -1192,37 +1232,52 @@ _BLOCK_MULTI_GOLD_RULES = (
     "playing and go for another gold if any remain. The boundary walls "
     "may have an OPENING (a gap leading out of the room); if the room "
     "has no gold left, or never had any, your goal is to find the "
-    "opening and walk out through it."
+    "opening and walk out through it. Gold and openings are two "
+    "different objectives: a gold is a yellow circle you eat; an "
+    "opening is a gap in a wall you walk through. Never describe an "
+    "opening as gold, and never chase an opening while gold remains."
 )
 
 _BLOCK_TARGET_COMMIT = (
-    "PICK ONE TARGET AND COMMIT: when more than one gold is visible, "
-    "choose exactly ONE of them to eat first -- for example 'the left "
-    "one' (the leftmost gold on screen), 'the right one', or 'the near "
-    "one' (closest to you). Save your choice in your notepad under the "
-    "key 'target':\n"
+    "PICK ONE TARGET AND COMMIT: your notepad's 'target' note is the "
+    "thing you are chasing this turn. There are two kinds, and they "
+    "are not interchangeable -- name the kind in the note:\n"
+    "  - a GOLD (a yellow circle), while any gold remains;\n"
+    "  - an OPENING / EXIT (a gap in a wall), only when no gold remains.\n"
+    "When more than one gold is visible, choose exactly ONE of them to "
+    "eat first -- for example 'the left one' (the leftmost gold on "
+    "screen), 'the right one', or 'the near one' (closest to you). Save "
+    "your choice in your notepad under the key 'target':\n"
     "[REMEMBER target: the left gold, near the top wall]\n"
-    "Your notepad shows your current target every turn. Pursue THAT gold "
-    "and do NOT switch targets mid-chase, even if another gold briefly "
+    "Your notepad shows your current target every turn. Pursue THAT "
+    "target and do NOT switch mid-chase, even if another gold briefly "
     "looks closer. Overwrite the note (write a new [REMEMBER target: "
     "...] line) in exactly two situations:\n"
     "  - the Board update says a gold was EATEN. The eaten gold is "
     "usually your target: check the screen, and if the gold your note "
-    "describes is gone, pick a NEW gold and save it before you move.\n"
+    "describes is gone, pick a NEW gold (if any remain) and save it "
+    "before you move. If NO gold remains, your objective has changed "
+    "-- save an OPENING as the target (see WHEN THE ROOM HAS NO GOLD), "
+    "not another gold.\n"
     "  - your target has disappeared from the screen for any other "
-    "reason.\n"
+    "reason. If golds remain, pick another gold; if none remain, pick "
+    "an opening.\n"
     "If a gold is visible and your notepad has no 'target' note, your "
-    "FIRST job this turn is to pick one and save it."
+    "FIRST job this turn is to pick one gold and save it. If no gold "
+    "is visible, do not invent a gold target -- follow WHEN THE ROOM "
+    "HAS NO GOLD."
 )
 
 _BLOCK_NO_GOLD_EXPLORE = (
-    "WHEN THE ROOM HAS NO GOLD: do not wander. Scan the boundary walls "
-    "for an opening -- a visible gap in one of the four walls -- and "
-    "declare it as your target in the same searchable form (e.g. "
-    "[REMEMBER target: the opening in the right wall]). Then treat the "
-    f"middle of the gap exactly like a gold: use the same {_TOK_TRIO} "
-    "moves to rotate until the opening is roughly dead ahead, then go "
-    "FORWARD and walk out through it."
+    "WHEN THE ROOM HAS NO GOLD: your objective has changed. You are "
+    "no longer chasing gold -- there is none. Do not wander. Scan the "
+    "boundary walls for an opening -- a visible gap in one of the four "
+    "walls, also called an exit -- and save it as your target:\n"
+    "[REMEMBER target: the opening in the right wall]\n"
+    "Name it an opening or an exit in OBS, in reasoning, and in the "
+    "notepad. Never call it 'the gold'. Then use the same "
+    f"{_TOK_TRIO} moves to rotate until the opening is roughly dead "
+    "ahead, then go FORWARD and walk out through it."
 )
 
 _BLOCK_END_GAME = (
@@ -1240,32 +1295,44 @@ _BLOCK_END_GAME = (
 )
 
 _BLOCK_TARGET_GRADING = (
-    "WHICH GOLD IS THE PLAYER CHASING: this variant room can hold "
-    "several golds, so before grading any geometry decide which gold "
-    "the move should be measured against. The prompt includes THE "
-    "NOTEPAD THE PLAYER SAW while writing this reply; its 'target' "
-    "note names the player's committed target. A [REMEMBER target: "
-    "...] line inside the reply itself is a NEW commitment taking "
-    "effect on future turns. Map the committed target's words onto a "
-    "gold in the settings by comparing coordinates: 'the left one' is "
-    "the gold with the SMALLEST x, 'the right one' the LARGEST x, 'the "
-    "top one' the LARGEST y, 'the bottom one' the SMALLEST y, 'the "
-    "near one' the smallest distance to the agent. Then run your usual "
-    "geometry (bearing, delta, rotation direction) against THAT gold's "
+    "WHICH THING IS THE PLAYER CHASING: this variant room can hold "
+    "several golds, or none, plus openings, so before grading any "
+    "geometry decide which object the move should be measured against. "
+    "The prompt includes THE NOTEPAD THE PLAYER SAW while writing this "
+    "reply; its 'target' note names the player's committed target. A "
+    "[REMEMBER target: ...] line inside the reply itself is a NEW "
+    "commitment taking effect on future turns. Decide the target's "
+    "KIND from its words:\n"
+    "  - If it names a gold, map its words onto a gold in the settings "
+    "by comparing coordinates: 'the left one' is the gold with the "
+    "SMALLEST x, 'the right one' the LARGEST x, 'the top one' the "
+    "LARGEST y, 'the bottom one' the SMALLEST y, 'the near one' the "
+    "smallest distance to the agent. Then run your usual geometry "
+    "(bearing, delta, rotation direction) against THAT gold's "
     "coordinates -- not the nearest gold, and not a vague average over "
-    "all of them. A target saved rounds ago and silently pursued since "
-    "is CORRECT play -- do not demand a fresh [REMEMBER] each turn. If "
-    "the notepad had no 'target' note and the reply saves one, that is "
-    "the required first commitment: grade the geometry against the "
-    "newly saved target. Real defects that must LOWER the RATING even "
-    "when the move happens to be geometrically fine:\n"
+    "all of them.\n"
+    "  - If it names an opening, exit, or gap, grade geometry against "
+    "that opening's center (OPENINGS block). An opening target is "
+    "CORRECT play when no gold remains; it is a defect when golds are "
+    "still in the settings.\n"
+    "A target saved rounds ago and silently pursued since is CORRECT "
+    "play -- do not demand a fresh [REMEMBER] each turn. If the "
+    "notepad had no 'target' note and the reply saves one, that is the "
+    "required first commitment: grade the geometry against the newly "
+    "saved target. Real defects that must LOWER the RATING even when "
+    "the move happens to be geometrically fine:\n"
     "  - golds are visible, the notepad has no 'target' note, and the "
     "reply does not save one;\n"
     "  - the reply overwrites the target note while the old target is "
     "still on the board (overwriting is REQUIRED when the question's "
     "Board update reports the target eaten, or the old target is gone "
     "from the settings);\n"
-    "  - the committed target matches no gold in the settings."
+    "  - the committed target names a gold that matches no gold in the "
+    "settings;\n"
+    "  - the committed target names an opening while golds remain;\n"
+    "  - no gold remains and the target is an opening, but OBS or "
+    "reasoning calls it 'the gold' -- naming the wrong kind is a real "
+    "mistake even if the geometry toward the gap is fine."
 )
 
 _BLOCK_OPENINGS_PRIVILEGED = (
@@ -1278,10 +1345,11 @@ _BLOCK_OPENINGS_PRIVILEGED = (
     "the nearest opening's 'center' exactly as you would treat a "
     "gold's coordinates -- compute the bearing to it with the same "
     "atan2 recipe, decide the shorter rotation with the same delta "
-    "rule, and grade the player's move against that. A player that "
-    "rotates or walks away from every opening in an empty room is "
-    "making a real mistake; a player that aims at a gap and steps "
-    "FORWARD through it is playing correctly."
+    "rule, and grade the player's move against that. The missed-forward "
+    "and wrong-direction rules apply to that opening's center, not to "
+    "a gold. A player that rotates or walks away from every opening in "
+    "an empty room is making a real mistake; a player that aims at a "
+    "gap and steps FORWARD through it is playing correctly."
 )
 
 _BLOCK_END_GAME_GRADING = (
@@ -1347,13 +1415,13 @@ SYSTEM_PROMPT_SCENE_PLAY_MULTI = "\n\n".join([
     _BLOCK_MULTI_GOLD_RULES,
     _BLOCK_MOVE_TOKENS,
     _BLOCK_SCENE_SCOPE,
-    _BLOCK_HOW_TO_PLAY,
+    _BLOCK_HOW_TO_PLAY_MULTI,
     _BLOCK_NOTEPAD,
     _BLOCK_TARGET_COMMIT,
     _BLOCK_NO_GOLD_EXPLORE,
     _BLOCK_END_GAME,
-    _BLOCK_AIM_TOLERANCE,
-    _BLOCK_CURRENT_SCREEN,
+    _BLOCK_AIM_TOLERANCE_MULTI,
+    _BLOCK_CURRENT_SCREEN_MULTI,
     _search_tool_block(_SEARCH_SCOPE_PLAY),
 ])
 
@@ -1365,7 +1433,7 @@ SYSTEM_PROMPT_SCENE_ANALYST_MULTI = "\n\n".join([
     _BLOCK_TARGET_GRADING,
     _BLOCK_OPENINGS_PRIVILEGED,
     _BLOCK_END_GAME_GRADING,
-    _BLOCK_AIM_TOLERANCE_REVIEW,
+    _BLOCK_AIM_TOLERANCE_REVIEW_MULTI,
     _BLOCK_GRADING_TOLERANCE,
     _BLOCK_SCENE_ANALYST_SCOPE,
     _BLOCK_REVIEW_WHOLE_REPLY,
