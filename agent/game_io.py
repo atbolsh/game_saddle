@@ -408,6 +408,17 @@ def parse_action(text: str) -> str | None:
     return matches[-1].upper()
 
 
+def truncate_at_first_move_token(text: str) -> str:
+    """Keep ``text`` through the first bracketed move token, drop the rest.
+
+    Notebook human-takeover: a hand-typed ``[FORWARD]`` / ``[CLOCK]`` /
+    ``[ANTICLOCK]`` ends the move the same way a generate stop-string
+    would. No token -> the string is unchanged. Uses the same
+    :data:`_MOVE_RE` as :func:`parse_action`."""
+    m = _MOVE_RE.search(text)
+    return text[: m.end()] if m else text
+
+
 def find_bare_move(text: str) -> str | None:
     """Return the LAST bare (unbracketed) move word in ``text`` -- e.g.
     'ANTICLOCK' without brackets -- or ``None``.

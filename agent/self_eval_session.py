@@ -182,12 +182,19 @@ class InteractiveSelfEvalSession(InteractiveSession):
         )
 
     # ----------------------------------------------------------------- player
-    def ask_player(self, question: str) -> dict[str, Any]:
+    def ask_player(self, question: str,
+                   human_reply: str | None = None) -> dict[str, Any]:
         """Player phase: one single-generation answer about the CURRENT scene.
 
         A move token in the reply is parsed and stored as the pending action
         but NOT applied -- propagation happens in :meth:`end_round`, after
         the analyst exchanges. Flips ``phase`` to "analyst".
+
+        ``human_reply`` (notebook takeover only): skip ``model.generate``
+        and the ``[SEARCH]`` loop; the string is the final reply after
+        :func:`game_io.truncate_at_first_move_token`. Snapshot, context,
+        persist, and parse are unchanged. Datagen / ``play.ipynb`` never
+        pass this.
         """
         if self.phase != "player":
             raise ValueError(
@@ -220,39 +227,47 @@ class InteractiveSelfEvalSession(InteractiveSession):
 
         # 3. Single generation under the scene-play prompt, with the same
         #    [SEARCH] loop as play mode (semantic + reasoning tiers, scrubbed).
+        #    human_reply skips generate + search: the typed string IS the reply.
         search_notes: list[str] = []
         searches: list[dict[str, str]] = []
-        while True:
+        if human_reply is not None:
             messages = modes._build_game_messages(
                 self.PLAYER_SYSTEM_PROMPT, before_path, ctx, question,
-                search_results="\n\n".join(search_notes) or None,
             )
-            over_budget = len(searches) >= self.cfg.memory_search_max_calls
-            raw = self.model.generate(
-                messages,
-                max_new_tokens=self.cfg.max_new_tokens,
-                stop_strings=self.PLAYER_STOP_STRINGS,
-                stop_regex=None if over_budget else modes.SEARCH_TOOL_PATTERN,
-            )
-            kind, payload, text = modes.classify_move_or_search(raw)
-            if kind != "search" or over_budget:
-                break
-            results = self._run(
-                mem.search_memory(
-                    self.client, payload, tiers=("semantic", "reasoning"),
-                    top_k=self.cfg.memory_search_top_k, scrub=True,
-                    # The round's trace records the ANALYST's search thoughts
-                    # too; excluding this session keeps the player from
-                    # fishing privileged analysis out of the reasoning tier.
-                    exclude_session=self.session_id,
-                    exclude_analyst=True,
+            raw = game_io.truncate_at_first_move_token(human_reply)
+            kind, _payload, _text = modes.classify_move_or_search(raw)
+        else:
+            while True:
+                messages = modes._build_game_messages(
+                    self.PLAYER_SYSTEM_PROMPT, before_path, ctx, question,
+                    search_results="\n\n".join(search_notes) or None,
                 )
-            )
-            search_notes.append(modes.format_search_note(payload, results))
-            searches.append({"query": payload, "results": results, "thought": text})
-            if len(searches) >= self.cfg.memory_search_max_calls:
-                search_notes.append(modes.SEARCH_BUDGET_NOTE)
-            logger.info("player: [SEARCH %s]", payload)
+                over_budget = len(searches) >= self.cfg.memory_search_max_calls
+                raw = self.model.generate(
+                    messages,
+                    max_new_tokens=self.cfg.max_new_tokens,
+                    stop_strings=self.PLAYER_STOP_STRINGS,
+                    stop_regex=None if over_budget else modes.SEARCH_TOOL_PATTERN,
+                )
+                kind, payload, text = modes.classify_move_or_search(raw)
+                if kind != "search" or over_budget:
+                    break
+                results = self._run(
+                    mem.search_memory(
+                        self.client, payload, tiers=("semantic", "reasoning"),
+                        top_k=self.cfg.memory_search_top_k, scrub=True,
+                        # The round's trace records the ANALYST's search thoughts
+                        # too; excluding this session keeps the player from
+                        # fishing privileged analysis out of the reasoning tier.
+                        exclude_session=self.session_id,
+                        exclude_analyst=True,
+                    )
+                )
+                search_notes.append(modes.format_search_note(payload, results))
+                searches.append({"query": payload, "results": results, "thought": text})
+                if len(searches) >= self.cfg.memory_search_max_calls:
+                    search_notes.append(modes.SEARCH_BUDGET_NOTE)
+                logger.info("player: [SEARCH %s]", payload)
         action = self._parse_player_action(raw, kind)
 
         # 4. Persist the scene: user question + player reply, both anchored to

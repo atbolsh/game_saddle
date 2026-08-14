@@ -1044,7 +1044,16 @@ def t1_pure() -> str:
         _SIDE_WALL_WIDTH,
         boundary_openings,
         new_multi_gold_game,
+        truncate_at_first_move_token,
     )
+    # Notebook human-takeover: first bracketed move token ends the reply.
+    assert (
+        truncate_at_first_move_token("aim then [FORWARD]\njunk after")
+        == "aim then [FORWARD]"
+    )
+    checks += 1
+    assert truncate_at_first_move_token("no token here") == "no token here"
+    checks += 1
     w = _SIDE_WALL_WIDTH
     full = [
         [0.0, 0.0, w, 1.0, 0.0],
