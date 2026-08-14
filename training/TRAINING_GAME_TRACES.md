@@ -206,17 +206,21 @@ reaches the gradient. Multiplicative chain, per reply:
    degenerate). Equal total cloning mass per move TYPE; closed-loop, so a
    turn-heavy corpus can no longer amplify itself. REMOVE once a
    principled per-move signal exists;
-4. **× novelty ("boredom") decay — WORK IN PROGRESS, OFF BY DEFAULT**
-   (`NoveltyTracker`; enable with `GameTraceSource(..., novelty=True)`):
-   `max(0.1, 0.9^k)` on the k-th consecutive identical move (perception
-   rounds skipped, not reset). Off since 2026-08-05: with the RL-scale
-   LR, the exp-advantage contrast, and the oracle penalty the spin-bot
-   should be starved without it, and now that example scaling actually
-   bites, an untuned ×0.1 is a much sharper knife than it was. Re-enable
-   only on observed repetition degeneracy;
+4. **× novelty ("boredom") decay — OFF BY DEFAULT, ON in weekend runs
+   since 2026-08-11** (`NoveltyTracker`; `GameTraceSource(...,
+   novelty=True)` at the `run_weekend.train_one_epoch` call site; class
+   default stays False): `max(0.1, 0.9^k)` on the k-th consecutive
+   identical move (perception rounds skipped, not reset). The
+   "re-enable only on observed repetition degeneracy" condition fired:
+   the aug6 run's turn runs were 97% self-continuing and 11 epochs of
+   training *deepened* the commitment (flip rate 0.10 → 0.03);
 5. **× 0.25 when the engine oracle contradicts the move**
    (`ORACLE_WRONG_SCALE`, crutch below) — the rationalization of a wrong
-   move is suspect end to end.
+   move is suspect end to end;
+6. **× 2.0 on ray-hit rounds** (`TRANSITION_BOOST`, 2026-08-11) — the
+   transition moves that gate winning are a handful per game and were
+   drowning in continuation moves; see the tightening note in the
+   oracle section below.
 
 A scale of exactly 0 (floored rating, no win boost) **skips the record**
 (logged) — zero-scaled forwards teach nothing and cost real GPU time.
@@ -235,7 +239,7 @@ A scale of exactly 0 (floored rating, no win boost) **skips the record**
 3. **the move token gets the oracle's verdict** (crutch block in
    [game_traces.py](game_traces.py)): `[MOVE]` span → **1.5** when it
    matches the engine oracle, **−0.5** (unlikelihood) when it contradicts
-   it, untouched on "neutral" (defensible under the instructed 45° cone)
+   it, untouched on "neutral" (defensible under the instructed 20° cone)
    or "unknown" (no oracle meta — pre-2026-08-05 corpora; counted and
    logged).
 
@@ -392,9 +396,24 @@ facts per move (`_oracle_meta`: `oracle_rel_bearing`, `oracle_ray_hit`,
 | verdict | geometry | effect |
 |---|---|---|
 | `correct` | matches `oracle_move` (or any turn when the gold is ≥170° behind) | move-token span **1.5** |
-| `neutral` | defensible under the instructed 45° cone (FORWARD in-cone without a ray hit; toward-gold turn despite a ray hit) | none — the analyst's rating stands |
-| `wrong` | turn away from the shorter rotation; FORWARD outside the cone | move-token span **−0.5** (unlikelihood) + example scale **×0.25** |
+| `neutral` | defensible under the instructed 20° cone (FORWARD in-cone without a ray hit) | none — the analyst's rating stands |
+| `wrong` | turn away from the shorter rotation; FORWARD outside the cone; **any turn under a ray hit** (missed forward — tightened 2026-08-11) | move-token span **−0.5** (unlikelihood) + example scale **×0.25** |
 | `unknown` | no oracle meta (old corpora) / no move | none; counted + logged |
+
+**2026-08-11 tightening + transition boost:** the aug6 11-epoch run showed
+missed forwards were the biggest leak — ~900 of them slipped through as
+"fine-tuning neutral" while the analyst rated 42% of them ≥ +0.8, so
+FORWARD-on-ray-hit compliance sat at ~50% for 11 epochs. A turn under a
+ray hit is now `wrong`, and every RAY-HIT round's `example_weight` is
+multiplied by `TRANSITION_BOOST` (2.0): taking the FORWARD at alignment is
+cloned at 2×, missing it nets 0.25 × 2 = 0.5× with a sharpened −0.5 span
+on the turn token. The same run also turned novelty decay ON at the
+`run_weekend` call site (`GameTraceSource(..., novelty=True)`, class
+default still False) to tax the 97%-self-continuing turn runs, and the
+shared analyst grading block (`_BLOCK_GRADING_TOLERANCE` in
+[agent/modes.py](../agent/modes.py)) gained explicit must-be-negative
+rules for missed forwards (<~10° off dead-ahead) and wrong-direction
+turns, plus a "rating must follow your own geometry" consistency clause.
 
 Facts live in the data, thresholds live train-side — retuning never
 requires regenerating traces. The springboard principle still holds as the

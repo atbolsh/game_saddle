@@ -11,7 +11,7 @@ lines back for review. On a FAIL, also paste the traceback that precedes it.
 | # | Command | Cost | What it proves |
 |---|---------|------|----------------|
 | 0 | `python -m training.selftest t0` | seconds | imports; transformers >= 5.10; CUDA visible; bitsandbytes loads |
-| 1 | `python -m training.selftest t1` | seconds | pure units: `parse_rating` (incl. bold variants), the 2026-08-05 SHAPE/SCALE reward split — `rating_advantage` (exp-advantage vs a baseline: 1.0 at the mean, ~2x per +0.2, hard floor 0 at r ≤ -0.5, cap `ADV_CAP` 3.0) and `example_scale` (ADDITIVE win boost `1.0 * 0.95^d`, rescues a floored reply, exact-0 floor otherwise) on the SCALE side; `build_span_weights` on the SHAPE side (base 1.0, WRONG spans at −0.5 = bounded unlikelihood, oracle move-token modifier LAST and only on correct/wrong verdicts); `oracle_verdict` geometry (10 cases: exact match, either-turn ≥170°, in-cone FORWARD neutral, fine-tuning-turn neutral, out-of-cone/away-turn/wrong-way wrong, unknown on missing meta or perception rounds) and `_oracle_meta` raw facts from fabricated settings (compass convention, nearest-gold bearing, any-gold ray hit, empty when won); `action_balance_multipliers` (TEMPORARY hack: inverse-frequency mean/count per action, mass-preserving, cap 4x both ways on degenerate mixes), `NoveltyTracker` (WIP boredom decay: 0.9^k, floor 0.1, reset on a different move, perception rounds skipped WITHOUT resetting, per-game keys) standalone AND through `GameTraceSource` with `novelty=True` (OFF by default — a default source must NOT decay); `GameTraceSource` integration on fabricated corpora: span weights stay pure shape while `example_weight` carries exp-advantage × balance × novelty × oracle penalty (r_bar pre-pass asserted, oracle-wrong record gets ×0.25 + a −0.5 move span, floored records SKIPPED, rating-null DROPPED), `MetricGuard` ceiling-only mode (`relative=False`) and `warn_only`, image-noise determinism/identity + the 10% clean pass-through (`_SKIP_PROB`), analyst-leak tripwire (incl. multi-line), `_rewrite_image_urls`, `PlayerAnchorSource` (kd_anchor loss, rating-null KEPT, uniform weights, 0.25 weight, ceiling-only guard at 1.0), micro-batch bucketing, planted-error scrambler, perception-question sampling, `AnalystTraceSource` (KD loss kind, rating-null kept, unverified-span record dropped, quota weight, ceiling-only guard at 5.0), `stack_equal_length` |
+| 1 | `python -m training.selftest t1` | seconds | pure units: `parse_rating` (incl. bold variants), the 2026-08-05 SHAPE/SCALE reward split — `rating_advantage` (exp-advantage vs a baseline: 1.0 at the mean, ~2x per +0.2, hard floor 0 at r ≤ -0.5, cap `ADV_CAP` 3.0) and `example_scale` (ADDITIVE win boost `1.0 * 0.95^d`, rescues a floored reply, exact-0 floor otherwise) on the SCALE side; `build_span_weights` on the SHAPE side (base 1.0, WRONG spans at −0.5 = bounded unlikelihood, oracle move-token modifier LAST and only on correct/wrong verdicts); `oracle_verdict` geometry (11 cases: exact match, either-turn ≥170°, in-cone (20°) FORWARD neutral, 28.6° FORWARD wrong (the 2026-08-13 cone shrink), ray-hit turns WRONG in both directions (the 2026-08-11 missed-forward tightening), out-of-cone/away-turn wrong, unknown on missing meta or perception rounds) and `_oracle_meta` raw facts from fabricated settings (compass convention, nearest-gold bearing, any-gold ray hit, empty when won); `action_balance_multipliers` (TEMPORARY hack: inverse-frequency mean/count per action, mass-preserving, cap 4x both ways on degenerate mixes), `NoveltyTracker` (WIP boredom decay: 0.9^k, floor 0.1, reset on a different move, perception rounds skipped WITHOUT resetting, per-game keys) standalone AND through `GameTraceSource` with `novelty=True` (OFF by default — a default source must NOT decay); `GameTraceSource` integration on fabricated corpora: span weights stay pure shape while `example_weight` carries exp-advantage × balance × novelty × oracle penalty × ray-hit `TRANSITION_BOOST` (r_bar pre-pass asserted, oracle-wrong record gets ×0.25 + a −0.5 move span, missed-forward record gets ×0.25 × 2.0 + the −0.5 span, ray-hit FORWARD gets ×2.0, floored records SKIPPED, rating-null DROPPED), `MetricGuard` ceiling-only mode (`relative=False`) and `warn_only`, image-noise determinism/identity + the 10% clean pass-through (`_SKIP_PROB`), analyst-leak tripwire (incl. multi-line), `_rewrite_image_urls`, `PlayerAnchorSource` (kd_anchor loss, rating-null KEPT, uniform weights, 0.25 weight, ceiling-only guard at 1.0), micro-batch bucketing, planted-error scrambler, perception-question sampling, `AnalystTraceSource` (KD loss kind, rating-null kept, unverified-span record dropped, quota weight, ceiling-only guard at 5.0), `stack_equal_length` |
 | 2 | `python -m training.selftest t2` | seconds | every enabled manifest entry materialized; `data.jsonl` row counts match `meta.json`; probe files present |
 | 3 | `python -m training.selftest t3` | minutes | 4-bit QLoRA load; LoRA target discovery + projector resolution; terminator id; one collated forward+backward per loss kind (image example included); fresh-adapter KD loss equals teacher entropy (the `disable_adapter()` teacher path); kd_anchor with NO anchor adapter loaded equals kd (the epoch-1 base fallback); `example_weight` ×0.1 scales the loss by EXACTLY 0.1 (the 2026-08-05 shape/scale regression — the old code normalized reply-wide reward away); the negative-span smoke example yields a FINITE NON-NEGATIVE loss (bounded unlikelihood, not negative CE); `kd` with negative span weights raises ValueError |
 | 4 | `python -m training.selftest t4` | ~15–30 min | batch-4 vs batch-1 per-example loss parity (mixed CE/KD/image/negative-span buckets); CLI smoke train lands a checkpoint + `eval_log.jsonl` rows (INCLUDING the new step-0 baseline eval); destructive-LR variant fires the rollback path via the HARD tier (`--hard-multiplier 1.0` pins any regression to hard) AND must now END EARLY on the second consecutive rollback (2026-08-05): asserts a `consecutive_rollback_stop` event, exit 0, and a `done` event carrying `ended_early` + a usable `last_good_checkpoint` (the orchestrator hand-off contract) |
@@ -304,6 +304,40 @@ a real epoch boundary):
   `game_*_noise_*` / `player_anchor_*_noise_*` / `analyst_*_noise_*`
   dirs left; the sweep logs `swept N stale noised-frame temp dir(s)`
   when it finds crash leftovers.
+
+Transition reward + analyst tightening (2026-08-11 evening, before the
+aug11 2-epoch run — design note in TRAINING_GAME_TRACES.md's oracle
+section): oracle ray-hit turns → "wrong", `TRANSITION_BOOST` ×2 on
+ray-hit rounds, novelty decay ON at the `run_weekend` call site, and the
+shared `_BLOCK_GRADING_TOLERANCE` analyst block gained explicit
+must-be-negative rules. All source-side; `weighted_loss` and collation
+are untouched, so the standing t3/t4 rule does NOT trigger:
+
+* **Rerun t1 only** (seconds — oracle table, transition-boost
+  assertions through `GameTraceSource`, novelty units). t7 is an
+  optional cheap end-to-end pass.
+* **On the run itself:** epoch 1's datagen plays with the old
+  checkpoint but is graded under the new analyst prompt and trained
+  under the new reward; epoch 2's smoke is the first behavioral read.
+  Grep the smoke stats for FORWARD-on-ray-hit compliance (the aug6 run
+  sat at ~50%) and check the rating histogram — the tightened prompt
+  should push missed-forward ratings negative rather than the old
+  42%-at-≥+0.8 coin flip. Novelty decay's fingerprint is shorter
+  identical-turn runs in the traces.
+
+Weekend-run tweaks (2026-08-13, before the aug13 9-epoch run): random
+`--seed` unless specified (logged + `base_seed` in the state file);
+aim cone 45°→20° (prompt blocks + `ORACLE_CONE_RAD`; 20–45° FORWARDs
+reclassify from oracle-neutral to oracle-wrong at the next train);
+navigation `examples_per_epoch` 900→450; smoke-only 400 gens and
+`--question-rate 0.075`. `weighted_loss` / collation untouched, so
+t3/t4 do NOT trigger.
+
+* **Rerun t1 only** (seconds — oracle table now has an in-20° neutral
+  and a 28.6° wrong). Prompt byte-identity is NOT required: the cone
+  wording is an intentional prompt edit.
+* **On the run itself:** omit `--seed`; grep `base seed` from the log
+  and keep it. Smoke wall is ~65 min healthy / ~15 min if poisoned.
 
 Weekend rehearsal (before launching `training/run_weekend.py` for
 real): with NAMS up and external data downloaded, run

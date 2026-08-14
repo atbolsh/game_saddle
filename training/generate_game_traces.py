@@ -779,7 +779,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="probability that a round asks a perception "
                         "question (direction-balanced pool, see "
                         "PERCEPTION_QUESTION_GROUPS) instead of the default "
-                        "move request (default 0.2)")
+                        "move request (default 0.15)")
     p.add_argument("--seed", type=int, default=17,
                    help="seed for the inference-time image noise stream and "
                         "the question sampler")

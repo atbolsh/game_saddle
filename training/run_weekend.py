@@ -82,6 +82,11 @@ Run on the remote box (NAMS up, repo root, inside tmux or nohup)::
 
     nohup python -m training.run_weekend > weekend.log 2>&1 &
 
+Omit ``--seed`` for a fresh board stream (a random base seed is drawn,
+logged at INFO as ``base seed N (...)``, and stored in the state file).
+Pass that logged value as ``--seed N`` to replay the same run; a mismatch
+with a stored ``base_seed`` is a hard error.
+
 Budget arithmetic before launching: one datagen epoch costs about
 ``--max-generations`` x the seconds-per-generation of your ``--parallel``
 setting, plus the train stage. Measured 2026-07-30: serial 24.1 s/gen
@@ -100,6 +105,7 @@ import argparse
 import json
 import logging
 import random
+import secrets
 import shutil
 import subprocess
 import sys
@@ -265,6 +271,48 @@ def _save_state(prefix: str, state: dict) -> None:
     path = _state_path(prefix)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def _resolve_seed(args: argparse.Namespace, state: dict | None,
+                  persist_prefix: str | None) -> None:
+    """Fill ``args.seed`` once per process: explicit flag, reused from
+    the state file (crash-resume of this prefix), or a fresh random
+    draw. A mismatch between ``--seed`` and a stored ``base_seed`` is
+    a hard error -- mixing two streams silently is the failure mode
+    this exists to prevent. The resolved value is logged at INFO and
+    persisted so the run is replayable."""
+    explicit = args.seed
+    stored = None if state is None else state.get("base_seed")
+    if stored is not None:
+        stored = int(stored)
+
+    if explicit is not None:
+        if stored is not None and stored != explicit:
+            where = (str(_state_path(persist_prefix))
+                     if persist_prefix else "the state file")
+            raise SystemExit(
+                f"--seed {explicit} disagrees with base_seed {stored} "
+                f"in {where}; pass the stored seed to resume this run, "
+                f"or a new --prefix to start a fresh stream"
+            )
+        args.seed = explicit
+        source = "explicit"
+    elif stored is not None:
+        args.seed = stored
+        source = "reused from state"
+    else:
+        n = secrets.randbelow(2 ** 31 - 1)
+        if n == 0:
+            n = 1
+        args.seed = n
+        source = ("resolved, stored in state" if persist_prefix
+                  else "resolved")
+
+    if persist_prefix is not None and state is not None:
+        if state.get("base_seed") != args.seed:
+            state["base_seed"] = args.seed
+            _save_state(persist_prefix, state)
+    logger.info("base seed %d (%s)", args.seed, source)
 
 
 # ================================================================== helpers
@@ -558,11 +606,14 @@ def _prune_datagen(label: str, seed: int) -> dict | None:
 
 # =================================================================== stages
 
-#: Post-train smoke eval size: 8 real games (~100-200 generations,
-#: ~10-20 min at --parallel 16) -- enough for a win-rate/rating/degeneracy
-#: reading on every fresh checkpoint, cheap enough to run unconditionally.
+#: Post-train smoke eval size: 8 real games x 50 gens (400 generations,
+#: ~65 min at measured 9.9 s/gen) -- a full-length game so the player
+#: has time to finish, cheap enough to run unconditionally. Poisoned
+#: checkpoints still surface in ~15 min (degeneracy fuse trips after 25
+#: consecutive bad generations, early in the smoke).
 SMOKE_GAMES = 8
-SMOKE_MAX_GENERATIONS = 200
+SMOKE_MAX_GENERATIONS = 400
+SMOKE_QUESTION_RATE = 0.075  # half of datagen's default 0.15
 
 
 def _smoke_eval(k: int, checkpoint: str | None,
@@ -583,6 +634,7 @@ def _smoke_eval(k: int, checkpoint: str | None,
         "--games", str(SMOKE_GAMES),
         "--max-generations", str(SMOKE_MAX_GENERATIONS),
         "--seed", str(args.seed + 100 * k + 51),
+        "--question-rate", str(SMOKE_QUESTION_RATE),
     ]
     if checkpoint:
         cmd += ["--checkpoint", checkpoint]
@@ -698,7 +750,12 @@ def train_one_epoch(k: int, prefix: str, resume: str | None,
     configure_logging()
     label = f"{prefix}_iter{k}"
     sources = [
-        GameTraceSource(f"data_game/{label}/traces.jsonl"),
+        # novelty=True (2026-08-11): the boredom decay taxes blind
+        # continuation -- the aug6 run's turn runs were 97%
+        # self-continuing and training DEEPENED the commitment (flip
+        # rate 0.10 -> 0.03 over 11 epochs). Class default stays False
+        # (t1 asserts a default source must not decay).
+        GameTraceSource(f"data_game/{label}/traces.jsonl", novelty=True),
         # Trust region over the SAME player traces: kd_anchor to the parent
         # checkpoint (= resume; falls back to the base when resume is None,
         # which IS epoch 1's parent). Rationale in game_traces.py.
@@ -723,6 +780,7 @@ def orchestrate(args: argparse.Namespace) -> int:
     global _MONITOR
     _MONITOR = VramMonitor(args.prefix)
     state = _load_state(args.prefix)
+    _resolve_seed(args, state, persist_prefix=args.prefix)
     checkpoint = args.start_checkpoint
     failures = 0
     poisoned = False
@@ -868,9 +926,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "generate_game_traces); 1 = the fully serial "
                         "conservative path; default 16 is set by VRAM "
                         "headroom on a 96 GB box")
-    p.add_argument("--seed", type=int, default=17,
+    p.add_argument("--seed", type=int, default=None,
                    help="base seed; each epoch and resume attempt derives "
-                        "a distinct noise/question stream from it")
+                        "a distinct noise/question stream from it. Omit "
+                        "to draw a random seed (logged and stored in the "
+                        "state file so the run is replayable); pass the "
+                        "logged value to replay")
     p.add_argument("--prefix", default="weekend",
                    help="label prefix: data_game/<prefix>_iter<k>/, "
                         "checkpoints <prefix>_iter<k>_step<N>, state file "
@@ -917,6 +978,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.prune:
         # Standalone prune mode: exit code counts labels with no
         # traces.jsonl (already-pruned dirs log INFO and are fine).
+        _resolve_seed(args, state=None, persist_prefix=None)
         missing = 0
         for label in args.prune:
             if not (DATA_GAME_DIR / label / "traces.jsonl").is_file():

@@ -228,6 +228,7 @@ def t1_pure() -> str:
         ORACLE_MATCH_SPAN,
         ORACLE_WRONG_SCALE,
         ORACLE_WRONG_SPAN,
+        TRANSITION_BOOST,
         WRONG_SPAN_WEIGHT,
         AnalystTraceSource,
         GameTraceSource,
@@ -322,11 +323,14 @@ def t1_pure() -> str:
         (("FORWARD", "FORWARD", 0.0, True), "correct"),   # exact match
         (("CLOCK", "CLOCK", 0.7, False), "correct"),
         (("ANTICLOCK", "CLOCK", 3.05, False), "correct"),  # ~behind: either
-        (("FORWARD", "CLOCK", 0.5, False), "neutral"),    # inside 45deg cone
-        (("CLOCK", "FORWARD", 0.3, True), "neutral"),     # fine-tuning aim
-        (("FORWARD", "CLOCK", 1.2, False), "wrong"),      # outside the cone
+        (("FORWARD", "CLOCK", 0.25, False), "neutral"),   # inside 20deg cone
+        # missed forward: ANY turn under a ray hit is wrong since the
+        # 2026-08-11 tightening (was the "fine-tuning" neutral)
+        (("CLOCK", "FORWARD", 0.3, True), "wrong"),
+        (("ANTICLOCK", "FORWARD", 0.3, True), "wrong"),   # other direction
+        (("FORWARD", "CLOCK", 0.5, False), "wrong"),      # 28.6deg: outside 20deg cone (was neutral at 45deg)
+        (("FORWARD", "CLOCK", 1.2, False), "wrong"),      # well outside the cone
         (("CLOCK", "ANTICLOCK", -0.8, False), "wrong"),   # away from gold
-        (("ANTICLOCK", "FORWARD", 0.3, True), "wrong"),   # wrong-way turn
         ((None, "FORWARD", 0.0, True), "unknown"),        # perception round
         (("CLOCK", None, None, None), "unknown"),         # pre-oracle corpus
     ]:
@@ -653,12 +657,14 @@ def t1_pure() -> str:
         checks += 2
 
         # ---- oracle through GameTraceSource: stamped meta -> move-token
-        # span modifier + the x0.25 example-scale penalty on "wrong"
-        # (crutch block in game_traces.py); floored ratings are SKIPPED.
+        # span modifier + the x0.25 example-scale penalty on "wrong" +
+        # the x2 TRANSITION_BOOST on ray-hit rounds (crutch block in
+        # game_traces.py); floored ratings are SKIPPED.
         orc_dir = tmp_dir / "traces_oracle"
         orc_dir.mkdir()
         orc_records = [
-            # matches the oracle -> [FORWARD] span at ORACLE_MATCH_SPAN
+            # matches the oracle -> [FORWARD] span at ORACLE_MATCH_SPAN;
+            # ray hit -> example_weight x TRANSITION_BOOST
             {"action": "FORWARD", "oracle_move": "FORWARD",
              "oracle_rel_bearing": 0.05, "oracle_ray_hit": True,
              "rating": 0.0},
@@ -666,6 +672,12 @@ def t1_pure() -> str:
             # ORACLE_WRONG_SPAN and example_weight x ORACLE_WRONG_SCALE
             {"action": "CLOCK", "oracle_move": "ANTICLOCK",
              "oracle_rel_bearing": -0.9, "oracle_ray_hit": False,
+             "rating": 0.0},
+            # missed forward (turn under ray hit): "wrong" since the
+            # 2026-08-11 tightening -> ORACLE_WRONG_SPAN on [CLOCK] and
+            # example_weight x ORACLE_WRONG_SCALE x TRANSITION_BOOST
+            {"action": "CLOCK", "oracle_move": "FORWARD",
+             "oracle_rel_bearing": 0.05, "oracle_ray_hit": True,
              "rating": 0.0},
             # floored rating, no win -> zero scale -> record SKIPPED
             {"action": "FORWARD", "oracle_move": "FORWARD",
@@ -685,22 +697,29 @@ def t1_pure() -> str:
                 }) + "\n")
         osrc = GameTraceSource(orc_dir / "traces.jsonl", noise_strength=0.0)
         oexs = list(osrc.examples())
-        assert len(oexs) == 2, f"floored record not skipped: {len(oexs)}"
-        # r_bar = (0 + 0 - 1)/3 (the floored record still counts in the
-        # pre-pass -- it happened); survivors share rating 0.0, so with
-        # the balance factored out the scales isolate the oracle penalty
+        assert len(oexs) == 3, f"floored record not skipped: {len(oexs)}"
+        # r_bar = (0 + 0 + 0 - 1)/4 (the floored record still counts in
+        # the pre-pass -- it happened); survivors share rating 0.0, so
+        # with the balance factored out the scales isolate the oracle
+        # penalty and the transition boost
         adv = rating_advantage(0.0, osrc.rating_baseline)
         bal = osrc.action_balance
-        assert abs(oexs[0].example_weight - adv * bal["FORWARD"]) < 1e-9, (
+        assert abs(oexs[0].example_weight - adv * bal["FORWARD"]
+                   * TRANSITION_BOOST) < 1e-9, (
             oexs[0].example_weight, adv, bal,
         )
         assert abs(oexs[1].example_weight - adv * bal["CLOCK"]
                    * ORACLE_WRONG_SCALE) < 1e-9, (
             oexs[1].example_weight, adv, bal,
         )
+        assert abs(oexs[2].example_weight - adv * bal["CLOCK"]
+                   * ORACLE_WRONG_SCALE * TRANSITION_BOOST) < 1e-9, (
+            oexs[2].example_weight, adv, bal,
+        )
         assert oexs[0].span_weights[-1][2] == ORACLE_MATCH_SPAN, oexs[0]
         assert oexs[1].span_weights[-1][2] == ORACLE_WRONG_SPAN, oexs[1]
-        checks += 5
+        assert oexs[2].span_weights[-1][2] == ORACLE_WRONG_SPAN, oexs[2]
+        checks += 7
 
         # ---- PlayerAnchorSource on the same fabricated dir: trust-region
         # semantics -- EVERY parseable record kept (rating-null included),
