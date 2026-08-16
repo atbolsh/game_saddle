@@ -159,6 +159,31 @@ sees Settings.
    The password defaults to `changeme` (matching `.env.example`); override
    with `NEO4J_PASSWORD=… bash scripts/vast_neo4j_launch.sh`.
 
+   **Known failure mode: thread exhaustion panics Neo4j (2026-08-15).**
+   Vast containers cap *total threads*, not just processes, via cgroup
+   `pids.max` (≈2800 observed) — far below the bare-metal `ulimit -u`.
+   Datagen's 12 workers each spawn nproc-sized torch/OpenMP/tokenizer
+   pools, and once the cap is reached Neo4j's Lucene merge scheduler fails
+   with `OutOfMemoryError: unable to create native thread` mid-flush of a
+   vector index (plenty of free RAM — the name is misleading), the database
+   marks itself panicked, and every later transaction fails until restart.
+   The fix is to cap the Python-side pools; the GPU does the heavy lifting,
+   so this costs nothing. `vast_neo4j_launch.sh` writes the caps into
+   `~/.bashrc` (new shells only — `source ~/.bashrc` for the current one):
+
+   ```bash
+   export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+   export TOKENIZERS_PARALLELISM=false
+   ```
+
+   These must live in the shell environment, not the repo `.env`: dotenv
+   loads at `agent.config` import time, which can be after torch has
+   already sized its native pools. To check headroom while a run is up:
+   `echo "pids: $(cat /sys/fs/cgroup/pids.current 2>/dev/null)/$(cat /sys/fs/cgroup/pids.max 2>/dev/null)"`.
+   If Neo4j has already panicked, `neo4j stop && neo4j start` (or rerun the
+   launch script) recovers it; the store itself was undamaged in the
+   observed crash.
+
    Manage the bare-metal database with `scripts/neo4j_db.sh`:
 
    ```bash

@@ -23,6 +23,20 @@
 #   7. Waits for bolt on :7687 and verifies APOC is callable.
 #   8. Appends NEO4J_URI / NEO4J_USERNAME / NEO4J_PASSWORD to the repo-root
 #      .env so agent/config.py picks them up (idempotent).
+#   9. Appends native-thread-pool caps (OMP_NUM_THREADS=1 etc.) to ~/.bashrc
+#      so every LATER shell on this box inherits them (idempotent). Exports
+#      inside this script would die with its shell; .bashrc is the only spot
+#      that reaches the shells that actually launch datagen/training. WHY:
+#      Vast containers cap total threads via cgroup pids.max (~2816 observed),
+#      and without the caps each of the 12 datagen workers spawns nproc-sized
+#      torch/OpenMP pools. On 2026-08-15 that exhausted the cap and Neo4j's
+#      Lucene merge scheduler could not create a native thread mid-flush of
+#      the message_embedding_idx vector index -> database panic ("critical
+#      error, needs to be restarted") -> the rest of the weekend run starved.
+#      The caps cost nothing (the GPU does the heavy lifting) and cut thread
+#      usage ~10x. NOTE: they must be in the SHELL environment; the repo .env
+#      is not a substitute (dotenv loads at agent.config import, which can be
+#      after torch has already sized its native pools).
 #
 # The agent then connects with the defaults from agent/config.py:
 # NEO4J_URI=bolt://localhost:7687, NEO4J_USERNAME=neo4j,
@@ -184,6 +198,29 @@ verify_apoc() {
   fi
 }
 
+# Cap native thread pools for every later shell on this box (see header
+# step 9: cgroup pids.max exhaustion panicked Neo4j on 2026-08-15).
+# Idempotent: strips any previous block, then appends a fresh one.
+write_thread_caps() {
+  local rc_file="${HOME}/.bashrc"
+  touch "$rc_file"
+  sed -i '/# --- game_saddle thread caps ---/,/# --- end game_saddle thread caps ---/d' "$rc_file"
+  cat >> "$rc_file" <<'EOF'
+# --- game_saddle thread caps ---
+# Vast containers cap total threads (cgroup pids.max). Without these, 12
+# datagen workers x nproc-sized torch/OpenMP pools exhaust the cap and Neo4j
+# panics when Lucene cannot spawn a merge thread (seen 2026-08-15). See the
+# header of scripts/vast_neo4j_launch.sh.
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export TOKENIZERS_PARALLELISM=false
+# --- end game_saddle thread caps ---
+EOF
+  log "thread caps written to ${rc_file} (takes effect in NEW shells;"
+  log "  run 'source ${rc_file}' to apply to the current one)"
+}
+
 # Write the Neo4j connection vars into the repo-root .env so agent/config.py
 # picks them up explicitly (it loads .env on import via python-dotenv). The
 # defaults already match, so this is for explicitness. Idempotent: only appends
@@ -214,6 +251,7 @@ start_neo4j
 wait_for_bolt
 verify_apoc
 write_env_file
+write_thread_caps
 
 log "Neo4j is ready for game_saddle NAMS:"
 log "  bolt:    bolt://localhost:7687"
