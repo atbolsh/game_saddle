@@ -214,6 +214,7 @@ _TAKEOVER_MOVE_FACES = (
 
 def player_takeover_controls(
     on_submit: Callable[[str], None],
+    on_mode_change: Callable[[], None] | None = None,
 ) -> SimpleNamespace:
     """Sticky human-player takeover panel for the two self-eval notebooks.
 
@@ -221,6 +222,12 @@ def player_takeover_controls(
     appended when a move button was pressed. Truncation at the first
     move token happens in ``ask_player``. Takeover stays on until
     **Resume agent**; Restart / New room / Reset do not clear it.
+
+    ``on_mode_change`` (if given) fires after **Takeover** and **Resume
+    agent**. The notebooks pass ``_sync_phase`` here: that is the only
+    place that re-enables **Ask**, and Resume/Takeover never go through
+    it on their own. Without this callback, Ask stays grey after
+    Takeover -> move -> Back to player -> Resume agent.
 
     Returns a namespace with ``takeover_btn``, ``resume_btn``,
     ``reply_box``, ``controls_box`` (reply + submit/move row; hidden
@@ -284,14 +291,21 @@ def player_takeover_controls(
         takeover_on = on
         _apply_visibility()
 
+    def _notify() -> None:
+        # Always refresh this panel first; then let the notebook re-sync
+        # Ask / Reset / etc. Resume does not otherwise call _sync_phase.
+        sync(last_player_on)
+        if on_mode_change is not None:
+            on_mode_change()
+
     def _on_takeover(_) -> None:
         _set_takeover(True)
-        sync(last_player_on)
+        _notify()
 
     def _on_resume(_) -> None:
         _set_takeover(False)
         reply_box.value = ""
-        sync(last_player_on)
+        _notify()
 
     def _fire(extra_token: str | None) -> None:
         raw = reply_box.value
