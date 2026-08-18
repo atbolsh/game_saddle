@@ -343,7 +343,7 @@ def scratchpad_html(text: str, *, height_px: int = 420) -> str:
     """Light-maroon notepad card, game-height and wide; scrolls if taller."""
     escaped = _html.escape(text or "")
     return (
-        f"<div style='flex:1 1 900px;min-width:700px;height:{height_px}px;"
+        f"<div style='flex:1 1 640px;min-width:520px;height:{height_px}px;"
         "overflow:auto;background:#f7e6e6;border:1px solid #c69c9c;"
         "border-radius:6px;padding:10px 12px;box-sizing:border-box;"
         "font-family:monospace;white-space:pre-wrap;font-size:13px'>"

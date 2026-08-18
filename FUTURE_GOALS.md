@@ -248,3 +248,15 @@ When picked up, in order of leverage:
   anything — that reading should gate how much effort the rest gets;
 * **resolution case/label merging** is real but minor (dozens of nodes,
   not thousands).
+
+## 9. Debrief notepad injection — *Not started*
+
+`_BLOCK_REVIEW_WHOLE_REPLY` (shared by the scene analyst and debrief) now
+tells the reviewer to check `[REMEMBER ...]` lines against "the notepad
+shown in your context". `build_scene_analyst_messages` injects that
+notepad; `build_debrief_messages` does not. In debrief the instruction
+is therefore dangling. Harmless today (debrief reviews recorded play,
+not live `[REMEMBER]` spam), but if debrief verdicts ever complain
+about a missing notepad, either inject the recorded notepad into the
+debrief builder or gate that one sentence out of the debrief
+composition.
