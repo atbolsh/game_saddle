@@ -749,9 +749,13 @@ class discreteGame:
             exit_wall = random.randint(0, 3)
         else:
             exit_wall = -1
+        # When a side has an exit, the gap is at least 1.5x the agent's
+        # width (diameter). A diameter-wide hole is a squeeze; 1.5x lets
+        # the agent walk through without pinning on the jambs.
+        min_opening = 1.5 * (2.0 * self.typical_agent_r)
         for i in range(4):# left wall; top wall; bottom wall; right wall
             if i == exit_wall:
-                longside = 0.5 - self.typical_agent_r
+                longside = 0.5 - min_opening / 2.0
             else:
                 longside = 1.0
             wall_theta = 0
@@ -776,10 +780,10 @@ class discreteGame:
             if i == exit_wall:
                 if isHorizontal:
                     wall_y2 = wall_y
-                    wall_x2 = longside + 2*self.typical_agent_r
+                    wall_x2 = longside + min_opening
                 else:
                     wall_x2 = wall_x
-                    wall_y2 = longside + 2*self.typical_agent_r
+                    wall_y2 = longside + min_opening
                 walls.append([wall_x2, wall_y2, wall_w, wall_h, wall_theta])
         return walls
 

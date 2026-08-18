@@ -18,6 +18,9 @@
 
 from __future__ import annotations
 
+import base64
+import html as _html
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
@@ -336,34 +339,43 @@ def player_takeover_controls(
     )
 
 
-def scratchpad_panel() -> SimpleNamespace:
-    """Sticky light-maroon notepad sidebar for the self-eval notebooks.
-
-    Returns ``widget`` (a ~300px VBox to place next to the output area)
-    and ``update(text)`` which renders ``text`` verbatim (the
-    ``format_notepad`` string the player saw).
-    """
-    import html as _html
-
-    box = widgets.HTML(value="")
-    widget = widgets.VBox(
-        [box],
-        layout=widgets.Layout(width="300px", flex="0 0 300px"),
+def scratchpad_html(text: str, *, height_px: int = 420) -> str:
+    """Light-maroon notepad card, game-height and wide; scrolls if taller."""
+    escaped = _html.escape(text or "")
+    return (
+        f"<div style='flex:1 1 900px;min-width:700px;height:{height_px}px;"
+        "overflow:auto;background:#f7e6e6;border:1px solid #c69c9c;"
+        "border-radius:6px;padding:10px 12px;box-sizing:border-box;"
+        "font-family:monospace;white-space:pre-wrap;font-size:13px'>"
+        "<div style='font-weight:bold;color:#7a2e2e;margin-bottom:6px'>"
+        "Player's scratchpad</div>"
+        f"{escaped}</div>"
     )
 
-    def update(text: str) -> None:
-        escaped = _html.escape(text or "")
-        box.value = (
-            "<div style='position:sticky;top:8px;background:#f7e6e6;"
-            "border:1px solid #c69c9c;border-radius:6px;padding:10px 12px;"
-            "font-family:monospace;white-space:pre-wrap;font-size:12px'>"
-            "<div style='font-weight:bold;color:#7a2e2e;margin-bottom:6px'>"
-            "Player's scratchpad</div>"
-            f"{escaped}</div>"
-        )
 
-    update("")
-    return SimpleNamespace(widget=widget, update=update)
+def display_frame_with_scratchpad(
+    path: str | None,
+    caption: str,
+    notepad: str,
+    *,
+    width: int = 420,
+) -> None:
+    """Print ``caption``, then the game image with the notepad to its right."""
+    if not path:
+        return
+    print(caption)
+    raw = Path(path).read_bytes()
+    b64 = base64.b64encode(raw).decode("ascii")
+    suffix = Path(path).suffix.lstrip(".").lower() or "png"
+    if suffix == "jpg":
+        suffix = "jpeg"
+    display(HTML(
+        "<div style='display:flex;align-items:flex-start;gap:16px;width:100%'>"
+        f"<img src='data:image/{suffix};base64,{b64}' width='{width}' "
+        f"style='flex:0 0 {width}px;height:auto;display:block'/>"
+        f"{scratchpad_html(notepad, height_px=width)}"
+        "</div>"
+    ))
 
 
 def tame_shift_enter(*text_widgets) -> None:

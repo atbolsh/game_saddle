@@ -287,6 +287,9 @@ def new_multi_gold_game(
     for _ in range(_MULTI_GOLD_TRIES):
         walls = engine.random_walls(num_extra_walls=0)
         openings = boundary_openings({"walls": walls})
+        min_opening = 1.5 * (2.0 * engine.typical_agent_r)
+        if any(op["width"] + 1e-12 < min_opening for op in openings):
+            continue
         if opening == "require" and not openings:
             continue
         if opening == "forbid" and openings:

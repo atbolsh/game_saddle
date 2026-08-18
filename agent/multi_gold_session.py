@@ -47,7 +47,8 @@ class MultiGoldSelfEvalSession(InteractiveSelfEvalSession):
         self.opening = opening
         self.END_ON_CLEAR = end_on_clear
         self.session_state: str = "active"
-        super().__init__(*args, **kwargs)
+        log_label = kwargs.pop("log_label", None)
+        super().__init__(*args, log_label=log_label or "multi_gold_eval", **kwargs)
 
     def _new_game(self) -> Any:
         return game_io.new_multi_gold_game(
