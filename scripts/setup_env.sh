@@ -98,6 +98,13 @@ mkdir -p "${REPO_ROOT}/weights"
 log "ensuring game-trace directory exists: ${REPO_ROOT}/data_game"
 mkdir -p "${REPO_ROOT}/data_game"
 
+# Per-run logs, DB dumps, train/datagen dirs (agent.run_logging, TrainLogger,
+# neo4j_db.sh save logs/...). Created lazily on first use too, but pre-creating
+# it here matches weights/ and data_game/ and lets a dump land before any run.
+# -p honors a symlink onto removable storage.
+log "ensuring log directory exists: ${REPO_ROOT}/logs"
+mkdir -p "${REPO_ROOT}/logs"
+
 # ------------------------------------------------ 5. external replay datasets
 # Materialize the replay datasets described in training/datasets.json into
 # data_external/ (gitignored; on the owner's local box it is a symlink onto
