@@ -336,6 +336,36 @@ def player_takeover_controls(
     )
 
 
+def scratchpad_panel() -> SimpleNamespace:
+    """Sticky light-maroon notepad sidebar for the self-eval notebooks.
+
+    Returns ``widget`` (a ~300px VBox to place next to the output area)
+    and ``update(text)`` which renders ``text`` verbatim (the
+    ``format_notepad`` string the player saw).
+    """
+    import html as _html
+
+    box = widgets.HTML(value="")
+    widget = widgets.VBox(
+        [box],
+        layout=widgets.Layout(width="300px", flex="0 0 300px"),
+    )
+
+    def update(text: str) -> None:
+        escaped = _html.escape(text or "")
+        box.value = (
+            "<div style='position:sticky;top:8px;background:#f7e6e6;"
+            "border:1px solid #c69c9c;border-radius:6px;padding:10px 12px;"
+            "font-family:monospace;white-space:pre-wrap;font-size:12px'>"
+            "<div style='font-weight:bold;color:#7a2e2e;margin-bottom:6px'>"
+            "Player's scratchpad</div>"
+            f"{escaped}</div>"
+        )
+
+    update("")
+    return SimpleNamespace(widget=widget, update=update)
+
+
 def tame_shift_enter(*text_widgets) -> None:
     """Make Shift+Enter insert a plain newline in the given Textarea widgets.
 

@@ -122,6 +122,11 @@ class InteractiveSelfEvalSession(InteractiveSession):
         if path and self.image_filter is not None:
             self.image_filter(path)
 
+    def current_notepad(self) -> str:
+        """The notepad block as the player would see it right now."""
+        notes = self._run(mem.get_session_notes(self.client, self.session_id))
+        return mem.format_notepad(notes)
+
     # ------------------------------------------------------------------ state
     def restart(self) -> dict[str, Any]:
         """Full reset: new bare game AND a new conversation thread. Also
@@ -367,6 +372,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
             # the training data must reproduce byte for byte.
             "messages": messages,
             "notes": new_notes,
+            "notepad": notepad,
             "phase": self.phase,
         }
 
