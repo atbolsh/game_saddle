@@ -26,7 +26,7 @@ Each round:
      ``[SEARCH]`` over all memory tiers. No [SHOW]/[NEXT]/[BACK] navigation
      exists in this mode -- there is exactly one message to review. Each
      verdict is stored in the SAME conversation (assistant message,
-     ``kind='analysis'``, content prefixed "(analyst)") for the record and
+     ``kind='analysis'``, every line tagged ``[ANALYST]``) for the record and
      for the analyst's own continuity. Any ``WRONG: "..."`` error spans in a
      verdict are verified against the recorded player reply by exact
      substring match (:func:`agent.modes.parse_wrong_spans`).
@@ -37,12 +37,13 @@ Each round:
      to "player".
 
 The player's memory access works as in play mode, with one EXTRA privacy
-rule: analyst-voice content (the "(analyst) " verdicts and "(to analyst) "
-requests) is MASKED from the player's context -- recency window, semantic
-block, and the reasoning tier of [SEARCH] (via ``exclude_analyst`` /
-``exclude_session``). A capable player model otherwise peeks at the
-privileged analysis instead of reading the screen. The analyst itself still
-sees the full conversation, its own past verdicts included.
+rule: analyst-voice content (tagged with ``[ANALYST]`` on every line of
+verdicts, analysis requests, and analyst ``[SEARCH]`` thoughts) is MASKED
+from the player's context -- recency window, semantic block, and
+``[SEARCH]`` (via ``exclude_analyst`` / ``exclude_session``). A capable
+player model otherwise peeks at the privileged analysis instead of reading
+the screen. The analyst itself still sees the full conversation, its own
+past verdicts included.
 
 :meth:`reset_game` swaps in a brand-new random bare board mid-conversation
 and records that fact as a message, so the agent's memory never silently
@@ -230,6 +231,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
                     # too; excluding this session keeps the player from
                     # fishing privileged analysis out of the reasoning tier.
                     exclude_session=self.session_id,
+                    exclude_analyst=True,
                 )
             )
             search_notes.append(modes.format_search_note(payload, results))
@@ -345,13 +347,13 @@ class InteractiveSelfEvalSession(InteractiveSession):
             question = DEFAULT_ANALYST_QUESTION
         trace = pending["trace"]
 
-        # The analysis request lives in the same conversation; the "(to
-        # analyst)" prefix keeps it distinguishable from scene questions in
-        # the player's recency window.
+        # The analysis request lives in the same conversation; every line is
+        # tagged so NAMS line-splitting cannot leak it into the player's
+        # semantic block (see agent.memory.tag_analyst_text).
         self._run(
             self.client.short_term.add_message(
                 session_id=self.session_id, role="user",
-                content="(to analyst) " + question,
+                content=mem.tag_analyst_text("(to analyst) " + question),
                 metadata={"kind": "analysis_request"},
             )
         )
@@ -400,7 +402,9 @@ class InteractiveSelfEvalSession(InteractiveSession):
             )
             search_notes.append(modes.format_search_note(q, results))
             self._run(
-                modes.record_search_tool_call(self.client, trace, text, q, results)
+                modes.record_search_tool_call(
+                    self.client, trace, text, q, results, privileged=True,
+                )
             )
             n_searches += 1
             if n_searches >= self.cfg.memory_search_max_calls:
@@ -409,12 +413,13 @@ class InteractiveSelfEvalSession(InteractiveSession):
         analysis = raw
 
         # Store the analysis in the SAME conversation for the record and for
-        # the analyst's own continuity; the "(analyst) " prefix is the exact
-        # marker the player-context masking filters on (see agent.memory
-        # ANALYST_CONTENT_PREFIXES) -- the player never sees these.
+        # the analyst's own continuity. Every line is tagged with [ANALYST]
+        # (see agent.memory.tag_analyst_text) so player-context screening
+        # cannot miss a NAMS-split continuation line.
         self._run(
             mem.add_assistant_message(
-                self.client, self.session_id, "(analyst) " + analysis,
+                self.client, self.session_id,
+                mem.tag_analyst_text("(analyst) " + analysis),
                 kind="analysis",
             )
         )

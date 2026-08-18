@@ -592,6 +592,7 @@ async def mode_game(
             ctx = await mem.get_game_context(
                 client, session_id, query=query,
                 recent_window=cfg.recent_messages_window,
+                exclude_analyst=True,
             )
 
             # Inner [SEARCH] loop: the model may spend up to
@@ -621,6 +622,7 @@ async def mode_game(
                 results = await mem.search_memory(
                     client, payload, tiers=("semantic", "reasoning"),
                     top_k=cfg.memory_search_top_k, scrub=True,
+                    exclude_analyst=True,
                 )
                 search_notes.append(format_search_note(payload, results))
                 searches.append({"query": payload, "results": results, "thought": text})
@@ -888,9 +890,11 @@ async def mode_self_eval(
     ]
     verdict = model.generate(messages, max_new_tokens=cfg.max_new_tokens)
 
-    # Append the verdict to the same Conversation.
+    # Append the verdict to the same Conversation. Tagged so a later player
+    # retrieve cannot surface privileged evaluation into play context.
+    tagged_verdict = mem.tag_analyst_text(verdict)
     eval_msg = await client.short_term.add_message(
-        session_id=session_id, role="assistant", content=verdict,
+        session_id=session_id, role="assistant", content=tagged_verdict,
         metadata={"kind": "self_evaluation", "evaluated_session": session_id},
     )
 
@@ -899,7 +903,7 @@ async def mode_self_eval(
         session_id, task=f"self-evaluation of session {session_id}",
         triggered_by_message_id=eval_msg.id,
     )
-    step = await client.reasoning.add_step(trace.id, thought=verdict)
+    step = await client.reasoning.add_step(trace.id, thought=tagged_verdict)
     await client.reasoning.record_tool_call(
         step.id, "self_evaluate", {"session_id": session_id},
         {"verdict_length": len(verdict)},
@@ -1420,12 +1424,19 @@ SEARCH_BUDGET_NOTE = (
 
 
 async def record_search_tool_call(
-    client: Any, trace: Any, thought: str, query: str, results: str
+    client: Any, trace: Any, thought: str, query: str, results: str,
+    *, privileged: bool = False,
 ) -> None:
     """Record one [SEARCH] call on the turn's reasoning trace: the reply text
-    that requested it as the step's thought, the query as the tool arguments."""
+    that requested it as the step's thought, the query as the tool arguments.
+
+    ``privileged=True`` tags every line of ``thought`` with ``[ANALYST]`` so
+    player-facing retrieval cannot surface analyst SEARCH reasoning.
+    """
     if trace is None:
         return
+    if privileged:
+        thought = mem.tag_analyst_text(thought)
     step = await client.reasoning.add_step(trace.id, thought=thought)
     await client.reasoning.record_tool_call(
         step.id, "SEARCH", {"query": query}, result={"result_chars": len(results)}
@@ -1572,8 +1583,9 @@ async def persist_debrief_verdict(
     ]
     verdict = model.generate(messages, max_new_tokens=cfg.max_new_tokens)
 
+    tagged_verdict = mem.tag_analyst_text(verdict)
     eval_msg = await client.short_term.add_message(
-        session_id=play_session_id, role="assistant", content=verdict,
+        session_id=play_session_id, role="assistant", content=tagged_verdict,
         metadata={
             "kind": "self_evaluation",
             "evaluated_session": play_session_id,
@@ -1585,7 +1597,7 @@ async def persist_debrief_verdict(
         task=f"debrief-distilled self-evaluation of session {play_session_id}",
         triggered_by_message_id=eval_msg.id,
     )
-    step = await client.reasoning.add_step(trace.id, thought=verdict)
+    step = await client.reasoning.add_step(trace.id, thought=tagged_verdict)
     await client.reasoning.record_tool_call(
         step.id,
         "save_self_eval",

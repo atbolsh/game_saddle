@@ -120,9 +120,9 @@ logger = logging.getLogger("train.generate_game_traces")
 #: removable storage on the owner's local box).
 DATA_GAME_DIR = Path(__file__).resolve().parent.parent / "data_game"
 
-#: How much of each stored analyst analysis the leak tripwire matches on.
-#: Long enough to never fire on a coincidental phrase, short enough to catch
-#: a truncated leak.
+#: How much of each stored analyst analysis the leak tripwire matches on
+#: (belt on top of the ``[ANALYST]`` tag check). Long enough to never fire
+#: on a coincidental phrase, short enough to catch a truncated leak.
 _TRIPWIRE_PREFIX_LEN = 100
 
 #: DEGENERACY FUSE (2026-08-01 postmortem): a collapsed checkpoint produces
@@ -299,11 +299,21 @@ def _record_text(record: dict) -> str:
 
 
 def _assert_no_analyst_leak(record: dict, analyses: list[str]) -> None:
-    """Tripwire: no analysis generated in THIS session may appear inside the
-    record (the load-side screening -- exclude_analyst + exclude_session --
-    should make this impossible; if it ever regresses, abort the run rather
-    than silently poison the dataset)."""
+    """Tripwire: no analysis generated in THIS session, and no ``[ANALYST]``
+    tag, may appear inside the player record (the load-side screening --
+    per-line tag + exclude_analyst + exclude_session -- should make this
+    impossible; if it ever regresses, abort the run rather than silently
+    poison the dataset)."""
+    from agent.memory import ANALYST_TAG
+
     haystack = _record_text(record)
+    if ANALYST_TAG in haystack:
+        raise RuntimeError(
+            "ANALYST LEAK: the [ANALYST] tag appears in a recorded player "
+            "context -- the player peeked over the analyst's shoulder. "
+            "Screening (per-line tag / exclude_analyst / exclude_session) "
+            "has regressed."
+        )
     for analysis in analyses:
         needle = analysis[:_TRIPWIRE_PREFIX_LEN]
         if needle and needle in haystack:

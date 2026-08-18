@@ -137,11 +137,11 @@ Housekeeping baked into the generator:
   snapshot is degraded in place (strength 0.5, see below) BEFORE the player,
   the analyst, NAMS, or the training copy sees it — one invariant, one set
   of bytes.
-- **Analyst-leak tripwire:** every analysis generated in the current session
-  is matched against each record's serialized player context; a hit aborts
-  the run. The load-side screening (`exclude_analyst` + `exclude_session`)
-  should make a hit impossible — the tripwire is there for the day that
-  regresses.
+- **Analyst-leak tripwire:** screening is the per-line `[ANALYST]` tag
+  written on every analyst utterance and dropped on every player retrieve
+  (`exclude_analyst` + `exclude_session`). The tripwire aborts if that tag
+  or a current-session analysis snippet appears in a recorded player
+  context -- a hit means the contract regressed.
 - Records whose analyst forgot the `RATING:` line are written with
   `rating: null` and counted; `GameTraceSource` DROPS them loudly at load
   time (never train on a guessed reward).

@@ -221,6 +221,12 @@ def t1_pure() -> str:
 
     from PIL import Image
 
+    from agent.memory import (
+        ANALYST_TAG,
+        is_analyst_text,
+        strip_analyst_lines,
+        tag_analyst_text,
+    )
     from agent.modes import parse_rating
     from training.game_traces import (
         ACTION_BALANCE_CAP,
@@ -523,6 +529,52 @@ def t1_pure() -> str:
         assert fired, "tripwire did not fire on an embedded analysis"
         _assert_no_analyst_leak(clean, [analysis])  # must not raise
         checks += 2
+
+        # ---- per-line [ANALYST] tag: write every line, drop any tagged line
+        raw = "The move was poor.\nThe agent ignored the wall at 9."
+        tagged = tag_analyst_text(raw)
+        lines = tagged.splitlines()
+        assert len(lines) == 2
+        assert all(ln.startswith(ANALYST_TAG + " ") for ln in lines)
+        assert tag_analyst_text(tagged) == tagged  # idempotent
+        assert is_analyst_text(f"**assistant**: {lines[0]}")
+        assert is_analyst_text("(analyst) leftover first-line prefix")
+        assert not is_analyst_text("player said [FORWARD]")
+        nams_shaped = (
+            f"**assistant**: {ANALYST_TAG} (analyst) The player's response\n"
+            f"{ANALYST_TAG} - **Agent Position**: (5, 5)\n"
+            "player said [FORWARD]\n"
+        )
+        stripped = strip_analyst_lines(nams_shaped)
+        assert ANALYST_TAG not in stripped
+        assert "Agent Position" not in stripped
+        assert "player said [FORWARD]" in stripped
+        leftover = (
+            "**assistant**: (analyst) first line of an old untagged blob\n"
+            "player said [FORWARD]\n"
+        )
+        leftover_stripped = strip_analyst_lines(leftover)
+        assert "first line" not in leftover_stripped
+        assert "player said [FORWARD]" in leftover_stripped
+        checks += 1
+
+        # tripwire fires on a tagged fragment even when analysis[:100] is absent
+        tagged_fragment = {
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": (
+                    f"context: {ANALYST_TAG} - **Agent Position**: (5, 5)"
+                )},
+            ]}],
+            "target_text": "[FORWARD]",
+        }
+        fired = False
+        try:
+            _assert_no_analyst_leak(tagged_fragment, [analysis])
+        except RuntimeError:
+            fired = True
+        assert fired, "tripwire did not fire on a tagged fragment without analysis[:100]"
+        _assert_no_analyst_leak(clean, [analysis])  # still silent on clean text
+        checks += 1
 
         # ---- GameTraceSource on a fabricated trace dir
         trace_dir = tmp_dir / "traces_fab"

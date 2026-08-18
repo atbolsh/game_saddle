@@ -174,6 +174,7 @@ class InteractiveSession:
             mem.get_game_context(
                 self.client, self.session_id, query=query,
                 recent_window=self.cfg.recent_messages_window,
+                exclude_analyst=True,
             )
         )
 
@@ -222,6 +223,7 @@ class InteractiveSession:
                 mem.search_memory(
                     self.client, payload, tiers=("semantic", "reasoning"),
                     top_k=self.cfg.memory_search_top_k, scrub=True,
+                    exclude_analyst=True,
                 )
             )
             search_notes.append(modes.format_search_note(payload, results))

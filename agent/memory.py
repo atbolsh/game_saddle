@@ -209,16 +209,47 @@ def _format_message_line(m: Any, scrub: bool = True) -> str:
     return f"[{role}] {content}"
 
 
-# Analyst-voice markers in self-eval conversations. Both prefixes are written
-# by InteractiveSelfEvalSession itself ("(to analyst) " on analysis requests,
-# "(analyst) " on verdicts), so matching on them is exact, not fuzzy. The
-# self-eval PLAYER must never see this content -- a capable model peeks at
-# the privileged analysis instead of reading the screen.
+# Analyst-voice markers. Every privileged utterance is persisted with
+# ANALYST_TAG on EVERY non-empty line (see :func:`tag_analyst_text`). NAMS
+# ``get_context`` reformats one Message blob into many lines, so a first-line
+# -only prefix used to leak continuation lines (coordinates, WRONG:, RATING:)
+# into the player's semantic block. Screening is therefore a substring check
+# for the tag (or the leftover human prefixes from pre-tag graph rows), not
+# ``startswith``. The self-eval PLAYER must never see this content -- a
+# capable model peeks at the privileged analysis instead of reading the screen.
+ANALYST_TAG = "[ANALYST]"
+ANALYST_LINE_PREFIX = ANALYST_TAG + " "
 ANALYST_CONTENT_PREFIXES = ("(analyst) ", "(to analyst) ")
 
 
-def _is_analyst_content(content: str) -> bool:
-    return content.startswith(ANALYST_CONTENT_PREFIXES)
+def tag_analyst_text(text: str) -> str:
+    """Prefix every non-empty line with :data:`ANALYST_LINE_PREFIX`. Idempotent."""
+    if not text:
+        return text
+    tagged: list[str] = []
+    for line in text.splitlines():
+        if not line or line.startswith(ANALYST_LINE_PREFIX) or line.startswith(ANALYST_TAG):
+            tagged.append(line)
+        else:
+            tagged.append(ANALYST_LINE_PREFIX + line)
+    out = "\n".join(tagged)
+    if text.endswith("\n"):
+        out += "\n"
+    return out
+
+
+def is_analyst_text(s: str) -> bool:
+    """True if ``s`` carries the per-line tag or a leftover first-line prefix.
+
+    ``in``, not ``startswith``: NAMS may prepend ``**assistant**: `` to the
+    first line of a stored message, which would defeat a prefix match.
+    """
+    return ANALYST_TAG in s or any(p in s for p in ANALYST_CONTENT_PREFIXES)
+
+
+def strip_analyst_lines(text: str) -> str:
+    """Drop every line that :func:`is_analyst_text` flags. Over-masking is safe."""
+    return "\n".join(line for line in text.splitlines() if not is_analyst_text(line))
 
 
 async def get_recent_messages(
@@ -239,14 +270,16 @@ async def get_recent_messages(
     settings-leaking fields are stripped for the mode-1 privacy invariant;
     privileged modes (e.g. the mode-4 debrief) pass ``scrub=False``. With
     ``exclude_analyst=True`` (the self-eval PLAYER path), analyst-voice
-    messages (:data:`ANALYST_CONTENT_PREFIXES`) are filtered out BEFORE the
+    messages (those containing :data:`ANALYST_TAG` or a leftover
+    :data:`ANALYST_CONTENT_PREFIXES` marker) are filtered out BEFORE the
     window limit, so masked messages never eat the window.
     Returns "" if there are none / on error.
     """
     if window <= 0:
         return ""
     where = (
-        "WHERE NOT any(p IN $analyst_prefixes WHERE m.content STARTS WITH p) "
+        "WHERE NOT (m.content CONTAINS $analyst_tag "
+        "OR any(p IN $analyst_prefixes WHERE m.content CONTAINS p)) "
         if exclude_analyst else ""
     )
     lines: list[str] = []
@@ -258,6 +291,7 @@ async def get_recent_messages(
             "ORDER BY m.timestamp DESC LIMIT $window",
             {
                 "sid": session_id, "window": window,
+                "analyst_tag": ANALYST_TAG,
                 "analyst_prefixes": list(ANALYST_CONTENT_PREFIXES),
             },
         )
@@ -312,7 +346,7 @@ async def _recent_messages_fallback(
         # Filter BEFORE the tail slice, matching the direct query's behavior.
         msgs = [
             m for m in msgs
-            if not _is_analyst_content(str(getattr(m, "content", "")))
+            if not is_analyst_text(str(getattr(m, "content", "")))
         ]
     # Defensive: ensure chronological order before taking the tail.
     try:
@@ -377,11 +411,13 @@ async def get_game_context(
     fields before they reach the model.
 
     Passing ``recent_window=0`` reproduces the old behaviour (semantic only).
-    With ``exclude_analyst=True`` (the self-eval PLAYER path), analyst-voice
-    content is masked from BOTH blocks: the recency window filters whole
-    messages exactly (see :func:`get_recent_messages`), and the semantic
-    block drops any line carrying an analyst marker -- a masking-only line
-    filter, where over-masking is safe and leaking is not.
+    With ``exclude_analyst=True`` (the self-eval PLAYER path, and mode-1
+    play so leftover self-eval rows in the same graph cannot leak),
+    analyst-voice content is masked from BOTH blocks: the recency window
+    filters whole messages exactly (see :func:`get_recent_messages`), and
+    the semantic block drops any line carrying :data:`ANALYST_TAG` or a
+    leftover prefix -- a masking-only line filter, where over-masking is
+    safe and leaking is not.
     """
     ctx = await retrieve_context(client, query=query, session_id=session_id)
     if isinstance(ctx, str):
@@ -398,10 +434,7 @@ async def get_game_context(
     # Recent moves belong to the recency window below, not the semantic block.
     semantic = strip_nams_recent_conversation(semantic)
     if exclude_analyst:
-        semantic = "\n".join(
-            line for line in semantic.splitlines()
-            if not any(p in line for p in ANALYST_CONTENT_PREFIXES)
-        )
+        semantic = strip_analyst_lines(semantic)
 
     recent = await get_recent_messages(
         client, session_id, recent_window, exclude_analyst=exclude_analyst
@@ -546,6 +579,7 @@ async def search_memory(
     top_k: int = 5,
     scrub: bool = True,
     exclude_session: str | None = None,
+    exclude_analyst: bool = False,
 ) -> str:
     """Run the agent's [SEARCH] tool: query each requested memory tier through
     its own NAMS search API and return one formatted text block.
@@ -559,6 +593,10 @@ async def search_memory(
     ``exclude_session`` drops that session's own traces/steps from the
     reasoning tier -- a searching session should never be shown its own
     in-flight reasoning echoed back as a "similar past trace".
+
+    ``exclude_analyst=True`` (player-facing search) drops any line carrying
+    :data:`ANALYST_TAG` or a leftover analyst prefix, so privileged SEARCH
+    thoughts and semantic hits from analyst Messages cannot surface.
 
     With ``scrub=True`` message contents are stripped of settings-leaking
     fields (mode-1 privacy invariant). A tier whose search *errors* degrades
@@ -588,11 +626,14 @@ async def search_memory(
         sections.extend(lines)
 
     result = "\n".join(sections) if sections else "(no results)"
+    if exclude_analyst:
+        result = strip_analyst_lines(result)
     run_logging.log_db_retrieval(
         function="search_memory",
         arguments={
             "query": query, "tiers": list(tiers), "top_k": top_k,
             "exclude_session": exclude_session,
+            "exclude_analyst": exclude_analyst,
         },
         result=result,
     )
