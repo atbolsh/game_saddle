@@ -106,13 +106,15 @@ structural — no loader reads both files.
 
 Housekeeping baked into the generator:
 
-- **Parallel sessions** (`--parallel`, default 16): N sessions play N games
+- **Parallel sessions** (`--parallel`, default 12): N sessions play N games
   concurrently, one worker thread each, sharing the ONE loaded model
   through `agent/parallel_gen.py` — concurrent generations merge into
   batched decode calls (batch-1 decode is memory-bandwidth-bound, so
   extra rows are cheap; measured 2026-07-30: serial 24.1 s/gen,
   `--parallel 10` 8.5, `--parallel 24` 6.4 — diminishing but
-  never-inverting returns, default set by VRAM headroom). Caveat for Gemma 4
+  never-inverting returns). 16 looked like VRAM headroom until 2026-08-17:
+  MiniLM embed + 16 KV caches on one 96 GB GPU died with
+  `CUBLAS_STATUS_ALLOC_FAILED`. Caveat for Gemma 4
   Unified: a left-padded multimodal prefill is corrupted at specific
   widths (upstream transformers#47651), so `generate_batch` pads
   mixed-length rows around the poisoned widths and parity-checks every

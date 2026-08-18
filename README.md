@@ -428,7 +428,7 @@ token is the model's default behavior — staged plan in
 [training/TRAINING_TRACE_EXTRAS.md](training/TRAINING_TRACE_EXTRAS.md).
 
 **Intermission optimizations** (between phase 3 and the first real run):
-datagen runs `--parallel 16` game sessions by default, merged into batched
+datagen runs `--parallel 12` game sessions by default, merged into batched
 decode calls on the one shared model (`agent/parallel_gen.py` — decode is
 bandwidth-bound, so extra rows are cheap: measured 24.1 s/gen serial vs
 6.4 at `--parallel 24`; mixed-length prompts batch via a verified left-pad

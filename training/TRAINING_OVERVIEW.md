@@ -53,7 +53,7 @@ deviations and calls the loop — copy
 
 `python -m training.run_weekend` chains **3 expert-iteration epochs**
 unattended: for each epoch k it runs datagen
-(`generate_game_traces --label weekend_iter<k> --parallel 16`, on the
+(`generate_game_traces --label weekend_iter<k> --parallel 12`, on the
 previous epoch's adapter), trains on that epoch's traces (reward-weighted
 CE + the `PlayerAnchorSource` trust region anchored to the previous
 adapter — see TRAINING_GAME_TRACES.md) + the analyst anchor + the manifest
@@ -69,9 +69,10 @@ parallel by default: the Gemma 4 left-pad prefill bug
 ([huggingface/transformers#47651](https://github.com/huggingface/transformers/issues/47651))
 has a verified workaround (stage-6 notes in [TO_TEST.md](TO_TEST.md)),
 and measured scaling (2026-07-30, 96 GB box) never inverts: serial
-24.1 s/gen, `--parallel 10` 8.5, `--parallel 24` 6.4. The default 16 is
-set by VRAM comfort — 24 ran close to the limit. `--parallel 1` restores
-the fully serial conservative path.
+24.1 s/gen, `--parallel 10` 8.5, `--parallel 24` 6.4. The default is 12
+(16 concurrent KV caches plus the NAMS MiniLM embedder on the same GPU
+died with `CUBLAS_STATUS_ALLOC_FAILED` on 2026-08-17). `--parallel 1`
+restores the fully serial conservative path.
 
 Launch (remote box, NAMS up, external data downloaded, from repo root):
 

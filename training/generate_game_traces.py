@@ -69,14 +69,15 @@ so the orchestrator stops instead of burning hours on gibberish (the
 noticed). Per-move gold distances (``meta.dist_to_gold_before/after``) are
 recorded as a rating-independent quality cross-check.
 
-**Parallelism** (``--parallel``, default 16): N sessions play N games
+**Parallelism** (``--parallel``, default 12): N sessions play N games
 concurrently, one worker thread each, sharing ONE model through
 ``agent.parallel_gen`` -- concurrent generations merge into batched decode
 calls (batch-1 decode is bandwidth-bound, so extra rows are cheap).
 Measured 2026-07-30 (96 GB box, base weights): serial 24.1 s/gen,
 ``--parallel 10`` 8.5, ``--parallel 24`` 6.4 -- returns diminish but never
-invert, so the default is set by VRAM comfort, not scaling efficiency
-(24 ran close to the limit; 16 leaves headroom). NAMS resets happen at
+invert. 16 looked like VRAM headroom until 2026-08-17: 16 long KV caches
+plus the NAMS MiniLM embedder on the same GPU died with
+``CUBLAS_STATUS_ALLOC_FAILED``. Default 12 is that lesson. NAMS resets happen at
 BLOCK boundaries: games run in
 sequential blocks of ``--reset-every``, all workers drain between blocks,
 one session resets, all restart. Each concurrent session is invisible to
@@ -134,7 +135,7 @@ _TRIPWIRE_PREFIX_LEN = 100
 #: EXIT_POISONED so the orchestrator can stop the whole loop. 25 is far
 #: past anything a healthy model produces (a healthy run breaks a streak
 #: within a handful of generations) yet costs only ~3 minutes at
-#: --parallel 16 to trip.
+#: --parallel 12 to trip.
 DEGENERACY_FUSE = 25
 
 #: Distinct exit code for "the checkpoint is poisoned" (vs 1 = ordinary
@@ -765,13 +766,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "generations)")
     p.add_argument("--max-generations", type=int, default=3000,
                    help="hard cap on player generations for the whole run")
-    p.add_argument("--parallel", type=int, default=16,
+    p.add_argument("--parallel", type=int, default=12,
                    help="concurrent game sessions sharing one model via "
                         "batched decode (agent/parallel_gen.py); 1 = the "
-                        "plain sequential loop; default 16 is set by VRAM "
-                        "headroom on a 96 GB box, not scaling efficiency "
-                        "(returns diminish but never invert -- module "
-                        "docstring)")
+                        "plain sequential loop; default 12 leaves GPU "
+                        "headroom for the NAMS MiniLM embedder (16 died "
+                        "with CUBLAS_STATUS_ALLOC_FAILED on a 96 GB box, "
+                        "2026-08-17; module docstring)")
     p.add_argument("--reset-every", type=int, default=100,
                    help="reset NAMS episodic memory (tips survive) every N "
                         "games (default 100 per TRAINING_EXTRA_DATASETS.md)")

@@ -3,7 +3,7 @@
 One "epoch" here is one full expert-iteration cycle. For epoch k (1-based):
 
   1. datagen   ``python -m training.generate_game_traces --label
-     <prefix>_iter<k> --parallel <--parallel, default 16> --checkpoint
+     <prefix>_iter<k> --parallel <--parallel, default 12> --checkpoint
      <previous epoch's adapter>`` (``--parallel 1`` restores the fully
      serial datagen path)
   2. train     ``python -m training.run_weekend --train-iter <k>`` -- the
@@ -921,11 +921,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "knob for fitting the window (epoch datagen hours "
                         "~= this x s/gen / 3600; measured s/gen in the "
                         "module docstring)")
-    p.add_argument("--parallel", type=int, default=16,
+    p.add_argument("--parallel", type=int, default=12,
                    help="concurrent datagen sessions per epoch (passed to "
                         "generate_game_traces); 1 = the fully serial "
-                        "conservative path; default 16 is set by VRAM "
-                        "headroom on a 96 GB box")
+                        "conservative path; default 12 leaves GPU headroom "
+                        "for the NAMS MiniLM embedder (16 died with "
+                        "CUBLAS_STATUS_ALLOC_FAILED on a 96 GB box, "
+                        "2026-08-17)")
     p.add_argument("--seed", type=int, default=None,
                    help="base seed; each epoch and resume attempt derives "
                         "a distinct noise/question stream from it. Omit "
