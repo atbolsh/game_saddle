@@ -11,7 +11,7 @@ One "epoch" here is one full expert-iteration cycle. For epoch k (1-based):
      anchored to the previous epoch's adapter) + AnalystTraceSource plus
      the manifest replay sources, resumed from the previous epoch's
      adapter (epoch 1 starts from bare HF weights unless
-     --start-checkpoint is given).
+     --checkpoint is given).
   3. smoke eval  8 real games with the FRESH checkpoint through the same
      datagen path (label ``<prefix>_smoke<k>``, never trained on): win
      rate, mean/min rating, degeneracy fraction, and mean gold-distance
@@ -81,6 +81,13 @@ ONCE and stops -- monitoring must never take down the weekend.
 Run on the remote box (NAMS up, repo root, inside tmux or nohup)::
 
     nohup python -m training.run_weekend > weekend.log 2>&1 &
+
+To continue from an existing adapter, pass ``--checkpoint NAME`` (epoch 1
+datagen + train start from that adapter; later epochs follow last-good).
+``--start-checkpoint`` and ``--resume-checkpoint`` are rejected: they used
+to be two flags on this parser with different meanings, and the latter was
+ignored by the parent (the 2026-08-16 weekend started from bare HF).
+``--resume-checkpoint`` belongs to ``python -m training.train``.
 
 Omit ``--seed`` for a fresh board stream (a random base seed is drawn,
 logged at INFO as ``base seed N (...)``, and stored in the state file).
@@ -711,7 +718,7 @@ def _train(k: int, resume: str | None, args: argparse.Namespace) -> str | None:
         "--train-iter", str(k), "--prefix", args.prefix,
     ]
     if resume:
-        cmd += ["--resume-checkpoint", resume]
+        cmd += ["--checkpoint", resume]
     if args.train_max_steps:
         cmd += ["--train-max-steps", str(args.train_max_steps)]
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -781,7 +788,7 @@ def orchestrate(args: argparse.Namespace) -> int:
     _MONITOR = VramMonitor(args.prefix)
     state = _load_state(args.prefix)
     _resolve_seed(args, state, persist_prefix=args.prefix)
-    checkpoint = args.start_checkpoint
+    checkpoint = args.checkpoint
     failures = 0
     poisoned = False
 
@@ -902,6 +909,33 @@ def orchestrate(args: argparse.Namespace) -> int:
     return failures + (1 if poisoned else 0)
 
 
+class _RejectedCheckpointFlag(argparse.Action):
+    """Trap for the two names that used to mean different things here.
+
+    ``--start-checkpoint`` was the parent dest (epoch 1's adapter).
+    ``--resume-checkpoint`` was a child-only dest the parent never read,
+    so ``python -m training.run_weekend --resume-checkpoint X`` started
+    from bare HF (the 2026-08-16 weekend). Both collapsed to
+    ``--checkpoint``, used by parent and child. Accepting either old
+    name again would re-open the silent-ignore hole.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if option_string == "--resume-checkpoint":
+            parser.error(
+                "--resume-checkpoint is a python -m training.train flag, "
+                "not a run_weekend flag. The 2026-08-16 weekend started "
+                "from bare HF because this name was accepted and ignored. "
+                f"Pass --checkpoint {values} (epoch 1 starts from that "
+                "adapter; later epochs follow the previous epoch's "
+                "last-good checkpoint)."
+            )
+        parser.error(
+            f"{option_string} was renamed to --checkpoint (same meaning). "
+            f"Pass --checkpoint {values}."
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m training.run_weekend",
@@ -938,10 +972,21 @@ def build_parser() -> argparse.ArgumentParser:
                    help="label prefix: data_game/<prefix>_iter<k>/, "
                         "checkpoints <prefix>_iter<k>_step<N>, state file "
                         "data_game/<prefix>_state.json")
-    p.add_argument("--start-checkpoint", default=None,
-                   help="adapter under weights/<arch>/ for epoch 1's "
-                        "datagen + train to start from (default: bare HF "
-                        "weights)")
+    p.add_argument("--checkpoint", default=None, metavar="NAME",
+                   help="adapter under weights/<arch>/ for this process to "
+                        "start from. Parent: epoch 1's datagen + train "
+                        "(default: bare HF weights). Child (--train-iter): "
+                        "the adapter this train stage resumes from. Later "
+                        "epochs follow the previous epoch's last-good "
+                        "checkpoint automatically. --start-checkpoint and "
+                        "--resume-checkpoint are rejected: they used to "
+                        "mean different things on this parser, and "
+                        "--resume-checkpoint was ignored by the parent "
+                        "(the 2026-08-16 weekend started from bare HF)")
+    p.add_argument("--start-checkpoint", "--resume-checkpoint",
+                   dest="_rejected_checkpoint",
+                   action=_RejectedCheckpointFlag, metavar="NAME",
+                   help=argparse.SUPPRESS)
     p.add_argument("--train-max-steps", type=int, default=None,
                    help="cap each train stage at N optimizer steps "
                         "(default: full pass); use a small N to smoke-test "
@@ -960,10 +1005,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "The keepsake pick derives from --seed.")
     p.add_argument("--train-iter", type=int, default=None,
                    help="INTERNAL (child mode): run epoch k's train stage "
-                        "in this process and exit")
-    p.add_argument("--resume-checkpoint", default=None,
-                   help="INTERNAL (child mode): adapter the train stage "
-                        "resumes from")
+                        "in this process and exit. Pass the adapter as "
+                        "--checkpoint (same flag as the parent)")
     return p
 
 
@@ -975,7 +1018,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.train_iter is not None:
         return train_one_epoch(args.train_iter, args.prefix,
-                               args.resume_checkpoint,
+                               args.checkpoint,
                                max_steps=args.train_max_steps)
     if args.prune:
         # Standalone prune mode: exit code counts labels with no

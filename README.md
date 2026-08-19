@@ -385,8 +385,11 @@ Checkpoints are **PEFT adapter folders** under
 `weights/<architecture>/<name>/` (git-ignored; the directory is created by
 `scripts/setup_env.sh`), saved periodically plus whenever training ends. Every
 entry point can load one on top of the HF base weights: set
-`MODEL_CHECKPOINT` in `.env`, pass `--checkpoint` to `agent.runner`, or use
-the checkpoint dropdown in the notebooks (`[default]` = bare HF weights).
+`MODEL_CHECKPOINT` in `.env`, pass `--checkpoint` to `agent.runner`,
+`generate_game_traces`, or `run_weekend` (`python -m training.train` uses
+`--resume-checkpoint` — a different CLI; that name is a hard error on
+`run_weekend`), or use the checkpoint dropdown in the notebooks
+(`[default]` = bare HF weights).
 Training runs log to `logs/train_<label>_<stamp>/` (including a flat
 `eval_log.jsonl` with every per-task eval metric per row, for graphing) and
 roll back to the last good checkpoint (loudly) if a guarded eval metric

@@ -92,11 +92,17 @@ reuses the stored seed so `--append` stays on one stream.
 (measured ~2 h + setup on the 3000-generation overnight corpus, selftest
 t10 2026-07-31; pad ~10–15% for save-time eval hooks);
 `--max-generations` (default 3000) is the knob. `--epochs`, `--games`,
-`--parallel`, `--start-checkpoint`, and `--prefix` are also flags. Before
-the real launch, rehearse the whole orchestration cheaply (TO_TEST.md,
-"weekend rehearsal"): a tiny budget plus `--train-max-steps` exercises
-subprocess chaining, checkpoint hand-off, and the state file in under an
-hour.
+`--parallel`, `--checkpoint`, and `--prefix` are also flags.
+`--checkpoint NAME` is how epoch 1 starts from an existing adapter
+(later epochs follow that epoch's last-good automatically).
+`--start-checkpoint` and `--resume-checkpoint` are rejected here —
+they used to be two flags with different meanings, and
+`--resume-checkpoint` was ignored by the parent (the 2026-08-16
+weekend started from bare HF). `--resume-checkpoint` is the
+`python -m training.train` flag. Before the real launch, rehearse
+the whole orchestration cheaply (TO_TEST.md, "weekend rehearsal"):
+a tiny budget plus `--train-max-steps` exercises subprocess chaining,
+checkpoint hand-off, and the state file in under an hour.
 
 **Weights survive every epoch by construction:** each epoch's train stage
 saves under `weights/<arch>/weekend_iter<k>_step<N>/` (periodic +
@@ -279,7 +285,9 @@ packing (incompatible with per-example images and span weights), adapter EMA
   owner's local editing box it is a symlink onto removable storage; remote
   boxes just use the plain directory.)
 - Every entry point can select a checkpoint: `MODEL_CHECKPOINT` in `.env`,
-  `--checkpoint` on `agent.runner` and `train.py` (`--resume-checkpoint`),
+  `--checkpoint` on `agent.runner`, `generate_game_traces`, and
+  `run_weekend`; `python -m training.train` uses `--resume-checkpoint`
+  (a different CLI — passing that name to `run_weekend` is a hard error);
   and the architecture + checkpoint dropdowns in the notebooks.
 
 ## Rollback and the early-warning hook

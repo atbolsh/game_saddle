@@ -1990,7 +1990,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="run label; names the log dir and checkpoints")
     p.add_argument("--resume-checkpoint", default=d.resume_checkpoint,
                    help="checkpoint name under weights/<architecture>/ to "
-                        "resume the adapter from")
+                        "resume the adapter from (this CLI only; "
+                        "run_weekend / generate_game_traces / agent.runner "
+                        "use --checkpoint, and run_weekend rejects this name)")
     p.add_argument("--anchor-checkpoint", default=d.anchor_checkpoint,
                    help="checkpoint whose adapter serves as the frozen "
                         "teacher for kd_anchor examples (the trust region; "

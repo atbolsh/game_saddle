@@ -100,7 +100,7 @@ nohup python -m training.run_weekend \
     --epochs "$NEXT_EPOCHS" \
     --prefix "$NEXT_PREFIX" \
     --parallel "$NEXT_PARALLEL" \
-    --start-checkpoint "$CKPT" \
+    --checkpoint "$CKPT" \
     > "$NEXT_LOG" 2>&1 &
 NEXT_PID=$!
 log "overnight launched: pid=${NEXT_PID} log=${NEXT_LOG}"

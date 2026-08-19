@@ -30,7 +30,8 @@ Stage map (rationale in the Intermission plan):
                 tripwire, _rewrite_image_urls, Game/PlayerAnchor/Analyst
                 sources on fabricated dirs (example_weight, oracle
                 modifiers, novelty toggle), epoch_batches bucketing,
-                stack_equal_length
+                stack_equal_length, run_weekend --checkpoint (rejects
+                --start-checkpoint / --resume-checkpoint)
   * t2-data     manifest loads, per-source counts vs meta.json, probes exist
   * t3-model    4-bit QLoRA load, terminator, CE/KD forward+backward
                 (image example included), teacher-path sanity, kd_anchor
@@ -1000,9 +1001,46 @@ def t1_pure() -> str:
         pass
     checks += 1
 
+    # ---- run_weekend checkpoint flag: one name, the old two rejected.
+    # --resume-checkpoint used to be a child-only dest the parent ignored
+    # (2026-08-16 started from bare HF). --start-checkpoint was the parent
+    # dest. Both collapsed to --checkpoint.
+    from contextlib import redirect_stderr
+    from training.run_weekend import build_parser as weekend_parser
+
+    wp = weekend_parser()
+    ns = wp.parse_args(["--checkpoint", "aug13_iter2_step212"])
+    assert ns.checkpoint == "aug13_iter2_step212"
+    ns = wp.parse_args([])
+    assert ns.checkpoint is None
+    ns = wp.parse_args(["--train-iter", "2", "--checkpoint", "parent"])
+    assert ns.train_iter == 2 and ns.checkpoint == "parent"
+    for argv in (
+        ["--start-checkpoint", "aug13_iter2_step212"],
+        ["--resume-checkpoint", "aug13_iter2_step212"],
+        # the 2026-08-16 form: parent argv with the train.py name
+        ["--prefix", "aug16", "--resume-checkpoint", "aug13_iter3_step177"],
+        # child mode must not re-open the old dest either
+        ["--train-iter", "1", "--resume-checkpoint", "aug13_iter2_step212"],
+    ):
+        err = io.StringIO()
+        try:
+            with redirect_stderr(err):
+                wp.parse_args(argv)
+            raise AssertionError(f"{argv} should have been rejected")
+        except SystemExit as exc:
+            assert exc.code == 2, (argv, exc.code)
+            msg = err.getvalue()
+            assert "--checkpoint" in msg, msg
+            if "--resume-checkpoint" in argv:
+                assert "training.train" in msg, msg
+            else:
+                assert "renamed" in msg, msg
+    checks += 1
+
     return (
         f"{checks} unit groups passed (ratings, rewards, noise, tripwire, "
-        "source, batching, scrambler, questions, stack-eq)"
+        "source, batching, scrambler, questions, stack-eq, weekend-ckpt)"
     )
 
 
