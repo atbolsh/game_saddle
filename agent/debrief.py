@@ -110,6 +110,7 @@ class DebriefSession:
         self._thread.start()
 
         self.client = self._run(mem.connect(self.cfg))
+        self._system_prompts = self._run(modes.load_scene_prompts(self.client))
         self.model = get_model(self.cfg) if load_model else None
 
         # Analysis target state (set by select()).
@@ -328,6 +329,7 @@ class DebriefSession:
                     self._trace_block + "\n" + self._cursor_line(),
                     recent, current, prompt_text,
                     search_results="\n\n".join(search_notes) or None,
+                    system_prompt=self._system_prompts["debrief"],
                 )
                 raw = self.model.generate(
                     messages,
@@ -491,6 +493,7 @@ class DebriefSession:
             modes.persist_debrief_verdict(
                 self.client, self.play_session_id, self.debrief_session_id,
                 self.model, cfg=self.cfg,
+                system_prompt=self._system_prompts["debrief"],
             )
         )
 

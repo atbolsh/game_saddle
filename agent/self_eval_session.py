@@ -81,8 +81,6 @@ class InteractiveSelfEvalSession(InteractiveSession):
 
     DEFAULT_PLAYER_QUESTION = DEFAULT_PLAYER_QUESTION
     DEFAULT_ANALYST_QUESTION = DEFAULT_ANALYST_QUESTION
-    PLAYER_SYSTEM_PROMPT = modes.SYSTEM_PROMPT_SCENE_PLAY
-    ANALYST_SYSTEM_PROMPT = modes.SYSTEM_PROMPT_SCENE_ANALYST
     PLAYER_STOP_STRINGS = game_io.MOVE_STOP_STRINGS + [modes._TOK_END_GAME]
     END_ON_CLEAR = True
     # Prefixed onto the next player question after a graded [END_GAME] that
@@ -95,6 +93,8 @@ class InteractiveSelfEvalSession(InteractiveSession):
 
     def __init__(self, *args: Any, log_label: str | None = None, **kwargs: Any):
         super().__init__(*args, log_label=log_label or "self_eval", **kwargs)
+        self.PLAYER_SYSTEM_PROMPT = self._system_prompts["scene_play"]
+        self.ANALYST_SYSTEM_PROMPT = self._system_prompts["scene_analyst"]
         #: Optional in-place PNG post-processor (path -> None) applied to
         #: every snapshot right after it is stored, BEFORE anyone (player,
         #: analyst, NAMS links, training copies) sees it. The datagen loop

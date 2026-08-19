@@ -10,8 +10,9 @@
 #   1. Wipe the neo4j database via `neo4j_db.sh wipe` (stops neo4j, deletes the
 #      db files, restarts it empty; auth/password are preserved).
 #   2. Run `python -m agent.runner seed` to recreate the Entity + Preference
-#      nodes, then `python -m agent.runner link` to (idempotently) add the
-#      hardwired entity relationships.
+#      nodes (legacy tips AND the current core_player_* / core_analyst_*
+#      prompt-block tips), then `python -m agent.runner link` to
+#      (idempotently) add the hardwired entity relationships.
 #   3. Unless KEEP_IMAGES=1, clear the on-disk snapshot images (all orphaned
 #      once the GameSnapshot nodes are gone).
 #
@@ -38,7 +39,7 @@ log() { printf '[reset-semantics] %s\n' "$*"; }
 log "1/3 wiping neo4j database"
 bash "${SCRIPT_DIR}/neo4j_db.sh" wipe
 
-log "2/3 seeding the semantic model (entities + preferences, then relationships)"
+log "2/3 seeding the semantic model (entities + legacy prefs + core tips, then relationships)"
 python -m agent.runner seed
 python -m agent.runner link
 

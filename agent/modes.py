@@ -526,6 +526,7 @@ async def mode_game(
     cfg = cfg or CONFIG
     model = get_model(cfg)
     max_steps = max_steps or cfg.max_solve_steps
+    play_prompt = (await load_scene_prompts(client))["scene_play"]
 
     # Legacy training/play board -- sealed one-gold room; eating gold still
     # wins; openings / [END_GAME] exist in the prompt for the multi-gold
@@ -575,7 +576,7 @@ async def mode_game(
             searches: list[dict[str, str]] = []
             while True:
                 messages = _build_game_messages(
-                    SYSTEM_PROMPT_SCENE_PLAY, snapshot_before_path, ctx, question,
+                    play_prompt, snapshot_before_path, ctx, question,
                     search_results="\n\n".join(search_notes) or None,
                     notepad=notepad,
                 )
@@ -810,6 +811,7 @@ async def mode_self_eval(
     """
     cfg = cfg or CONFIG
     model = get_model(cfg)
+    debrief_prompt = (await load_scene_prompts(client))["debrief"]
 
     messages_with_snaps = await image_store.fetch_messages_with_snapshots(client, session_id)
     traces = await _fetch_session_traces(client, session_id)
@@ -843,7 +845,7 @@ async def mode_self_eval(
     sections.append(DEFAULT_ANALYST_QUESTION)
 
     messages = [
-        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT_DEBRIEF}]},
+        {"role": "system", "content": [{"type": "text", "text": debrief_prompt}]},
         {"role": "user", "content": [
             {"type": "text", "text": "\n\n".join(sections)},
         ]},
@@ -1323,6 +1325,99 @@ SYSTEM_PROMPT_DEBRIEF = "\n\n".join([
 ])
 
 
+# Role statements stay hardcoded -- the one thing not stored as a tip.
+ROLE_SCENE_PLAY = _BLOCK_GAME_INTRO
+ROLE_SCENE_ANALYST = (
+    "You are reviewing ONE RECORDED reply from a 2D discrete game. "
+    + _BLOCK_REVIEWER_STANCE
+)
+ROLE_DEBRIEF = (
+    "You are reviewing a RECORDED session of a 2D discrete game. "
+    + _BLOCK_REVIEWER_STANCE
+)
+
+# Code seed for NAMS Preference rows. Category names carry a zero-padded
+# 3-digit number so plain string sort reproduces the SYSTEM_PROMPT_* join
+# orders. Do not renumber. Numbers below 500 are reserved for this seed
+# (FUTURE_GOALS goal 11: agent-written tips use 500+).
+CORE_PLAYER_TIPS: list[tuple[str, str]] = [
+    ("core_player_010_multi_gold_rules", _BLOCK_MULTI_GOLD_RULES),
+    ("core_player_020_move_tokens", _BLOCK_MOVE_TOKENS),
+    ("core_player_030_scene_scope", _BLOCK_SCENE_SCOPE),
+    ("core_player_040_how_to_play", _BLOCK_HOW_TO_PLAY),
+    ("core_player_050_notepad", _BLOCK_NOTEPAD),
+    ("core_player_060_target_commit", _BLOCK_TARGET_COMMIT),
+    ("core_player_070_no_gold_explore", _BLOCK_NO_GOLD_EXPLORE),
+    ("core_player_080_end_game", _BLOCK_END_GAME),
+    ("core_player_090_aim_tolerance", _BLOCK_AIM_TOLERANCE),
+    ("core_player_100_current_screen", _BLOCK_CURRENT_SCREEN),
+    ("core_player_110_search_tool", _search_tool_block(_SEARCH_SCOPE_PLAY)),
+]
+CORE_ANALYST_TIPS: list[tuple[str, str]] = [
+    ("core_analyst_010_privileged_view", _BLOCK_PRIVILEGED_VIEW),
+    ("core_analyst_020_debrief_record", _BLOCK_DEBRIEF_RECORD),
+    ("core_analyst_030_geometry", _BLOCK_GEOMETRY_PRIVILEGED),
+    ("core_analyst_040_target_grading", _BLOCK_TARGET_GRADING),
+    ("core_analyst_050_openings", _BLOCK_OPENINGS_PRIVILEGED),
+    ("core_analyst_060_end_game_grading", _BLOCK_END_GAME_GRADING),
+    ("core_analyst_070_aim_tolerance_review", _BLOCK_AIM_TOLERANCE_REVIEW),
+    ("core_analyst_080_grading_tolerance", _BLOCK_GRADING_TOLERANCE),
+    ("core_analyst_090_scene_scope", _BLOCK_SCENE_ANALYST_SCOPE),
+    ("core_analyst_100_review_whole_reply", _BLOCK_REVIEW_WHOLE_REPLY),
+    ("core_analyst_110_debrief_nav", _BLOCK_DEBRIEF_NAV),
+    ("core_analyst_120_search_tool", _search_tool_block(_SEARCH_SCOPE_FULL)),
+    ("core_analyst_130_tip_tool", _BLOCK_TIP_TOOL),
+    ("core_analyst_140_rating", _BLOCK_RATING),
+]
+SCENE_ANALYST_EXCLUDE = {
+    "core_analyst_020_debrief_record",
+    "core_analyst_110_debrief_nav",
+    "core_analyst_130_tip_tool",
+}
+DEBRIEF_EXCLUDE = {
+    "core_analyst_090_scene_scope",
+}
+
+
+async def load_scene_prompts(client: Any) -> dict[str, str]:
+    """Heal-then-read the core-tip Preference rows and assemble the three
+    scene system prompts by category-sort. Asserts byte identity against
+    the ``SYSTEM_PROMPT_*`` module constants -- a mismatch means NAMS
+    healing failed.
+    """
+    await mem.ensure_core_tips(client)
+    player = await mem.get_core_tips(client, "core_player_")
+    analyst = await mem.get_core_tips(client, "core_analyst_")
+    assembled = {
+        "scene_play": "\n\n".join(
+            [ROLE_SCENE_PLAY] + [player[c] for c in sorted(player)]
+        ),
+        "scene_analyst": "\n\n".join(
+            [ROLE_SCENE_ANALYST]
+            + [analyst[c] for c in sorted(analyst)
+               if c not in SCENE_ANALYST_EXCLUDE]
+        ),
+        "debrief": "\n\n".join(
+            [ROLE_DEBRIEF]
+            + [analyst[c] for c in sorted(analyst)
+               if c not in DEBRIEF_EXCLUDE]
+        ),
+    }
+    expected = {
+        "scene_play": SYSTEM_PROMPT_SCENE_PLAY,
+        "scene_analyst": SYSTEM_PROMPT_SCENE_ANALYST,
+        "debrief": SYSTEM_PROMPT_DEBRIEF,
+    }
+    for name, got in assembled.items():
+        if got != expected[name]:
+            raise RuntimeError(
+                f"assembled {name} prompt != SYSTEM_PROMPT_* constant "
+                f"(len got={len(got)} expected={len(expected[name])}); "
+                "core-tip healing failed or the seed tables drifted"
+            )
+    return assembled
+
+
 def build_scene_analyst_messages(
     player_question: str,
     player_reply: str,
@@ -1639,6 +1734,7 @@ def build_debrief_messages(
     current: dict[str, Any] | None,
     question: str,
     search_results: str | None = None,
+    system_prompt: str = SYSTEM_PROMPT_DEBRIEF,
 ) -> list[dict]:
     """Assemble one debrief generation's prompt as at most three content
     parts. Chat templates (Gemma's among them) may concatenate adjacent text
@@ -1693,7 +1789,7 @@ def build_debrief_messages(
     tail.append(question)
     user_content.append({"type": "text", "text": "\n\n".join(tail)})
     return [
-        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT_DEBRIEF}]},
+        {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
         {"role": "user", "content": user_content},
     ]
 
@@ -1704,6 +1800,7 @@ async def persist_debrief_verdict(
     debrief_session_id: str,
     model: Any,
     cfg: AgentConfig | None = None,
+    system_prompt: str = SYSTEM_PROMPT_DEBRIEF,
 ) -> dict[str, Any]:
     """Distill the debrief conversation into a mode-3-format structured verdict
     and store it on the ANALYZED play conversation: assistant message with
@@ -1723,7 +1820,7 @@ async def persist_debrief_verdict(
         )
 
     messages = [
-        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT_DEBRIEF}]},
+        {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
         {"role": "user", "content": [
             {
                 "type": "text",

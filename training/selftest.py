@@ -3,7 +3,7 @@
 Run on the REMOTE box (GPU + NAMS), in order, as soon as setup_env.sh has
 finished::
 
-    python -m training.selftest t0     # seconds   env + imports
+    python -m training.selftest t0     # seconds   env + imports + NAMS pref round-trip
     python -m training.selftest t1     # seconds   pure-python units
     python -m training.selftest t2     # seconds   materialized data + manifest
     python -m training.selftest t3     # minutes   4-bit load, forward/backward
@@ -23,7 +23,8 @@ new dependencies -- plain asserts.
 
 Stage map (rationale in the Intermission plan):
 
-  * t0-env      imports + versions + CUDA + bitsandbytes
+  * t0-env      imports + versions + CUDA + bitsandbytes; NAMS
+                add_preference text round-trip (byte identity)
   * t1-pure     parse_rating, the shape/scale reward split
                 (rating_advantage / example_scale / build_span_weights),
                 oracle_verdict + _oracle_meta geometry, image noise,
@@ -35,7 +36,8 @@ Stage map (rationale in the Intermission plan):
                 openings / multi-gold / END_GAME parse (base class too);
                 universal openings on settings_to_dict; openings JSON
                 backfill; leak scrubber covers openings; END_GAME oracle
-                unknown + action-balance 1.0; unified prompt composition
+                unknown + action-balance 1.0; unified prompt composition;
+                core-tip numbered categories + sorted-assembly byte identity
   * t2-data     manifest loads, per-source counts vs meta.json, probes exist
   * t3-model    4-bit QLoRA load, terminator, CE/KD forward+backward
                 (image example included), teacher-path sanity, kd_anchor
@@ -190,7 +192,9 @@ def _free_cuda(*objs) -> None:
 # ================================================================== stages
 
 def t0_env() -> str:
-    """Imports, versions, CUDA."""
+    """Imports, versions, CUDA, plus a NAMS ``add_preference`` byte-fidelity
+    probe (the remote box has Neo4j; this stage is already CUDA-gated)."""
+    import asyncio
     import platform
 
     import torch
@@ -207,13 +211,25 @@ def t0_env() -> str:
     import matplotlib
     from PIL import Image  # noqa: F401
 
+    from agent import memory as mem
+
+    async def _nams_pref_roundtrip() -> None:
+        client = await mem.connect()
+        try:
+            await mem.assert_preference_text_roundtrip(client)
+        finally:
+            await client.close()
+
+    asyncio.run(_nams_pref_roundtrip())
+
     gpu = torch.cuda.get_device_name(0)
     vram = torch.cuda.get_device_properties(0).total_memory / 2**30
     return (
         f"python {platform.python_version()}, torch {torch.__version__}, "
         f"transformers {transformers.__version__}, peft {peft.__version__}, "
         f"bitsandbytes {bitsandbytes.__version__}, "
-        f"matplotlib {matplotlib.__version__}; {gpu} ({vram:.0f} GiB)"
+        f"matplotlib {matplotlib.__version__}; {gpu} ({vram:.0f} GiB); "
+        "NAMS add_preference round-trip ok"
     )
 
 
@@ -1185,10 +1201,61 @@ def t1_pure() -> str:
     checks += 1
 
     from agent import modes
+    from agent.memory import ANALYST_TAG, tag_analyst_text, untag_analyst_text
     assert "PICK ONE TARGET AND COMMIT" in modes.SYSTEM_PROMPT_SCENE_PLAY
     assert "Making a move does NOT end your turn" not in modes.SYSTEM_PROMPT_SCENE_PLAY
     assert "RATING:" in modes.SYSTEM_PROMPT_DEBRIEF
     assert "overall_score" not in modes.SYSTEM_PROMPT_DEBRIEF
+    checks += 1
+
+    import re as _re
+    cat_re = _re.compile(r"^core_(player|analyst)_(\d{3})_[a-z0-9_]+$")
+    seen_cats: set[str] = set()
+    for table, role in (
+        (modes.CORE_PLAYER_TIPS, "player"),
+        (modes.CORE_ANALYST_TIPS, "analyst"),
+    ):
+        for cat, text in table:
+            m = cat_re.match(cat)
+            assert m, cat
+            assert m.group(1) == role, cat
+            assert int(m.group(2)) < 500, cat
+            assert cat not in seen_cats, cat
+            seen_cats.add(cat)
+            assert ANALYST_TAG not in text, cat
+    checks += 1
+
+    player_map = dict(modes.CORE_PLAYER_TIPS)
+    analyst_map = dict(modes.CORE_ANALYST_TIPS)
+    assert (
+        "\n\n".join(
+            [modes.ROLE_SCENE_PLAY]
+            + [player_map[c] for c in sorted(player_map)]
+        ) == modes.SYSTEM_PROMPT_SCENE_PLAY
+    )
+    assert (
+        "\n\n".join(
+            [modes.ROLE_SCENE_ANALYST]
+            + [analyst_map[c] for c in sorted(analyst_map)
+               if c not in modes.SCENE_ANALYST_EXCLUDE]
+        ) == modes.SYSTEM_PROMPT_SCENE_ANALYST
+    )
+    assert (
+        "\n\n".join(
+            [modes.ROLE_DEBRIEF]
+            + [analyst_map[c] for c in sorted(analyst_map)
+               if c not in modes.DEBRIEF_EXCLUDE]
+        ) == modes.SYSTEM_PROMPT_DEBRIEF
+    )
+    checks += 1
+
+    analyst_cats = {c for c, _ in modes.CORE_ANALYST_TIPS}
+    assert modes.SCENE_ANALYST_EXCLUDE <= analyst_cats
+    assert modes.DEBRIEF_EXCLUDE <= analyst_cats
+    checks += 1
+
+    for cat, text in modes.CORE_ANALYST_TIPS:
+        assert untag_analyst_text(tag_analyst_text(text)) == text, cat
     checks += 1
 
     from agent.game_io import (
@@ -1228,7 +1295,7 @@ def t1_pure() -> str:
         f"{checks} unit groups passed (ratings, rewards, noise, tripwire, "
         "source, batching, scrambler, questions, stack-eq, weekend-ckpt, "
         "openings, multi-gold, end-game parse, prompt composition, "
-        "openings backfill, leak scrubber)"
+        "openings backfill, leak scrubber, core-tip seed)"
     )
 
 
@@ -2205,7 +2272,7 @@ def t10_traintime() -> str:
 # ================================================================== runner
 
 STAGES: list[tuple[str, str, "callable"]] = [
-    ("t0-env", "imports, versions, CUDA", t0_env),
+    ("t0-env", "imports, versions, CUDA, NAMS pref round-trip", t0_env),
     ("t1-pure", "pure-python units", t1_pure),
     ("t2-data", "materialized data vs manifest", t2_data),
     ("t3-model", "4-bit load + forward/backward", t3_model),

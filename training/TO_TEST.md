@@ -10,7 +10,7 @@ lines back for review. On a FAIL, also paste the traceback that precedes it.
 
 | # | Command | Cost | What it proves |
 |---|---------|------|----------------|
-| 0 | `python -m training.selftest t0` | seconds | imports; transformers >= 5.10; CUDA visible; bitsandbytes loads |
+| 0 | `python -m training.selftest t0` | seconds | imports; transformers >= 5.10; CUDA visible; bitsandbytes loads; NAMS `add_preference` writes a throwaway Preference (newlines, `[FORWARD]`, `[ANALYST]` line) and reads it back byte-identical, then deletes it |
 | 1 | `python -m training.selftest t1` | seconds | pure units: `parse_rating` (incl. bold variants), the 2026-08-05 SHAPE/SCALE reward split — `rating_advantage` (exp-advantage vs a baseline: 1.0 at the mean, ~2x per +0.2, hard floor 0 at r ≤ -0.5, cap `ADV_CAP` 3.0) and `example_scale` (ADDITIVE win boost `1.0 * 0.95^d`, rescues a floored reply, exact-0 floor otherwise) on the SCALE side; `build_span_weights` on the SHAPE side (base 1.0, WRONG spans at −0.5 = bounded unlikelihood, oracle move-token modifier LAST and only on correct/wrong verdicts); `oracle_verdict` geometry (12 cases: exact match, either-turn ≥170°, in-cone (20°) FORWARD neutral, 28.6° FORWARD wrong (the 2026-08-13 cone shrink), ray-hit turns WRONG in both directions (the 2026-08-11 missed-forward tightening), out-of-cone/away-turn wrong, unknown on missing meta or perception rounds) and `_oracle_meta` raw facts from fabricated settings (compass convention, nearest-gold bearing, any-gold ray hit, empty when won); `action_balance_multipliers` (TEMPORARY hack: inverse-frequency mean/count per action, mass-preserving, cap 4x both ways on degenerate mixes), `NoveltyTracker` (WIP boredom decay: 0.9^k, floor 0.1, reset on a different move, perception rounds skipped WITHOUT resetting, per-game keys) standalone AND through `GameTraceSource` with `novelty=True` (OFF by default — a default source must NOT decay); `GameTraceSource` integration on fabricated corpora: span weights stay pure shape while `example_weight` carries exp-advantage × balance × novelty × oracle penalty × ray-hit `TRANSITION_BOOST` (r_bar pre-pass asserted, oracle-wrong record gets ×0.25 + a −0.5 move span, missed-forward record gets ×0.25 × 2.0 + the −0.5 span, ray-hit FORWARD gets ×2.0, floored records SKIPPED, rating-null DROPPED), `MetricGuard` ceiling-only mode (`relative=False`) and `warn_only`, image-noise determinism/identity + the 10% clean pass-through (`_SKIP_PROB`), analyst-leak tripwire (incl. multi-line), `_rewrite_image_urls`, `PlayerAnchorSource` (kd_anchor loss, rating-null KEPT, uniform weights, 0.25 weight, ceiling-only guard at 1.0), micro-batch bucketing, planted-error scrambler, perception-question sampling, `AnalystTraceSource` (KD loss kind, rating-null kept, unverified-span record dropped, quota weight, ceiling-only guard at 5.0), `stack_equal_length`; `run_weekend --checkpoint` (rejects `--start-checkpoint` / `--resume-checkpoint`); 2026-08-12: `boundary_openings` (full walls → empty, fabricated right-wall gap, no walls → 4 sides, rotated boundary wall → ValueError), `new_multi_gold_game` (n_gold=0/2/3, opening require/forbid), `[END_GAME]` parser on the multi-gold subclass AND the base class; universal `openings` on every `settings_to_dict`; `oracle_verdict` END_GAME → unknown; `action_balance_multipliers` pins END_GAME at 1.0; unified prompt composition (`PICK ONE TARGET AND COMMIT` present, multi-move wording gone, debrief uses `RATING:` not `overall_score`); 2026-08-14: `parse_remember_notes` (order, overwrite-in-order, case-fold, malformed ignored, value-to-`]`, strip), truncation+parse composition, `board_update_line` (eaten / not-eaten), `format_notepad` (empty / populated) |
 | 2 | `python -m training.selftest t2` | seconds | every enabled manifest entry materialized; `data.jsonl` row counts match `meta.json`; probe files present |
 | 3 | `python -m training.selftest t3` | minutes | 4-bit QLoRA load; LoRA target discovery + projector resolution; terminator id; one collated forward+backward per loss kind (image example included); fresh-adapter KD loss equals teacher entropy (the `disable_adapter()` teacher path); kd_anchor with NO anchor adapter loaded equals kd (the epoch-1 base fallback); `example_weight` ×0.1 scales the loss by EXACTLY 0.1 (the 2026-08-05 shape/scale regression — the old code normalized reply-wide reward away); the negative-span smoke example yields a FINITE NON-NEGATIVE loss (bounded unlikelihood, not negative CE); `kd` with negative span weights raises ValueError |
@@ -485,3 +485,25 @@ play is one generation per `ask`, debrief/self-eval grade on the self-eval rubri
   onto today's multi-gold strings). The recorded sha256 digests in this file
   therefore change: `SYSTEM_PROMPT_SCENE_PLAY` / `SYSTEM_PROMPT_SCENE_ANALYST`
   must match the pre-change `*_MULTI` hashes, not the old unsuffixed ones.
+
+Core tips in NAMS (2026-08-19): scene-play / scene-analyst / debrief system
+prompts are assembled from numbered `core_player_*` / `core_analyst_*`
+Preference rows (exact category fetch, category-sort join). Code seed remains
+source of truth; assembled prompts must stay byte-identical to the
+`SYSTEM_PROMPT_*` constants. `weighted_loss` / collation untouched.
+
+* **Rerun t0** (seconds — NAMS `add_preference` byte-identity probe: newlines,
+  `[FORWARD]`, an `[ANALYST]` line; leftover Preference must be gone).
+  A FAIL here means NAMS mutates stored text and core tips cannot use
+  `add_preference`.
+* **Rerun t1** (seconds — numbered category regex, sorted-assembly byte
+  identity vs the three `SYSTEM_PROMPT_*` constants, exclusion-set
+  membership, `untag_analyst_text(tag_analyst_text(text))` round-trip).
+* **Remote:** with a live client, `load_scene_prompts` returns strings
+  hash-equal to the constants; a fresh graph (post-reset) self-heals with
+  INFO logs; a manually edited core row heals with a WARNING.
+  `session.reset_memory_to_seed()` (notebooks + datagen) now re-heals
+  `core_player_*` / `core_analyst_*` after the episodic wipe, so a graph
+  that never had them still gets the current crop.
+* **Rerun t5** (datagen smoke — parallel path + tripwire silent: no analyst
+  tip text in player context). Recorded prompt hashes do NOT change.

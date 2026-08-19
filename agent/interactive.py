@@ -80,6 +80,7 @@ class InteractiveSession:
         self._thread.start()
 
         self.client = self._run(mem.connect(self.cfg))
+        self._system_prompts = self._run(modes.load_scene_prompts(self.client))
         self.model = get_model(self.cfg) if load_model else None
 
         self.game: Any = None
@@ -190,7 +191,7 @@ class InteractiveSession:
         searches: list[dict[str, str]] = []
         while True:
             messages = modes._build_game_messages(
-                modes.SYSTEM_PROMPT_SCENE_PLAY, before_path, ctx, question,
+                self._system_prompts["scene_play"], before_path, ctx, question,
                 search_results="\n\n".join(search_notes) or None,
                 notepad=notepad,
             )
@@ -329,6 +330,11 @@ class InteractiveSession:
         ``{label: count}`` deleted. Note: it clears EVERY conversation, not just
         the current one.
 
+        After the wipe, re-heals ``core_player_*`` / ``core_analyst_*``
+        Preference rows from the code seed (:func:`memory.ensure_core_tips`)
+        so a graph that never had them (or drifted) still gets the current
+        crop of prompt tips.
+
         This does NOT touch on-disk images or start a new conversation; call
         :meth:`restart` afterwards for a fresh thread + board.
         """
@@ -346,6 +352,7 @@ class InteractiveSession:
         for r in rows:
             labels = dict(r).get("l") or []
             counts["+".join(labels) or "(none)"] += 1
+        await mem.ensure_core_tips(self.client)
         return dict(counts)
 
     def close(self) -> None:

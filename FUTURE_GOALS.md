@@ -281,3 +281,30 @@ matches the prompt (goal 2's notebook cut is the mechanics to copy):
 Do not start this while a sealed-room training run is in flight. The
 analyst prompt can stay as-is until this lands — it already describes
 the target-exit rules.
+
+## 11. Agent-written core tips (the "always after" plan) — *Not started*
+
+A future tool will let the player and the analyst write their own core
+tips into the same substrate the system prompts load from
+(`core_player_*` / `core_analyst_*` Preference rows, assembled by
+category-sort). The TOOL, never the agent, assigns the category name:
+role prefix (`core_player_` / `core_analyst_`) + a number in the reserved
+500+ range + a short slug. Because assembly is category-sort, agent-
+written tips therefore always land AFTER every seeded block (seeded
+numbers stop at 140; t1 enforces < 500), in a deterministic, reproducible
+position, with zero code changes. Landing before the seeded blocks
+(numbers below 010) is deliberately possible under the same sort
+mechanism but not the default.
+
+Analyst-authored tips get `tag_analyst_text` applied by the tool, so both
+gates (category prefix and `[ANALYST]` text scrub) hold; player-authored
+tips stay untagged.
+
+Two loader relaxations are prerequisites, deferred with this goal:
+`get_core_tips` accepts well-formed extras in the 500+ range (today it
+rejects ALL unexpected categories), and the byte-equality assert against
+`SYSTEM_PROMPT_*` becomes "seeded prefix of the assembly matches" rather
+than whole-string equality.
+
+Trigger to pick it up: player-written `tip_learned_*` tips seeing real
+use (2026-08-19 discussion).
