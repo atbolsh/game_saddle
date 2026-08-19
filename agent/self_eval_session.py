@@ -50,8 +50,8 @@ and records that fact as a message, so the agent's memory never silently
 jumps between unrelated boards.
 
 Inherits the async bridge, model, logging, dump/close machinery from
-:class:`agent.interactive.InteractiveSession`; the multi-move :meth:`ask` of
-the parent is disabled (this mode is strictly one generation per scene).
+:class:`agent.interactive.InteractiveSession`; the parent's :meth:`ask` is
+disabled (this mode is strictly ``ask_player`` / ``ask_analyst``).
 """
 
 from __future__ import annotations
@@ -64,33 +64,9 @@ from . import image_store
 from . import memory as mem
 from . import modes
 from .interactive import InteractiveSession
+from .modes import DEFAULT_ANALYST_QUESTION, DEFAULT_PLAYER_QUESTION
 
 logger = logging.getLogger(__name__)
-
-
-#: Pre-filled into the player text box in the notebook; the user may edit it
-#: or submit it unchanged.
-DEFAULT_PLAYER_QUESTION = "Please make the right move for this position."
-
-#: Pre-filled into the analyst text box in the notebook; the user may edit it
-#: or submit it unchanged.
-DEFAULT_ANALYST_QUESTION = (
-    "Analyze the player's performance, using newly available privileged "
-    "information. Go through the response part by part -- the OBS line, the "
-    "reasoning, any [REMEMBER] lines, and the move token (or its correct "
-    "absence, if the user asked a question) -- and say which parts were "
-    "correct and which were incorrect. Check each [REMEMBER] line against "
-    "the notepad the player saw: a line that merely re-saves what the "
-    "notepad already holds is a mistake. Apply your GRADING CALIBRATION "
-    "when deciding what counts as mistaken: direction estimates within 2 "
-    "clock hours of the truth are NOT mistakes.\n"
-    "For EVERY mistaken phrase, add a line of the form:\n"
-    "WRONG: \"<the exact words copied from the player's reply>\"\n"
-    "(one line per mistake, copied verbatim so the words can be found in "
-    "the reply). Put NOTHING else on a WRONG line -- corrections or "
-    "suggested alternatives go on their own following line. Then give a "
-    "final rating from -1.0 to 1.0."
-)
 
 
 class InteractiveSelfEvalSession(InteractiveSession):
@@ -107,8 +83,15 @@ class InteractiveSelfEvalSession(InteractiveSession):
     DEFAULT_ANALYST_QUESTION = DEFAULT_ANALYST_QUESTION
     PLAYER_SYSTEM_PROMPT = modes.SYSTEM_PROMPT_SCENE_PLAY
     ANALYST_SYSTEM_PROMPT = modes.SYSTEM_PROMPT_SCENE_ANALYST
-    PLAYER_STOP_STRINGS = game_io.MOVE_STOP_STRINGS
+    PLAYER_STOP_STRINGS = game_io.MOVE_STOP_STRINGS + [modes._TOK_END_GAME]
     END_ON_CLEAR = True
+    # Prefixed onto the next player question after a graded [END_GAME] that
+    # did not end the session (legacy eat-gold / training). Multi-gold never
+    # hits this: its END_GAME path terminates and does not set _last_outcome.
+    END_GAME_UNAVAILABLE_NOTE = (
+        "You are playing in a mode where the [END_GAME] move is not "
+        "available; it does nothing."
+    )
 
     def __init__(self, *args: Any, log_label: str | None = None, **kwargs: Any):
         super().__init__(*args, log_label=log_label or "self_eval", **kwargs)
@@ -176,19 +159,16 @@ class InteractiveSelfEvalSession(InteractiveSession):
             "gold_remaining": game_io.gold_remaining(self.game),
         }
 
-    def _analyst_settings_dict(self) -> dict[str, Any]:
-        """Privileged settings JSON the analyst sees. Subclasses may add
-        derived fields (openings); the default is the raw engine dump."""
-        return game_io.game_to_settings_dict(self.game)
-
     def _parse_player_action(self, raw: str, kind: str) -> str | None:
-        """Reply -> pending action. Subclasses may recognise extra tokens
-        (e.g. [END_GAME]); the default is game_io.parse_action on a move."""
+        """Reply -> pending action. ``[END_GAME]`` is recognized even on
+        non-move replies; board tokens still require ``kind == 'move'``."""
+        if modes._TOK_END_GAME in raw:
+            return "END_GAME"
         return game_io.parse_action(raw) if kind == "move" else None
 
     def ask(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         raise NotImplementedError(
-            "InteractiveSelfEvalSession has no multi-move ask(); use "
+            "InteractiveSelfEvalSession has no play-style ask(); use "
             "ask_player() / ask_analyst()."
         )
 
@@ -213,13 +193,14 @@ class InteractiveSelfEvalSession(InteractiveSession):
                 "ask_analyst() first."
             )
         if self._last_outcome is not None:
-            question = (
-                game_io.board_update_line(**self._last_outcome) + "\n\n" + question
-            )
+            prefix = game_io.board_update_line(**self._last_outcome)
+            if self._last_outcome.get("action") == "END_GAME":
+                prefix = prefix + "\n" + self.END_GAME_UNAVAILABLE_NOTE
+            question = prefix + "\n\n" + question
 
         # 1. Snapshot the current ('before') frame -> disk + GameSnapshot node.
         snapshot_before_id = image_store.snapshot_id()
-        settings_before = self._analyst_settings_dict()
+        settings_before = game_io.game_to_settings_dict(self.game)
         before_path, before_props = self._run(
             image_store.store_snapshot(
                 self.client, self.session_id, snapshot_before_id, self.game,
@@ -531,6 +512,50 @@ class InteractiveSelfEvalSession(InteractiveSession):
         trace = pending["trace"]
 
         action = pending["action"]
+        if action == "END_GAME":
+            # Legacy: [END_GAME] is graded but does not finish this session;
+            # eating gold still does (END_ON_CLEAR).
+            n_analyses = pending["n_analyses"]
+            gold_remaining = game_io.gold_remaining(self.game)
+            self._run(
+                mem.add_reasoning_step(
+                    self.client, trace, thought=pending["raw"],
+                    action="END_GAME", gold_collected=0,
+                )
+            )
+            outcome = (
+                f"scene round: action=END_GAME; gold_collected=0; "
+                f"analyst_exchanges={n_analyses}; gold_remaining={gold_remaining}"
+            )
+            self._run(
+                mem.complete_turn_trace(
+                    self.client, trace, outcome=outcome, success=True,
+                )
+            )
+            self._last_outcome = {
+                "action": "END_GAME",
+                "gold_collected": 0,
+                "gold_remaining": gold_remaining,
+            }
+            self.round_no += 1
+            self._pending = None
+            self.phase = "player"
+            logger.info(
+                "round ended after %d analyst exchange(s); [END_GAME] "
+                "graded but session continues (legacy eat-gold win).",
+                n_analyses,
+            )
+            return {
+                "session_id": self.session_id,
+                "action": "END_GAME",
+                "gold_collected": 0,
+                "gold_remaining": gold_remaining,
+                "after_path": None,
+                "frame_path": self.current_frame_path(),
+                "n_analyses": n_analyses,
+                "phase": self.phase,
+            }
+
         gold_collected = game_io.apply_action(self.game, action) if action else 0
         self._run(
             mem.add_reasoning_step(
@@ -541,9 +566,8 @@ class InteractiveSelfEvalSession(InteractiveSession):
         after_path = None
         if action:
             snapshot_after_id = image_store.snapshot_id()
-            # Same hook as the 'before' snapshot, so subclass-added keys
-            # (e.g. openings) appear in BOTH stored settings dicts.
-            settings_after = self._analyst_settings_dict()
+            # Same serializer as the 'before' snapshot (openings included).
+            settings_after = game_io.game_to_settings_dict(self.game)
             after_path, _ = self._run(
                 image_store.store_snapshot(
                     self.client, self.session_id, snapshot_after_id, self.game,

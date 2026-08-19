@@ -339,7 +339,27 @@ def settings_to_dict(s: Settings) -> dict[str, Any]:
     out: dict[str, Any] = {k: getattr(s, k) for k in _SETTINGS_FIELDS}
     out["gold"] = [list(g) for g in s.gold]
     out["walls"] = [list(w) for w in s.walls]
+    # Derived, always present: sealed rooms yield []. settings_from_dict
+    # ignores the extra key.
+    out["openings"] = boundary_openings(out)
     return out
+
+
+def settings_json_with_openings(settings_json: str | None) -> str | None:
+    """Backfill so every analyst view has an ``openings`` key.
+
+    New snapshots already carry ``openings`` from :func:`settings_to_dict`.
+    Pre-change stored JSON lacks it; this recomputes from ``walls``.
+    Malformed stored walls raise -- do not swallow. Already-present
+    ``openings`` returns the original string unchanged (byte identity).
+    """
+    if not settings_json:
+        return settings_json
+    d = json.loads(settings_json)
+    if "openings" not in d:
+        d["openings"] = boundary_openings(d)
+        return json.dumps(d)
+    return settings_json
 
 
 def settings_from_dict(d: dict[str, Any]) -> Settings:

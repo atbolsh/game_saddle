@@ -284,6 +284,10 @@ def oracle_verdict(action: str | None, oracle_move: str | None,
     data."""
     if action is None or oracle_move is None or rel_bearing is None:
         return "unknown"
+    if action == "END_GAME":
+        # Legacy: [END_GAME] is not a board move; eat-gold games do not
+        # treat it as a win or an oracle-wrong turn.
+        return "unknown"
     rel = float(rel_bearing)
     if action == oracle_move:
         return "correct"
@@ -345,9 +349,16 @@ def action_balance_multipliers(counts: dict[str, int]) -> dict[str, float]:
     mean, before clamping)."""
     if not counts:
         return {}
-    mean_count = sum(counts.values()) / len(counts)
+    # Legacy: a stray [END_GAME] in a sealed-room corpus must not get the
+    # inverse-frequency boost (amplifying quitting is exactly wrong).
+    balanceable = {a: n for a, n in counts.items() if a != "END_GAME"}
     out: dict[str, float] = {}
-    for action, n in counts.items():
+    if "END_GAME" in counts:
+        out["END_GAME"] = 1.0
+    if not balanceable:
+        return out
+    mean_count = sum(balanceable.values()) / len(balanceable)
+    for action, n in balanceable.items():
         raw = mean_count / n
         clamped = max(1.0 / ACTION_BALANCE_CAP, min(ACTION_BALANCE_CAP, raw))
         if clamped != raw:

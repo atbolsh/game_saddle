@@ -32,7 +32,10 @@ Stage map (rationale in the Intermission plan):
                 modifiers, novelty toggle), epoch_batches bucketing,
                 stack_equal_length, run_weekend --checkpoint (rejects
                 --start-checkpoint / --resume-checkpoint), boundary
-                openings / multi-gold / END_GAME parse
+                openings / multi-gold / END_GAME parse (base class too);
+                universal openings on settings_to_dict; openings JSON
+                backfill; leak scrubber covers openings; END_GAME oracle
+                unknown + action-balance 1.0; unified prompt composition
   * t2-data     manifest loads, per-source counts vs meta.json, probes exist
   * t3-model    4-bit QLoRA load, terminator, CE/KD forward+backward
                 (image example included), teacher-path sanity, kd_anchor
@@ -341,6 +344,7 @@ def t1_pure() -> str:
         (("CLOCK", "ANTICLOCK", -0.8, False), "wrong"),   # away from gold
         ((None, "FORWARD", 0.0, True), "unknown"),        # perception round
         (("CLOCK", None, None, None), "unknown"),         # pre-oracle corpus
+        (("END_GAME", "FORWARD", 0.0, True), "unknown"),  # not a board move
     ]:
         got = oracle_verdict(*args)
         assert got == want, f"oracle_verdict{args} = {got}, want {want}"
@@ -396,7 +400,13 @@ def t1_pure() -> str:
     lo = action_balance_multipliers({"A": 100, "B": 1, "C": 1, "D": 1, "E": 1})
     assert lo["A"] == 1.0 / ACTION_BALANCE_CAP, lo       # dominant: floored
     assert lo["B"] == ACTION_BALANCE_CAP, lo
-    checks += 6
+    # stray END_GAME is pinned at 1.0 and does not enter the mean
+    mixed = action_balance_multipliers(
+        {"ANTICLOCK": 10, "CLOCK": 10, "FORWARD": 10, "END_GAME": 1}
+    )
+    assert mixed["END_GAME"] == 1.0, mixed
+    assert all(abs(mixed[a] - 1.0) < 1e-9 for a in ("ANTICLOCK", "CLOCK", "FORWARD")), mixed
+    checks += 7
 
     # ---- NoveltyTracker (WORK IN PROGRESS -- "boredom" decay, block above
     # the class in training/game_traces.py): 0.9^k on consecutive identical
@@ -1167,17 +1177,58 @@ def t1_pure() -> str:
     assert MultiGoldSelfEvalSession._parse_player_action(
         stub, "aiming [CLOCK]", "move"
     ) == "CLOCK"
-    # base class never sees END_GAME as a move
+    # base class now parses [END_GAME] too (legacy: graded, non-terminal)
     base_stub = object.__new__(InteractiveSelfEvalSession)
     assert InteractiveSelfEvalSession._parse_player_action(
         base_stub, "TARGET: none\n[END_GAME]", "answer"
-    ) is None
+    ) == "END_GAME"
+    checks += 1
+
+    from agent import modes
+    assert "PICK ONE TARGET AND COMMIT" in modes.SYSTEM_PROMPT_SCENE_PLAY
+    assert "Making a move does NOT end your turn" not in modes.SYSTEM_PROMPT_SCENE_PLAY
+    assert "RATING:" in modes.SYSTEM_PROMPT_DEBRIEF
+    assert "overall_score" not in modes.SYSTEM_PROMPT_DEBRIEF
+    checks += 1
+
+    from agent.game_io import (
+        new_bare_game, settings_from_dict, settings_json_with_openings,
+        settings_to_dict,
+    )
+    from agent import memory as memmod
+    sealed = settings_to_dict(new_bare_game().settings)
+    assert sealed["openings"] == [], sealed["openings"]
+    gapped_settings = settings_from_dict({
+        "gameSize": 64, "direction": 0.0, "agent_x": 0.5, "agent_y": 0.5,
+        "agent_r": 0.05, "gold_r": 0.03, "gold": [], "walls": gapped,
+    })
+    ser = settings_to_dict(gapped_settings)
+    assert ser["openings"] == boundary_openings({"walls": gapped})
+    roundtrip = settings_from_dict(ser)
+    assert [list(w) for w in roundtrip.walls] == [list(w) for w in gapped_settings.walls]
+    assert "openings" in memmod._SETTINGS_LEAK_KEYS
+    scrubbed = memmod._strip_settings_from_text('"openings": [{"side": "left"}]')
+    assert "left" not in scrubbed, scrubbed
+    assert "<redacted>" in scrubbed, scrubbed
+    checks += 1
+
+    old_json = json.dumps({
+        "gameSize": 64, "direction": 0.0, "agent_x": 0.5, "agent_y": 0.5,
+        "agent_r": 0.05, "gold_r": 0.03, "gold": [], "walls": gapped,
+    })
+    assert "openings" not in json.loads(old_json)
+    filled = settings_json_with_openings(old_json)
+    assert json.loads(filled)["openings"] == boundary_openings({"walls": gapped})
+    already = json.dumps(ser)
+    assert settings_json_with_openings(already) is already
+    assert settings_json_with_openings(None) is None
     checks += 1
 
     return (
         f"{checks} unit groups passed (ratings, rewards, noise, tripwire, "
         "source, batching, scrambler, questions, stack-eq, weekend-ckpt, "
-        "openings, multi-gold, end-game parse)"
+        "openings, multi-gold, end-game parse, prompt composition, "
+        "openings backfill, leak scrubber)"
     )
 
 

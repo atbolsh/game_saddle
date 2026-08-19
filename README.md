@@ -321,16 +321,12 @@ E4B); the wider 2026-07 candidate field, and why it lost, is recorded in
 `MODEL_CANDIDATES.md`.
 
 * **`notebooks/play.ipynb`** — interactive mode-1 play. It holds **one
-  persistent game** and **one conversation thread**. Asking the agent to play
-  starts a **multi-move turn**: it sees the *current* live frame plus its
-  (settings-stripped) memory context and emits a move token (`[CLOCK]`,
-  `[ANTICLOCK]`, `[FORWARD]`). Generation is stopped early the instant that token
-  appears (HF `stop_strings`), the move is applied, and — because a move does
-  *not* end the turn — the board is re-rendered and fed back so it keeps moving
-  (`[CLOCK] [CLOCK] [FORWARD] ...`). The turn ends when the agent finishes a
-  reply without a move token (Gemma's native `<end_of_turn>`), collects the gold,
-  or hits the step cap (`MAX_SOLVE_STEPS`). You watch every intermediate frame
-  and move live. A
+  persistent game** and **one conversation thread**. One click is **one
+  generation**: the agent sees the *current* live frame plus its
+  (settings-stripped) memory context and emits at most one move token
+  (`[CLOCK]`, `[ANTICLOCK]`, `[FORWARD]`). Generation is stopped early the
+  instant that token appears (HF `stop_strings`) and the move is applied.
+  Ask again for the next move. A
   **"Restart conversation"** button re-initializes the env (a fresh bare level)
   and starts a new `session_id`. To discard an unwanted conversation and get
   back to the "semantic seeding only" state, either run the notebook's gated
@@ -340,6 +336,12 @@ E4B); the wider 2026-07 candidate field, and why it lost, is recorded in
   which runs the async NAMS client on a background event loop so the
   synchronous ipywidgets buttons can drive it. The mode-1 privacy invariant
   holds: the Settings dict is never fed to the model here.
+
+* **`notebooks/debrief.ipynb`** — privileged post-game analysis. The analyst
+  rubric matches self-eval (`RATING: -1.0..1.0`, `WRONG` spans, target /
+  openings / `[END_GAME]`), plus navigation (`[SHOW]` / `[NEXT]` / `[BACK]`),
+  search, and tip tools. Old recordings may still contain reflection
+  messages; new play sessions do not produce them.
 
 * **`notebooks/visualize_memory.ipynb`** — an interactive view of the memory
   graph via [`pyvis`](https://pyvis.readthedocs.io/). Pan/zoom/drag through all

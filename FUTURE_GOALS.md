@@ -48,9 +48,8 @@ only the level-creation call and the stop condition
 0–3 golds, sealed vs open rooms, target commitment (`TARGET:` line),
 walking out an opening, and `[END_GAME]` when the room is sealed and
 empty. The existing self-eval / datagen critical path is unchanged
-(`[END_GAME]` is not in `game_io.ACTIONS`). Candidate future datagen
-mode once the notebook behavior looks right — do not wire it into
-`generate_game_traces` until then.
+(`[END_GAME]` is not in `game_io.ACTIONS`). Wiring this into training is
+goal 10 — do not touch `generate_game_traces` until that is picked up.
 
 ## 3. Audio and video modalities of Gemma 4 — *Exploring*
 
@@ -260,3 +259,25 @@ not live `[REMEMBER]` spam), but if debrief verdicts ever complain
 about a missing notepad, either inject the recorded notepad into the
 debrief builder or gate that one sentence out of the debrief
 composition.
+
+## 10. Align training with multi-gold / target-exit play — *Not started*
+
+The 2026-08-19 mode unification put target commitment, openings, and
+`[END_GAME]` into every player/analyst prompt, but datagen and the
+reward path still run sealed one-gold eat-to-win games: `[END_GAME]` is
+graded as a no-op (oracle `unknown`, action-balance pinned at 1.0) and
+does not end the session. The player is told after that token that it
+is unavailable in this mode. Training should catch up so the corpus
+matches the prompt (goal 2's notebook cut is the mechanics to copy):
+
+* datagen uses `new_multi_gold_game` (0–3 golds, sealed vs open rooms);
+* `[END_GAME]` is a real terminal action on a sealed empty room (and a
+  graded mistake otherwise);
+* oracle / action-balance / win-boost stop treating eat-last-gold as
+  the only success;
+* drop the player-facing "END_GAME is not available in this mode"
+  notice once the mode actually supports it.
+
+Do not start this while a sealed-room training run is in flight. The
+analyst prompt can stay as-is until this lands — it already describes
+the target-exit rules.

@@ -394,6 +394,13 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
     move cap is hit, or the run-wide generation budget runs out. Buffers the
     game's records, stamps the outcome, writes them under the shared lock.
 
+    Legacy eat-gold win; ``[END_GAME]`` may appear because the unified
+    prompt mentions it, but it does not terminate datagen games (the
+    base ``end_round`` grades it without applying a board action). The
+    next player question then says the token is unavailable in this
+    mode. Analyst prompts are left as-is until training switches
+    (FUTURE_GOALS goal 10).
+
     Each round asks either the default move request or (with probability
     ``--question-rate``, drawn from ``qrng``) a perception question --
     those rounds do not advance the game (a correct answer is prose with no

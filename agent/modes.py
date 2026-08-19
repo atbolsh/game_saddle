@@ -44,37 +44,25 @@ _TOK_CLOCK = _TOK["CLOCK"]
 _TOK_ANTICLOCK = _TOK["ANTICLOCK"]
 _TOK_FORWARD = _TOK["FORWARD"]
 _TOK_TRIO = "/".join(_TOK.values())  # "[CLOCK]/[ANTICLOCK]/[FORWARD]"
-#: Variant-only token (multi-gold notebook). NOT in game_io.ACTIONS -- the
-#: existing parser, stop strings, and datagen path never see it.
+#: Extra player token. NOT in game_io.ACTIONS -- ``apply_action`` never
+#: receives it. Self-eval parses it; play / ``mode_game`` treat it as a
+#: no-op (``parse_action`` returns None). The unified prompt mentions it;
+#: legacy sealed-room sessions grade it but do not end on it.
 _TOK_END_GAME = "[END_GAME]"
 
 _SENT_GAME_INTRO = "You are an agent playing a 2D discrete game on a square board."
 _SENT_GAME_SCREEN = "You see the current game screen as an image."
 _SENT_GAME_WORLD = (
-    "The board is the unit square framed by four boundary walls; there is "
-    "exactly one gold piece (small yellow circle). You are the green circle "
-    "with a red eye showing the direction you are facing."
+    "The board is the unit square framed by four boundary walls, which may "
+    "have an opening; gold pieces (small yellow circles) may be present -- "
+    "several, one, or none. You are the green circle with a red eye showing "
+    "the direction you are facing."
 )
 
 _BLOCK_GAME_INTRO = " ".join([
     _SENT_GAME_INTRO,
     _SENT_GAME_SCREEN,
     _SENT_GAME_WORLD,
-    "Your goal is to collect the gold.",
-])
-
-#: Multi-gold variant intro -- shared sentences, gold-count clause replaced
-#: (prompt-composition: do not fork the whole intro paragraph).
-_SENT_GAME_WORLD_MULTI = (
-    "The board is the unit square framed by four boundary walls, which may "
-    "have an opening; gold pieces (small yellow circles) may be present -- "
-    "several, one, or none. You are the green circle with a red eye showing "
-    "the direction you are facing."
-)
-_BLOCK_GAME_INTRO_MULTI = " ".join([
-    _SENT_GAME_INTRO,
-    _SENT_GAME_SCREEN,
-    _SENT_GAME_WORLD_MULTI,
     "Your goal depends on what is in the room -- see the variant rules below.",
 ])
 
@@ -88,22 +76,6 @@ _BLOCK_MOVE_TOKENS = (
     "moving in prose (e.g. writing the word 'forward') does NOTHING. You may "
     "reason in plain prose as much as you like; nothing happens until you emit "
     "a bracketed move token, so emit one only when you truly intend that move."
-)
-
-_BLOCK_MULTI_MOVE_TURN = (
-    "The instant you emit a move token it is executed, the screen is "
-    "re-rendered, and you are shown the updated screen and asked for your next "
-    "move. So a turn is a sequence of moves -- reason, emit one move token, see "
-    f"the result, repeat -- e.g. {_TOK_CLOCK} {_TOK_CLOCK} {_TOK_FORWARD} {_TOK_FORWARD} ... to "
-    "navigate to the gold. Making a move does NOT end your turn.\n\n"
-    "To END your turn, simply finish your reply WITHOUT emitting a move token "
-    "(just stop normally). Do this once you have collected the gold or wish to "
-    "stop. If the user asks a question about the screen rather than asking you "
-    "to play, answer in prose with no move token (which likewise ends the turn).\n\n"
-    "NOTE: the default mode is to try to solve the game (get the gold), which is "
-    "what the user usually asks for. However, you may instead be asked questions "
-    "about the game; in that case answer in prose, and avoid using move tokens "
-    "unless it is very apparent that the user is asking you to play."
 )
 
 def _block_how_to_play(target: str, obs_object: str, question_example: str) -> str:
@@ -139,11 +111,6 @@ def _block_how_to_play(target: str, obs_object: str, question_example: str) -> s
 
 
 _BLOCK_HOW_TO_PLAY = _block_how_to_play(
-    "the gold",
-    "the gold is at <where on the board>, toward <clock direction> of me",
-    "is the gold to your left?",
-)
-_BLOCK_HOW_TO_PLAY_MULTI = _block_how_to_play(
     "your current target",
     "my target, <a remaining gold | an opening/exit>, is at <where on the "
     "board>, toward <clock direction> of me",
@@ -182,8 +149,7 @@ def _block_current_screen(target: str) -> str:
     )
 
 
-_BLOCK_CURRENT_SCREEN = _block_current_screen("the gold")
-_BLOCK_CURRENT_SCREEN_MULTI = _block_current_screen("your current target")
+_BLOCK_CURRENT_SCREEN = _block_current_screen("your current target")
 
 
 def _block_aim_tolerance(target: str) -> str:
@@ -201,8 +167,7 @@ def _block_aim_tolerance(target: str) -> str:
     )
 
 
-_BLOCK_AIM_TOLERANCE = _block_aim_tolerance("the gold")
-_BLOCK_AIM_TOLERANCE_MULTI = _block_aim_tolerance("your current target")
+_BLOCK_AIM_TOLERANCE = _block_aim_tolerance("your current target")
 
 
 def _block_aim_tolerance_review(tolerance: str, target: str) -> str:
@@ -217,10 +182,7 @@ def _block_aim_tolerance_review(tolerance: str, target: str) -> str:
 
 
 _BLOCK_AIM_TOLERANCE_REVIEW = _block_aim_tolerance_review(
-    _BLOCK_AIM_TOLERANCE, "the gold",
-)
-_BLOCK_AIM_TOLERANCE_REVIEW_MULTI = _block_aim_tolerance_review(
-    _BLOCK_AIM_TOLERANCE_MULTI, "your current target",
+    _BLOCK_AIM_TOLERANCE, "your current target",
 )
 
 # Grading calibration shared by every reviewer prompt (scene analyst +
@@ -307,44 +269,6 @@ _BLOCK_TIP_TOOL = (
 
 # --------------------------------------------------------- composed prompts
 
-SYSTEM_PROMPT_GAME = "\n\n".join([
-    _BLOCK_GAME_INTRO,
-    _BLOCK_MOVE_TOKENS,
-    _BLOCK_MULTI_MOVE_TURN,
-    _BLOCK_HOW_TO_PLAY,
-    _BLOCK_NOTEPAD,
-    _BLOCK_AIM_TOLERANCE,
-    _BLOCK_CURRENT_SCREEN,
-    _search_tool_block(_SEARCH_SCOPE_PLAY),
-])
-
-SYSTEM_PROMPT_REFLECT = "\n\n".join([
-    " ".join([_SENT_GAME_INTRO, _SENT_GAME_WORLD]),
-    (
-        "This is NOT a move request. This is a REFLECTION pause: you have made many "
-        "moves without collecting the gold, so you must stop, look at the CURRENT "
-        "screen with fresh eyes, and re-examine your plan before continuing. Your "
-        "recent reasoning may have been repeating itself without checking the "
-        "screen; assume nothing you previously said is still true."
-    ),
-    (
-        "Study the CURRENT image and answer, concretely and honestly:\n"
-        "1. Am I *certain* that I was never facing the gold at any point during my "
-        "recent moves? Each rotation is 6 degrees, so 30 rotations sweep 180 "
-        "degrees -- could my eye have swept past the gold without me noticing?\n"
-        "2. Am I possibly facing it now? Describe where the red eye points and "
-        "where the gold is in the CURRENT image, not from memory.\n"
-        "3. Am I still turning in the right direction? Would reversing direction, "
-        "or simply going FORWARD, get my eye onto the gold faster?"
-    ),
-    _BLOCK_AIM_TOLERANCE,
-    (
-        f"Do NOT emit any move token ({_TOK_TRIO}) in this reply "
-        "-- it would not be executed. End with the single move you intend to make "
-        "next and why; you will act on it when the next screen is shown."
-    ),
-])
-
 SYSTEM_PROMPT_DISCUSS = "\n\n".join([
     (
         "You are an agent that plays a 2D discrete game and is also able to "
@@ -356,18 +280,29 @@ SYSTEM_PROMPT_DISCUSS = "\n\n".join([
     _search_tool_block(_SEARCH_SCOPE_FULL),
 ])
 
-SYSTEM_PROMPT_EVAL = "\n\n".join([
-    (
-        "You are evaluating how well an earlier instance of yourself played a "
-        "2D discrete game. You are given the full Conversation (user questions "
-        "and assistant moves), the reasoning traces recorded for each move, "
-        "and the underlying game Settings at each step (which the player did "
-        "NOT have access to at the time). Be specific and critical. Output a "
-        "structured verdict with: overall_score (0-10), strengths, weaknesses, "
-        "and per-move notes where relevant."
-    ),
-    _BLOCK_AIM_TOLERANCE_REVIEW,
-])
+#: Pre-filled into the player text box in the notebook; the user may edit it
+#: or submit it unchanged.
+DEFAULT_PLAYER_QUESTION = "Please make the right move for this position."
+
+#: Pre-filled into the analyst text box in the notebook; the user may edit it
+#: or submit it unchanged.
+DEFAULT_ANALYST_QUESTION = (
+    "Analyze the player's performance, using newly available privileged "
+    "information. Go through the response part by part -- the OBS line, the "
+    "reasoning, any [REMEMBER] lines, and the move token (or its correct "
+    "absence, if the user asked a question) -- and say which parts were "
+    "correct and which were incorrect. Check each [REMEMBER] line against "
+    "the notepad the player saw: a line that merely re-saves what the "
+    "notepad already holds is a mistake. Apply your GRADING CALIBRATION "
+    "when deciding what counts as mistaken: direction estimates within 2 "
+    "clock hours of the truth are NOT mistakes.\n"
+    "For EVERY mistaken phrase, add a line of the form:\n"
+    "WRONG: \"<the exact words copied from the player's reply>\"\n"
+    "(one line per mistake, copied verbatim so the words can be found in "
+    "the reply). Put NOTHING else on a WRONG line -- corrections or "
+    "suggested alternatives go on their own following line. Then give a "
+    "final rating from -1.0 to 1.0."
+)
 
 
 # --------------------------------------------------------------- mode 1
@@ -423,24 +358,12 @@ def _build_game_messages(
     image_path: str,
     context: str,
     question: str,
-    reflection: str | None = None,
     search_results: str | None = None,
     notepad: str | None = None,
 ) -> list[dict]:
     user_text = []
     if context:
         user_text.append({"type": "text", "text": f"Memory context:\n{context}"})
-    if reflection:
-        user_text.append(
-            {
-                "type": "text",
-                "text": (
-                    "Your latest self-reflection (you wrote this after pausing "
-                    "to re-examine the board; trust it over older, repetitive "
-                    "memories):\n" + reflection
-                ),
-            }
-        )
     if search_results:
         user_text.append(
             {
@@ -466,15 +389,6 @@ def _build_game_messages(
     ]
 
 
-# ------------------------------------------------------------- reflection
-#
-# Generative-agents style reflection (arXiv:2304.03442): every applied move is
-# worth ``cfg.reflection_points_per_move`` importance points, and when the
-# running total reaches ``cfg.reflection_threshold`` the agent pauses to
-# reflect instead of blindly continuing. With the defaults (5 points/move,
-# threshold 150) a stuck agent reflects every 30 moves -- exactly one 180-degree
-# sweep of rotations -- forcing it to ask whether it rotated past the gold.
-
 def _summarize_actions(actions: list[str]) -> str:
     """Run-length compress a move list into 'CLOCKx61 FORWARDx1 ...' -- the ONE
     canonical way a move trace is presented to the model, in every mode."""
@@ -490,41 +404,6 @@ def _summarize_actions(actions: list[str]) -> str:
             current, count = a, 1
     runs.append(f"{current}x{count}")
     return " ".join(runs)
-
-
-def build_reflection_messages(
-    image_path: str, question: str, actions: list[str]
-) -> list[dict]:
-    """Prompt for one reflection pause: the CURRENT frame + a compressed record
-    of every move made this turn, under the reflection system prompt. Memory
-    context is deliberately omitted -- the whole point is to break the loop of
-    re-reading (and re-copying) stale observations."""
-    n = len(actions)
-    user_text = (
-        f"Original instruction: {question}\n\n"
-        f"You have made {n} move(s) this turn without collecting the gold: "
-        f"{_summarize_actions(actions)}.\n\n"
-        "This is the CURRENT screen. Reflect now: answer the three questions "
-        "from your instructions based on what you actually see in this image."
-    )
-    return [
-        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT_REFLECT}]},
-        {"role": "user", "content": [
-            {"type": "image", "url": image_path},
-            {"type": "text", "text": user_text},
-        ]},
-    ]
-
-
-async def persist_reflection(
-    client: Any, session_id: str, trace: Any, text: str
-) -> None:
-    """Store a reflection in memory: as an assistant message (so it enters the
-    recency window and semantic search like any other memory, per the paper)
-    and as a reasoning step on the turn trace (action=None -- no move made)."""
-    content = f"(reflection) {text}"
-    await mem.add_assistant_message(client, session_id, content, kind="reflection")
-    await mem.add_reasoning_step(client, trace, thought=content, action=None)
 
 
 async def _record_step(
@@ -636,21 +515,26 @@ async def mode_game(
 
     If ``solve`` is True, loop moves until the gold is eaten (or the step
     cap is hit), re-rendering the screen and recomputing context each step.
-    Otherwise, take a single turn: the model either answers the question or
-    emits one move.
+    That code-side loop is not a prompt multi-move turn: each generation
+    still emits at most one move. Otherwise, take a single generation: the
+    model either answers the question or emits one move.
+
+    ``[END_GAME]`` is a stop string so generation halts at the token;
+    ``game_io.parse_action`` returns None for it, so it is a no-op on the
+    board and does not end the session.
     """
     cfg = cfg or CONFIG
     model = get_model(cfg)
     max_steps = max_steps or cfg.max_solve_steps
 
+    # Legacy training/play board -- sealed one-gold room; eating gold still
+    # wins; openings / [END_GAME] exist in the prompt for the multi-gold
+    # path but this factory does not spawn them.
     game = game_io.new_bare_game(gameSize=cfg.game_size)
     turns: list[dict[str, Any]] = []
+    play_stop = game_io.MOVE_STOP_STRINGS + [_TOK_END_GAME]
 
     steps = 0
-    # Reflection bookkeeping (see the "reflection" section above): points accrue
-    # per applied move; at the threshold the agent reflects and the total resets.
-    reflection_points = 0
-    last_reflection: str | None = None
     # One reasoning trace for the whole turn; opened after the first step's user
     # message exists (so it can be triggered_by that message) and completed once
     # the loop ends.
@@ -691,15 +575,14 @@ async def mode_game(
             searches: list[dict[str, str]] = []
             while True:
                 messages = _build_game_messages(
-                    SYSTEM_PROMPT_GAME, snapshot_before_path, ctx, question,
-                    reflection=last_reflection,
+                    SYSTEM_PROMPT_SCENE_PLAY, snapshot_before_path, ctx, question,
                     search_results="\n\n".join(search_notes) or None,
                     notepad=notepad,
                 )
                 over_budget = len(searches) >= cfg.memory_search_max_calls
                 raw = model.generate(
                     messages,
-                    stop_strings=game_io.MOVE_STOP_STRINGS,
+                    stop_strings=play_stop,
                     # Once the budget is spent the stop pattern is dropped, so
                     # a stray [SEARCH] is inert prose instead of a stall.
                     stop_regex=None if over_budget else SEARCH_TOOL_PATTERN,
@@ -723,7 +606,6 @@ async def mode_game(
 
             if action:
                 gold_collected = game_io.apply_action(game, action)
-                reflection_points += cfg.reflection_points_per_move
             else:
                 gold_collected = 0
 
@@ -776,22 +658,6 @@ async def mode_game(
             if steps >= max_steps:
                 logger.warning("Hit max_steps=%d without eating the gold.", max_steps)
                 break
-
-            # Reflection pause: enough importance points have accrued (default:
-            # 30 moves, i.e. up to a 180-degree sweep of rotations). Generate a
-            # reflection on the freshly rendered frame (no move this step),
-            # persist it, and feed it into every subsequent prompt.
-            if reflection_points >= cfg.reflection_threshold:
-                actions_so_far = [t["action"] for t in turns if t.get("action")]
-                refl_messages = build_reflection_messages(
-                    snapshot_before_path, question, actions_so_far
-                )
-                last_reflection = model.generate(
-                    refl_messages, max_new_tokens=cfg.max_new_tokens
-                ).strip()
-                await persist_reflection(client, session_id, trace, last_reflection)
-                reflection_points = 0
-                logger.info("step %d: reflection pause: %s", steps, last_reflection)
     finally:
         gold_remaining = game_io.gold_remaining(game)
         outcome, success = _turn_trace_outcome(turns, gold_remaining)
@@ -913,7 +779,10 @@ def _format_session_for_eval(
             lines.append(f"  snapshot id={s.get('id')} label={s.get('label')}")
             lines.append(f"    path={s.get('path')} "
                          f"size={s.get('width')}x{s.get('height')}")
-            lines.append(f"    settings_json={s.get('settings_json')}")
+            lines.append(
+                f"    settings_json="
+                f"{game_io.settings_json_with_openings(s.get('settings_json'))}"
+            )
     if traces:
         lines.append("\n# Reasoning traces")
         for t in traces:
@@ -971,9 +840,10 @@ async def mode_self_eval(
             "judge the play against)\n" + semantic_model
         )
     sections.append(dump)
+    sections.append(DEFAULT_ANALYST_QUESTION)
 
     messages = [
-        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT_EVAL}]},
+        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT_DEBRIEF}]},
         {"role": "user", "content": [
             {"type": "text", "text": "\n\n".join(sections)},
         ]},
@@ -1143,10 +1013,8 @@ _BLOCK_GEOMETRY_PRIVILEGED = (
 _BLOCK_DEBRIEF_RECORD = (
     "HOW THE RECORD IS ORGANIZED: the player's messages are numbered from 0 "
     "(see the 'Current message' line in your context for the valid range). "
-    f"Most messages end in a move token ({_TOK_TRIO}); "
-    "reflection messages (no move) occur roughly every 30 moves -- to find "
-    "one, [SHOW] a multiple of 30 and step with [NEXT]/[BACK] until you hit "
-    "it. The user instruction the player was answering is always shown "
+    f"Most messages end in a move token ({_TOK_TRIO} or {_TOK_END_GAME}). "
+    "The user instruction the player was answering is always shown "
     "separately in your context."
 )
 
@@ -1189,28 +1057,6 @@ _BLOCK_REVIEW_WHOLE_REPLY = (
     "unrequested move token is itself a mistake to call out."
 )
 
-_BLOCK_DEBRIEF_VERDICT = (
-    "You may also be asked to produce a final structured verdict on the play "
-    "(overall_score 0-10, strengths, weaknesses, per-move notes); do so only "
-    "when asked."
-)
-
-SYSTEM_PROMPT_DEBRIEF = "\n\n".join([
-    "You are reviewing a RECORDED session of a 2D discrete game. "
-    + _BLOCK_REVIEWER_STANCE,
-    _BLOCK_PRIVILEGED_VIEW,
-    _BLOCK_DEBRIEF_RECORD,
-    _BLOCK_GEOMETRY_PRIVILEGED,
-    _BLOCK_AIM_TOLERANCE_REVIEW,
-    _BLOCK_GRADING_TOLERANCE,
-    _BLOCK_REVIEW_WHOLE_REPLY,
-    _BLOCK_DEBRIEF_NAV,
-    _search_tool_block(_SEARCH_SCOPE_FULL),
-    _BLOCK_TIP_TOOL,
-    _BLOCK_DEBRIEF_VERDICT,
-])
-
-
 # ------------------------------------------------- interactive self-eval
 #
 # Two prompts for the interactive self-eval notebook, both recompositions of
@@ -1230,8 +1076,8 @@ _BLOCK_SCENE_SCOPE = (
     "token."
 )
 
-# ------------------------------------------------- multi-gold variant blocks
-# Used ONLY by SYSTEM_PROMPT_SCENE_PLAY_MULTI / _ANALYST_MULTI.
+# ------------------------------------------------- variant-rule blocks
+# Shared by the unified scene-play / scene-analyst / debrief prompts.
 
 _BLOCK_MULTI_GOLD_RULES = (
     "THIS SESSION'S VARIANT RULES: "
@@ -1413,10 +1259,14 @@ _BLOCK_END_GAME_GRADING = (
 
 SYSTEM_PROMPT_SCENE_PLAY = "\n\n".join([
     _BLOCK_GAME_INTRO,
+    _BLOCK_MULTI_GOLD_RULES,
     _BLOCK_MOVE_TOKENS,
     _BLOCK_SCENE_SCOPE,
     _BLOCK_HOW_TO_PLAY,
     _BLOCK_NOTEPAD,
+    _BLOCK_TARGET_COMMIT,
+    _BLOCK_NO_GOLD_EXPLORE,
+    _BLOCK_END_GAME,
     _BLOCK_AIM_TOLERANCE,
     _BLOCK_CURRENT_SCREEN,
     _search_tool_block(_SEARCH_SCOPE_PLAY),
@@ -1443,6 +1293,9 @@ SYSTEM_PROMPT_SCENE_ANALYST = "\n\n".join([
     + _BLOCK_REVIEWER_STANCE,
     _BLOCK_PRIVILEGED_VIEW,
     _BLOCK_GEOMETRY_PRIVILEGED,
+    _BLOCK_TARGET_GRADING,
+    _BLOCK_OPENINGS_PRIVILEGED,
+    _BLOCK_END_GAME_GRADING,
     _BLOCK_AIM_TOLERANCE_REVIEW,
     _BLOCK_GRADING_TOLERANCE,
     _BLOCK_SCENE_ANALYST_SCOPE,
@@ -1451,34 +1304,21 @@ SYSTEM_PROMPT_SCENE_ANALYST = "\n\n".join([
     _BLOCK_RATING,
 ])
 
-SYSTEM_PROMPT_SCENE_PLAY_MULTI = "\n\n".join([
-    _BLOCK_GAME_INTRO_MULTI,
-    _BLOCK_MULTI_GOLD_RULES,
-    _BLOCK_MOVE_TOKENS,
-    _BLOCK_SCENE_SCOPE,
-    _BLOCK_HOW_TO_PLAY_MULTI,
-    _BLOCK_NOTEPAD,
-    _BLOCK_TARGET_COMMIT,
-    _BLOCK_NO_GOLD_EXPLORE,
-    _BLOCK_END_GAME,
-    _BLOCK_AIM_TOLERANCE_MULTI,
-    _BLOCK_CURRENT_SCREEN_MULTI,
-    _search_tool_block(_SEARCH_SCOPE_PLAY),
-])
-
-SYSTEM_PROMPT_SCENE_ANALYST_MULTI = "\n\n".join([
-    "You are reviewing ONE RECORDED reply from a 2D discrete game. "
+SYSTEM_PROMPT_DEBRIEF = "\n\n".join([
+    "You are reviewing a RECORDED session of a 2D discrete game. "
     + _BLOCK_REVIEWER_STANCE,
     _BLOCK_PRIVILEGED_VIEW,
+    _BLOCK_DEBRIEF_RECORD,
     _BLOCK_GEOMETRY_PRIVILEGED,
     _BLOCK_TARGET_GRADING,
     _BLOCK_OPENINGS_PRIVILEGED,
     _BLOCK_END_GAME_GRADING,
-    _BLOCK_AIM_TOLERANCE_REVIEW_MULTI,
+    _BLOCK_AIM_TOLERANCE_REVIEW,
     _BLOCK_GRADING_TOLERANCE,
-    _BLOCK_SCENE_ANALYST_SCOPE,
     _BLOCK_REVIEW_WHOLE_REPLY,
+    _BLOCK_DEBRIEF_NAV,
     _search_tool_block(_SEARCH_SCOPE_FULL),
+    _BLOCK_TIP_TOOL,
     _BLOCK_RATING,
 ])
 
@@ -1883,18 +1723,14 @@ async def persist_debrief_verdict(
         )
 
     messages = [
-        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT_EVAL}]},
+        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT_DEBRIEF}]},
         {"role": "user", "content": [
             {
                 "type": "text",
                 "text": (
                     f"Session id: {play_session_id}\n\n"
-                    "The following is a privileged debrief conversation about "
-                    "the recorded session (the analyst saw the screens and the "
-                    "exact settings). Distill it into your structured verdict "
-                    "on the PLAY -- overall_score (0-10), strengths, "
-                    "weaknesses, and per-move notes where relevant.\n\n"
-                    "# Debrief conversation\n" + transcript
+                    "# Debrief conversation\n" + transcript + "\n\n"
+                    + DEFAULT_ANALYST_QUESTION
                 ),
             },
         ]},

@@ -166,7 +166,7 @@ async def complete_turn_trace(
 
 # ------------------------------------------------------------------ context
 
-_SETTINGS_LEAK_KEYS = ("settings_json", "settings", "walls", "gold", "agent_x", "agent_y", "direction")
+_SETTINGS_LEAK_KEYS = ("settings_json", "settings", "walls", "gold", "agent_x", "agent_y", "direction", "openings")
 
 
 def _strip_settings(obj: Any) -> Any:
@@ -185,7 +185,7 @@ def _strip_settings(obj: Any) -> Any:
 
 
 _SETTINGS_TEXT_RE = re.compile(
-    r'"(settings_json|settings|walls|gold|agent_x|agent_y|direction)"\s*:\s*[^,}\]]+',
+    r'"(settings_json|settings|walls|gold|agent_x|agent_y|direction|openings)"\s*:\s*[^,}\]]+',
     re.IGNORECASE,
 )
 

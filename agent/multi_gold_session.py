@@ -1,9 +1,9 @@
 """Multi-gold / no-gold / no-end self-eval session.
 
-A subclass of :class:`InteractiveSelfEvalSession` that leaves the existing
-one-gold critical path untouched. New prompt blocks, a multi-gold factory,
-a boundary-openings oracle on the analyst's settings JSON, and an
-``[END_GAME]`` token that the base parser never sees.
+A subclass of :class:`InteractiveSelfEvalSession`. The player/analyst
+prompts are the unified scene prompts; this class only changes mechanics:
+a multi-gold factory, ``END_ON_CLEAR = False``, and ``[END_GAME]`` ending
+the session.
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ from typing import Any
 
 from . import game_io
 from . import memory as mem
-from . import modes
 from .self_eval_session import InteractiveSelfEvalSession
 
 logger = logging.getLogger(__name__)
@@ -28,9 +27,6 @@ class MultiGoldSelfEvalSession(InteractiveSelfEvalSession):
     ``[END_GAME]``.
     """
 
-    PLAYER_SYSTEM_PROMPT = modes.SYSTEM_PROMPT_SCENE_PLAY_MULTI
-    ANALYST_SYSTEM_PROMPT = modes.SYSTEM_PROMPT_SCENE_ANALYST_MULTI
-    PLAYER_STOP_STRINGS = game_io.MOVE_STOP_STRINGS + [modes._TOK_END_GAME]
     END_ON_CLEAR = False
 
     def __init__(
@@ -56,16 +52,6 @@ class MultiGoldSelfEvalSession(InteractiveSelfEvalSession):
             n_gold=self.n_gold,
             opening=self.opening,
         )
-
-    def _analyst_settings_dict(self) -> dict[str, Any]:
-        d = super()._analyst_settings_dict()
-        d["openings"] = game_io.boundary_openings(d)
-        return d
-
-    def _parse_player_action(self, raw: str, kind: str) -> str | None:
-        if modes._TOK_END_GAME in raw:
-            return "END_GAME"
-        return super()._parse_player_action(raw, kind)
 
     def restart(self) -> dict[str, Any]:
         self.session_state = "active"

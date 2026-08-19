@@ -553,6 +553,8 @@ class DebriefSession:
         if e["action"]:
             desc = f"move: {e['action']}"
         elif e["kind"] == "reflection":
+            # Old recorded sessions still contain reflection messages even
+            # though new sessions never produce them.
             desc = "reflection, no move"
         else:
             desc = f"{e['kind'] or 'commentary'}, no move"
@@ -562,7 +564,10 @@ class DebriefSession:
             "content": e["content"],
             "instruction": e["instruction"],
             "path": self._resolve_path(frame["path"]) if frame else None,
-            "settings_json": frame.get("settings_json") if frame else None,
+            "settings_json": (
+                game_io.settings_json_with_openings(frame.get("settings_json"))
+                if frame else None
+            ),
             "snapshot_id": frame.get("id") if frame else None,
         }
 
