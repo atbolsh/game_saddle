@@ -285,12 +285,16 @@ the target-exit rules.
 ## 11. Agent-written core tips (the "always after" plan) — *Not started*
 
 A future tool will let the player and the analyst write their own core
-tips into the same NAMS Preference substrate that similarity search
-already recalls (`core_player_*` / `core_analyst_*` rows). They are not
-assembled into the system message. The TOOL, never the agent, assigns the
-category name:
+tips into the same substrate the system prompts load from
+(`core_player_*` / `core_analyst_*` Preference rows, assembled by
+category-sort). The TOOL, never the agent, assigns the category name:
 role prefix (`core_player_` / `core_analyst_`) + a number in the reserved
-500+ range + a short slug. Seeded numbers stop at 140; t1 enforces < 500.
+500+ range + a short slug. Because assembly is category-sort, agent-
+written tips therefore always land AFTER every seeded block (seeded
+numbers stop at 140; t1 enforces < 500), in a deterministic, reproducible
+position, with zero code changes. Landing before the seeded blocks
+(numbers below 010) is deliberately possible under the same sort
+mechanism but not the default.
 
 Analyst-authored tips get `tag_analyst_text` applied by the tool, so both
 gates (category prefix and `[ANALYST]` text scrub) hold; player-authored

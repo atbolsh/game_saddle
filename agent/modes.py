@@ -30,11 +30,10 @@ logger = logging.getLogger(__name__)
 #
 # System prompts are COMPOSED from the named blocks below (see
 # .cursor/rules/prompt-composition.mdc): a concept shared by two or more modes
-# lives in exactly ONE block. Scene-play / scene-analyst / debrief send a
-# short role as the system message; the rest of those blocks are NAMS
-# Preference rows recalled by similarity search. Discuss still joins blocks
-# into SYSTEM_PROMPT_DISCUSS. Fixing a fact in its block fixes every mode
-# that uses it.
+# lives in exactly ONE block. Scene-play / scene-analyst / debrief assemble
+# those blocks as a short role plus a labeled dump of numbered core-tip
+# Preference rows. Discuss still joins blocks into SYSTEM_PROMPT_DISCUSS.
+# Fixing a fact in its block fixes every mode that uses it.
 
 # The move-token vocabulary is defined ONCE, in game_io (ACTION_MAP -> ACTIONS
 # -> MOVE_STOP_STRINGS -> the parser regexes). Every prompt block references
@@ -1330,17 +1329,39 @@ DEBRIEF_EXCLUDE = {
     "core_analyst_090_scene_scope",
 }
 
+_CORE_TIPS_HEADING = "Long-term tips (loaded from memory):"
+
+
+def format_core_tips_dump(
+    role: str, tips: dict[str, str], exclude: set[str],
+) -> str:
+    """Assemble a system message: short role, then a labeled dump of
+    core-tip Preference rows (category-sort, ``exclude`` dropped)."""
+    cats = sorted(c for c in tips if c not in exclude)
+    if not cats:
+        raise RuntimeError(
+            "format_core_tips_dump: no core tips remain after exclude "
+            f"{sorted(exclude)!r}"
+        )
+    entries = ["[" + c + "]\n" + tips[c] for c in cats]
+    return role + "\n\n" + _CORE_TIPS_HEADING + "\n\n" + "\n\n".join(entries)
+
 
 async def load_scene_prompts(client: Any) -> dict[str, str]:
-    """Heal core-tip Preference rows so NAMS similarity search can recall
-    them. System messages are the role statements only -- tip bodies are
-    not assembled into the system prompt.
+    """Heal-then-read the core-tip Preference rows and assemble the three
+    scene system prompts as role + labeled NAMS dump.
     """
     await mem.ensure_core_tips(client)
+    player = await mem.get_core_tips(client, "core_player_")
+    analyst = await mem.get_core_tips(client, "core_analyst_")
     return {
-        "scene_play": ROLE_SCENE_PLAY,
-        "scene_analyst": ROLE_SCENE_ANALYST,
-        "debrief": ROLE_DEBRIEF,
+        "scene_play": format_core_tips_dump(ROLE_SCENE_PLAY, player, set()),
+        "scene_analyst": format_core_tips_dump(
+            ROLE_SCENE_ANALYST, analyst, SCENE_ANALYST_EXCLUDE,
+        ),
+        "debrief": format_core_tips_dump(
+            ROLE_DEBRIEF, analyst, DEBRIEF_EXCLUDE,
+        ),
     }
 
 
