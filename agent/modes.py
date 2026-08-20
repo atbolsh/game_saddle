@@ -30,9 +30,10 @@ logger = logging.getLogger(__name__)
 #
 # System prompts are COMPOSED from the named blocks below (see
 # .cursor/rules/prompt-composition.mdc): a concept shared by two or more modes
-# lives in exactly ONE block, and each SYSTEM_PROMPT_* is a "\n\n".join of
-# blocks plus at most a short mode-specific paragraph. Fixing a fact in its
-# block fixes every mode that uses it.
+# lives in exactly ONE block. Scene-play / scene-analyst / debrief assemble
+# those blocks as a short role plus a labeled dump of numbered core-tip
+# Preference rows. Discuss still joins blocks into SYSTEM_PROMPT_DISCUSS.
+# Fixing a fact in its block fixes every mode that uses it.
 
 # The move-token vocabulary is defined ONCE, in game_io (ACTION_MAP -> ACTIONS
 # -> MOVE_STOP_STRINGS -> the parser regexes). Every prompt block references
@@ -1259,21 +1260,6 @@ _BLOCK_END_GAME_GRADING = (
     "and lower the RATING."
 )
 
-SYSTEM_PROMPT_SCENE_PLAY = "\n\n".join([
-    _BLOCK_GAME_INTRO,
-    _BLOCK_MULTI_GOLD_RULES,
-    _BLOCK_MOVE_TOKENS,
-    _BLOCK_SCENE_SCOPE,
-    _BLOCK_HOW_TO_PLAY,
-    _BLOCK_NOTEPAD,
-    _BLOCK_TARGET_COMMIT,
-    _BLOCK_NO_GOLD_EXPLORE,
-    _BLOCK_END_GAME,
-    _BLOCK_AIM_TOLERANCE,
-    _BLOCK_CURRENT_SCREEN,
-    _search_tool_block(_SEARCH_SCOPE_PLAY),
-])
-
 _BLOCK_RATING = (
     "Say explicitly which parts of the player's response were correct and "
     "which were incorrect, and END your final answer with a single overall "
@@ -1290,41 +1276,6 @@ _BLOCK_SCENE_ANALYST_SCOPE = (
     "decision, not its outcome."
 )
 
-SYSTEM_PROMPT_SCENE_ANALYST = "\n\n".join([
-    "You are reviewing ONE RECORDED reply from a 2D discrete game. "
-    + _BLOCK_REVIEWER_STANCE,
-    _BLOCK_PRIVILEGED_VIEW,
-    _BLOCK_GEOMETRY_PRIVILEGED,
-    _BLOCK_TARGET_GRADING,
-    _BLOCK_OPENINGS_PRIVILEGED,
-    _BLOCK_END_GAME_GRADING,
-    _BLOCK_AIM_TOLERANCE_REVIEW,
-    _BLOCK_GRADING_TOLERANCE,
-    _BLOCK_SCENE_ANALYST_SCOPE,
-    _BLOCK_REVIEW_WHOLE_REPLY,
-    _search_tool_block(_SEARCH_SCOPE_FULL),
-    _BLOCK_RATING,
-])
-
-SYSTEM_PROMPT_DEBRIEF = "\n\n".join([
-    "You are reviewing a RECORDED session of a 2D discrete game. "
-    + _BLOCK_REVIEWER_STANCE,
-    _BLOCK_PRIVILEGED_VIEW,
-    _BLOCK_DEBRIEF_RECORD,
-    _BLOCK_GEOMETRY_PRIVILEGED,
-    _BLOCK_TARGET_GRADING,
-    _BLOCK_OPENINGS_PRIVILEGED,
-    _BLOCK_END_GAME_GRADING,
-    _BLOCK_AIM_TOLERANCE_REVIEW,
-    _BLOCK_GRADING_TOLERANCE,
-    _BLOCK_REVIEW_WHOLE_REPLY,
-    _BLOCK_DEBRIEF_NAV,
-    _search_tool_block(_SEARCH_SCOPE_FULL),
-    _BLOCK_TIP_TOOL,
-    _BLOCK_RATING,
-])
-
-
 # Role statements stay hardcoded -- the one thing not stored as a tip.
 ROLE_SCENE_PLAY = _BLOCK_GAME_INTRO
 ROLE_SCENE_ANALYST = (
@@ -1337,9 +1288,9 @@ ROLE_DEBRIEF = (
 )
 
 # Code seed for NAMS Preference rows. Category names carry a zero-padded
-# 3-digit number so plain string sort reproduces the SYSTEM_PROMPT_* join
-# orders. Do not renumber. Numbers below 500 are reserved for this seed
-# (FUTURE_GOALS goal 11: agent-written tips use 500+).
+# 3-digit number so plain string sort is the dump order. Do not renumber.
+# Numbers below 500 are reserved for this seed (FUTURE_GOALS goal 11:
+# agent-written tips use 500+).
 CORE_PLAYER_TIPS: list[tuple[str, str]] = [
     ("core_player_010_multi_gold_rules", _BLOCK_MULTI_GOLD_RULES),
     ("core_player_020_move_tokens", _BLOCK_MOVE_TOKENS),
@@ -1378,44 +1329,40 @@ DEBRIEF_EXCLUDE = {
     "core_analyst_090_scene_scope",
 }
 
+_CORE_TIPS_HEADING = "Long-term tips (loaded from memory):"
+
+
+def format_core_tips_dump(
+    role: str, tips: dict[str, str], exclude: set[str],
+) -> str:
+    """Assemble a system message: short role, then a labeled dump of
+    core-tip Preference rows (category-sort, ``exclude`` dropped)."""
+    cats = sorted(c for c in tips if c not in exclude)
+    if not cats:
+        raise RuntimeError(
+            "format_core_tips_dump: no core tips remain after exclude "
+            f"{sorted(exclude)!r}"
+        )
+    entries = ["[" + c + "]\n" + tips[c] for c in cats]
+    return role + "\n\n" + _CORE_TIPS_HEADING + "\n\n" + "\n\n".join(entries)
+
 
 async def load_scene_prompts(client: Any) -> dict[str, str]:
     """Heal-then-read the core-tip Preference rows and assemble the three
-    scene system prompts by category-sort. Asserts byte identity against
-    the ``SYSTEM_PROMPT_*`` module constants -- a mismatch means NAMS
-    healing failed.
+    scene system prompts as role + labeled NAMS dump.
     """
     await mem.ensure_core_tips(client)
     player = await mem.get_core_tips(client, "core_player_")
     analyst = await mem.get_core_tips(client, "core_analyst_")
-    assembled = {
-        "scene_play": "\n\n".join(
-            [ROLE_SCENE_PLAY] + [player[c] for c in sorted(player)]
+    return {
+        "scene_play": format_core_tips_dump(ROLE_SCENE_PLAY, player, set()),
+        "scene_analyst": format_core_tips_dump(
+            ROLE_SCENE_ANALYST, analyst, SCENE_ANALYST_EXCLUDE,
         ),
-        "scene_analyst": "\n\n".join(
-            [ROLE_SCENE_ANALYST]
-            + [analyst[c] for c in sorted(analyst)
-               if c not in SCENE_ANALYST_EXCLUDE]
-        ),
-        "debrief": "\n\n".join(
-            [ROLE_DEBRIEF]
-            + [analyst[c] for c in sorted(analyst)
-               if c not in DEBRIEF_EXCLUDE]
+        "debrief": format_core_tips_dump(
+            ROLE_DEBRIEF, analyst, DEBRIEF_EXCLUDE,
         ),
     }
-    expected = {
-        "scene_play": SYSTEM_PROMPT_SCENE_PLAY,
-        "scene_analyst": SYSTEM_PROMPT_SCENE_ANALYST,
-        "debrief": SYSTEM_PROMPT_DEBRIEF,
-    }
-    for name, got in assembled.items():
-        if got != expected[name]:
-            raise RuntimeError(
-                f"assembled {name} prompt != SYSTEM_PROMPT_* constant "
-                f"(len got={len(got)} expected={len(expected[name])}); "
-                "core-tip healing failed or the seed tables drifted"
-            )
-    return assembled
 
 
 def build_scene_analyst_messages(
@@ -1427,7 +1374,8 @@ def build_scene_analyst_messages(
     recent: str,
     question: str,
     search_results: str | None = None,
-    system_prompt: str = SYSTEM_PROMPT_SCENE_ANALYST,
+    *,
+    system_prompt: str,
     player_notepad: str | None = None,
 ) -> list[dict]:
     """Assemble one scene-analyst generation's prompt, mirroring
@@ -1734,7 +1682,8 @@ def build_debrief_messages(
     current: dict[str, Any] | None,
     question: str,
     search_results: str | None = None,
-    system_prompt: str = SYSTEM_PROMPT_DEBRIEF,
+    *,
+    system_prompt: str,
 ) -> list[dict]:
     """Assemble one debrief generation's prompt as at most three content
     parts. Chat templates (Gemma's among them) may concatenate adjacent text
@@ -1800,7 +1749,8 @@ async def persist_debrief_verdict(
     debrief_session_id: str,
     model: Any,
     cfg: AgentConfig | None = None,
-    system_prompt: str = SYSTEM_PROMPT_DEBRIEF,
+    *,
+    system_prompt: str,
 ) -> dict[str, Any]:
     """Distill the debrief conversation into a mode-3-format structured verdict
     and store it on the ANALYZED play conversation: assistant message with

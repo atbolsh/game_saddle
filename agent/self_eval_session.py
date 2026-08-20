@@ -9,27 +9,28 @@ Each round:
   1. **Player phase** (:meth:`ask_player`). The user asks about the CURRENT
      scene -- usually "what's the best move?", sometimes a general question
      ("are you facing the gold?"). The player answers in a SINGLE generation
-     under ``SYSTEM_PROMPT_SCENE_PLAY`` (same memory context as play mode:
-     recency window + semantic search, settings scrubbed; ``[SEARCH]`` over
-     the semantic + reasoning tiers allowed). If the reply ends in a move
-     token, the move is parsed but **deliberately NOT applied** -- it is held
-     as the pending action so the analyst can judge the decision before its
-     outcome exists.
+     under the loaded scene-play prompt (role + core tips from NAMS)
+     (same memory context as play mode: recency window + semantic search,
+     settings scrubbed; ``[SEARCH]`` over the semantic + reasoning tiers
+     allowed). If the reply ends in a move token, the move is parsed but
+     **deliberately NOT applied** -- it is held as the pending action so
+     the analyst can judge the decision before its outcome exists.
 
   2. **Analyst phase** (:meth:`ask_analyst`, repeatable). Control returns to
      the user, who may edit the default analysis question or submit it as-is,
      and then go BACK AND FORTH with the analyst as long as they like (each
      follow-up is another :meth:`ask_analyst` call in the same round). The
-     analyst reviews ONLY the player's latest reply, under
-     ``SYSTEM_PROMPT_SCENE_ANALYST``, with privileged access: the exact frame
-     the player saw AND its Settings JSON (which the player never sees), plus
-     ``[SEARCH]`` over all memory tiers. No [SHOW]/[NEXT]/[BACK] navigation
-     exists in this mode -- there is exactly one message to review. Each
-     verdict is stored in the SAME conversation (assistant message,
-     ``kind='analysis'``, every line tagged ``[ANALYST]``) for the record and
-     for the analyst's own continuity. Any ``WRONG: "..."`` error spans in a
-     verdict are verified against the recorded player reply by exact
-     substring match (:func:`agent.modes.parse_wrong_spans`).
+     analyst reviews ONLY the player's latest reply, under the loaded
+     scene-analyst prompt (role + core tips from NAMS), with privileged
+     access: the exact frame the player saw AND its Settings JSON (which
+     the player never sees), plus ``[SEARCH]`` over all memory tiers. No
+     [SHOW]/[NEXT]/[BACK] navigation exists in this mode -- there is exactly
+     one message to review. Each verdict is stored in the SAME conversation
+     (assistant message, ``kind='analysis'``, every line tagged
+     ``[ANALYST]``) for the record and for the analyst's own continuity.
+     Any ``WRONG: "..."`` error spans in a verdict are verified against
+     the recorded player reply by exact substring match
+     (:func:`agent.modes.parse_wrong_spans`).
 
   3. **End of round** (:meth:`end_round`). When the user is satisfied with
      the analysis, the pending move is propagated to the game, the 'after'

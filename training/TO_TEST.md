@@ -355,6 +355,9 @@ the standing t3/t4 rule does NOT trigger.
 
       python -c "import hashlib; from agent import modes; print(hashlib.sha256(modes.SYSTEM_PROMPT_SCENE_PLAY.encode()).hexdigest(), hashlib.sha256(modes.SYSTEM_PROMPT_SCENE_ANALYST.encode()).hexdigest())"
 
+  SUPERSEDED 2026-08-20: those constants were deleted. System messages are
+  now a short role plus a labeled core-tip dump; this hash command is dead."
+
 * **AV eval script** (`python -m training.eval_av <checkpoint>`): on the
   remote box, first verify the NExT-QA HF id (`lmms-lab/NExTQA`; override
   with `--video-hf-id` if Hub renamed it), materialize with `--force` if
@@ -485,12 +488,17 @@ play is one generation per `ask`, debrief/self-eval grade on the self-eval rubri
   onto today's multi-gold strings). The recorded sha256 digests in this file
   therefore change: `SYSTEM_PROMPT_SCENE_PLAY` / `SYSTEM_PROMPT_SCENE_ANALYST`
   must match the pre-change `*_MULTI` hashes, not the old unsuffixed ones.
+  SUPERSEDED 2026-08-20: those constants were deleted; hash-equality against
+  them is no longer an acceptance criterion.
 
 Core tips in NAMS (2026-08-19): scene-play / scene-analyst / debrief system
 prompts are assembled from numbered `core_player_*` / `core_analyst_*`
 Preference rows (exact category fetch, category-sort join). Code seed remains
 source of truth; assembled prompts must stay byte-identical to the
 `SYSTEM_PROMPT_*` constants. `weighted_loss` / collation untouched.
+SUPERSEDED 2026-08-20: the reconstruct-the-blob `== SYSTEM_PROMPT_*` assert
+was the wrong acceptance criterion and is gone; see the labeled-dump note
+below.
 
 * **Rerun t0** (seconds — NAMS `add_preference` byte-identity probe: newlines,
   `[FORWARD]`, an `[ANALYST]` line; leftover Preference must be gone).
@@ -499,11 +507,30 @@ source of truth; assembled prompts must stay byte-identical to the
 * **Rerun t1** (seconds — numbered category regex, sorted-assembly byte
   identity vs the three `SYSTEM_PROMPT_*` constants, exclusion-set
   membership, `untag_analyst_text(tag_analyst_text(text))` round-trip).
+  SUPERSEDED 2026-08-20: t1 now checks labeled-dump shape, not blob identity.
 * **Remote:** with a live client, `load_scene_prompts` returns strings
   hash-equal to the constants; a fresh graph (post-reset) self-heals with
   INFO logs; a manually edited core row heals with a WARNING.
   `session.reset_memory_to_seed()` (notebooks + datagen) now re-heals
   `core_player_*` / `core_analyst_*` after the episodic wipe, so a graph
   that never had them still gets the current crop.
+  SUPERSEDED 2026-08-20: hash-equality to the deleted constants is gone;
+  healing still applies. See the labeled-dump note below.
 * **Rerun t5** (datagen smoke — parallel path + tripwire silent: no analyst
   tip text in player context). Recorded prompt hashes do NOT change.
+
+Labeled NAMS tips dump (2026-08-20): scene system messages are a short role
+statement plus a labeled dump of `core_player_*` / `core_analyst_*` rows
+(`Long-term tips (loaded from memory):` then `[category]` + body). The
+reconstruct-the-blob `== SYSTEM_PROMPT_*` assert is gone. Prompt hashes
+**will** change (intentional). `weighted_loss` / collation untouched, so
+t3/t4 do NOT trigger.
+
+* **Rerun t1 only** (seconds — dump starts with `ROLE_*`, heading appears
+  once immediately after the role, every included category is a
+  `[category]` line with its seed body verbatim, excluded categories
+  absent).
+* **Remote:** one live generation: `llm_calls.txt` system section is the
+  short role, then `Long-term tips (loaded from memory):`, then
+  `[core_player_010_multi_gold_rules]` etc. — **not** the old
+  undifferentiated prompt.

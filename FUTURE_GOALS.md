@@ -300,11 +300,9 @@ Analyst-authored tips get `tag_analyst_text` applied by the tool, so both
 gates (category prefix and `[ANALYST]` text scrub) hold; player-authored
 tips stay untagged.
 
-Two loader relaxations are prerequisites, deferred with this goal:
+One loader relaxation is a prerequisite, deferred with this goal:
 `get_core_tips` accepts well-formed extras in the 500+ range (today it
-rejects ALL unexpected categories), and the byte-equality assert against
-`SYSTEM_PROMPT_*` becomes "seeded prefix of the assembly matches" rather
-than whole-string equality.
+rejects ALL unexpected categories).
 
 Trigger to pick it up: player-written `tip_learned_*` tips seeing real
 use (2026-08-19 discussion).
