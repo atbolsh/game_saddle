@@ -515,17 +515,11 @@ async def _search_semantic_tier(client: Any, query: str, top_k: int) -> list[str
                 f"{_fmt_similarity(e)}"
             )
     prefs = await client.long_term.search_preferences(query, limit=top_k)
-    # Core tips live in the system prompt; surfacing them via [SEARCH] is
-    # noise, and skipping core_analyst_* here is an exact category gate
-    # rather than a tag-dependent one. The [ANALYST] tag remains the
-    # defense for NAMS's opaque retrieve_context fan-out into player context.
-    non_core = [
-        p for p in (prefs or [])
-        if not (getattr(p, "category", "") or "").startswith("core_")
-    ]
-    if non_core:
+    # The [ANALYST] tag remains the defense for NAMS's opaque
+    # retrieve_context fan-out into player context.
+    if prefs:
         lines.append("Preferences / tips:")
-        for p in non_core:
+        for p in prefs:
             lines.append(
                 f"  - [{p.category}] {p.preference}{_fmt_similarity(p)}"
             )

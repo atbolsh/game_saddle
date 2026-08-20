@@ -36,8 +36,8 @@ Stage map (rationale in the Intermission plan):
                 openings / multi-gold / END_GAME parse (base class too);
                 universal openings on settings_to_dict; openings JSON
                 backfill; leak scrubber covers openings; END_GAME oracle
-                unknown + action-balance 1.0; unified prompt composition;
-                core-tip numbered categories + labeled dump shape
+                unknown + action-balance 1.0;                 unified prompt composition;
+                core-tip numbered categories (role-only system prompts)
   * t2-data     manifest loads, per-source counts vs meta.json, probes exist
   * t3-model    4-bit QLoRA load, terminator, CE/KD forward+backward
                 (image example included), teacher-path sanity, kd_anchor
@@ -1221,40 +1221,19 @@ def t1_pure() -> str:
     checks += 1
 
     player_map = dict(modes.CORE_PLAYER_TIPS)
-    analyst_map = dict(modes.CORE_ANALYST_TIPS)
-    play_dump = modes.format_core_tips_dump(
-        modes.ROLE_SCENE_PLAY, player_map, set(),
+    player_bodies = "\n".join(player_map.values())
+    debrief_bodies = "\n".join(
+        t for c, t in modes.CORE_ANALYST_TIPS
+        if c not in modes.DEBRIEF_EXCLUDE
     )
-    analyst_dump = modes.format_core_tips_dump(
-        modes.ROLE_SCENE_ANALYST, analyst_map, modes.SCENE_ANALYST_EXCLUDE,
-    )
-    debrief_dump = modes.format_core_tips_dump(
-        modes.ROLE_DEBRIEF, analyst_map, modes.DEBRIEF_EXCLUDE,
-    )
-
-    assert "PICK ONE TARGET AND COMMIT" in play_dump
-    assert "Making a move does NOT end your turn" not in play_dump
-    assert "RATING:" in debrief_dump
-    assert "overall_score" not in debrief_dump
-    checks += 1
-
-    for dump, role, tips, exclude in (
-        (play_dump, modes.ROLE_SCENE_PLAY, player_map, set()),
-        (analyst_dump, modes.ROLE_SCENE_ANALYST, analyst_map,
-         modes.SCENE_ANALYST_EXCLUDE),
-        (debrief_dump, modes.ROLE_DEBRIEF, analyst_map, modes.DEBRIEF_EXCLUDE),
-    ):
-        assert dump.startswith(role)
-        after_role = dump.split("\n\n", 1)[1]
-        assert after_role.startswith(modes._CORE_TIPS_HEADING)
-        assert dump.count(modes._CORE_TIPS_HEADING) == 1
-        lines = dump.split("\n")
-        included = [c for c in sorted(tips) if c not in exclude]
-        for c in included:
-            assert "[" + c + "]" in lines, c
-            assert tips[c] in dump, c
-        for c in exclude:
-            assert "[" + c + "]" not in lines, c
+    assert "PICK ONE TARGET AND COMMIT" in player_bodies
+    assert "Making a move does NOT end your turn" not in player_bodies
+    assert "RATING:" in debrief_bodies
+    assert "overall_score" not in debrief_bodies
+    # System messages are the role statements only; tip bodies are NAMS
+    # Preference rows recalled by similarity search, not assembled here.
+    assert "PICK ONE TARGET AND COMMIT" not in modes.ROLE_SCENE_PLAY
+    assert "RATING:" not in modes.ROLE_DEBRIEF
     checks += 1
 
     analyst_cats = {c for c, _ in modes.CORE_ANALYST_TIPS}

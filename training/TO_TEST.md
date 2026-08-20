@@ -534,3 +534,15 @@ t3/t4 do NOT trigger.
   short role, then `Long-term tips (loaded from memory):`, then
   `[core_player_010_multi_gold_rules]` etc. — **not** the old
   undifferentiated prompt.
+
+SUPERSEDED 2026-08-20 (later the same day): the labeled dump must NOT
+live in the system message. System = `ROLE_*` only. Tip bodies reach the
+agent through existing NAMS similarity search (`get_context` / user
+Memory context). `format_core_tips_dump` is gone. Prompt hashes change
+again (intentional). t3/t4 still not triggered.
+
+* **Rerun t1 only** (seconds — seed-table content asserts; system roles
+  do not contain the tip bodies).
+* **Remote:** `llm_calls.txt` `--- system ---` is the short role only.
+  Core-tip text appears in the user Memory context (and therefore in
+  `rendered_prompt`), not in the system message.
