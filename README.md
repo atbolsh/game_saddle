@@ -79,11 +79,12 @@ flowchart TD
   (controls, geometry, goal, facing/distance/overshoot heuristics). We add
   these manually so NAMS needs **no LLM provider** (no `llm=` is passed),
   keeping the whole stack local. Scene-play / scene-analyst / debrief
-  system prompts are assembled at session start from numbered
-  `core_player_*` / `core_analyst_*` Preference rows (exact category
-  match, joined in category-sort order). The code seed in `agent/modes.py`
-  remains source of truth; `ensure_core_tips` heals drift. Analyst rows
-  are stored `[ANALYST]`-tagged so they cannot leak into player context.
+  system messages are a short role statement plus a labeled dump of
+  numbered `core_player_*` / `core_analyst_*` Preference rows (exact
+  category fetch, category-sort; not a reconstructed `SYSTEM_PROMPT_*`
+  blob). The code seed in `agent/modes.py` remains source of truth;
+  `ensure_core_tips` heals drift. Analyst rows are stored `[ANALYST]`-tagged
+  so they cannot leak into player context.
 * **`GameSnapshot` (custom)** — written via `client.graph.execute_write`
   (bolt-only). Holds the filesystem `path`, `width`, `height`, a 64×64
   base64 PNG `thumbnail_b64`, and the full `settings_json`. Linked to the
