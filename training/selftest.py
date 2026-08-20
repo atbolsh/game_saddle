@@ -1255,6 +1255,22 @@ def t1_pure() -> str:
             assert tips[c] in dump, c
         for c in exclude:
             assert "[" + c + "]" not in lines, c
+    extra = dict(player_map)
+    extra["core_player_500_note"] = "agent-written extra"
+    extra_dump = modes.format_core_tips_dump(
+        modes.ROLE_SCENE_PLAY, extra, set(),
+    )
+    extra_lines = extra_dump.split("\n")
+    assert "[core_player_500_note]" in extra_lines
+    assert extra_dump.index("[core_player_110_search_tool]") < extra_dump.index(
+        "[core_player_500_note]"
+    )
+    from agent.memory import _is_agent_written_core_tip
+    assert _is_agent_written_core_tip("core_player_", "core_player_500_note")
+    assert _is_agent_written_core_tip("core_analyst_", "core_analyst_500_note")
+    assert not _is_agent_written_core_tip("core_player_", "core_player_110_search_tool")
+    assert not _is_agent_written_core_tip("core_player_", "core_analyst_500_note")
+    assert not _is_agent_written_core_tip("core_player_", "tip_learned_1")
     checks += 1
 
     analyst_cats = {c for c, _ in modes.CORE_ANALYST_TIPS}

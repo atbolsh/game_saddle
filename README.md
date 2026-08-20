@@ -82,8 +82,9 @@ flowchart TD
   system messages are a short role statement plus a labeled dump of
   numbered `core_player_*` / `core_analyst_*` Preference rows (exact
   category fetch, category-sort; not a reconstructed `SYSTEM_PROMPT_*`
-  blob). The code seed in `agent/modes.py` remains source of truth;
-  `ensure_core_tips` heals drift. Analyst rows are stored `[ANALYST]`-tagged
+  blob). The code seed in `agent/modes.py` is written at `seed` /
+  `reset_memory_to_seed`; session load is read-only from NAMS (500+
+  extras included if present). Analyst rows are stored `[ANALYST]`-tagged
   so they cannot leak into player context.
 * **`GameSnapshot` (custom)** — written via `client.graph.execute_write`
   (bolt-only). Holds the filesystem `path`, `width`, `height`, a 64×64

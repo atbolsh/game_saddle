@@ -606,7 +606,7 @@ def _worker(worker_id: int, session: Any, block: list[int], shared: _Shared,
 def run_generation(args: argparse.Namespace) -> dict[str, Any]:
     """The loop. Split from main() so a run script / notebook cell can call
     it with a Namespace built by hand."""
-    from agent import memory as mem
+    # from agent import memory as mem  # only used by commented ensure_core_tips
     from agent.model import get_model, set_default_checkpoint
     from agent.parallel_gen import BatchingProxy, GenerationDispatcher
     from agent.self_eval_session import InteractiveSelfEvalSession
@@ -680,10 +680,10 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
                     "NAMS hygiene: run-start reset deleted %d episodic "
                     "node(s): %s", sum(deleted.values()), deleted,
                 )
-            # Heal core tips once before workers spawn so concurrent
-            # sessions only ever read Preference rows (first-run insert
-            # races would trip get_core_tips' duplicate check).
-            sessions[0]._run(mem.ensure_core_tips(sessions[0].client))
+            # Core-tip healing is reset-only (reset_memory_to_seed above).
+            # load_scene_prompts is read-only, so concurrent workers cannot
+            # race on first-run Preference inserts.
+            # sessions[0]._run(mem.ensure_core_tips(sessions[0].client))
             for s in sessions:
                 s.restart()
             fresh = [True] * n_workers

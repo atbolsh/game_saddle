@@ -300,9 +300,8 @@ Analyst-authored tips get `tag_analyst_text` applied by the tool, so both
 gates (category prefix and `[ANALYST]` text scrub) hold; player-authored
 tips stay untagged.
 
-One loader relaxation is a prerequisite, deferred with this goal:
-`get_core_tips` accepts well-formed extras in the 500+ range (today it
-rejects ALL unexpected categories).
+`get_core_tips` already keeps well-formed extras in the 500+ range.
+The remaining work is the writing tool itself.
 
 Trigger to pick it up: player-written `tip_learned_*` tips seeing real
 use (2026-08-19 discussion).

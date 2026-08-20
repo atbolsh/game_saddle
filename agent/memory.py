@@ -720,9 +720,9 @@ async def add_tip(client: Any, tip: str, source_session: str | None = None) -> d
     tips MUST carry both the ``core_analyst_`` (or ``tip_learned_analyst_``)
     category prefix AND :func:`tag_analyst_text` on the stored text, so
     the category gate and the ``[ANALYST]`` scrub both hold. Player-
-    authored core tips stay untagged. ``get_core_tips`` currently rejects
-    extras; relaxing that is a prerequisite of that goal, not of this
-    function.
+    authored core tips stay untagged. ``get_core_tips`` keeps well-formed
+    extras in the 500+ range (agent-written core tips); other unexpected
+    categories still fail the strict set check.
     """
     tip = tip.strip()
     if not tip:
@@ -896,15 +896,34 @@ async def ensure_core_tips(client: Any) -> dict[str, int]:
     return {"added": added, "healed": healed, "unchanged": unchanged}
 
 
+# Category shape shared with t1: core_(player|analyst)_NNN_slug, NNN zero-padded.
+_CORE_TIP_CAT_RE = re.compile(r"^core_(player|analyst)_(\d{3})_[a-z0-9_]+$")
+
+
+def _is_agent_written_core_tip(prefix: str, category: str) -> bool:
+    """True for a well-formed extra in the reserved 500+ range under
+    ``prefix`` (``core_player_`` / ``core_analyst_``). Seed numbers stay
+    below 500; this is the gate that lets agent-written rows into the
+    dump without treating them as graph corruption."""
+    m = _CORE_TIP_CAT_RE.match(category)
+    if not m:
+        return False
+    role = "player" if prefix == "core_player_" else "analyst"
+    if m.group(1) != role:
+        return False
+    if not category.startswith(prefix):
+        return False
+    return int(m.group(2)) >= 500
+
+
 async def get_core_tips(client: Any, prefix: str) -> dict[str, str]:
     """Exact fetch of one core-tip namespace. ``prefix`` is
     ``core_player_`` or ``core_analyst_``.
 
-    Strict: the returned category set must equal the code seed for that
-    prefix -- missing, duplicated, or unexpected categories raise
-    :class:`RuntimeError` (no partial results). Analyst rows are untagged
-    on the way out. Extras (including future 500+ agent-written tips)
-    are rejected today; relaxing that is FUTURE_GOALS goal 11.
+    Seed categories must all be present (missing / duplicated rows
+    raise). Well-formed extras in the 500+ range are kept and sorted
+    into the dump; any other unexpected category still raises.
+    Analyst rows are untagged on the way out.
     """
     seed = _core_tip_seed_for_prefix(prefix)
     expected = {c for c, _ in seed}
@@ -932,7 +951,10 @@ async def get_core_tips(client: Any, prefix: str) -> dict[str, str]:
             )
         found[cat] = pref
     missing = sorted(expected - set(found))
-    unexpected = sorted(set(found) - expected)
+    unexpected = sorted(
+        cat for cat in set(found) - expected
+        if not _is_agent_written_core_tip(prefix, cat)
+    )
     if dupes or missing or unexpected:
         raise RuntimeError(
             f"core tips {prefix!r} failed strict set check: "

@@ -1348,10 +1348,15 @@ def format_core_tips_dump(
 
 
 async def load_scene_prompts(client: Any) -> dict[str, str]:
-    """Heal-then-read the core-tip Preference rows and assemble the three
-    scene system prompts as role + labeled NAMS dump.
+    """Read core-tip Preference rows and assemble the three scene system
+    prompts as role + labeled NAMS dump.
     """
-    await mem.ensure_core_tips(client)
+    # Healing belongs at seed / reset_memory_to_seed, not here: this
+    # path is read-only so the dump is whatever NAMS holds at this
+    # moment (including any future agent-written 500+ rows). If a later
+    # agent becomes over-eager at editing tip nodes, restore the line
+    # below so load-time reconcile can overwrite drift again.
+    # await mem.ensure_core_tips(client)
     player = await mem.get_core_tips(client, "core_player_")
     analyst = await mem.get_core_tips(client, "core_analyst_")
     return {
