@@ -26,7 +26,7 @@ Concrete first steps when picked up:
 * a quality filter that drops turns the mode-3 evaluator scored below a
   threshold.
 
-## 2. Interior walls and multi-gold levels — *Not started*
+## 2. Interior walls and multi-gold levels — *Exploring*
 
 Generalise the level generator past `random_bare_settings` (4 boundary
 walls + 1 gold piece). Targets:
@@ -42,10 +42,28 @@ machinery in `agent/game_io.py` and `agent/modes.py` already generalise;
 only the level-creation call and the stop condition
 (`gold_remaining == 0`) need widening.
 
-## 3. Audio and video modalities of Gemma 4 — *Not started*
+**2026-08-12 notebook-only cut:** `agent/game_io.new_multi_gold_game` +
+`boundary_openings` (non-AI oracle of boundary gaps) +
+`MultiGoldSelfEvalSession` (`notebooks/multi_gold_eval.ipynb`) exercise
+0–3 golds, sealed vs open rooms, target commitment (`TARGET:` line),
+walking out an opening, and `[END_GAME]` when the room is sealed and
+empty. The existing self-eval / datagen critical path is unchanged
+(`[END_GAME]` is not in `game_io.ACTIONS`). Wiring this into training is
+goal 10 — do not touch `generate_game_traces` until that is picked up.
 
-Gemma 4 E4B natively supports audio input, and the Gemma 4 family
-supports video. Future work:
+## 3. Audio and video modalities of Gemma 4 — *Exploring*
+
+**Measurement harness written (2026-08-12), first run pending.**
+`training/eval_av.py` scores a named checkpoint against the frozen
+Gemma 4 12B base on LibriSpeech test-clean (WER) and NExT-QA multiple
+choice (letter accuracy), using the standard processor chat-template
+parts `{"type": "audio", "path": ...}` / `{"type": "video", "path": ...}`
+(video via `num_frames` / `do_sample_frames`). Whether the 12B accepts
+both modalities through this path is settled by the script's first
+remote run — a processor rejection there is a finding, not something to
+route around.
+
+Still future work:
 
 * feed short audio instructions (e.g. a spoken "turn right") to the agent
   in mode 1, and record the audio as a message attachment;
@@ -59,9 +77,11 @@ supports video. Future work:
   no game-harness connection). Deliberately sidelined for the first
   training rounds: the vision/audio towers are LoRA-frozen, so drift risk
   is low, and enabling costs converters + a fresh VRAM profile (rationale
-  in `training/TRAINING_EXTRA_DATASETS.md`).
+  in `training/TRAINING_EXTRA_DATASETS.md`). The eval script does not
+  unblock that.
 
-Currently only image + text are used.
+Currently only image + text are used **in the agent loop**; audio/video
+comprehension is measurable off to the side.
 
 ## 4. Analyst revamp: CORRECT spans + per-span ratings — *Not started*
 
@@ -193,3 +213,95 @@ Cost: K× the datagen per position and a harness rework (the dispatcher
 already batches, but the trace format assumes one reply per round).
 Prerequisite: a reward cheaper than the full analyst call per sample, or
 K analyst calls accepted as the price.
+
+## 8. NAMS entity-extraction pollution + retrieval value — *Not started*
+
+**2026-08-13 finding (July session dumps + aug11/aug12 reset censuses):**
+NAMS runs spaCy NER over every message, and spaCy on geometry/clock-face
+prose produces steady junk entities: `~118 degrees` as a Person, `CLOCK` /
+`CLOCKWISE` / `~4:20` as Organizations, `\approx` / `OBS` / `AI` as
+Geopolitical Locations, `radians` as an Organization+Group, LaTeX sliced
+mid-expression (`\text{atan2}(-0.0204` as an Organization), clock-position
+phrases (`4:18 o'clock`) as Event+Time. Volume: ~6,000 junk entities per
+60-game datagen epoch (~3.5–4k `Entity+Object`, ~1.9k `Entity+Event+Time`,
+~130 Person / ~150 Organization / ~110 Location), roughly 2 per
+generation. Character: almost all are single-mention orphans (~1
+`MENTIONS` edge each — unique numeric strings, not shared references),
+and where strings DO repeat, resolution fails to merge case/label
+variants (4 `agent` nodes shadowing the seeded semantic `Agent`; `OBS`
+under two label sets). Everything sits at spaCy's default ~0.85
+confidence, so thresholding is not a lever. The datagen run-start hygiene
+reset already deletes all of it (census lines in the weekend logs), so
+this is contained-per-run pollution, not accumulating pollution.
+
+When picked up, in order of leverage:
+
+* **kill it at the source, not at reset time**: disable or restrict
+  NAMS's NER extraction for game-session messages (NAMS extraction
+  config — not this repo's code);
+* **measure retrieval value first**: the pollution's practical cost is
+  the entity tier serving `~4:20 (Organization)` to a semantic query
+  about clock bearings mid-run. Datagen traces already record every
+  `[SEARCH]` call and its results (`searches` in the trace meta), so
+  "is NAMS pulling its weight" is answerable offline before changing
+  anything — that reading should gate how much effort the rest gets;
+* **resolution case/label merging** is real but minor (dozens of nodes,
+  not thousands).
+
+## 9. Debrief notepad injection — *Not started*
+
+`_BLOCK_REVIEW_WHOLE_REPLY` (shared by the scene analyst and debrief) now
+tells the reviewer to check `[REMEMBER ...]` lines against "the notepad
+shown in your context". `build_scene_analyst_messages` injects that
+notepad; `build_debrief_messages` does not. In debrief the instruction
+is therefore dangling. Harmless today (debrief reviews recorded play,
+not live `[REMEMBER]` spam), but if debrief verdicts ever complain
+about a missing notepad, either inject the recorded notepad into the
+debrief builder or gate that one sentence out of the debrief
+composition.
+
+## 10. Align training with multi-gold / target-exit play — *Not started*
+
+The 2026-08-19 mode unification put target commitment, openings, and
+`[END_GAME]` into every player/analyst prompt, but datagen and the
+reward path still run sealed one-gold eat-to-win games: `[END_GAME]` is
+graded as a no-op (oracle `unknown`, action-balance pinned at 1.0) and
+does not end the session. The player is told after that token that it
+is unavailable in this mode. Training should catch up so the corpus
+matches the prompt (goal 2's notebook cut is the mechanics to copy):
+
+* datagen uses `new_multi_gold_game` (0–3 golds, sealed vs open rooms);
+* `[END_GAME]` is a real terminal action on a sealed empty room (and a
+  graded mistake otherwise);
+* oracle / action-balance / win-boost stop treating eat-last-gold as
+  the only success;
+* drop the player-facing "END_GAME is not available in this mode"
+  notice once the mode actually supports it.
+
+Do not start this while a sealed-room training run is in flight. The
+analyst prompt can stay as-is until this lands — it already describes
+the target-exit rules.
+
+## 11. Agent-written core tips (the "always after" plan) — *Not started*
+
+A future tool will let the player and the analyst write their own core
+tips into the same substrate the system prompts load from
+(`core_player_*` / `core_analyst_*` Preference rows, assembled by
+category-sort). The TOOL, never the agent, assigns the category name:
+role prefix (`core_player_` / `core_analyst_`) + a number in the reserved
+500+ range + a short slug. Because assembly is category-sort, agent-
+written tips therefore always land AFTER every seeded block (seeded
+numbers stop at 140; t1 enforces < 500), in a deterministic, reproducible
+position, with zero code changes. Landing before the seeded blocks
+(numbers below 010) is deliberately possible under the same sort
+mechanism but not the default.
+
+Analyst-authored tips get `tag_analyst_text` applied by the tool, so both
+gates (category prefix and `[ANALYST]` text scrub) hold; player-authored
+tips stay untagged.
+
+`get_core_tips` already keeps well-formed extras in the 500+ range.
+The remaining work is the writing tool itself.
+
+Trigger to pick it up: player-written `tip_learned_*` tips seeing real
+use (2026-08-19 discussion).

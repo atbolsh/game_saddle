@@ -394,6 +394,13 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
     move cap is hit, or the run-wide generation budget runs out. Buffers the
     game's records, stamps the outcome, writes them under the shared lock.
 
+    Legacy eat-gold win; ``[END_GAME]`` may appear because the unified
+    prompt mentions it, but it does not terminate datagen games (the
+    base ``end_round`` grades it without applying a board action). The
+    next player question then says the token is unavailable in this
+    mode. Analyst prompts are left as-is until training switches
+    (FUTURE_GOALS goal 10).
+
     Each round asks either the default move request or (with probability
     ``--question-rate``, drawn from ``qrng``) a perception question --
     those rounds do not advance the game (a correct answer is prose with no
@@ -599,6 +606,7 @@ def _worker(worker_id: int, session: Any, block: list[int], shared: _Shared,
 def run_generation(args: argparse.Namespace) -> dict[str, Any]:
     """The loop. Split from main() so a run script / notebook cell can call
     it with a Namespace built by hand."""
+    # from agent import memory as mem  # only used by commented ensure_core_tips
     from agent.model import get_model, set_default_checkpoint
     from agent.parallel_gen import BatchingProxy, GenerationDispatcher
     from agent.self_eval_session import InteractiveSelfEvalSession
@@ -672,6 +680,10 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
                     "NAMS hygiene: run-start reset deleted %d episodic "
                     "node(s): %s", sum(deleted.values()), deleted,
                 )
+            # Core-tip healing is reset-only (reset_memory_to_seed above).
+            # load_scene_prompts is read-only, so concurrent workers cannot
+            # race on first-run Preference inserts.
+            # sessions[0]._run(mem.ensure_core_tips(sessions[0].client))
             for s in sessions:
                 s.restart()
             fresh = [True] * n_workers

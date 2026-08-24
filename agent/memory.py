@@ -166,7 +166,7 @@ async def complete_turn_trace(
 
 # ------------------------------------------------------------------ context
 
-_SETTINGS_LEAK_KEYS = ("settings_json", "settings", "walls", "gold", "agent_x", "agent_y", "direction")
+_SETTINGS_LEAK_KEYS = ("settings_json", "settings", "walls", "gold", "agent_x", "agent_y", "direction", "openings")
 
 
 def _strip_settings(obj: Any) -> Any:
@@ -185,7 +185,7 @@ def _strip_settings(obj: Any) -> Any:
 
 
 _SETTINGS_TEXT_RE = re.compile(
-    r'"(settings_json|settings|walls|gold|agent_x|agent_y|direction)"\s*:\s*[^,}\]]+',
+    r'"(settings_json|settings|walls|gold|agent_x|agent_y|direction|openings)"\s*:\s*[^,}\]]+',
     re.IGNORECASE,
 )
 
@@ -250,6 +250,28 @@ def is_analyst_text(s: str) -> bool:
 def strip_analyst_lines(text: str) -> str:
     """Drop every line that :func:`is_analyst_text` flags. Over-masking is safe."""
     return "\n".join(line for line in text.splitlines() if not is_analyst_text(line))
+
+
+def untag_analyst_text(text: str) -> str:
+    """Inverse of :func:`tag_analyst_text`: strip one leading
+    :data:`ANALYST_LINE_PREFIX` (or a bare :data:`ANALYST_TAG`) from each
+    line. Lines without the tag are left unchanged. Trailing newline is
+    preserved, matching :func:`tag_analyst_text`.
+    """
+    if not text:
+        return text
+    untagged: list[str] = []
+    for line in text.splitlines():
+        if line.startswith(ANALYST_LINE_PREFIX):
+            untagged.append(line[len(ANALYST_LINE_PREFIX):])
+        elif line.startswith(ANALYST_TAG):
+            untagged.append(line[len(ANALYST_TAG):])
+        else:
+            untagged.append(line)
+    out = "\n".join(untagged)
+    if text.endswith("\n"):
+        out += "\n"
+    return out
 
 
 async def get_recent_messages(
@@ -444,7 +466,11 @@ async def get_game_context(
     if recent:
         parts.append(
             "Recent conversation (most recent last -- your latest questions and "
-            "moves this session, in order):\n" + recent
+            "moves this session, in order). These messages describe EARLIER "
+            "positions of the board: the attached image is the only CURRENT "
+            "view, and your notepad is the current state of your saved notes. "
+            "Where old messages disagree with the image or the notepad, trust "
+            "the image and the notepad:\n" + recent
         )
     if semantic and semantic.strip() not in ("", "{}", "[]"):
         parts.append(
@@ -489,9 +515,17 @@ async def _search_semantic_tier(client: Any, query: str, top_k: int) -> list[str
                 f"{_fmt_similarity(e)}"
             )
     prefs = await client.long_term.search_preferences(query, limit=top_k)
-    if prefs:
+    # Core tips live in the system prompt; surfacing them via [SEARCH] is
+    # noise, and skipping core_analyst_* here is an exact category gate
+    # rather than a tag-dependent one. The [ANALYST] tag remains the
+    # defense for NAMS's opaque retrieve_context fan-out into player context.
+    non_core = [
+        p for p in (prefs or [])
+        if not (getattr(p, "category", "") or "").startswith("core_")
+    ]
+    if non_core:
         lines.append("Preferences / tips:")
-        for p in prefs:
+        for p in non_core:
             lines.append(
                 f"  - [{p.category}] {p.preference}{_fmt_similarity(p)}"
             )
@@ -677,6 +711,18 @@ async def add_tip(client: Any, tip: str, source_session: str | None = None) -> d
     Categories follow the seeded ``tip_*`` convention with a running index
     (``tip_learned_1``, ``tip_learned_2``, ...) so each learned tip keeps its
     own category (NAMS dedups near-identical preferences within a category).
+
+    FUTURE (FUTURE_GOALS goal 11, the "always after" plan -- comment only,
+    no tool yet): when the scene player/analyst can write their own CORE
+    tips, this function (or a sibling) must assign the category itself --
+    never the agent. Role prefix ``core_player_`` / ``core_analyst_`` + a
+    number in the reserved 500+ range + a short slug. Analyst-authored
+    tips MUST carry both the ``core_analyst_`` (or ``tip_learned_analyst_``)
+    category prefix AND :func:`tag_analyst_text` on the stored text, so
+    the category gate and the ``[ANALYST]`` scrub both hold. Player-
+    authored core tips stay untagged. ``get_core_tips`` keeps well-formed
+    extras in the 500+ range (agent-written core tips); other unexpected
+    categories still fail the strict set check.
     """
     tip = tip.strip()
     if not tip:
@@ -700,6 +746,302 @@ async def add_tip(client: Any, tip: str, source_session: str | None = None) -> d
         result=info,
     )
     return info
+
+
+def _core_tip_seed_for_prefix(prefix: str) -> list[tuple[str, str]]:
+    """The code seed table for one core-tip namespace. Local import of
+    ``modes``: this module must not import it at the top level (modes
+    already imports memory)."""
+    from . import modes
+    if prefix == "core_player_":
+        return list(modes.CORE_PLAYER_TIPS)
+    if prefix == "core_analyst_":
+        return list(modes.CORE_ANALYST_TIPS)
+    raise ValueError(f"unknown core-tip prefix {prefix!r}")
+
+
+async def _preference_texts(client: Any, category: str) -> list[Any]:
+    """Exact-category read of ``p.preference`` values. Empty list if none."""
+    rows = await client.query.cypher(
+        "MATCH (p:Preference {category: $cat}) "
+        "RETURN p.preference AS preference",
+        {"cat": category},
+    ) or []
+    return [dict(r).get("preference") for r in rows]
+
+
+async def _assert_preference_text(
+    client: Any, category: str, expected: str,
+) -> None:
+    """NAMS ``add_preference`` must round-trip bytes. A mismatch means the
+    library stripped, normalized, or merged the text -- core tips cannot
+    be stored through that API until it is byte-faithful (store via
+    Cypher ``CREATE`` instead)."""
+    got = await _preference_texts(client, category)
+    if got != [expected]:
+        raise RuntimeError(
+            f"NAMS add_preference did not round-trip category {category!r}: "
+            f"wrote {expected!r} ({len(expected)} bytes), "
+            f"read {got!r}. Core tips cannot use add_preference if it "
+            "mutates text; store via Cypher CREATE instead."
+        )
+
+
+async def assert_preference_text_roundtrip(client: Any) -> str:
+    """Write a throwaway Preference, read it back by exact category, demand
+    byte identity, delete it. Used by t0 so a NAMS text-fidelity failure
+    surfaces in seconds, before any GPU stage.
+    """
+    category = f"_selftest_pref_roundtrip_{uuid.uuid4().hex}"
+    # Shape of a stored core tip: newlines, indent, move-token brackets,
+    # and an [ANALYST] line (analyst tips are stored tagged).
+    probe = (
+        "HOW TO PLAY -- take these steps.\n"
+        "  OBS: I am at <where>; emit [FORWARD].\n"
+        f"{ANALYST_LINE_PREFIX}privileged geometry follows.\n"
+        "Trailing punctuation."
+    )
+    try:
+        await client.long_term.add_preference(
+            category=category, preference=probe,
+        )
+        await _assert_preference_text(client, category, probe)
+    finally:
+        await client.graph.execute_write(
+            "MATCH (p:Preference {category: $cat}) DETACH DELETE p",
+            {"cat": category},
+        )
+    leftover = await _preference_texts(client, category)
+    if leftover:
+        raise RuntimeError(
+            f"selftest Preference {category!r} survived cleanup: {leftover!r}"
+        )
+    return probe
+
+
+async def _upsert_core_tip(client: Any, category: str, stored_text: str) -> str:
+    """Exact-category reconcile of one Preference row. Returns 'ok',
+    'added', or 'healed'. After every write, re-reads and demands byte
+    identity (NAMS ``add_preference`` is not assumed faithful)."""
+    texts = await _preference_texts(client, category)
+    if len(texts) == 1 and texts[0] == stored_text:
+        return "ok"
+    if len(texts) == 0:
+        await client.long_term.add_preference(
+            category=category, preference=stored_text,
+        )
+        await _assert_preference_text(client, category, stored_text)
+        logger.info("core tip %s missing; seeded from code.", category)
+        return "added"
+    await client.graph.execute_write(
+        "MATCH (p:Preference {category: $cat}) DETACH DELETE p",
+        {"cat": category},
+    )
+    await client.long_term.add_preference(
+        category=category, preference=stored_text,
+    )
+    await _assert_preference_text(client, category, stored_text)
+    logger.warning(
+        "core tip %s drifted from code seed; overwritten", category,
+    )
+    return "healed"
+
+
+async def ensure_core_tips(client: Any) -> dict[str, int]:
+    """Idempotent reconcile of ``core_player_*`` / ``core_analyst_*``
+    Preference rows against the code seed tables. Code is source of
+    truth: missing rows are added, drifted or duplicated rows are
+    deleted and re-added (so NAMS embeddings stay consistent -- never
+    ``SET p.preference`` via raw Cypher).
+
+    Analyst seed text is stored with :func:`tag_analyst_text` applied.
+    Seed text that already contains :data:`ANALYST_TAG` raises -- the
+    tag is a storage marker, not prompt prose.
+    """
+    from . import modes  # local: modes imports this module at top level
+
+    added = healed = unchanged = 0
+    for category, text in modes.CORE_PLAYER_TIPS:
+        if ANALYST_TAG in text:
+            raise RuntimeError(
+                f"core player tip {category} contains {ANALYST_TAG}; "
+                "player seed text must be stored untagged"
+            )
+        status = await _upsert_core_tip(client, category, text)
+        if status == "added":
+            added += 1
+        elif status == "healed":
+            healed += 1
+        else:
+            unchanged += 1
+    for category, text in modes.CORE_ANALYST_TIPS:
+        if ANALYST_TAG in text:
+            raise RuntimeError(
+                f"core analyst tip {category} already contains "
+                f"{ANALYST_TAG}; tag at seed time, not in the source block"
+            )
+        status = await _upsert_core_tip(
+            client, category, tag_analyst_text(text),
+        )
+        if status == "added":
+            added += 1
+        elif status == "healed":
+            healed += 1
+        else:
+            unchanged += 1
+    logger.info(
+        "ensure_core_tips: added=%d healed=%d unchanged=%d",
+        added, healed, unchanged,
+    )
+    return {"added": added, "healed": healed, "unchanged": unchanged}
+
+
+# Category shape shared with t1: core_(player|analyst)_NNN_slug, NNN zero-padded.
+_CORE_TIP_CAT_RE = re.compile(r"^core_(player|analyst)_(\d{3})_[a-z0-9_]+$")
+
+
+def _is_agent_written_core_tip(prefix: str, category: str) -> bool:
+    """True for a well-formed extra in the reserved 500+ range under
+    ``prefix`` (``core_player_`` / ``core_analyst_``). Seed numbers stay
+    below 500; this is the gate that lets agent-written rows into the
+    dump without treating them as graph corruption."""
+    m = _CORE_TIP_CAT_RE.match(category)
+    if not m:
+        return False
+    role = "player" if prefix == "core_player_" else "analyst"
+    if m.group(1) != role:
+        return False
+    if not category.startswith(prefix):
+        return False
+    return int(m.group(2)) >= 500
+
+
+async def get_core_tips(client: Any, prefix: str) -> dict[str, str]:
+    """Exact fetch of one core-tip namespace. ``prefix`` is
+    ``core_player_`` or ``core_analyst_``.
+
+    Seed categories must all be present (missing / duplicated rows
+    raise). Well-formed extras in the 500+ range are kept and sorted
+    into the dump; any other unexpected category still raises.
+    Analyst rows are untagged on the way out.
+    """
+    seed = _core_tip_seed_for_prefix(prefix)
+    expected = {c for c, _ in seed}
+    rows = await client.query.cypher(
+        "MATCH (p:Preference) WHERE p.category STARTS WITH $prefix "
+        "RETURN p.category AS category, p.preference AS preference",
+        {"prefix": prefix},
+    ) or []
+    found: dict[str, str] = {}
+    dupes: list[str] = []
+    for r in rows:
+        d = dict(r)
+        cat = d.get("category")
+        pref = d.get("preference")
+        if not cat:
+            raise RuntimeError(
+                f"core-tip row under {prefix!r} has empty category: {d!r}"
+            )
+        if cat in found:
+            dupes.append(cat)
+            continue
+        if pref is None:
+            raise RuntimeError(
+                f"core tip {cat} has null preference text"
+            )
+        found[cat] = pref
+    missing = sorted(expected - set(found))
+    unexpected = sorted(
+        cat for cat in set(found) - expected
+        if not _is_agent_written_core_tip(prefix, cat)
+    )
+    if dupes or missing or unexpected:
+        raise RuntimeError(
+            f"core tips {prefix!r} failed strict set check: "
+            f"missing={missing} unexpected={unexpected} duplicates={dupes}"
+        )
+    if prefix == "core_analyst_":
+        return {c: untag_analyst_text(t) for c, t in found.items()}
+    return found
+
+
+# ------------------------- session notes (scratchpad)
+
+async def set_session_note(
+    client: Any, session_id: str, key: str, value: str, round_no: int,
+) -> None:
+    """Write (or overwrite) one session-scoped scratchpad note.
+
+    Exact-keyed ``MERGE`` on ``(:SessionNote {session_id, key})`` -- no
+    embedding, so the note never enters ``get_context`` similarity recall.
+    Write failures log at WARNING and re-raise.
+    """
+    try:
+        await client.graph.execute_write(
+            "MERGE (n:SessionNote {session_id: $sid, key: $key}) "
+            "SET n.value = $value, n.updated_round = $round, "
+            "n.updated_at = timestamp()",
+            {"sid": session_id, "key": key, "value": value, "round": round_no},
+        )
+    except Exception as exc:
+        logger.warning("set_session_note failed: %s", exc)
+        raise
+    logger.info("notepad: [%s] %s", key, value)
+
+
+async def get_session_notes(client: Any, session_id: str) -> list[dict]:
+    """Return this session's scratchpad notes, ordered by key.
+
+    Exact ``MATCH`` by ``session_id``. Returns ``[]`` only when the query
+    genuinely returns no rows -- a query error raises.
+    """
+    rows = await client.query.cypher(
+        "MATCH (n:SessionNote {session_id: $sid}) "
+        "RETURN n.key AS key, n.value AS value, "
+        "n.updated_round AS updated_round ORDER BY n.key",
+        {"sid": session_id},
+    )
+    notes = [dict(r) for r in rows or []]
+    run_logging.log_db_retrieval(
+        function="get_session_notes",
+        arguments={"session_id": session_id},
+        result=notes,
+    )
+    return notes
+
+
+async def clear_session_notes(client: Any, session_id: str) -> None:
+    """Delete every ``SessionNote`` for ``session_id``. Write failures
+    log at WARNING and re-raise."""
+    try:
+        await client.graph.execute_write(
+            "MATCH (n:SessionNote {session_id: $sid}) DETACH DELETE n",
+            {"sid": session_id},
+        )
+    except Exception as exc:
+        logger.warning("clear_session_notes failed: %s", exc)
+        raise
+
+
+def format_notepad(notes: list[dict]) -> str:
+    """Render the complete notepad block injected into the player prompt.
+
+    Returns the header-included string; callers never wrap or prefix it.
+    """
+    if not notes:
+        return (
+            "Your notepad is empty. Save facts you will need later with\n"
+            "[REMEMBER key: short note]."
+        )
+    lines = [
+        "Your notepad (notes you saved with [REMEMBER key: ...]; "
+        "current values):"
+    ]
+    for n in notes:
+        lines.append(
+            f"  {n['key']}: {n['value']}   (updated round {n['updated_round']})"
+        )
+    return "\n".join(lines)
 
 
 async def get_semantic_model(client: Any) -> str:
@@ -943,9 +1285,17 @@ async def build_semantic_model(client: Any) -> dict[str, int]:
 
     rel_counts = await add_semantic_relationships(client)
     n_rel = rel_counts.get("relationships", 0)
+    core_counts = await ensure_core_tips(client)
 
     logger.info(
-        "Seeded semantic model: %d entities, %d preferences, %d relationships.",
+        "Seeded semantic model: %d entities, %d preferences, %d relationships, "
+        "core tips added=%d healed=%d unchanged=%d.",
         n_ent, n_pref, n_rel,
+        core_counts.get("added", 0),
+        core_counts.get("healed", 0),
+        core_counts.get("unchanged", 0),
     )
-    return {"entities": n_ent, "preferences": n_pref, "relationships": n_rel}
+    return {
+        "entities": n_ent, "preferences": n_pref, "relationships": n_rel,
+        "core_tips": core_counts,
+    }

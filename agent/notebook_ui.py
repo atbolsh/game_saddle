@@ -11,14 +11,23 @@
   lists every trained adapter found under ``weights/<architecture>/`` (see
   training/TRAINING_OVERVIEW.md), rescanned whenever the architecture
   changes.
+- :func:`player_takeover_controls` is the sticky human-player takeover
+  used only by the two self-eval notebooks (reply box + Submit +
+  pictographic move buttons).
 """
 
 from __future__ import annotations
 
+import base64
+import html as _html
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import ipywidgets as widgets
 from IPython.display import HTML, display
+
+from agent.game_io import ACTIONS
 
 #: CSS class marking a Textarea widget as Shift-Enter-tamed.
 _TAMED_CLASS = "tame-shift-enter"
@@ -194,6 +203,179 @@ def model_picker(
         one_copy,
         status,
     ])
+
+
+#: Visible faces for the takeover move buttons. The appended token is
+#: still ``[FORWARD]`` / ``[CLOCK]`` / ``[ANTICLOCK]``; only the label
+#: is a glyph. Order is the play order (step, then the two turns).
+_TAKEOVER_MOVE_FACES = (
+    ("→", "FORWARD"),
+    ("↻", "CLOCK"),
+    ("↺", "ANTICLOCK"),
+)
+
+
+def player_takeover_controls(
+    on_submit: Callable[[str], None],
+    on_mode_change: Callable[[], None] | None = None,
+) -> SimpleNamespace:
+    """Sticky human-player takeover panel for the two self-eval notebooks.
+
+    ``on_submit(raw)`` receives the reply-box text, with ``\\n\\n[TOKEN]``
+    appended when a move button was pressed. Truncation at the first
+    move token happens in ``ask_player``. Takeover stays on until
+    **Resume agent**; Restart / New room / Reset do not clear it.
+
+    ``on_mode_change`` (if given) fires after **Takeover** and **Resume
+    agent**. The notebooks pass ``_sync_phase`` here: that is the only
+    place that re-enables **Ask**, and Resume/Takeover never go through
+    it on their own. Without this callback, Ask stays grey after
+    Takeover -> move -> Back to player -> Resume agent.
+
+    Returns a namespace with ``takeover_btn``, ``resume_btn``,
+    ``reply_box``, ``controls_box`` (reply + submit/move row; hidden
+    until takeover), ``toggle_box`` (the two mode buttons), and
+    ``sync(player_on)`` to enable/disable with the player phase.
+    """
+    takeover_on = False
+    last_player_on = False
+    takeover_btn = widgets.Button(
+        description="Takeover", button_style="warning",
+        tooltip="Drive the player yourself (no generation)",
+    )
+    resume_btn = widgets.Button(
+        description="Resume agent", button_style="info",
+        tooltip="Give the player turn back to the model",
+    )
+    resume_btn.layout.display = "none"
+    reply_box = widgets.Textarea(
+        value="",
+        placeholder="Write the player's reply (or just press a move button)...",
+        description="Player:",
+        layout=widgets.Layout(width="600px", height="90px"),
+    )
+    submit_btn = widgets.Button(description="Submit", button_style="primary")
+    move_btns: list[widgets.Button] = []
+    for face, action in _TAKEOVER_MOVE_FACES:
+        if action not in ACTIONS:
+            raise ValueError(f"takeover face {action!r} is not a game action")
+        btn = widgets.Button(
+            description=face,
+            tooltip=action,
+            layout=widgets.Layout(width="48px"),
+        )
+        move_btns.append(btn)
+
+    controls_box = widgets.VBox([
+        reply_box,
+        widgets.HBox([submit_btn, *move_btns]),
+    ])
+    controls_box.layout.display = "none"
+    toggle_box = widgets.HBox([takeover_btn, resume_btn])
+
+    def _apply_visibility() -> None:
+        controls_box.layout.display = None if takeover_on else "none"
+        takeover_btn.layout.display = "none" if takeover_on else None
+        resume_btn.layout.display = None if takeover_on else "none"
+
+    def sync(player_on: bool) -> None:
+        nonlocal last_player_on
+        last_player_on = player_on
+        takeover_btn.disabled = not player_on
+        resume_btn.disabled = False
+        live = player_on and takeover_on
+        reply_box.disabled = not live
+        submit_btn.disabled = not live
+        for btn in move_btns:
+            btn.disabled = not live
+
+    def _set_takeover(on: bool) -> None:
+        nonlocal takeover_on
+        takeover_on = on
+        _apply_visibility()
+
+    def _notify() -> None:
+        # Always refresh this panel first; then let the notebook re-sync
+        # Ask / Reset / etc. Resume does not otherwise call _sync_phase.
+        sync(last_player_on)
+        if on_mode_change is not None:
+            on_mode_change()
+
+    def _on_takeover(_) -> None:
+        _set_takeover(True)
+        _notify()
+
+    def _on_resume(_) -> None:
+        _set_takeover(False)
+        reply_box.value = ""
+        _notify()
+
+    def _fire(extra_token: str | None) -> None:
+        raw = reply_box.value
+        if extra_token:
+            raw = raw + "\n\n" + extra_token
+        if not raw.strip():
+            return
+        on_submit(raw)
+        reply_box.value = ""
+
+    takeover_btn.on_click(_on_takeover)
+    resume_btn.on_click(_on_resume)
+    submit_btn.on_click(lambda _: _fire(None))
+    for btn, (_face, action) in zip(move_btns, _TAKEOVER_MOVE_FACES):
+        token = f"[{action}]"
+        btn.on_click(lambda _, tok=token: _fire(tok))
+
+    return SimpleNamespace(
+        takeover_btn=takeover_btn,
+        resume_btn=resume_btn,
+        reply_box=reply_box,
+        submit_btn=submit_btn,
+        move_btns=move_btns,
+        controls_box=controls_box,
+        toggle_box=toggle_box,
+        sync=sync,
+        is_on=lambda: takeover_on,
+    )
+
+
+def scratchpad_html(text: str, *, height_px: int = 420) -> str:
+    """Light-maroon notepad card, game-height and wide; scrolls if taller."""
+    escaped = _html.escape(text or "")
+    return (
+        f"<div style='flex:1 1 640px;min-width:520px;height:{height_px}px;"
+        "overflow:auto;background:#f7e6e6;border:1px solid #c69c9c;"
+        "border-radius:6px;padding:10px 12px;box-sizing:border-box;"
+        "font-family:monospace;white-space:pre-wrap;font-size:13px'>"
+        "<div style='font-weight:bold;color:#7a2e2e;margin-bottom:6px'>"
+        "Player's scratchpad</div>"
+        f"{escaped}</div>"
+    )
+
+
+def display_frame_with_scratchpad(
+    path: str | None,
+    caption: str,
+    notepad: str,
+    *,
+    width: int = 420,
+) -> None:
+    """Print ``caption``, then the game image with the notepad to its right."""
+    if not path:
+        return
+    print(caption)
+    raw = Path(path).read_bytes()
+    b64 = base64.b64encode(raw).decode("ascii")
+    suffix = Path(path).suffix.lstrip(".").lower() or "png"
+    if suffix == "jpg":
+        suffix = "jpeg"
+    display(HTML(
+        "<div style='display:flex;align-items:flex-start;gap:16px;width:100%'>"
+        f"<img src='data:image/{suffix};base64,{b64}' width='{width}' "
+        f"style='flex:0 0 {width}px;height:auto;display:block'/>"
+        f"{scratchpad_html(notepad, height_px=width)}"
+        "</div>"
+    ))
 
 
 def tame_shift_enter(*text_widgets) -> None:

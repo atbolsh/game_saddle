@@ -221,20 +221,12 @@ class AgentConfig:
     recent_messages_window: int = field(
         default_factory=lambda: _env_int("RECENT_MESSAGES_WINDOW", 7)
     )
-
-    # Reflection (generative-agents style, arXiv:2304.03442). Every *applied*
-    # move accrues ``reflection_points_per_move`` importance points; when the
-    # running total reaches ``reflection_threshold`` mid-turn, the agent pauses
-    # to reflect (no move that step: it re-examines the current frame and its
-    # recent moves, then the reflection is fed into subsequent prompts) and the
-    # total resets. Defaults: 5 points/move, threshold 150 -> reflect every 30
-    # moves, i.e. after at most a 180-degree turn (one rotation is pi/30 = 6
-    # degrees) if the agent is stuck spinning.
-    reflection_points_per_move: int = field(
-        default_factory=lambda: _env_int("REFLECTION_POINTS_PER_MOVE", 5)
-    )
-    reflection_threshold: int = field(
-        default_factory=lambda: _env_int("REFLECTION_THRESHOLD", 150)
+    # Player-only recency window (self-eval PLAYER path; the analyst keeps
+    # ``recent_messages_window``). Sized from measured aug11/aug12 traces:
+    # p99 example 9.4k chars, p90 message 317 chars -- 8 messages plus the
+    # notepad + Board update blocks stays far under train.py's 16k drop cap.
+    player_recent_messages_window: int = field(
+        default_factory=lambda: _env_int("PLAYER_RECENT_MESSAGES_WINDOW", 8)
     )
 
     # Debrief (mode 4). The context always carries exactly ONE frame -- the

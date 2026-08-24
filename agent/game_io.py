@@ -1,8 +1,9 @@
 """Game level generation, rendering, and Settings serialization.
 
-Wraps the ``game.discreteEngine`` package. Only "bare" levels are generated
-for now: 4 boundary walls + 1 gold piece near the agent, via
-``discreteGame.random_bare_settings``.
+Wraps the ``game.discreteEngine`` package. Datagen uses only "bare" levels
+(4 boundary walls + 1 gold piece) via :func:`new_bare_game`. A notebook-only
+multi-gold factory (:func:`new_multi_gold_game`) and a boundary-openings
+oracle (:func:`boundary_openings`) live alongside it.
 
 COORDINATE CONVENTION (single source of truth, engine and prompts agree):
   - The world is y-UP: larger y = higher on the presented screen. The engine
@@ -31,6 +32,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import re
 from pathlib import Path
 from typing import Any
@@ -87,6 +89,13 @@ _SETTINGS_FIELDS = [
 # agent has to navigate.
 MIN_GOLD_DISTANCE = 0.6
 
+# Side-wall thickness in the engine (discreteEngine.side_wall_width = 50/800).
+# boundary_openings uses 1.5x this as the "this rect is a boundary wall" band.
+_SIDE_WALL_WIDTH = 50 / 800
+_OPENING_BAND = 1.5 * _SIDE_WALL_WIDTH
+_OPENING_MIN_WIDTH = 0.01
+_MULTI_GOLD_TRIES = 200
+
 
 def new_bare_game(
     gameSize: int = 768,
@@ -128,12 +137,229 @@ def new_bare_game(
     return discreteGame(settings=best_settings, envMode=True)
 
 
+def _merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    if not intervals:
+        return []
+    ordered = sorted((min(a, b), max(a, b)) for a, b in intervals)
+    out = [ordered[0]]
+    for lo, hi in ordered[1:]:
+        last_lo, last_hi = out[-1]
+        if lo <= last_hi:
+            out[-1] = (last_lo, max(last_hi, hi))
+        else:
+            out.append((lo, hi))
+    return out
+
+
+def _complement(covered: list[tuple[float, float]],
+                lo: float = 0.0, hi: float = 1.0) -> list[tuple[float, float]]:
+    """Gaps in ``[lo, hi]`` not covered by the merged intervals."""
+    gaps: list[tuple[float, float]] = []
+    cursor = lo
+    for a, b in _merge_intervals(covered):
+        a = max(a, lo)
+        b = min(b, hi)
+        if a > cursor:
+            gaps.append((cursor, a))
+        cursor = max(cursor, b)
+    if cursor < hi:
+        gaps.append((cursor, hi))
+    return gaps
+
+
+def boundary_openings(settings: dict[str, Any]) -> list[dict[str, Any]]:
+    """Continuous stretches of the unit-square boundary NOT covered by any
+    wall -- the exits.
+
+    Each opening is ``{"side": "left"|"right"|"top"|"bottom",
+    "from": [x, y], "to": [x, y], "center": [x, y], "width": float}``.
+    Coordinates are the same y-up system as the rest of the settings dict
+    (larger y = higher on the presented screen).
+
+    Algorithm, per side independently (corners are therefore counted on
+    both adjacent sides -- documented, not a bug): collect axis-aligned
+    (``angle == 0``) walls whose rect lies in that side's boundary band
+    (inner face within 1.5 x the side-wall thickness of the edge); project
+    each onto the edge axis; merge covered intervals; complement within
+    ``[0, 1]``; drop slivers narrower than 0.01. A wall in the boundary
+    band with ``angle != 0`` raises ``ValueError`` -- rotated boundary
+    geometry is not guessed at.
+
+    LIMITATION: band membership is decided from the UNROTATED extents
+    ``[x, x+w] x [y, y+h]``, so a rotated wall anchored OUTSIDE the band
+    that sweeps into it is silently ignored rather than raising. Safe
+    today because every caller feeds ``random_side_walls`` output, whose
+    side walls are always axis-aligned (``wall_theta = 0`` hardcoded); if
+    interior/rotated walls (FUTURE_GOALS goal 2) ever reach this function,
+    the band test must be redone with rotated extents first.
+    """
+    walls = settings.get("walls") or []
+    band = _OPENING_BAND
+    sides = {
+        "left":   {"axis": "y", "edge": 0.0, "is_low": True},
+        "right":  {"axis": "y", "edge": 1.0, "is_low": False},
+        "bottom": {"axis": "x", "edge": 0.0, "is_low": True},
+        "top":    {"axis": "x", "edge": 1.0, "is_low": False},
+    }
+    openings: list[dict[str, Any]] = []
+    for side, spec in sides.items():
+        covered: list[tuple[float, float]] = []
+        for wall in walls:
+            if len(wall) < 5:
+                raise ValueError(
+                    f"wall {wall!r} is not [x, y, w, h, angle]"
+                )
+            x, y, w, h, angle = (float(wall[0]), float(wall[1]),
+                                 float(wall[2]), float(wall[3]),
+                                 float(wall[4]))
+            x0, x1 = min(x, x + w), max(x, x + w)
+            y0, y1 = min(y, y + h), max(y, y + h)
+            if spec["axis"] == "y":
+                # left/right: wall must sit in the x-band of that edge
+                if spec["is_low"]:
+                    in_band = x0 <= band and x1 >= 0.0
+                else:
+                    in_band = x1 >= 1.0 - band and x0 <= 1.0
+                proj = (y0, y1)
+            else:
+                if spec["is_low"]:
+                    in_band = y0 <= band and y1 >= 0.0
+                else:
+                    in_band = y1 >= 1.0 - band and y0 <= 1.0
+                proj = (x0, x1)
+            if not in_band:
+                continue
+            if abs(angle) > 1e-9:
+                raise ValueError(
+                    f"boundary-band wall on the {side} side has nonzero "
+                    f"angle {angle} (wall={wall!r}); openings are only "
+                    f"defined for axis-aligned boundary walls"
+                )
+            covered.append(proj)
+        for a, b in _complement(covered):
+            width = b - a
+            if width < _OPENING_MIN_WIDTH:
+                continue
+            mid = (a + b) / 2.0
+            if side == "left":
+                fr, to, center = [0.0, a], [0.0, b], [0.0, mid]
+            elif side == "right":
+                fr, to, center = [1.0, a], [1.0, b], [1.0, mid]
+            elif side == "bottom":
+                fr, to, center = [a, 0.0], [b, 0.0], [mid, 0.0]
+            else:
+                fr, to, center = [a, 1.0], [b, 1.0], [mid, 1.0]
+            openings.append({
+                "side": side, "from": fr, "to": to,
+                "center": center, "width": width,
+            })
+    return openings
+
+
+def new_multi_gold_game(
+    gameSize: int = 768,
+    n_gold: int | None = None,
+    opening: str = "require",
+    min_gold_separation: float = 0.15,
+    min_gold_distance: float = MIN_GOLD_DISTANCE,
+) -> discreteGame:
+    """A room that may hold 0–3 golds and may or may not have a boundary
+    opening. ``new_bare_game`` is untouched; this factory is the multi-gold
+    notebook's constructor.
+
+    ``n_gold`` None -> uniform random in {0,1,2,3}. ``opening`` is one of
+    ``"require"`` (at least one exit), ``"forbid"`` (sealed -- the
+    ``[END_GAME]``-correct empty-room case), or ``"any"``. Golds (when any)
+    sit at least ``min_gold_distance`` from the agent and
+    ``min_gold_separation`` from each other. Does NOT route through
+    ``random_bare_settings`` (that function indexes ``gold[0]``).
+    """
+    if opening not in ("require", "forbid", "any"):
+        raise ValueError(
+            f"opening must be 'require', 'forbid', or 'any'; got {opening!r}"
+        )
+    if n_gold is not None and n_gold not in (0, 1, 2, 3):
+        raise ValueError(f"n_gold must be 0..3 or None; got {n_gold!r}")
+
+    engine = discreteGame(envMode=True)
+    target_n = n_gold
+
+    for _ in range(_MULTI_GOLD_TRIES):
+        walls = engine.random_walls(num_extra_walls=0)
+        openings = boundary_openings({"walls": walls})
+        min_opening = 1.5 * (2.0 * engine.typical_agent_r)
+        if any(op["width"] + 1e-12 < min_opening for op in openings):
+            continue
+        if opening == "require" and not openings:
+            continue
+        if opening == "forbid" and openings:
+            continue
+        ax, ay = engine.random_valid_coords(walls, engine.typical_agent_r)
+        n = target_n if target_n is not None else random.randint(0, 3)
+        golds: list[tuple[float, float]] = []
+        placed = True
+        for _g in range(n):
+            found = None
+            for _try in range(200):
+                gx, gy = engine.random_valid_coords(
+                    walls, engine.typical_gold_r)
+                if math.hypot(gx - ax, gy - ay) < min_gold_distance:
+                    continue
+                if any(math.hypot(gx - px, gy - py) < min_gold_separation
+                       for px, py in golds):
+                    continue
+                found = (gx, gy)
+                break
+            if found is None:
+                placed = False
+                break
+            golds.append(found)
+        if not placed:
+            continue
+        settings = Settings(
+            gameSize=gameSize,
+            agent_r=engine.typical_agent_r,
+            gold_r=engine.typical_gold_r,
+            walls=walls,
+            gold=list(golds),
+            agent_x=ax,
+            agent_y=ay,
+            direction=random.uniform(0, 2 * math.pi),
+        )
+        return discreteGame(settings=settings, envMode=True)
+
+    raise ValueError(
+        f"new_multi_gold_game: no board matched n_gold={n_gold!r} "
+        f"opening={opening!r} after {_MULTI_GOLD_TRIES} tries"
+    )
+
+
 def settings_to_dict(s: Settings) -> dict[str, Any]:
     """Serialise a Settings object to a plain dict (JSON-safe)."""
     out: dict[str, Any] = {k: getattr(s, k) for k in _SETTINGS_FIELDS}
     out["gold"] = [list(g) for g in s.gold]
     out["walls"] = [list(w) for w in s.walls]
+    # Derived, always present: sealed rooms yield []. settings_from_dict
+    # ignores the extra key.
+    out["openings"] = boundary_openings(out)
     return out
+
+
+def settings_json_with_openings(settings_json: str | None) -> str | None:
+    """Backfill so every analyst view has an ``openings`` key.
+
+    New snapshots already carry ``openings`` from :func:`settings_to_dict`.
+    Pre-change stored JSON lacks it; this recomputes from ``walls``.
+    Malformed stored walls raise -- do not swallow. Already-present
+    ``openings`` returns the original string unchanged (byte identity).
+    """
+    if not settings_json:
+        return settings_json
+    d = json.loads(settings_json)
+    if "openings" not in d:
+        d["openings"] = boundary_openings(d)
+        return json.dumps(d)
+    return settings_json
 
 
 def settings_from_dict(d: dict[str, Any]) -> Settings:
@@ -203,6 +429,47 @@ def parse_action(text: str) -> str | None:
     if not matches:
         return None
     return matches[-1].upper()
+
+
+def truncate_at_first_move_token(text: str) -> str:
+    """Keep ``text`` through the first bracketed move token, drop the rest.
+
+    Notebook human-takeover: a hand-typed ``[FORWARD]`` / ``[CLOCK]`` /
+    ``[ANTICLOCK]`` ends the move the same way a generate stop-string
+    would. No token -> the string is unchanged. Uses the same
+    :data:`_MOVE_RE` as :func:`parse_action`."""
+    m = _MOVE_RE.search(text)
+    return text[: m.end()] if m else text
+
+
+#: One scratchpad write: ``[REMEMBER key: free text]``. Key is a short
+#: identifier; the value runs to the first ``]`` on the same line.
+_REMEMBER_RE = re.compile(r"\[REMEMBER ([A-Za-z0-9_]+):\s*([^\]\n]+)\]")
+
+
+def parse_remember_notes(text: str) -> list[tuple[str, str]]:
+    """All ``[REMEMBER key: value]`` writes in ``text``, in order of
+    appearance. Keys are lowercased; values stripped. The caller applies
+    them in order, so a repeated key means last-one-wins."""
+    return [(m.group(1).lower(), m.group(2).strip())
+            for m in _REMEMBER_RE.finditer(text)]
+
+
+def board_update_line(action: str, gold_collected: int, gold_remaining: int) -> str:
+    """Engine-truth one-liner for the turn after an applied move (pure
+    function so t1 can cover it). ``action`` is the bare move word
+    (e.g. "FORWARD"); render it bracketed, ``[FORWARD]``."""
+    if gold_collected > 0:
+        return (
+            f"Board update: your last move ([{action}]) ATE a gold. "
+            f"{gold_remaining} gold(s) now remain. If the eaten gold was "
+            "your saved target, that gold no longer exists -- pick a new "
+            "target and save it with [REMEMBER target: ...] before you move."
+        )
+    return (
+        f"Board update: your last move ([{action}]) did not eat a gold. "
+        f"{gold_remaining} gold(s) remain on the board."
+    )
 
 
 def find_bare_move(text: str) -> str | None:

@@ -148,6 +148,8 @@ comes through two small types:
   comprehension sets: each is just another `DataSource` plugged into the same
   loop. Stage 1 ships only `JsonlSource` (examples serialized as JSON lines)
   so the loop is testable end to end; real sources arrive in stages 2–3.
+  Audio/video comprehension is measurable off to the side with
+  `training/eval_av.py` (not a training `DataSource` yet).
 
 ### One loss for both label types
 

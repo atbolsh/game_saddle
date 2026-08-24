@@ -3,7 +3,7 @@
 Run on the REMOTE box (GPU + NAMS), in order, as soon as setup_env.sh has
 finished::
 
-    python -m training.selftest t0     # seconds   env + imports
+    python -m training.selftest t0     # seconds   env + imports + NAMS pref round-trip
     python -m training.selftest t1     # seconds   pure-python units
     python -m training.selftest t2     # seconds   materialized data + manifest
     python -m training.selftest t3     # minutes   4-bit load, forward/backward
@@ -23,7 +23,8 @@ new dependencies -- plain asserts.
 
 Stage map (rationale in the Intermission plan):
 
-  * t0-env      imports + versions + CUDA + bitsandbytes
+  * t0-env      imports + versions + CUDA + bitsandbytes; NAMS
+                add_preference text round-trip (byte identity)
   * t1-pure     parse_rating, the shape/scale reward split
                 (rating_advantage / example_scale / build_span_weights),
                 oracle_verdict + _oracle_meta geometry, image noise,
@@ -31,7 +32,12 @@ Stage map (rationale in the Intermission plan):
                 sources on fabricated dirs (example_weight, oracle
                 modifiers, novelty toggle), epoch_batches bucketing,
                 stack_equal_length, run_weekend --checkpoint (rejects
-                --start-checkpoint / --resume-checkpoint)
+                --start-checkpoint / --resume-checkpoint), boundary
+                openings / multi-gold / END_GAME parse (base class too);
+                universal openings on settings_to_dict; openings JSON
+                backfill; leak scrubber covers openings; END_GAME oracle
+                unknown + action-balance 1.0; unified prompt composition;
+                core-tip numbered categories + labeled dump shape
   * t2-data     manifest loads, per-source counts vs meta.json, probes exist
   * t3-model    4-bit QLoRA load, terminator, CE/KD forward+backward
                 (image example included), teacher-path sanity, kd_anchor
@@ -186,7 +192,9 @@ def _free_cuda(*objs) -> None:
 # ================================================================== stages
 
 def t0_env() -> str:
-    """Imports, versions, CUDA."""
+    """Imports, versions, CUDA, plus a NAMS ``add_preference`` byte-fidelity
+    probe (the remote box has Neo4j; this stage is already CUDA-gated)."""
+    import asyncio
     import platform
 
     import torch
@@ -203,13 +211,25 @@ def t0_env() -> str:
     import matplotlib
     from PIL import Image  # noqa: F401
 
+    from agent import memory as mem
+
+    async def _nams_pref_roundtrip() -> None:
+        client = await mem.connect()
+        try:
+            await mem.assert_preference_text_roundtrip(client)
+        finally:
+            await client.close()
+
+    asyncio.run(_nams_pref_roundtrip())
+
     gpu = torch.cuda.get_device_name(0)
     vram = torch.cuda.get_device_properties(0).total_memory / 2**30
     return (
         f"python {platform.python_version()}, torch {torch.__version__}, "
         f"transformers {transformers.__version__}, peft {peft.__version__}, "
         f"bitsandbytes {bitsandbytes.__version__}, "
-        f"matplotlib {matplotlib.__version__}; {gpu} ({vram:.0f} GiB)"
+        f"matplotlib {matplotlib.__version__}; {gpu} ({vram:.0f} GiB); "
+        "NAMS add_preference round-trip ok"
     )
 
 
@@ -340,6 +360,7 @@ def t1_pure() -> str:
         (("CLOCK", "ANTICLOCK", -0.8, False), "wrong"),   # away from gold
         ((None, "FORWARD", 0.0, True), "unknown"),        # perception round
         (("CLOCK", None, None, None), "unknown"),         # pre-oracle corpus
+        (("END_GAME", "FORWARD", 0.0, True), "unknown"),  # not a board move
     ]:
         got = oracle_verdict(*args)
         assert got == want, f"oracle_verdict{args} = {got}, want {want}"
@@ -395,7 +416,13 @@ def t1_pure() -> str:
     lo = action_balance_multipliers({"A": 100, "B": 1, "C": 1, "D": 1, "E": 1})
     assert lo["A"] == 1.0 / ACTION_BALANCE_CAP, lo       # dominant: floored
     assert lo["B"] == ACTION_BALANCE_CAP, lo
-    checks += 6
+    # stray END_GAME is pinned at 1.0 and does not enter the mean
+    mixed = action_balance_multipliers(
+        {"ANTICLOCK": 10, "CLOCK": 10, "FORWARD": 10, "END_GAME": 1}
+    )
+    assert mixed["END_GAME"] == 1.0, mixed
+    assert all(abs(mixed[a] - 1.0) < 1e-9 for a in ("ANTICLOCK", "CLOCK", "FORWARD")), mixed
+    checks += 7
 
     # ---- NoveltyTracker (WORK IN PROGRESS -- "boredom" decay, block above
     # the class in training/game_traces.py): 0.9^k on consecutive identical
@@ -1038,9 +1065,261 @@ def t1_pure() -> str:
                 assert "renamed" in msg, msg
     checks += 1
 
+    # ---- boundary_openings + new_multi_gold_game (2026-08-12 multi-gold mode)
+    from agent.game_io import (
+        _SIDE_WALL_WIDTH,
+        board_update_line,
+        boundary_openings,
+        new_multi_gold_game,
+        parse_remember_notes,
+        truncate_at_first_move_token,
+    )
+    from agent.memory import format_notepad
+    # Notebook human-takeover: first bracketed move token ends the reply.
+    assert (
+        truncate_at_first_move_token("aim then [FORWARD]\njunk after")
+        == "aim then [FORWARD]"
+    )
+    checks += 1
+    assert truncate_at_first_move_token("no token here") == "no token here"
+    checks += 1
+    # Session scratchpad: [REMEMBER key: value] parser, last-one-wins
+    # ordering, truncation interplay, board-update line, notepad render.
+    assert parse_remember_notes(
+        "[REMEMBER target: left gold] then [REMEMBER plan: hug the wall]"
+    ) == [("target", "left gold"), ("plan", "hug the wall")]
+    checks += 1
+    assert parse_remember_notes(
+        "[REMEMBER target: a] mid [REMEMBER target: b]"
+    ) == [("target", "a"), ("target", "b")]
+    checks += 1
+    assert parse_remember_notes("[REMEMBER Target: x]") == [("target", "x")]
+    checks += 1
+    assert parse_remember_notes(
+        "[REMEMBER no-colon] [REMEMBER bad key: x] [REMEMBER unclosed: y "
+        "[REMEMBER nl: a\nb]"
+    ) == []
+    checks += 1
+    assert parse_remember_notes("[REMEMBER k: keep]drop]") == [("k", "keep")]
+    checks += 1
+    assert parse_remember_notes("[REMEMBER k:   padded  ]") == [("k", "padded")]
+    checks += 1
+    assert parse_remember_notes(
+        truncate_at_first_move_token(
+            "[REMEMBER a: b]\n[FORWARD]\n[REMEMBER c: d]"
+        )
+    ) == [("a", "b")]
+    checks += 1
+    eaten = board_update_line("FORWARD", 1, 2)
+    assert "[FORWARD]" in eaten and "2 gold(s)" in eaten
+    assert "[REMEMBER target:" in eaten
+    checks += 1
+    uneaten = board_update_line("CLOCK", 0, 3)
+    assert "[CLOCK]" in uneaten and "3 gold(s)" in uneaten
+    assert "ATE" not in uneaten
+    checks += 1
+    empty_pad = format_notepad([])
+    assert "Your notepad is empty" in empty_pad
+    assert "[REMEMBER key: short note]" in empty_pad
+    checks += 1
+    filled_pad = format_notepad([
+        {"key": "target", "value": "the left gold, near the top wall",
+         "updated_round": 4},
+    ])
+    assert "target: the left gold, near the top wall" in filled_pad
+    assert "(updated round 4)" in filled_pad
+    checks += 1
+    w = _SIDE_WALL_WIDTH
+    full = [
+        [0.0, 0.0, w, 1.0, 0.0],
+        [1.0 - w, 0.0, w, 1.0, 0.0],
+        [0.0, 0.0, 1.0, w, 0.0],
+        [0.0, 1.0 - w, 1.0, w, 0.0],
+    ]
+    assert boundary_openings({"walls": full}) == [], boundary_openings({"walls": full})
+    checks += 1
+
+    gapped = [
+        [0.0, 0.0, w, 1.0, 0.0],
+        [0.0, 0.0, 1.0, w, 0.0],
+        [0.0, 1.0 - w, 1.0, w, 0.0],
+        [1.0 - w, 0.0, w, 0.4, 0.0],
+        [1.0 - w, 0.6, w, 0.4, 0.0],
+    ]
+    ops = boundary_openings({"walls": gapped})
+    assert len(ops) == 1, ops
+    op = ops[0]
+    assert op["side"] == "right", op
+    assert abs(op["width"] - 0.2) < 1e-9, op
+    assert abs(op["center"][0] - 1.0) < 1e-9, op
+    assert abs(op["center"][1] - 0.5) < 1e-9, op
+    checks += 1
+
+    none = boundary_openings({"walls": []})
+    assert len(none) == 4, none
+    assert {o["side"] for o in none} == {"left", "right", "top", "bottom"}
+    assert all(abs(o["width"] - 1.0) < 1e-9 for o in none), none
+    checks += 1
+
+    rotated = [[0.0, 0.0, w, 1.0, 0.3]]
+    try:
+        boundary_openings({"walls": rotated})
+        raise AssertionError("rotated boundary wall did not raise")
+    except ValueError as exc:
+        assert "nonzero angle" in str(exc), exc
+    checks += 1
+
+    random.seed(20260812)
+    g0 = new_multi_gold_game(n_gold=0, opening="forbid")
+    assert len(g0.settings.gold) == 0, g0.settings.gold
+    assert boundary_openings(game_io_settings := {
+        "walls": [list(x) for x in g0.settings.walls]
+    }) == [], game_io_settings
+    checks += 1
+    g2 = new_multi_gold_game(n_gold=2, opening="require")
+    assert len(g2.settings.gold) == 2, g2.settings.gold
+    assert boundary_openings({"walls": [list(x) for x in g2.settings.walls]})
+    checks += 1
+    g3 = new_multi_gold_game(n_gold=3, opening="require")
+    assert len(g3.settings.gold) == 3, g3.settings.gold
+    checks += 1
+
+    from agent.multi_gold_session import MultiGoldSelfEvalSession
+    from agent.self_eval_session import InteractiveSelfEvalSession
+    stub = object.__new__(MultiGoldSelfEvalSession)
+    assert MultiGoldSelfEvalSession._parse_player_action(
+        stub, "TARGET: none\n[END_GAME]", "answer"
+    ) == "END_GAME"
+    assert MultiGoldSelfEvalSession._parse_player_action(
+        stub, "aiming [CLOCK]", "move"
+    ) == "CLOCK"
+    # base class now parses [END_GAME] too (legacy: graded, non-terminal)
+    base_stub = object.__new__(InteractiveSelfEvalSession)
+    assert InteractiveSelfEvalSession._parse_player_action(
+        base_stub, "TARGET: none\n[END_GAME]", "answer"
+    ) == "END_GAME"
+    checks += 1
+
+    from agent import modes
+    from agent.memory import ANALYST_TAG, tag_analyst_text, untag_analyst_text
+
+    import re as _re
+    cat_re = _re.compile(r"^core_(player|analyst)_(\d{3})_[a-z0-9_]+$")
+    seen_cats: set[str] = set()
+    for table, role in (
+        (modes.CORE_PLAYER_TIPS, "player"),
+        (modes.CORE_ANALYST_TIPS, "analyst"),
+    ):
+        for cat, text in table:
+            m = cat_re.match(cat)
+            assert m, cat
+            assert m.group(1) == role, cat
+            assert int(m.group(2)) < 500, cat
+            assert cat not in seen_cats, cat
+            seen_cats.add(cat)
+            assert ANALYST_TAG not in text, cat
+    checks += 1
+
+    player_map = dict(modes.CORE_PLAYER_TIPS)
+    analyst_map = dict(modes.CORE_ANALYST_TIPS)
+    play_dump = modes.format_core_tips_dump(
+        modes.ROLE_SCENE_PLAY, player_map, set(),
+    )
+    analyst_dump = modes.format_core_tips_dump(
+        modes.ROLE_SCENE_ANALYST, analyst_map, modes.SCENE_ANALYST_EXCLUDE,
+    )
+    debrief_dump = modes.format_core_tips_dump(
+        modes.ROLE_DEBRIEF, analyst_map, modes.DEBRIEF_EXCLUDE,
+    )
+
+    assert "PICK ONE TARGET AND COMMIT" in play_dump
+    assert "Making a move does NOT end your turn" not in play_dump
+    assert "RATING:" in debrief_dump
+    assert "overall_score" not in debrief_dump
+    checks += 1
+
+    for dump, role, tips, exclude in (
+        (play_dump, modes.ROLE_SCENE_PLAY, player_map, set()),
+        (analyst_dump, modes.ROLE_SCENE_ANALYST, analyst_map,
+         modes.SCENE_ANALYST_EXCLUDE),
+        (debrief_dump, modes.ROLE_DEBRIEF, analyst_map, modes.DEBRIEF_EXCLUDE),
+    ):
+        assert dump.startswith(role)
+        after_role = dump.split("\n\n", 1)[1]
+        assert after_role.startswith(modes._CORE_TIPS_HEADING)
+        assert dump.count(modes._CORE_TIPS_HEADING) == 1
+        lines = dump.split("\n")
+        included = [c for c in sorted(tips) if c not in exclude]
+        for c in included:
+            assert "[" + c + "]" in lines, c
+            assert tips[c] in dump, c
+        for c in exclude:
+            assert "[" + c + "]" not in lines, c
+    extra = dict(player_map)
+    extra["core_player_500_note"] = "agent-written extra"
+    extra_dump = modes.format_core_tips_dump(
+        modes.ROLE_SCENE_PLAY, extra, set(),
+    )
+    extra_lines = extra_dump.split("\n")
+    assert "[core_player_500_note]" in extra_lines
+    assert extra_dump.index("[core_player_110_search_tool]") < extra_dump.index(
+        "[core_player_500_note]"
+    )
+    from agent.memory import _is_agent_written_core_tip
+    assert _is_agent_written_core_tip("core_player_", "core_player_500_note")
+    assert _is_agent_written_core_tip("core_analyst_", "core_analyst_500_note")
+    assert not _is_agent_written_core_tip("core_player_", "core_player_110_search_tool")
+    assert not _is_agent_written_core_tip("core_player_", "core_analyst_500_note")
+    assert not _is_agent_written_core_tip("core_player_", "tip_learned_1")
+    checks += 1
+
+    analyst_cats = {c for c, _ in modes.CORE_ANALYST_TIPS}
+    assert modes.SCENE_ANALYST_EXCLUDE <= analyst_cats
+    assert modes.DEBRIEF_EXCLUDE <= analyst_cats
+    checks += 1
+
+    for cat, text in modes.CORE_ANALYST_TIPS:
+        assert untag_analyst_text(tag_analyst_text(text)) == text, cat
+    checks += 1
+
+    from agent.game_io import (
+        new_bare_game, settings_from_dict, settings_json_with_openings,
+        settings_to_dict,
+    )
+    from agent import memory as memmod
+    sealed = settings_to_dict(new_bare_game().settings)
+    assert sealed["openings"] == [], sealed["openings"]
+    gapped_settings = settings_from_dict({
+        "gameSize": 64, "direction": 0.0, "agent_x": 0.5, "agent_y": 0.5,
+        "agent_r": 0.05, "gold_r": 0.03, "gold": [], "walls": gapped,
+    })
+    ser = settings_to_dict(gapped_settings)
+    assert ser["openings"] == boundary_openings({"walls": gapped})
+    roundtrip = settings_from_dict(ser)
+    assert [list(w) for w in roundtrip.walls] == [list(w) for w in gapped_settings.walls]
+    assert "openings" in memmod._SETTINGS_LEAK_KEYS
+    scrubbed = memmod._strip_settings_from_text('"openings": [{"side": "left"}]')
+    assert "left" not in scrubbed, scrubbed
+    assert "<redacted>" in scrubbed, scrubbed
+    checks += 1
+
+    old_json = json.dumps({
+        "gameSize": 64, "direction": 0.0, "agent_x": 0.5, "agent_y": 0.5,
+        "agent_r": 0.05, "gold_r": 0.03, "gold": [], "walls": gapped,
+    })
+    assert "openings" not in json.loads(old_json)
+    filled = settings_json_with_openings(old_json)
+    assert json.loads(filled)["openings"] == boundary_openings({"walls": gapped})
+    already = json.dumps(ser)
+    assert settings_json_with_openings(already) is already
+    assert settings_json_with_openings(None) is None
+    checks += 1
+
     return (
         f"{checks} unit groups passed (ratings, rewards, noise, tripwire, "
-        "source, batching, scrambler, questions, stack-eq, weekend-ckpt)"
+        "source, batching, scrambler, questions, stack-eq, weekend-ckpt, "
+        "openings, multi-gold, end-game parse, prompt composition, "
+        "openings backfill, leak scrubber, core-tip seed)"
     )
 
 
@@ -2017,7 +2296,7 @@ def t10_traintime() -> str:
 # ================================================================== runner
 
 STAGES: list[tuple[str, str, "callable"]] = [
-    ("t0-env", "imports, versions, CUDA", t0_env),
+    ("t0-env", "imports, versions, CUDA, NAMS pref round-trip", t0_env),
     ("t1-pure", "pure-python units", t1_pure),
     ("t2-data", "materialized data vs manifest", t2_data),
     ("t3-model", "4-bit load + forward/backward", t3_model),

@@ -80,7 +80,18 @@ One record per player generation lands in `data_game/<label>/traces.jsonl`:
   prompt, screened NAMS context, accumulated search notes, frame), with the
   frame's url rewritten to a stable copy in `data_game/<label>/images/`
   (byte-identical to what the player saw; the live `memory_images/` copy
-  does not survive NAMS resets);
+  does not survive NAMS resets). From 2026-08-14 the player prompt also
+  contains a notepad block and (after the first applied move) a Board
+  update line; replies may contain `[REMEMBER]` writes. Analyst prompts
+  contain the notepad the player saw. Pre/post-change corpora have
+  different prompt shapes. Player/analyst prompts now include target /
+  opening / `[END_GAME]` language (the unified multi-gold wording): in
+  the one-gold game the single gold is the only possible target, and the
+  player may write `[REMEMBER target: ...]` notes that the analyst
+  audits. **The datagen game is still sealed one-gold; eating gold still
+  wins; `[END_GAME]` is not a stop condition yet.** The multi-gold
+  player prompt names gold and
+  openings as two distinct objectives (never call an opening "the gold").
 - `target_text` — the raw player reply, the ONLY trainable tokens;
 - `meta` — RAW annotations only: analyst rating, harness-verified `WRONG:`
   spans, action, game/move indices, the round's `question`, `game_won`,

@@ -342,6 +342,117 @@ class discreteGame:
         return 0
     
     ## Full definition of actions from here.    
+    def _contact_normal(self, x, y, wall):
+        """Outward unit normal of ``wall`` at the closest surface point to
+        ``(x, y)``. Computed in the wall's own frame (same ``backRot`` as
+        :meth:`wall_overlap_check`) so it is correct at any rotation: a
+        face gives the face normal, a convex corner the radial direction
+        from that corner. Returns ``None`` if the center is inside the
+        rectangle (no unique outward normal; validated positions cannot
+        reach this)."""
+        wall_x, wall_y, wall_w, wall_h, wall_theta = wall[:5]
+        ax, ay = self.backRot(x, y, wall_theta)
+        left_lim, top_lim = self.backRot(wall_x, wall_y, wall_theta)
+        right_lim = left_lim + wall_w
+        bot_lim = top_lim + wall_h
+        cx = min(max(ax, left_lim), right_lim)
+        cy = min(max(ay, top_lim), bot_lim)
+        nx, ny = ax - cx, ay - cy
+        mag = math.sqrt(nx * nx + ny * ny)
+        if mag < 1e-12:
+            return None
+        return self.backRot(nx / mag, ny / mag, -wall_theta)
+
+    def _first_blocking_wall(self, x, y):
+        for params in self.settings.walls:
+            if self.wall_overlap_check(
+                x, y, params[0], params[1], params[2], params[3], params[4]
+            ):
+                return params
+        return None
+
+    def _slide_move(self, dx, dy, lim):
+        """Steer ``lim`` along the desired unit direction ``(dx, dy)``.
+
+        While the desired heading is blocked, project it onto the contact
+        surface (keep the wall-parallel component) and continue; re-try
+        the original heading every micro-step and resume it the moment it
+        is free. ``settings.direction`` is not modified.
+        """
+        min_step = 1.0 / self.settings.gameSize
+        if lim < min_step:
+            return
+        v0 = (dx, dy)
+        v = v0
+        sliding = False
+        remaining = lim
+        max_iters = 4 * math.ceil(lim / min_step)
+        stalled = 0
+        for _ in range(max_iters):
+            if remaining < min_step:
+                return
+            px = self.settings.agent_x
+            py = self.settings.agent_y
+            if sliding:
+                # Two-step look-ahead: a single free micro-step along v0
+                # can be a numerical drift off a face, which would false-
+                # resume, re-deflect, and eat the remaining budget. After
+                # a real corner exit, several steps along v0 are free.
+                if (
+                    self.full_wall_check(
+                        px + min_step * v0[0], py + min_step * v0[1]
+                    )
+                    and self.full_wall_check(
+                        px + 2 * min_step * v0[0], py + 2 * min_step * v0[1]
+                    )
+                ):
+                    v = v0
+                    sliding = False
+            nx = px + min_step * v[0]
+            ny = py + min_step * v[1]
+            if self.full_wall_check(nx, ny):
+                self.settings.agent_x = nx
+                self.settings.agent_y = ny
+                remaining -= min_step
+                stalled = 0
+                continue
+            wall = self._first_blocking_wall(nx, ny)
+            if wall is None:
+                return
+            n = self._contact_normal(px, py, wall)
+            if n is None:
+                return
+            vdotn = v[0] * n[0] + v[1] * n[1]
+            v_new = (v[0] - vdotn * n[0], v[1] - vdotn * n[1])
+            speed = math.sqrt(v_new[0] ** 2 + v_new[1] ** 2)
+            if speed < 1e-6:
+                return
+            v_unit = (v_new[0] / speed, v_new[1] / speed)
+            if v_unit[0] * v[0] + v_unit[1] * v[1] <= 1e-9:
+                return
+            # Already sliding (projection didn't turn us) but the next
+            # micro-step still overlaps -- float drift into the surface.
+            # Nudge outward along the contact normal so the tangent walk
+            # can continue; do not tax remaining (speed is ~1).
+            if speed >= 1.0 - 1e-6:
+                qx = px + 0.5 * min_step * n[0]
+                qy = py + 0.5 * min_step * n[1]
+                if self.full_wall_check(qx, qy):
+                    self.settings.agent_x = qx
+                    self.settings.agent_y = qy
+                    stalled = 0
+                    continue
+                stalled += 1
+                if stalled >= 4:
+                    return
+                continue
+            remaining *= speed
+            v = v_unit
+            sliding = True
+            stalled += 1
+            if stalled >= 4:
+                return
+
     # CONVENTION: world coordinates are y-UP (larger y = higher on the
     # presented screen; the flip to pygame's y-down surface happens once at
     # presentation). 'direction' theta is a COMPASS BEARING: theta=0 points
@@ -351,17 +462,21 @@ class discreteGame:
     def stepForward(self, lim=None):
         if lim is None:
             lim = 1.0/16 # big enough for most pixelations, small enough to make gameSize 800 interesting.
-        stepSize = self.biggest_step(lim, lambda step : (self.settings.agent_x + step*math.sin(self.settings.direction), self.settings.agent_y + step*math.cos(self.settings.direction)))
-        self.settings.agent_x += stepSize*math.sin(self.settings.direction)
-        self.settings.agent_y += stepSize*math.cos(self.settings.direction)
+        self._slide_move(
+            math.sin(self.settings.direction),
+            math.cos(self.settings.direction),
+            lim,
+        )
         return self.universal_update() # returns the gold collected this step.
-    
+
     def stepBackward(self, lim=None):
         if lim is None:
             lim = 1.0/16 # big enough for most pixelations, small enough to make gameSize 800 interesting.
-        stepSize = self.biggest_step(lim, lambda step : (self.settings.agent_x - step*math.sin(self.settings.direction), self.settings.agent_y - step*math.cos(self.settings.direction)))
-        self.settings.agent_x -= stepSize*math.sin(self.settings.direction)
-        self.settings.agent_y -= stepSize*math.cos(self.settings.direction)
+        self._slide_move(
+            -math.sin(self.settings.direction),
+            -math.cos(self.settings.direction),
+            lim,
+        )
         return self.universal_update()
     
     def swivel_clock(self):
@@ -634,9 +749,13 @@ class discreteGame:
             exit_wall = random.randint(0, 3)
         else:
             exit_wall = -1
+        # When a side has an exit, the gap is at least 1.5x the agent's
+        # width (diameter). A diameter-wide hole is a squeeze; 1.5x lets
+        # the agent walk through without pinning on the jambs.
+        min_opening = 1.5 * (2.0 * self.typical_agent_r)
         for i in range(4):# left wall; top wall; bottom wall; right wall
             if i == exit_wall:
-                longside = 0.5 - self.typical_agent_r
+                longside = 0.5 - min_opening / 2.0
             else:
                 longside = 1.0
             wall_theta = 0
@@ -661,10 +780,10 @@ class discreteGame:
             if i == exit_wall:
                 if isHorizontal:
                     wall_y2 = wall_y
-                    wall_x2 = longside + 2*self.typical_agent_r
+                    wall_x2 = longside + min_opening
                 else:
                     wall_x2 = wall_x
-                    wall_y2 = longside + 2*self.typical_agent_r
+                    wall_y2 = longside + min_opening
                 walls.append([wall_x2, wall_y2, wall_w, wall_h, wall_theta])
         return walls
 

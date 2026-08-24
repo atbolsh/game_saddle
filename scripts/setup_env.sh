@@ -98,6 +98,13 @@ mkdir -p "${REPO_ROOT}/weights"
 log "ensuring game-trace directory exists: ${REPO_ROOT}/data_game"
 mkdir -p "${REPO_ROOT}/data_game"
 
+# Per-run logs, DB dumps, train/datagen dirs (agent.run_logging, TrainLogger,
+# neo4j_db.sh save logs/...). Created lazily on first use too, but pre-creating
+# it here matches weights/ and data_game/ and lets a dump land before any run.
+# -p honors a symlink onto removable storage.
+log "ensuring log directory exists: ${REPO_ROOT}/logs"
+mkdir -p "${REPO_ROOT}/logs"
+
 # ------------------------------------------------ 5. external replay datasets
 # Materialize the replay datasets described in training/datasets.json into
 # data_external/ (gitignored; on the owner's local box it is a symlink onto
@@ -152,4 +159,4 @@ log "NOTE: this script sets up the PYTHON environment only. Neo4j is a separate"
 log "server and is NOT started here. Bring it up next, THEN seed:"
 log "  bash scripts/vast_neo4j_launch.sh          # install + start Neo4j (+ APOC, .env)"
 log "  python scripts/neo4j_connect_diagnostic.py # verify connectivity (optional)"
-log "  python -m agent.runner seed                # seed the semantic model"
+log "  python -m agent.runner seed                # seed entities + tips (incl. core prompt tips)"

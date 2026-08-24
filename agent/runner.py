@@ -123,7 +123,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    p_seed = sub.add_parser("seed", help="Seed the NAMS long-term semantic model (run once).")
+    p_seed = sub.add_parser(
+        "seed",
+        help="Seed the NAMS long-term semantic model (entities, legacy "
+             "tips, and core_player_*/core_analyst_* prompt tips). Run once.",
+    )
     p_seed.set_defaults(func=_cmd_seed)
 
     p_link = sub.add_parser(

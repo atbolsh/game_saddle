@@ -78,7 +78,14 @@ flowchart TD
   `BoundaryWall`, `DiscreteGame`, `Direction`) and preferences / tips
   (controls, geometry, goal, facing/distance/overshoot heuristics). We add
   these manually so NAMS needs **no LLM provider** (no `llm=` is passed),
-  keeping the whole stack local.
+  keeping the whole stack local. Scene-play / scene-analyst / debrief
+  system messages are a short role statement plus a labeled dump of
+  numbered `core_player_*` / `core_analyst_*` Preference rows (exact
+  category fetch, category-sort; not a reconstructed `SYSTEM_PROMPT_*`
+  blob). The code seed in `agent/modes.py` is written at `seed` /
+  `reset_memory_to_seed`; session load is read-only from NAMS (500+
+  extras included if present). Analyst rows are stored `[ANALYST]`-tagged
+  so they cannot leak into player context.
 * **`GameSnapshot` (custom)** — written via `client.graph.execute_write`
   (bolt-only). Holds the filesystem `path`, `width`, `height`, a 64×64
   base64 PNG `thumbnail_b64`, and the full `settings_json`. Linked to the
@@ -321,16 +328,12 @@ E4B); the wider 2026-07 candidate field, and why it lost, is recorded in
 `MODEL_CANDIDATES.md`.
 
 * **`notebooks/play.ipynb`** — interactive mode-1 play. It holds **one
-  persistent game** and **one conversation thread**. Asking the agent to play
-  starts a **multi-move turn**: it sees the *current* live frame plus its
-  (settings-stripped) memory context and emits a move token (`[CLOCK]`,
-  `[ANTICLOCK]`, `[FORWARD]`). Generation is stopped early the instant that token
-  appears (HF `stop_strings`), the move is applied, and — because a move does
-  *not* end the turn — the board is re-rendered and fed back so it keeps moving
-  (`[CLOCK] [CLOCK] [FORWARD] ...`). The turn ends when the agent finishes a
-  reply without a move token (Gemma's native `<end_of_turn>`), collects the gold,
-  or hits the step cap (`MAX_SOLVE_STEPS`). You watch every intermediate frame
-  and move live. A
+  persistent game** and **one conversation thread**. One click is **one
+  generation**: the agent sees the *current* live frame plus its
+  (settings-stripped) memory context and emits at most one move token
+  (`[CLOCK]`, `[ANTICLOCK]`, `[FORWARD]`). Generation is stopped early the
+  instant that token appears (HF `stop_strings`) and the move is applied.
+  Ask again for the next move. A
   **"Restart conversation"** button re-initializes the env (a fresh bare level)
   and starts a new `session_id`. To discard an unwanted conversation and get
   back to the "semantic seeding only" state, either run the notebook's gated
@@ -340,6 +343,12 @@ E4B); the wider 2026-07 candidate field, and why it lost, is recorded in
   which runs the async NAMS client on a background event loop so the
   synchronous ipywidgets buttons can drive it. The mode-1 privacy invariant
   holds: the Settings dict is never fed to the model here.
+
+* **`notebooks/debrief.ipynb`** — privileged post-game analysis. The analyst
+  rubric matches self-eval (`RATING: -1.0..1.0`, `WRONG` spans, target /
+  openings / `[END_GAME]`), plus navigation (`[SHOW]` / `[NEXT]` / `[BACK]`),
+  search, and tip tools. Old recordings may still contain reflection
+  messages; new play sessions do not produce them.
 
 * **`notebooks/visualize_memory.ipynb`** — an interactive view of the memory
   graph via [`pyvis`](https://pyvis.readthedocs.io/). Pan/zoom/drag through all
@@ -507,10 +516,13 @@ has the high-res frame on disk for re-feeding into the model.
 ## Notes / limitations
 
 * Only **bare levels** (4 boundary walls + 1 gold piece, via
-  `random_bare_settings`) are generated for now. Generalisation to
-  interior walls / multi-gold is tracked in `FUTURE_GOALS.md`.
-* Only **image + text** modalities of the Gemma 4 models are used. Audio
-  and video are tracked in `FUTURE_GOALS.md`.
+  `random_bare_settings`) are generated for **datagen**. A notebook-only
+  multi-gold / openings variant lives in `notebooks/multi_gold_eval.ipynb`
+  (see `FUTURE_GOALS.md` goal 2).
+* The agent loop uses **image + text**. Audio/video comprehension is
+  measurable with `python -m training.eval_av <checkpoint>` (LibriSpeech
+  WER + NExT-QA); training-side KD replay is still future
+  (`FUTURE_GOALS.md` goal 3).
 * **Automatic finetuning dataset generation** from mode 1 + mode 3 is a
   future objective, not implemented here; see `FUTURE_GOALS.md`.
 * The project is **local bolt-only by design**: there is no plan to add
@@ -527,11 +539,12 @@ agent/
   config.py          # env-driven AgentConfig
   model.py           # model registry + family adapters + VLModel wrapper (incl. generate_batch)
   parallel_gen.py    # cross-thread generation batching (dispatcher + session proxy)
-  game_io.py         # bare level gen, Settings <-> dict, render to PNG, apply_action
+  game_io.py         # bare level gen, Settings <-> dict, render to PNG, apply_action; multi-gold factory + openings oracle
   image_store.py     # disk PNG + 64x64 thumbnail b64 + GameSnapshot node + linking
   memory.py          # NAMS MemoryClient factory; context stripping; semantic-model seed; DB dump
   modes.py           # mode_game / mode_discuss / mode_self_eval
   interactive.py     # InteractiveSession: persistent-game mode-1 for notebooks
+  multi_gold_session.py  # MultiGoldSelfEvalSession (notebook-only; 0–3 golds, openings, [END_GAME])
   run_logging.py     # per-run LLM-call + DB-retrieval logs (on by default)
   runner.py          # CLI
 training/
@@ -543,6 +556,7 @@ training/
   synth_navigation.py       # seeded generator: clock/compass/bearing problems + probe
   probes.py          # exact-match capability probes (GSM8K, navigation) + guards
   generate_self_distill.py  # optional: regenerate replay targets with the base model
+  eval_av.py         # audio/video comprehension: named checkpoint vs frozen Gemma 4 12B base
   generate_game_traces.py   # headless self-eval datagen -> data_game/<label>/
   game_traces.py     # GameTraceSource (traces -> REINFORCE-weighted examples) + AnalystTraceSource (KD anchor)
   planted_errors.py  # planted-error scrambler (labeled corruptions; not hooked up)
@@ -560,6 +574,7 @@ data_game/           # generated self-eval game traces + frames (git-ignored; se
 notebooks/
   play.ipynb            # interactive mode-1 play (Ask + Restart conversation)
   interactive_self_eval.ipynb # player/analyst two-phase loop (mode 3)
+  multi_gold_eval.ipynb     # multi-gold / openings self-eval (notebook-only)
   debrief.ipynb         # privileged post-game debrief (mode 4)
   trace_viewer.ipynb    # step through recorded datagen traces (no GPU/NAMS)
   noise_tuner.ipynb     # tune image-noise magnitudes by eye (no GPU/NAMS)
