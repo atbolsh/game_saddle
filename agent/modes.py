@@ -178,7 +178,9 @@ def _block_aim_tolerance_review(tolerance: str, target: str) -> str:
         f"Judge the play against it: a {_TOK_FORWARD} emitted while {target} was "
         "within roughly 20 degrees of the facing direction follows instructions "
         "and must not be penalized as imprecise aim; conversely, long "
-        "rotate-only fine-tuning inside that tolerance goes against them."
+        "rotate-only fine-tuning inside that tolerance goes against them. "
+        "Measure those 20 degrees from YOUR computed |delta|, never from the "
+        "player's 'about 30 degrees' or 'within aim tolerance' claim."
     )
 
 
@@ -204,6 +206,12 @@ _BLOCK_GRADING_TOLERANCE = (
     "direction words are simply correct -- do not mark them WRONG at all. "
     "If the chosen move was incorrect, DO mark the direction words that "
     "led to it as wrong.\n"
+    "That 2-clock-hour band is ONLY about OBS wording. It is not a "
+    "60-degree FORWARD cone and it does not excuse a wrong token. "
+    f"{_TOK_FORWARD} is allowed only when YOUR |delta| is within about 20 "
+    "degrees (about 0.35 rad, 0.67 clock hours). A player who says "
+    "'about 30 degrees off, so within aim tolerance' has failed that "
+    "test -- mark the move, not the wording band.\n"
     "Two cases ARE clear-cut, and in both the overall RATING must be "
     "NEGATIVE no matter how sound the rest of the reply reads:\n"
     "  - MISSED FORWARD: the gold lies within about 10 degrees of the "
@@ -941,7 +949,9 @@ _BLOCK_REVIEWER_STANCE = (
     "materials in your context and from the tools below. The user may say "
     "'you' meaning the player -- do not get defensive, and NEVER claim you "
     "lack access to the play: retrieve the recorded material with a tool "
-    "instead."
+    "instead. You are scoring a recorded reply, not continuing the play: do "
+    "not default to the same move or the same left/right story the player "
+    "just gave."
 )
 
 _BLOCK_PRIVILEGED_VIEW = (
@@ -1011,6 +1021,23 @@ _BLOCK_GEOMETRY_PRIVILEGED = (
     f"  - The {_TOK_CLOCK} move INCREASES theta by pi/30 (6 degrees) and rotates "
     f"clockwise on screen; {_TOK_ANTICLOCK} decreases theta. One {_TOK_FORWARD} "
     "advances up to 1/16 of the board along the facing direction."
+)
+
+# Analyst-only: the shared network will try to *be the player* in the
+# grader seat (2026-08-24 trace audit: atan2 was often right, then the
+# writeup adopted the player's left/right / "close enough, FORWARD").
+_BLOCK_TRUST_THE_MATH = (
+    "TRUST THE MATH, NOT THE PLAYER: you share weights with the player and "
+    "will feel the same reflexes -- 'to the left,' 'I'm basically aimed,' "
+    "forward. Ignore them. After you compute theta, theta_target, and delta "
+    "from the GEOMETRY recipe, those numbers are the verdict. The player's "
+    "OBS and REASONING are claims to grade, not hints to follow. If your "
+    "delta says CLOCKWISE and they wrote 'to the left' or emitted "
+    f"{_TOK_ANTICLOCK}, they are wrong -- including across the 12 o'clock "
+    "seam (facing 11 o'clock with the gold at 12 o'clock is a short "
+    "CLOCKWISE turn, not 30 degrees to the left). Do not write a second "
+    "player-style justification for their token. A fluent reply that "
+    "disagrees with your delta is still a bad reply."
 )
 
 _BLOCK_DEBRIEF_RECORD = (
@@ -1308,6 +1335,7 @@ CORE_ANALYST_TIPS: list[tuple[str, str]] = [
     ("core_analyst_010_privileged_view", _BLOCK_PRIVILEGED_VIEW),
     ("core_analyst_020_debrief_record", _BLOCK_DEBRIEF_RECORD),
     ("core_analyst_030_geometry", _BLOCK_GEOMETRY_PRIVILEGED),
+    ("core_analyst_035_trust_the_math", _BLOCK_TRUST_THE_MATH),
     ("core_analyst_040_target_grading", _BLOCK_TARGET_GRADING),
     ("core_analyst_050_openings", _BLOCK_OPENINGS_PRIVILEGED),
     ("core_analyst_060_end_game_grading", _BLOCK_END_GAME_GRADING),
