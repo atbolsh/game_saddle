@@ -2,26 +2,23 @@
 #
 # setup_env.sh -- one-shot Python environment setup for game_saddle.
 #
-# `pip install -r requirements.txt` is necessary but NOT sufficient: NAMS'
-# default entity-extraction pipeline runs spaCy then GLiNER on every message it
-# stores, and both need model *weights* that pip cannot install:
+# `pip install -r requirements.txt` is necessary but NOT sufficient: spaCy
+# and GLiNER need model *weights* that pip cannot install:
 #   * spaCy needs a language model downloaded via `python -m spacy download ...`.
 #   * GLiNER lazily fetches its weights from HuggingFace on first use; we
-#     pre-fetch them here so the first run isn't a surprise network stall and so
-#     an offline/gated box fails loudly at setup time instead of mid-game.
+#     pre-fetch them here so a later extraction re-enable isn't a surprise
+#     network stall, and so an offline/gated box fails loudly at setup.
 #
-# Without this step you get, on every stored message:
-#   Stage 'SpacyEntityExtractor' failed: spaCy is required for SpacyEntityExtractor.
-#   Stage 'GLiNEREntityExtractor' failed: GLiNER is required for GLiNEREntityExtractor.
+# Auto-NER is currently OFF (`ExtractorType.NONE` in agent/memory.py).
+# Keeping the downloads is cheap and leaves the extractors importable.
 #
 # Safe to re-run (pip + the downloaders are all idempotent).
 #
 # Usage:
 #   bash scripts/setup_env.sh
 #
-# Env overrides (defaults match NAMS' ExtractionConfig defaults, i.e. what the
-# agent actually loads at runtime -- keep them in sync if you change the NAMS
-# config):
+# Env overrides (NAMS ExtractionConfig defaults, used if extraction is
+# re-enabled -- keep them in sync with agent/memory.py if you change models):
 #   SPACY_MODEL     (default en_core_web_sm)
 #   GLINER_MODEL    (default urchade/gliner_medium-v2.1)
 #   SKIP_TORCH      (unset)  -- if set, do NOT let requirements.txt pull torch;
@@ -148,7 +145,7 @@ from neo4j_agent_memory.extraction import SpacyEntityExtractor, GLiNEREntityExtr
 print("[setup-env] spaCy model loads and NAMS extractors import OK.", flush=True)
 PY
 
-log "done. Extraction (spaCy -> GLiNER) is ready; runs will auto-discover entities."
+log "done. spaCy/GLiNER weights cached (auto-NER is off; see agent/memory.py)."
 log ""
 log "NOTE: credentials/config live in ${REPO_ROOT}/.env (cp .env.example .env)."
 log "Every Python entry point -- this script's downloads, the runner, and the"

@@ -78,7 +78,8 @@ flowchart TD
   `BoundaryWall`, `DiscreteGame`, `Direction`) and preferences / tips
   (controls, geometry, goal, facing/distance/overshoot heuristics). We add
   these manually so NAMS needs **no LLM provider** (no `llm=` is passed),
-  keeping the whole stack local. Scene-play / scene-analyst / debrief
+  keeping the whole stack local. Auto-NER is off (`ExtractorType.NONE`);
+  messages do not mint Entity nodes. Scene-play / scene-analyst / debrief
   system messages are a short role statement plus a labeled dump of
   numbered `core_player_*` / `core_analyst_*` Preference rows (exact
   category fetch, category-sort; not a reconstructed `SYSTEM_PROMPT_*`
@@ -118,11 +119,11 @@ sees Settings.
 ## Setup
 
 1. **Python deps.** Use the setup script — it runs `pip install` **and**
-   downloads the entity-extraction model weights that pip can't
-   (spaCy's `en_core_web_sm` and GLiNER's weights). NAMS runs a spaCy → GLiNER
-   extraction pipeline on every stored message, so without these you'll see
-   `Stage 'SpacyEntityExtractor' failed` / `Stage 'GLiNEREntityExtractor'
-   failed` on every run and no entities get auto-discovered:
+   downloads spaCy's `en_core_web_sm` and GLiNER's weights (pip cannot).
+   Auto-NER is currently **off** (`ExtractorType.NONE` in
+   `agent.memory.make_memory_settings`); the long-term graph is the five
+   seeded entities plus Preference rows. The weights stay in the setup so
+   a later re-enable does not stall mid-run:
 
    ```bash
    bash scripts/setup_env.sh
@@ -525,6 +526,8 @@ has the high-res frame on disk for re-feeding into the model.
   (`FUTURE_GOALS.md` goal 3).
 * **Automatic finetuning dataset generation** from mode 1 + mode 3 is a
   future objective, not implemented here; see `FUTURE_GOALS.md`.
+* **Deliberate agent-saved memory** (commit a novel in-game object to
+  keep) is future; auto-NER is off (`FUTURE_GOALS.md` goals 8 and 12).
 * The project is **local bolt-only by design**: there is no plan to add
   the hosted NAMS service or any external API key.
 * The game package (`game/discreteEngine.py`, `game/levels/skeleton.py`)

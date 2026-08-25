@@ -25,7 +25,7 @@ Stage map (rationale in the Intermission plan):
 
   * t0-env      imports + versions + CUDA + bitsandbytes; NAMS
                 add_preference text round-trip (byte identity)
-  * t1-pure     parse_rating, the shape/scale reward split
+  * t1-pure     parse_rating, ExtractorType.NONE, the shape/scale reward split
                 (rating_advantage / example_scale / build_span_weights),
                 oracle_verdict + _oracle_meta geometry, image noise,
                 tripwire, _rewrite_image_urls, Game/PlayerAnchor/Analyst
@@ -245,6 +245,7 @@ def t1_pure() -> str:
     from agent.memory import (
         ANALYST_TAG,
         is_analyst_text,
+        make_memory_settings,
         strip_analyst_lines,
         tag_analyst_text,
     )
@@ -289,6 +290,14 @@ def t1_pure() -> str:
     )
 
     checks = 0
+
+    # ---- NAMS extraction is off (ExtractorType.NONE); junk NER must not
+    # mint Entity nodes from OBS/LaTeX. spaCy/GLiNER weights still install.
+    ext = make_memory_settings().extraction
+    kind = getattr(ext.extractor_type, "value", ext.extractor_type)
+    assert str(kind).lower() == "none", ext.extractor_type
+    assert ext.enable_llm_fallback is False
+    checks += 1
 
     # ---- parse_rating: plain, bold variants, last-wins, clamp, absent,
     # leading [ANALYST] (the model sometimes emits the persistence tag)

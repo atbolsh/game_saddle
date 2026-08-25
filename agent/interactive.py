@@ -317,12 +317,13 @@ class InteractiveSession:
         ``add_semantic_relationships`` relies on) plus every ``Preference``
         node (seed prefs AND learned tips).
 
-        EXTRACTED entities are deleted too (2026-08-11): NAMS's entity
-        extraction mints ``Entity`` nodes from every stored message, and
-        the old blanket ``n:Entity`` exemption let them pile up through
-        every reset -- the aug6 11-epoch run accumulated ~33k junk
-        entities (vs 5 seed ones) that competed with the seed model in
-        semantic retrieval and never got cleared.
+        EXTRACTED entities are deleted too (2026-08-11): older graphs may
+        still hold spaCy/GLiNER-minted ``Entity`` nodes from before
+        extraction was disabled (``ExtractorType.NONE``, 2026-08-25). The
+        old blanket ``n:Entity`` exemption let them pile up through every
+        reset -- the aug6 11-epoch run accumulated ~33k junk entities (vs
+        5 seed ones) that competed with the seed model in semantic
+        retrieval and never got cleared.
 
         This restores the graph to the "semantic seeding only" state -- the
         status quo ante of a fresh box right after ``seed`` + ``link``. Use it

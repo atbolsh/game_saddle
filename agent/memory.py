@@ -33,24 +33,20 @@ logger = logging.getLogger(__name__)
 
 def make_memory_settings(cfg: AgentConfig | None = None):
     """Build a NAMS ``MemorySettings`` for the bolt backend."""
-    from neo4j_agent_memory import ExtractionConfig, MemorySettings  # local import for cost
+    from neo4j_agent_memory import (  # local import for cost
+        ExtractionConfig,
+        ExtractorType,
+        MemorySettings,
+    )
 
     cfg = cfg or CONFIG
-    # NAMS' default extraction pipeline has an optional "LLM fallback" stage
-    # that defaults to the ``openai`` provider. With ``llm=None`` (our design)
-    # NAMS still *tries* to build it, fails to find an adapter, and logs a
-    # noisy "LLM extractor not available, skipping ... provider 'openai'"
-    # warning on every connect. We never want a cloud LLM here (the local
-    # registry model does generation, not NAMS extraction), so disable
-    # the fallback explicitly: extraction stays fully local (spaCy / GLiNER /
-    # sentence-transformers) and the warning goes away -- no openai/litellm
-    # extra needs installing.
-    #
-    # The spaCy + GLiNER stages ARE enabled (NAMS defaults) so entities are
-    # auto-discovered from messages during runs. Those two stages need their
-    # packages AND model weights installed -- run ``scripts/setup_env.sh`` (not
-    # just ``pip install -r requirements.txt``), or every stored message logs
-    # "Stage 'SpacyEntityExtractor'/'GLiNEREntityExtractor' failed".
+    # Auto-NER is OFF. spaCy/GLiNER on geometry/clock-face/LaTeX prose minted
+    # ~2 junk Entity nodes per generation (FUTURE_GOALS goal 8 census); the
+    # long-term graph is the five seeded entities + Preferences, written
+    # explicitly. ``enable_llm_fallback=False`` is belt-and-suspenders with
+    # ``llm=None`` (NAMS otherwise tries an openai adapter on connect and
+    # warns). spaCy/GLiNER weights still download via setup_env.sh so a
+    # later re-enable does not stall mid-run.
     return MemorySettings(
         backend="bolt",
         neo4j={
@@ -60,9 +56,10 @@ def make_memory_settings(cfg: AgentConfig | None = None):
             "database": cfg.neo4j_database,
         },
         embedding=cfg.embedding_model,
-        # No llm= -> we skip LLM-driven entity extraction and add entities
-        # manually. This keeps the whole system local / API-key-free.
-        extraction=ExtractionConfig(enable_llm_fallback=False),
+        extraction=ExtractionConfig(
+            extractor_type=ExtractorType.NONE,
+            enable_llm_fallback=False,
+        ),
     )
 
 

@@ -214,39 +214,33 @@ already batches, but the trace format assumes one reply per round).
 Prerequisite: a reward cheaper than the full analyst call per sample, or
 K analyst calls accepted as the price.
 
-## 8. NAMS entity-extraction pollution + retrieval value — *Not started*
+## 8. NAMS entity-extraction pollution — *Done* (2026-08-25)
 
 **2026-08-13 finding (July session dumps + aug11/aug12 reset censuses):**
-NAMS runs spaCy NER over every message, and spaCy on geometry/clock-face
-prose produces steady junk entities: `~118 degrees` as a Person, `CLOCK` /
+NAMS ran spaCy NER over every message, and spaCy on geometry/clock-face
+prose produced steady junk entities: `~118 degrees` as a Person, `CLOCK` /
 `CLOCKWISE` / `~4:20` as Organizations, `\approx` / `OBS` / `AI` as
 Geopolitical Locations, `radians` as an Organization+Group, LaTeX sliced
 mid-expression (`\text{atan2}(-0.0204` as an Organization), clock-position
 phrases (`4:18 o'clock`) as Event+Time. Volume: ~6,000 junk entities per
 60-game datagen epoch (~3.5–4k `Entity+Object`, ~1.9k `Entity+Event+Time`,
 ~130 Person / ~150 Organization / ~110 Location), roughly 2 per
-generation. Character: almost all are single-mention orphans (~1
+generation. Character: almost all were single-mention orphans (~1
 `MENTIONS` edge each — unique numeric strings, not shared references),
-and where strings DO repeat, resolution fails to merge case/label
+and where strings DID repeat, resolution failed to merge case/label
 variants (4 `agent` nodes shadowing the seeded semantic `Agent`; `OBS`
-under two label sets). Everything sits at spaCy's default ~0.85
-confidence, so thresholding is not a lever. The datagen run-start hygiene
-reset already deletes all of it (census lines in the weekend logs), so
-this is contained-per-run pollution, not accumulating pollution.
+under two label sets). Everything sat at spaCy's default ~0.85
+confidence, so thresholding was not a lever.
 
-When picked up, in order of leverage:
+**Done:** `make_memory_settings` sets `extractor_type=ExtractorType.NONE`
+(and `enable_llm_fallback=False`). Messages are stored without auto-NER;
+the long-term graph is the five seeded entities plus Preference rows.
+spaCy/GLiNER weights still download via `scripts/setup_env.sh` so a later
+re-enable does not stall mid-run. `reset_memory_to_seed` still purges
+leftover extracted `Entity` nodes from older graphs.
 
-* **kill it at the source, not at reset time**: disable or restrict
-  NAMS's NER extraction for game-session messages (NAMS extraction
-  config — not this repo's code);
-* **measure retrieval value first**: the pollution's practical cost is
-  the entity tier serving `~4:20 (Organization)` to a semantic query
-  about clock bearings mid-run. Datagen traces already record every
-  `[SEARCH]` call and its results (`searches` in the trace meta), so
-  "is NAMS pulling its weight" is answerable offline before changing
-  anything — that reading should gate how much effort the rest gets;
-* **resolution case/label merging** is real but minor (dozens of nodes,
-  not thousands).
+Do not turn extraction back on as the discovery path for novel in-game
+objects — that is goal 12. Reasoning traces are unchanged.
 
 ## 9. Debrief notepad injection — *Not started*
 
@@ -305,3 +299,33 @@ The remaining work is the writing tool itself.
 
 Trigger to pick it up: player-written `tip_learned_*` tips seeing real
 use (2026-08-19 discussion).
+
+## 12. Deliberate agent-saved memory — *Not started*
+
+Auto-NER is off (goal 8). The session notepad (`[REMEMBER key: …]`) is
+session-scoped, exact-keyed, and unembedded — it never enters
+`get_context` similarity recall. Future tasks will introduce unseen
+in-game objects; the player must be able to **commit** a fact to
+preserve it, and those writes should be gradeable and schedulable into
+training.
+
+Do not turn spaCy/GLiNER extraction back on as the discovery path.
+Novel objects appear on the **frame** first; NAMS extraction only reads
+**message text**, and a malleable GLiNER schema only lists *kinds*, not
+instances. The house pattern is already `[REMEMBER target:]`: a
+parseable token in the reply, the harness writes an exact row, the
+analyst grades it against Settings.
+
+When picked up:
+
+* a parseable write token in the same family as `[REMEMBER]` (the
+  **tool**, not the model, assigns the graph key — same rule as goal 11
+  for tips);
+* persist via `long_term.add_entity` when the fact should survive
+  sessions and be `[SEARCH]`-able; keep `SessionNote` for this-game
+  scratchpad. Preferences stay tips, not objects;
+* type catalog stays code-seeded (new *kinds* are a seed/schema edit);
+  new *instances* are saves;
+* training is the REMEMBER path: the write is in the reply, the analyst
+  has Settings/oracle, WRONG/RATING on the span, traces become the
+  rows. Unverified NER nodes must not become CE/KD data.
