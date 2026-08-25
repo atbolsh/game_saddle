@@ -1263,6 +1263,23 @@ _BLOCK_TARGET_GRADING = (
     "part of the reply is perfect."
 )
 
+_BLOCK_TARGET_LINE = (
+    "TARGET LINE: after you have mapped the player's committed target "
+    "onto ONE object in the settings JSON (WHICH THING IS THE PLAYER "
+    "CHASING), declare that object on its own line. The lists are the "
+    "JSON keys 'gold' and 'openings'; the index is 0-based into that "
+    "list, in the order printed in the settings. Canonical forms -- "
+    "copy the shape:\n"
+    "TARGET: gold, 0\n"
+    "TARGET: openings, 1\n"
+    "TARGET: none\n"
+    "Use 'none' only when the settings have no gold and no openings "
+    "(a sealed empty room). If the player named a gold, the kind is "
+    "gold; if an opening, exit, or gap, the kind is openings. Emit "
+    "exactly one TARGET line per analysis, on its own line, before "
+    "the RATING line. Do not invent an index that is not in the list."
+)
+
 _BLOCK_OPENINGS_PRIVILEGED = (
     "OPENINGS: in this variant the settings JSON includes an 'openings' "
     "key -- the continuous stretches of the room boundary NOT covered "
@@ -1270,14 +1287,15 @@ _BLOCK_OPENINGS_PRIVILEGED = (
     "('left'/'right'/'top'/'bottom'), its two endpoints ('from', 'to'), "
     "its 'center' [x, y], and its 'width'. When NO gold remains in the "
     "settings, the correct play is to leave through an opening: treat "
-    "the nearest opening's 'center' exactly as you would treat a "
-    "gold's coordinates -- compute the bearing to it with the same "
-    "atan2 recipe, decide the shorter rotation with the same delta "
-    "rule, and grade the player's move against that. The missed-forward "
-    "and wrong-direction rules apply to that opening's center, not to "
-    "a gold. A player that rotates or walks away from every opening in "
-    "an empty room is making a real mistake; a player that aims at a "
-    "gap and steps FORWARD through it is playing correctly."
+    "the TARGET line's opening (that list index's 'center') exactly as "
+    "you would treat a gold's coordinates -- compute the bearing to it "
+    "with the same atan2 recipe, decide the shorter rotation with the "
+    "same delta rule, and grade the player's move against that. The "
+    "missed-forward and wrong-direction rules apply to that opening's "
+    "center, not to a gold. A player that rotates or walks away from "
+    "every opening in an empty room is making a real mistake; a player "
+    "that aims at a gap and steps FORWARD through it is playing "
+    "correctly."
 )
 
 _BLOCK_END_GAME_GRADING = (
@@ -1348,6 +1366,7 @@ CORE_ANALYST_TIPS: list[tuple[str, str]] = [
     ("core_analyst_030_geometry", _BLOCK_GEOMETRY_PRIVILEGED),
     ("core_analyst_035_trust_the_math", _BLOCK_TRUST_THE_MATH),
     ("core_analyst_040_target_grading", _BLOCK_TARGET_GRADING),
+    ("core_analyst_045_target_line", _BLOCK_TARGET_LINE),
     ("core_analyst_050_openings", _BLOCK_OPENINGS_PRIVILEGED),
     ("core_analyst_060_end_game_grading", _BLOCK_END_GAME_GRADING),
     ("core_analyst_070_aim_tolerance_review", _BLOCK_AIM_TOLERANCE_REVIEW),
@@ -1545,7 +1564,7 @@ def _without_analyst_line_tags(text: str) -> str:
     """Strip a leading ``[ANALYST]`` tag from each line, if present.
 
     The model sometimes emits the persistence tag itself. Line-start
-    extractors (RATING / WRONG / TIP) must not fail because of it.
+    extractors (RATING / WRONG / TIP / TARGET) must not fail because of it.
     Lines without the tag are unchanged. Delegates to
     :func:`agent.memory.untag_analyst_text` so tagging and parsing share
     one strip rule.
@@ -1623,6 +1642,41 @@ def parse_rating(analysis: str) -> float | None:
     if not matches:
         return None
     return max(-1.0, min(1.0, float(matches[-1])))
+
+
+# Analyst TARGET line: "TARGET: gold, 0" / "TARGET: openings, 1" /
+# "TARGET: none". Last match wins. Index is 0-based into that settings
+# JSON list. Anything else (missing line, bad kind, non-integer) is
+# None -- never guess an object (no-fuzzy-fallbacks).
+TARGET_RE = re.compile(
+    r"(?im)^[^\S\n]*\**[^\S\n]*TARGET[^\S\n]*\**[^\S\n]*:[^\S\n]*\**[^\S\n]*"
+    r"(?:"
+    r"(?P<none>none)"
+    r"|"
+    r"(?P<kind>gold|openings?)"
+    r"[^\S\n]*,[^\S\n]*\[?(?P<index>\d+)\]?"
+    r")"
+    r"[^\S\n]*$"
+)
+
+
+def parse_target(analysis: str) -> dict[str, Any] | None:
+    """Extract the analyst's ``TARGET: gold|openings, <index>`` (or
+    ``TARGET: none``) line. LAST match wins. Returns
+    ``{"kind": "gold"|"openings"|"none", "index": int|None}`` or None
+    when no well-formed line is present. ``opening`` (singular) is
+    accepted as the JSON key ``openings``; any other kind is a parse
+    failure. A leading ``[ANALYST]`` on the line is stripped first."""
+    matches = list(TARGET_RE.finditer(_without_analyst_line_tags(analysis)))
+    if not matches:
+        return None
+    m = matches[-1]
+    if m.group("none"):
+        return {"kind": "none", "index": None}
+    kind = m.group("kind").lower()
+    if kind == "opening":
+        kind = "openings"
+    return {"kind": kind, "index": int(m.group("index"))}
 
 
 def _clean_search_query(query: str) -> str:

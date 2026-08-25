@@ -4,20 +4,21 @@ One "epoch" here is one full expert-iteration cycle. For epoch k (1-based):
 
   1. datagen   ``python -m training.generate_game_traces --label
      <prefix>_iter<k> --parallel <--parallel, default 12> --checkpoint
-     <previous epoch's adapter>`` (``--parallel 1`` restores the fully
-     serial datagen path)
+     <previous epoch's adapter> --multi-gold`` (0–3 golds, openings any;
+     eating gold does not end the game). ``--parallel 1`` restores the
+     fully serial datagen path
   2. train     ``python -m training.run_weekend --train-iter <k>`` -- the
      epoch's GameTraceSource + PlayerAnchorSource (the trust region,
      anchored to the previous epoch's adapter) + AnalystTraceSource plus
      the manifest replay sources, resumed from the previous epoch's
      adapter (epoch 1 starts from bare HF weights unless
      --checkpoint is given).
-  3. smoke eval  8 real games with the FRESH checkpoint through the same
-     datagen path (label ``<prefix>_smoke<k>``, never trained on): win
+  3. smoke eval  8 real **sealed one-gold** games with the FRESH
+     checkpoint through the same generator without ``--multi-gold``
+     (label ``<prefix>_smoke<k>``, never trained on): eat-gold win
      rate, mean/min rating, degeneracy fraction, and mean gold-distance
      delta are logged and stored under ``smoke`` in the state file --
-     every checkpoint gets a game-performance reading even when no
-     further datagen follows it, and a poisoned checkpoint surfaces in
+     comparable to earlier weekends. A poisoned checkpoint surfaces in
      ~15 min. ``grep smoke_eval`` on the run log for the morning review.
   4. prune  after a SUCCESSFUL train, the consumed corpus is tombstoned
      down to a keepsake sample (one won game if any, plus one other
@@ -618,6 +619,10 @@ def _prune_datagen(label: str, seed: int) -> dict | None:
 #: has time to finish, cheap enough to run unconditionally. Poisoned
 #: checkpoints still surface in ~15 min (degeneracy fuse trips after 25
 #: consecutive bad generations, early in the smoke).
+#:
+#: Smoke stays sealed one-gold (no --multi-gold) so eat-gold win rates
+#: stay comparable to earlier weekends. Training datagen passes this.
+DATAGEN_ROOM_FLAG = ["--multi-gold"]
 SMOKE_GAMES = 8
 SMOKE_MAX_GENERATIONS = 400
 SMOKE_QUESTION_RATE = 0.075  # half of datagen's default 0.15
@@ -626,12 +631,12 @@ SMOKE_QUESTION_RATE = 0.075  # half of datagen's default 0.15
 def _smoke_eval(k: int, checkpoint: str | None,
                 args: argparse.Namespace) -> str:
     """Post-train sanity check on epoch k's fresh checkpoint: a tiny run
-    through the REAL datagen path (so the degeneracy fuse and distance
-    recording apply) under the separate label ``<prefix>_smoke<k>`` --
-    smoke traces never enter a training corpus. Returns ``"ok"`` /
-    ``"poisoned"`` (fuse tripped -> stop the run) / ``"failed"`` (crash:
-    a missing reading, logged at ERROR, but NOT a failed epoch -- the
-    checkpoint may still be fine)."""
+    through the REAL generator under the separate label ``<prefix>_smoke<k>``
+    -- smoke traces never enter a training corpus, and they stay sealed
+    one-gold eat-to-win so those win rates stay comparable to earlier
+    weekends. Returns ``"ok"`` / ``"poisoned"`` (fuse tripped -> stop
+    the run) / ``"failed"`` (crash: a missing reading, logged at ERROR,
+    but NOT a failed epoch -- the checkpoint may still be fine)."""
     label = f"{args.prefix}_smoke{k}"
     traces = DATA_GAME_DIR / label / "traces.jsonl"
     cmd = [
@@ -683,7 +688,7 @@ def _datagen(k: int, checkpoint: str | None,
             # Distinct noise/question streams per epoch AND per resume
             # attempt (a replayed stream would revisit the same frames).
             "--seed", str(args.seed + 100 * k + attempt),
-        ]
+        ] + DATAGEN_ROOM_FLAG
         if checkpoint:
             cmd += ["--checkpoint", checkpoint]
         # Existence, not record count: a crash can leave an empty

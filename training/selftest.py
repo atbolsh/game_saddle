@@ -25,18 +25,20 @@ Stage map (rationale in the Intermission plan):
 
   * t0-env      imports + versions + CUDA + bitsandbytes; NAMS
                 add_preference text round-trip (byte identity)
-  * t1-pure     parse_rating, ExtractorType.NONE, the shape/scale reward split
+  * t1-pure     parse_rating, parse_target (TARGET: gold|openings, i /
+                none), ExtractorType.NONE, the shape/scale reward split
                 (rating_advantage / example_scale / build_span_weights),
                 oracle_verdict + _oracle_meta geometry, image noise,
                 tripwire, _rewrite_image_urls, Game/PlayerAnchor/Analyst
                 sources on fabricated dirs (example_weight, oracle
                 modifiers, novelty toggle), epoch_batches bucketing,
                 stack_equal_length, run_weekend --checkpoint (rejects
-                --start-checkpoint / --resume-checkpoint), boundary
+                --start-checkpoint / --resume-checkpoint), datagen
+                --multi-gold vs smoke sealed, boundary
                 openings / multi-gold / END_GAME parse (base class too);
                 universal openings on settings_to_dict; openings JSON
                 backfill; leak scrubber covers openings; END_GAME oracle
-                unknown + action-balance 1.0; unified prompt composition;
+                correct/wrong + action-balance 1.0; unified prompt composition;
                 core-tip numbered categories + labeled dump shape
   * t2-data     manifest loads, per-source counts vs meta.json, probes exist
   * t3-model    4-bit QLoRA load, terminator, CE/KD forward+backward
@@ -47,7 +49,8 @@ Stage map (rationale in the Intermission plan):
   * t4-train    batch-4 vs batch-1 loss parity, CLI smoke train (CE + KD +
                 negative span + image), forced-rollback variant (hard tier)
   * t5-datagen  2 games x 5 moves at --parallel 2: traces, images, stats,
-                plots, tripwire silent
+                plots, tripwire silent (sealed one-gold default; does
+                NOT pass --multi-gold)
   * t6-ab       generate_batch vs generate equivalence, greedy
   * t7-e2e      Game + PlayerAnchor + Analyst sources over t5's output
                 through real train steps
@@ -249,7 +252,7 @@ def t1_pure() -> str:
         strip_analyst_lines,
         tag_analyst_text,
     )
-    from agent.modes import parse_rating, parse_tip_line, parse_wrong_spans
+    from agent.modes import parse_rating, parse_target, parse_tip_line, parse_wrong_spans
     from training.game_traces import (
         ACTION_BALANCE_CAP,
         ADV_CAP,
@@ -271,9 +274,12 @@ def t1_pure() -> str:
     from training.generate_game_traces import (
         PERCEPTION_QUESTION_GROUPS,
         _assert_no_analyst_leak,
+        _multi_gold_stop,
         _oracle_meta,
         _rewrite_image_urls,
         _sample_perception_question,
+        _sealed_empty,
+        build_parser as traces_parser,
     )
     from training.image_noise import make_image_filter, noise_image
     from training.planted_errors import (
@@ -315,6 +321,27 @@ def t1_pure() -> str:
     ]:
         got = parse_rating(text)
         assert got == expected, f"parse_rating({text!r}) = {got}, want {expected}"
+        checks += 1
+
+    # ---- parse_target: gold/openings + 0-based index, none, last-wins,
+    # [ANALYST] prefix, optional brackets; bad kind / missing -> None
+    for text, expected in [
+        ("TARGET: gold, 0", {"kind": "gold", "index": 0}),
+        ("TARGET: openings, 1", {"kind": "openings", "index": 1}),
+        ("TARGET: opening, 2", {"kind": "openings", "index": 2}),
+        ("TARGET: gold, [0]", {"kind": "gold", "index": 0}),
+        ("TARGET: none", {"kind": "none", "index": None}),
+        ("**TARGET:** gold, 0", {"kind": "gold", "index": 0}),
+        ("TARGET: gold, 0\nTARGET: openings, 1",
+         {"kind": "openings", "index": 1}),
+        ("[ANALYST] TARGET: gold, 0", {"kind": "gold", "index": 0}),
+        ("TARGET: golds, 0", None),          # not a JSON key
+        ("TARGET: left, 0", None),
+        ("TARGET: gold", None),              # no index
+        ("no target here", None),
+    ]:
+        got = parse_target(text)
+        assert got == expected, f"parse_target({text!r}) = {got}, want {expected}"
         checks += 1
 
     # ---- parse_wrong_spans: quoted span, unverified kept, [ANALYST] prefix
@@ -397,36 +424,99 @@ def t1_pure() -> str:
         (("CLOCK", "ANTICLOCK", -0.8, False), "wrong"),   # away from gold
         ((None, "FORWARD", 0.0, True), "unknown"),        # perception round
         (("CLOCK", None, None, None), "unknown"),         # pre-oracle corpus
-        (("END_GAME", "FORWARD", 0.0, True), "unknown"),  # not a board move
+        (("END_GAME", "FORWARD", 0.0, True), "wrong"),    # quit while gold remains
+        (("END_GAME", "END_GAME", None, False), "correct"),  # sealed empty
+        (("FORWARD", "END_GAME", None, False), "wrong"),  # should have quit
+        ((None, "END_GAME", None, False), "unknown"),     # perception on empty
     ]:
         got = oracle_verdict(*args)
         assert got == want, f"oracle_verdict{args} = {got}, want {want}"
         checks += 1
 
-    # ---- _oracle_meta: raw facts from a settings dict (datagen side).
+    # ---- _oracle_meta: TARGET line is engine-validated; invalid/missing
+    # falls back to nearest gold, else nearest opening, else END_GAME.
     # Agent center-board facing 12 o'clock (theta=0, facing (sin,cos)).
+    # Boards below are never equidistant on the fallback path.
     base_settings = {"agent_x": 0.5, "agent_y": 0.5, "direction": 0.0,
                      "agent_r": 0.05, "gold_r": 0.03}
-    north = _oracle_meta({**base_settings, "gold": [[0.5, 0.8]]})
+    g0 = {"kind": "gold", "index": 0}
+    north = _oracle_meta({**base_settings, "gold": [[0.5, 0.8]]}, g0)
     assert north["oracle_move"] == "FORWARD" and north["oracle_ray_hit"], north
+    assert north["oracle_target_ok"] is True, north
     assert abs(north["oracle_rel_bearing"]) < 1e-9, north
-    east = _oracle_meta({**base_settings, "gold": [[0.8, 0.5]]})
+    east = _oracle_meta({**base_settings, "gold": [[0.8, 0.5]]}, g0)
     assert east["oracle_move"] == "CLOCK" and not east["oracle_ray_hit"], east
     # the stamped bearing is round(rel, 4), so compare against the SAME
     # rounding -- pi/2 differs from 1.5708 by ~3.7e-6, far over any "exact"
     # tolerance (this assert failed at 1e-9 before the 2026-08-05 sweep)
     assert east["oracle_rel_bearing"] == round(math.pi / 2, 4), east
-    west = _oracle_meta({**base_settings, "gold": [[0.2, 0.5]]})
+    west = _oracle_meta({**base_settings, "gold": [[0.2, 0.5]]}, g0)
     assert west["oracle_move"] == "ANTICLOCK", west
-    # nearest gold sets the bearing; a second, farther gold on the ray
-    # still counts for ray_hit
-    two = _oracle_meta({**base_settings, "gold": [[0.5, 0.9], [0.52, 0.6]]})
-    assert two["oracle_ray_hit"], two          # 0.02 perp < 0.08 reach
-    assert two["oracle_rel_bearing"] == round(
-        math.atan2(0.02, 0.1), 4
-    ), two  # nearest = (0.52, 0.6); stamped bearing is round(rel, 4)
-    assert _oracle_meta({**base_settings, "gold": []}) == {}  # game won
-    checks += 8
+    # two golds, unequal distance: index 0 west (nearer, 0.3), index 1
+    # east (farther, 0.4). Valid pick of the farther gold is honored.
+    far_split = {**base_settings, "gold": [[0.2, 0.5], [0.9, 0.5]]}
+    far_gold = _oracle_meta(far_split, {"kind": "gold", "index": 1})
+    assert far_gold["oracle_move"] == "CLOCK", far_gold
+    assert far_gold["oracle_target_ok"] is True and far_gold["oracle_index"] == 1
+    near_gold = _oracle_meta(far_split, g0)
+    assert near_gold["oracle_move"] == "ANTICLOCK", near_gold
+    assert near_gold["oracle_target_ok"] is True and near_gold["oracle_index"] == 0
+    # missing / OOB -> nearest-gold fallback, ok=False (never silent unknown)
+    miss = _oracle_meta(far_split, None)
+    assert miss["oracle_kind"] == "gold" and miss["oracle_index"] == 0, miss
+    assert miss["oracle_move"] == "ANTICLOCK" and miss["oracle_target_ok"] is False
+    oob = _oracle_meta(far_split, {"kind": "gold", "index": 9})
+    assert oob["oracle_index"] == 0 and oob["oracle_target_ok"] is False, oob
+    # openings while gold remains: laundering case -> nearest gold
+    gold_and_exit = {
+        **far_split,
+        "openings": [{"side": "top", "center": [0.5, 1.0], "width": 0.3}],
+    }
+    launder = _oracle_meta(gold_and_exit, {"kind": "openings", "index": 0})
+    assert launder["oracle_kind"] == "gold" and launder["oracle_index"] == 0
+    assert launder["oracle_target_ok"] is False
+    assert launder["oracle_move"] == "ANTICLOCK", launder
+    # none while gold remains -> fallback, never END_GAME
+    none_gold = _oracle_meta(far_split, {"kind": "none", "index": None})
+    assert none_gold["oracle_move"] != "END_GAME", none_gold
+    assert none_gold["oracle_kind"] == "gold" and none_gold["oracle_target_ok"] is False
+    # empty room, two openings unequal distance: top nearer (0.4) than
+    # right (0.5). Valid non-nearest pick is honored.
+    two_ops = {
+        **base_settings, "gold": [],
+        "openings": [
+            {"side": "top", "center": [0.5, 0.9], "width": 0.3},
+            {"side": "right", "center": [1.0, 0.5], "width": 0.2},
+        ],
+    }
+    far_op = _oracle_meta(two_ops, {"kind": "openings", "index": 1})
+    assert far_op["oracle_move"] == "CLOCK" and far_op["oracle_target_ok"], far_op
+    near_op = _oracle_meta(two_ops, {"kind": "openings", "index": 0})
+    assert near_op["oracle_move"] == "FORWARD" and near_op["oracle_target_ok"]
+    assert near_op["oracle_ray_hit"], near_op
+    # none while an opening exists -> nearest-opening fallback
+    none_op = _oracle_meta(two_ops, {"kind": "none", "index": None})
+    assert none_op["oracle_kind"] == "openings" and none_op["oracle_index"] == 0
+    assert none_op["oracle_target_ok"] is False
+    assert none_op["oracle_move"] == "FORWARD", none_op
+    # sealed empty: none -> END_GAME ok=True; missing -> END_GAME ok=False
+    none_t = {"kind": "none", "index": None}
+    sealed_empty = _oracle_meta({**base_settings, "gold": []}, none_t)
+    assert sealed_empty["oracle_move"] == "END_GAME", sealed_empty
+    assert sealed_empty["oracle_rel_bearing"] is None, sealed_empty
+    assert sealed_empty["oracle_target_ok"] is True, sealed_empty
+    sealed_miss = _oracle_meta({**base_settings, "gold": []}, None)
+    assert sealed_miss["oracle_move"] == "END_GAME", sealed_miss
+    assert sealed_miss["oracle_target_ok"] is False, sealed_miss
+    # valid gold pick while an opening also exists still aims at gold
+    gold_over_exit = _oracle_meta(
+        {**base_settings, "gold": [[0.8, 0.5]],
+         "openings": [{"side": "top", "center": [0.5, 1.0], "width": 0.3}]},
+        g0,
+    )
+    assert gold_over_exit["oracle_move"] == "CLOCK", gold_over_exit
+    assert gold_over_exit["oracle_target_ok"] is True, gold_over_exit
+    checks += 16
 
     # ---- action balance (TEMPORARY HACK -- the screaming block above
     # action_balance_multipliers in training/game_traces.py): inverse
@@ -661,14 +751,37 @@ def t1_pure() -> str:
                 "target_text": "[LEFT]",
                 "meta": {"rating": None, "wrong_spans": []},
             },
+            {   # missing TARGET on a move round -> dropped like missing RATING
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "move?"},
+                ]}],
+                "target_text": "[CLOCK]",
+                "meta": {"rating": 0.5, "wrong_spans": [],
+                         "target_missing": True},
+            },
+            {   # perception round: TARGET not required, stamped False
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "Are you facing the gold?"},
+                ]}],
+                "target_text": "Yes, dead ahead.",
+                "meta": {"rating": 0.5, "wrong_spans": [],
+                         "perception": True, "target_missing": False},
+            },
         ]
         with open(trace_dir / "traces.jsonl", "w", encoding="utf-8") as f:
             for r in records:
                 f.write(json.dumps(r) + "\n")
         src = GameTraceSource(trace_dir / "traces.jsonl", noise_strength=0.0)
         exs = list(src.examples())
-        assert len(exs) == 1, f"expected 1 example (1 dropped), got {len(exs)}"
-        ex = exs[0]
+        assert len(exs) == 2, (
+            f"expected 2 examples (rating-null + target_missing dropped, "
+            f"perception kept, no-key kept), got {len(exs)}"
+        )
+        by_text = {ex.target_text: ex for ex in exs}
+        assert "thinking WRONG bit [FORWARD]" in by_text
+        assert "Yes, dead ahead." in by_text
+        assert "[CLOCK]" not in by_text and "[LEFT]" not in by_text
+        ex = by_text["thinking WRONG bit [FORWARD]"]
         assert ex.loss == "ce" and ex.span_weights, ex
         assert ex.messages[0]["content"][0]["url"] == str(img), (
             "image url not resolved against the trace dir"
@@ -678,11 +791,14 @@ def t1_pure() -> str:
         # per-example normalization, train.py SHAPE VS SCALE)
         assert ex.span_weights[0][2] == 1.0, ex.span_weights
         assert ex.span_weights[1][2] == WRONG_SPAN_WEIGHT, ex.span_weights
-        # SCALE: single rated record, so r_bar == its own rating 0.5 ->
+        # SCALE: three rated records at 0.5 (one dropped for
+        # target_missing still counts in r_bar) -> r_bar == 0.5;
         # exp(0) = 1.0 base, + 1.0 win boost at moves_from_end=0
         assert abs(src.rating_baseline - 0.5) < 1e-9, src.rating_baseline
         assert abs(ex.example_weight - 2.0) < 1e-9, ex.example_weight
-        checks += 6
+        perc = by_text["Yes, dead ahead."]
+        assert perc.loss == "ce" and abs(perc.example_weight - 1.0) < 1e-9, perc
+        checks += 8
 
         # ---- novelty decay through GameTraceSource (WIP, OFF by default
         # -- novelty=True to enable): three identical consecutive moves in
@@ -844,8 +960,9 @@ def t1_pure() -> str:
         psrc = PlayerAnchorSource(trace_dir / "traces.jsonl",
                                   noise_strength=0.0)
         pexs = list(psrc.examples())
-        assert len(pexs) == 2, (
-            f"expected 2 anchor examples (rating-null KEPT), got {len(pexs)}"
+        assert len(pexs) == 4, (
+            f"expected 4 anchor examples (rating-null KEPT, "
+            f"target_missing KEPT), got {len(pexs)}"
         )
         assert all(x.loss == "kd_anchor" and x.span_weights is None
                    for x in pexs), pexs
@@ -1102,6 +1219,51 @@ def t1_pure() -> str:
                 assert "renamed" in msg, msg
     checks += 1
 
+    # ---- datagen --multi-gold vs smoke sealed (2026-08-25)
+    from training.run_weekend import DATAGEN_ROOM_FLAG, _datagen, _smoke_eval
+    import inspect as _inspect
+    gp = traces_parser()
+    assert gp.parse_args(["--label", "x"]).multi_gold is False
+    assert gp.parse_args(["--label", "x", "--multi-gold"]).multi_gold is True
+    assert DATAGEN_ROOM_FLAG == ["--multi-gold"]
+    assert "DATAGEN_ROOM_FLAG" in _inspect.getsource(_datagen)
+    smoke_src = _inspect.getsource(_smoke_eval)
+    assert "DATAGEN_ROOM_FLAG" not in smoke_src
+    assert "--multi-gold" not in smoke_src
+    checks += 1
+
+    # ---- multi-gold stop / win (eat-gold is NOT a terminal)
+    inside = {"agent_x": 0.5, "agent_y": 0.5, "gold": [[0.8, 0.5]],
+              "openings": [{"center": [1.0, 0.5]}]}
+    empty_open = {"agent_x": 0.5, "agent_y": 0.5, "gold": [],
+                  "openings": [{"center": [1.0, 0.5]}]}
+    empty_sealed = {"agent_x": 0.5, "agent_y": 0.5, "gold": [],
+                    "openings": []}
+    assert _sealed_empty(empty_sealed) and not _sealed_empty(empty_open)
+    assert _multi_gold_stop(inside, inside, "FORWARD", False) == (
+        False, False, None,
+    )
+    # ate last gold but still inside with an opening: keep playing
+    assert _multi_gold_stop(inside, empty_open, "FORWARD", False) == (
+        False, False, None,
+    )
+    assert _multi_gold_stop(empty_sealed, empty_sealed, "END_GAME", False) == (
+        True, True, "end_game",
+    )
+    assert _multi_gold_stop(inside, inside, "END_GAME", False) == (
+        True, False, None,
+    )
+    assert _multi_gold_stop(empty_open, empty_open, "END_GAME", False) == (
+        True, False, None,
+    )
+    assert _multi_gold_stop(empty_open, empty_open, "FORWARD", True) == (
+        True, True, "exit",
+    )
+    assert _multi_gold_stop(inside, inside, "FORWARD", True) == (
+        True, False, None,
+    )
+    checks += 1
+
     # ---- boundary_openings + new_multi_gold_game (2026-08-12 multi-gold mode)
     from agent.game_io import (
         _SIDE_WALL_WIDTH,
@@ -1221,6 +1383,32 @@ def t1_pure() -> str:
     assert len(g3.settings.gold) == 3, g3.settings.gold
     checks += 1
 
+    # ---- agent_exited: disc contact with the unit-square boundary.
+    # Radius toward each tested edge (r=0.05: x=0.96 True, x=0.94 False).
+    g_exit = new_multi_gold_game(n_gold=0, opening="require")
+    assert abs(g_exit.settings.agent_r - 0.05) < 1e-9, g_exit.settings.agent_r
+    g_exit.settings.agent_x = 0.5
+    g_exit.settings.agent_y = 0.5
+    assert not g_exit.agent_exited()
+    g_exit.settings.agent_x = 0.96
+    assert g_exit.agent_exited()
+    g_exit.settings.agent_x = 0.94
+    assert not g_exit.agent_exited()
+    g_exit.settings.agent_x = 0.04
+    assert g_exit.agent_exited()
+    g_exit.settings.agent_x = 0.06
+    assert not g_exit.agent_exited()
+    g_exit.settings.agent_x = 0.5
+    g_exit.settings.agent_y = 0.96
+    assert g_exit.agent_exited()
+    g_exit.settings.agent_y = 0.94
+    assert not g_exit.agent_exited()
+    g_exit.settings.agent_y = 0.04
+    assert g_exit.agent_exited()
+    g_exit.settings.agent_y = 0.06
+    assert not g_exit.agent_exited()
+    checks += 1
+
     from agent.multi_gold_session import MultiGoldSelfEvalSession
     from agent.self_eval_session import InteractiveSelfEvalSession
     stub = object.__new__(MultiGoldSelfEvalSession)
@@ -1271,6 +1459,9 @@ def t1_pure() -> str:
 
     assert "PICK ONE TARGET AND COMMIT" in play_dump
     assert "Making a move does NOT end your turn" not in play_dump
+    assert "TARGET: gold, 0" in analyst_dump
+    assert "TARGET: openings, 1" in analyst_dump
+    assert "TARGET: none" in analyst_dump
     assert "RATING:" in debrief_dump
     assert "overall_score" not in debrief_dump
     checks += 1
@@ -1355,8 +1546,8 @@ def t1_pure() -> str:
     return (
         f"{checks} unit groups passed (ratings, rewards, noise, tripwire, "
         "source, batching, scrambler, questions, stack-eq, weekend-ckpt, "
-        "openings, multi-gold, end-game parse, prompt composition, "
-        "openings backfill, leak scrubber, core-tip seed)"
+        "multi-gold datagen flag, openings, end-game parse, prompt "
+        "composition, openings backfill, leak scrubber, core-tip seed)"
     )
 
 

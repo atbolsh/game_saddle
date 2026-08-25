@@ -69,6 +69,10 @@ SHAPE -- ``span_weights``, relative emphasis WITHIN the reply
 
 Records whose analyst forgot the RATING line are DROPPED with a warning
 count -- never trained with a guessed reward (no-fuzzy-fallbacks).
+Move-round records stamped ``target_missing`` (no parseable TARGET line)
+are DROPPED the same way. Perception rounds are excused at DATAGEN time
+(``target_missing: False`` even with no TARGET) and train as prose
+graded by rating alone; old corpora lack the key (falsy → kept).
 
 ``PlayerAnchorSource`` is the third source over the same trace file: an
 RLHF-style trust region that pins the player's distribution to the PARENT
@@ -219,22 +223,27 @@ def build_span_weights(
 # oracle facts per move (generate_game_traces._oracle_meta: rel bearing
 # to the nearest gold, whether the facing ray hits any gold, and the
 # resulting correct move -- EXACT, because the arena has no internal
-# walls to route around); this block classifies a recorded move against
+# walls to route around; after golds are gone the same geodesic aims at
+# the nearest opening, and a sealed empty board's oracle_move is
+# END_GAME); this block classifies a recorded move against
 # them at train time:
 #
 #   "correct" -- matches the oracle move (or turns when the gold is
 #                nearly behind, |bearing| >= 170 deg, where either turn
-#                is a correct move): move-token span ORACLE_MATCH_SPAN;
+#                is a correct move; or [END_GAME] on a sealed empty
+#                board): move-token span ORACLE_MATCH_SPAN;
 #   "neutral" -- defensible under the 20-degree aim tolerance the player
 #                is INSTRUCTED to use (FORWARD inside the cone without a
 #                ray hit): no modifier, the analyst's rating stands;
 #   "wrong"   -- contradicts ground truth (turn away from the shorter
 #                rotation, FORWARD outside the cone, ANY turn under a
-#                ray hit -- the 2026-08-11 tightening below): move-token
-#                span ORACLE_WRONG_SPAN (bounded unlikelihood) AND the
-#                whole reply's example_weight is multiplied by
-#                ORACLE_WRONG_SCALE -- the rationalization of a wrong
-#                move is not worth cloning at full strength either;
+#                ray hit -- the 2026-08-11 tightening below; [END_GAME]
+#                while gold or an opening remains; a board move on a
+#                sealed empty board): move-token span ORACLE_WRONG_SPAN
+#                (bounded unlikelihood) AND the whole reply's
+#                example_weight is multiplied by ORACLE_WRONG_SCALE --
+#                the rationalization of a wrong move is not worth
+#                cloning at full strength either;
 #   "unknown" -- no oracle meta (pre-2026-08-05 corpora) or no move:
 #                neutral, counted and logged once per source.
 #
@@ -282,11 +291,14 @@ def oracle_verdict(action: str | None, oracle_move: str | None,
     can enumerate the geometry; thresholds live here (train side), the
     raw facts in the trace meta -- retuning never requires regenerating
     data."""
-    if action is None or oracle_move is None or rel_bearing is None:
+    if action is None or oracle_move is None:
         return "unknown"
+    if oracle_move == "END_GAME":
+        return "correct" if action == "END_GAME" else "wrong"
     if action == "END_GAME":
-        # Legacy: [END_GAME] is not a board move; eat-gold games do not
-        # treat it as a win or an oracle-wrong turn.
+        # Quit while gold or an opening remains.
+        return "wrong"
+    if rel_bearing is None:
         return "unknown"
     rel = float(rel_bearing)
     if action == oracle_move:
@@ -349,8 +361,11 @@ def action_balance_multipliers(counts: dict[str, int]) -> dict[str, float]:
     mean, before clamping)."""
     if not counts:
         return {}
-    # Legacy: a stray [END_GAME] in a sealed-room corpus must not get the
-    # inverse-frequency boost (amplifying quitting is exactly wrong).
+    # [END_GAME] stays pinned at 1.0 even when it is a real terminal
+    # (multi-gold sealed-empty). Inverse-frequency would amplify a
+    # handful of quits -- including the wrong ones -- which is exactly
+    # the failure mode this pin exists to prevent. The oracle match
+    # span still teaches a correct quit.
     balanceable = {a: n for a, n in counts.items() if a != "END_GAME"}
     out: dict[str, float] = {}
     if "END_GAME" in counts:
@@ -582,6 +597,7 @@ class GameTraceSource(_TraceFileSource):
         noise_dir = _make_noise_dir(f"{self.name}_noise_")
         novelty = NoveltyTracker() if self.novelty else None
         n_dropped = 0
+        n_dropped_target = 0
         n_floored = 0
         n_yielded = 0
         verdicts = {"correct": 0, "neutral": 0, "wrong": 0, "unknown": 0}
@@ -595,6 +611,9 @@ class GameTraceSource(_TraceFileSource):
             ) if novelty else 1.0
             if meta.get("rating") is None:
                 n_dropped += 1
+                continue
+            if meta.get("target_missing"):
+                n_dropped_target += 1
                 continue
 
             action = meta.get("action")
@@ -659,18 +678,24 @@ class GameTraceSource(_TraceFileSource):
                 "%s: no oracle meta anywhere -- pre-2026-08-05 corpus, "
                 "move tokens graded by the analyst alone", self.name,
             )
+        n_seen = n_dropped + n_dropped_target + n_floored + n_yielded
         if n_floored:
             logger.info(
                 "%s: SKIPPED %d/%d record(s) at zero example weight "
                 "(rating at/below the %.1f floor, no win boost).",
-                self.name, n_floored, n_floored + n_yielded + n_dropped,
-                RATING_FLOOR,
+                self.name, n_floored, n_seen, RATING_FLOOR,
             )
         if n_dropped:
             logger.warning(
                 "%s: DROPPED %d/%d record(s) with no parseable RATING "
                 "(never train on a guessed reward).",
-                self.name, n_dropped, n_dropped + n_floored + n_yielded,
+                self.name, n_dropped, n_seen,
+            )
+        if n_dropped_target:
+            logger.warning(
+                "%s: DROPPED %d/%d record(s) with no parseable TARGET "
+                "line (same contract as a missing RATING).",
+                self.name, n_dropped_target, n_seen,
             )
 
 

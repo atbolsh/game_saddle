@@ -53,14 +53,17 @@ deviations and calls the loop — copy
 
 `python -m training.run_weekend` chains **3 expert-iteration epochs**
 unattended: for each epoch k it runs datagen
-(`generate_game_traces --label weekend_iter<k> --parallel 12`, on the
-previous epoch's adapter), trains on that epoch's traces (reward-weighted
+(`generate_game_traces --label weekend_iter<k> --parallel 12 --multi-gold`,
+on the previous epoch's adapter — walk-out is disc contact with the
+unit-square boundary; the oracle aims at the engine-validated `TARGET:`
+line), trains on that epoch's traces (reward-weighted
 CE + the `PlayerAnchorSource` trust region anchored to the previous
 adapter — see TRAINING_GAME_TRACES.md) + the analyst anchor + the manifest
 replay sources, resumed from the previous adapter, and finishes with a
-**post-train smoke eval**: 8 real games × 50 gens (~65 min healthy wall
+**post-train smoke eval**: 8 real sealed one-gold games × 50 gens (~65 min healthy wall
 at measured 9.9 s/gen; a poisoned checkpoint still surfaces in ~15 min)
 with the fresh checkpoint (label `<prefix>_smoke<k>`, never trained on;
+no `--multi-gold`, so eat-gold win rates stay comparable to earlier weekends;
 perception-question rate halved vs datagen) whose win rate / mean rating /
 degeneracy fraction / gold-distance deltas are logged (`grep smoke_eval`)
 and stored under `smoke` in the state file — every checkpoint gets a

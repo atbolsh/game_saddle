@@ -1,8 +1,7 @@
 """Headless self-eval datagen: play games, grade every move, write traces.
 
 The default data generator of the self-training loop (TRAINING_GAME_TRACES.md).
-Drives the EXACT machinery of the interactive self-eval notebook --
-:class:`agent.self_eval_session.InteractiveSelfEvalSession` with its default
+Drives the EXACT machinery of the interactive self-eval notebook -- same
 player and analyst questions, same prompts, same memory screening -- with no
 human in the loop:
 
@@ -11,14 +10,27 @@ human in the loop:
                 -> ask_analyst(DEFAULT_ANALYST_QUESTION)   (one exchange)
                 -> end_round()                             (move propagates)
 
-**A game is formally: the gold eaten, OR --max-moves player rounds**
-(default 50 -- early wandering traces carry little signal per round),
-whichever comes first. Records buffer per game and are written at
-game close, each stamped with ``meta.game_won`` and ``meta.moves_from_end``
-(0 = the round whose move ate the gold) -- the discounted win boost is
-computed from these at TRAINING time by ``GameTraceSource``, not here; this
-script stores raw annotations only (rating, verified WRONG spans, outcome),
-so every reward ratio stays tunable without regenerating data.
+Two room modes:
+
+  * default (no flag) -- sealed one-gold
+    (:class:`agent.self_eval_session.InteractiveSelfEvalSession`). A game
+    ends when the gold is eaten or ``--max-moves`` is hit. This is the
+    weekend **smoke** path, so eat-gold win rates stay comparable to
+    earlier runs.
+  * ``--multi-gold`` -- 0–3 golds, openings ``"any"``
+    (:class:`agent.multi_gold_session.MultiGoldSelfEvalSession`). Eating
+    gold does **not** end the game; the player is supposed to walk out an
+    opening (agent disc contacts the unit-square boundary) or emit
+    ``[END_GAME]`` on a sealed empty board. ``run_weekend`` datagen
+    passes this flag; smoke does not. Analyst prompts already include
+    the ``openings`` dict entry; player context strips it.
+
+Records buffer per game and are written at game close, each stamped with
+``meta.game_won`` and ``meta.moves_from_end`` (0 = the terminal winning
+round) -- the discounted win boost is computed from these at TRAINING
+time by ``GameTraceSource``, not here; this script stores raw annotations
+only (rating, verified WRONG spans, outcome), so every reward ratio stays
+tunable without regenerating data.
 
 One record per player generation, in ``data_game/<label>/traces.jsonl``:
 
@@ -32,10 +44,13 @@ One record per player generation, in ``data_game/<label>/traces.jsonl``:
     the round's agent-to-gold distances (``dist_to_gold_before/after``,
     normalized units; the rating-independent quality cross-check), the raw
     engine-oracle facts for the position the move was made from
-    (``oracle_move`` / ``oracle_rel_bearing`` / ``oracle_ray_hit`` --
-    ``_oracle_meta``; graded train-side by ``game_traces.oracle_verdict``),
-    and the exact ``question`` the round asked (perception rounds are the
-    records whose question differs from the default move request).
+    (``oracle_move`` / ``oracle_rel_bearing`` / ``oracle_ray_hit`` /
+    ``oracle_target_ok`` -- ``_oracle_meta``, aimed at the engine-
+    validated object on the analyst's ``TARGET:`` line; graded train-side
+    by ``game_traces.oracle_verdict``), ``perception`` /
+    ``target_missing`` (move rounds with no TARGET line are dropped
+    train-side like a missing RATING; perception rounds are excused at
+    stamp time), and the exact ``question`` the round asked.
 
 Analyst text is stored to NAMS exactly as in the notebook and never enters
 any PLAYER record's ``messages``/``target_text`` -- it exists in player
@@ -89,8 +104,8 @@ of the run, summary plots land in ``logs/datagen_stats_<label>_<stamp>/``.
 GPU + NAMS required; run on the remote box, typically once per training
 iteration with the current checkpoint::
 
-    python -m training.generate_game_traces --label iter1
-    python -m training.generate_game_traces --label iter2 \
+    python -m training.generate_game_traces --label iter1 --multi-gold
+    python -m training.generate_game_traces --label iter2 --multi-gold \
         --checkpoint iter1_step600 --games 60 --seed 11
 """
 
@@ -204,57 +219,153 @@ def _dist_to_gold(settings: dict) -> float | None:
     return round(min(math.hypot(gx - ax, gy - ay) for gx, gy in gold), 4)
 
 
-def _oracle_meta(settings: dict) -> dict:
-    """Engine-oracle facts for the CURRENT position, stamped into each
-    move's meta (computed before the move executes, next to
-    dist_to_gold_before). Only RAW FACTS are stored -- classification into
-    correct/neutral/wrong lives train-side (game_traces.oracle_verdict,
-    with its own ULTRAVIOLET crutch block), so thresholds can be retuned
-    without regenerating data.
-
-      * oracle_rel_bearing: signed bearing (radians, wrapped to [-pi, pi))
-        from the agent's facing to the NEAREST gold. The game_io compass
-        convention: bearing = atan2(dx, dy), theta increases clockwise,
-        so POSITIVE = the gold is clockwise of the facing;
-      * oracle_ray_hit: whether stepping straight ahead intersects ANY
-        gold within pickup reach (agent_r + gold_r). EXACT, because bare
-        levels have no internal walls to route around;
-      * oracle_move: FORWARD on a ray hit, else the shorter rotation
-        toward the nearest gold.
-
-    Empty when no gold remains (game already won)."""
+def _nearest_engine_target(settings: dict) -> tuple[str, int | None]:
+    """The board's own greedy target as ``(kind, index)``: nearest gold if
+    any remain, else nearest opening center, else ``("none", None)`` on a
+    sealed empty room. Pure engine truth -- the fallback aim whenever the
+    analyst's TARGET line is missing or names an object the game rules
+    forbid (see _resolve_oracle_target)."""
+    ax, ay = settings["agent_x"], settings["agent_y"]
     gold = settings.get("gold") or []
-    if not gold:
-        return {}
+    if gold:
+        i = min(range(len(gold)),
+                key=lambda k: math.hypot(gold[k][0] - ax, gold[k][1] - ay))
+        return ("gold", i)
+    openings = settings.get("openings") or []
+    if openings:
+        i = min(range(len(openings)),
+                key=lambda k: math.hypot(openings[k]["center"][0] - ax,
+                                         openings[k]["center"][1] - ay))
+        return ("openings", i)
+    return ("none", None)
+
+
+def _resolve_oracle_target(
+    settings: dict, target: dict | None,
+) -> tuple[str, int | None, bool]:
+    """Validate the analyst's parsed TARGET line against the board and
+    return ``(kind, index, ok)`` -- the object the oracle will actually
+    aim at.
+
+    The analyst chooses only where the rules leave a genuine choice
+    (WHICH gold while golds remain; WHICH opening on an empty open room).
+    Kind-level claims are ENGINE-CHECKED, never trusted: ``openings`` or
+    ``none`` while gold remains, ``none`` while an opening exists, and
+    out-of-range indices are analyst ERRORS -- the oracle falls back to
+    :func:`_nearest_engine_target` (nearest gold if gold remains, else
+    nearest opening, else END_GAME) with ``ok=False``. Without this check
+    the TARGET line would be a lever to launder any move into
+    oracle-correct, which is exactly what the engine oracle exists to
+    prevent."""
+    kind = (target or {}).get("kind")
+    index = (target or {}).get("index")
+    gold = settings.get("gold") or []
+    openings = settings.get("openings") or []
+    if kind == "gold" and isinstance(index, int) and 0 <= index < len(gold):
+        return ("gold", index, True)
+    if (kind == "openings" and not gold
+            and isinstance(index, int) and 0 <= index < len(openings)):
+        return ("openings", index, True)
+    if kind == "none" and not gold and not openings:
+        return ("none", None, True)
+    fb_kind, fb_index = _nearest_engine_target(settings)
+    return (fb_kind, fb_index, False)
+
+
+def _aim_point(settings: dict, kind: str, index: int) -> tuple[float, float, float]:
+    """The validated (kind, index) object as ``(x, y, reach)``. Gold reach
+    is pickup (agent_r + gold_r); an opening's is agent_r + max(width/2,
+    gold_r) so a FORWARD through the gap registers as a ray hit."""
+    ar = float(settings["agent_r"])
+    gr = float(settings.get("gold_r", 0.03))
+    if kind == "gold":
+        p = (settings.get("gold") or [])[index]
+        return (float(p[0]), float(p[1]), ar + gr)
+    opening = (settings.get("openings") or [])[index]
+    cx, cy = opening["center"][0], opening["center"][1]
+    width = float(opening.get("width") or 0.0)
+    return (float(cx), float(cy), ar + max(width / 2.0, gr))
+
+
+def _oracle_meta(settings: dict, target: dict | None = None) -> dict:
+    """Engine-oracle facts for the CURRENT position, stamped into each
+    move's meta (computed after the analyst replies; the analyst's TARGET
+    line, engine-validated by :func:`_resolve_oracle_target`, picks the
+    aim object). Only RAW FACTS are stored -- classification into
+    correct/neutral/wrong lives train-side (game_traces.oracle_verdict).
+
+      * oracle_kind / oracle_index: the object the oracle AIMED at,
+        post-validation (the analyst's pick when valid, else the engine
+        fallback; kind "none" = sealed empty, index None);
+      * oracle_target_ok: True when the analyst's TARGET line was present
+        AND valid (its object was used); False on fallback;
+      * oracle_rel_bearing: signed bearing (radians, wrapped to [-pi, pi))
+        from the agent's facing to that object. Compass convention:
+        bearing = atan2(dx, dy), theta increases clockwise, POSITIVE =
+        the target is clockwise of the facing; None on END_GAME;
+      * oracle_ray_hit: whether the facing ray intersects THAT object
+        within its reach (not any other gold or opening);
+      * oracle_move: FORWARD on a ray hit, else the shorter rotation
+        toward the object; ``END_GAME`` only on a genuinely sealed empty
+        board (engine-checked -- a 'TARGET: none' claim is never taken
+        on faith).
+
+    Always stamps oracle_move: validation guarantees an aim object (or
+    the sealed-empty END_GAME) on every board."""
+    kind, index, ok = _resolve_oracle_target(settings, target)
+    stamped: dict = {
+        "oracle_kind": kind,
+        "oracle_index": index,
+        "oracle_target_ok": ok,
+    }
+    if kind == "none":
+        stamped.update({
+            "oracle_move": "END_GAME",
+            "oracle_rel_bearing": None,
+            "oracle_ray_hit": False,
+        })
+        return stamped
+    gx, gy, reach = _aim_point(settings, kind, index)
     ax, ay = settings["agent_x"], settings["agent_y"]
     theta = settings["direction"]
-    reach = settings["agent_r"] + settings["gold_r"]
-
-    _, gx, gy = min(
-        (math.hypot(gx - ax, gy - ay), gx, gy) for gx, gy in gold
-    )
     rel = (math.atan2(gx - ax, gy - ay) - theta + math.pi) \
         % (2 * math.pi) - math.pi
-
     fx, fy = math.sin(theta), math.cos(theta)
-    ray_hit = False
-    for cx, cy in gold:
-        dx, dy = cx - ax, cy - ay
-        # positive projection along the facing ray, perpendicular
-        # miss distance within pickup reach
-        if dx * fx + dy * fy > 0 and abs(dx * fy - dy * fx) <= reach:
-            ray_hit = True
-            break
-
-    if ray_hit:
-        move = "FORWARD"
-    else:
-        move = "CLOCK" if rel > 0 else "ANTICLOCK"
-    return {
-        "oracle_move": move,
+    dx, dy = gx - ax, gy - ay
+    ray_hit = dx * fx + dy * fy > 0 and abs(dx * fy - dy * fx) <= reach
+    stamped.update({
+        "oracle_move": "FORWARD" if ray_hit else ("CLOCK" if rel > 0 else "ANTICLOCK"),
         "oracle_rel_bearing": round(rel, 4),
         "oracle_ray_hit": ray_hit,
-    }
+    })
+    return stamped
+
+
+def _sealed_empty(settings: dict) -> bool:
+    """No gold and no openings -- the only board on which [END_GAME] wins."""
+    return not (settings.get("gold") or []) and not (
+        settings.get("openings") or []
+    )
+
+
+def _multi_gold_stop(
+    settings_before: dict, settings_after: dict, action: str | None,
+    exited: bool,
+) -> tuple[bool, bool, str | None]:
+    """Multi-gold game-over: ``(stop, won, win_kind)``.
+
+    Eating gold never stops. ``[END_GAME]`` always stops (won iff the
+    board the player saw was sealed and empty). Walking out (``exited``,
+    from :meth:`discreteGame.agent_exited` -- disc contacts the unit-
+    square boundary) always stops (won iff no gold remains after the
+    step). ``win_kind`` is ``end_game`` / ``exit`` on a win, else None."""
+    if action == "END_GAME":
+        won = _sealed_empty(settings_before)
+        return True, won, "end_game" if won else None
+    if exited:
+        won = not (settings_after.get("gold") or [])
+        return True, won, "exit" if won else None
+    return False, False, None
 
 
 def _rewrite_image_urls(messages: list[dict], mapping: dict[str, str]) -> int:
@@ -390,16 +501,16 @@ class _Shared:
 def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
                shared: _Shared, session_analyses: list[str],
                qrng: random.Random) -> None:
-    """One full game on ``session``: rounds until the gold is eaten, the
-    move cap is hit, or the run-wide generation budget runs out. Buffers the
-    game's records, stamps the outcome, writes them under the shared lock.
+    """One full game on ``session``: rounds until a terminal, the move cap,
+    or the run-wide generation budget. Buffers the game's records, stamps
+    the outcome, writes them under the shared lock.
 
-    Legacy eat-gold win; ``[END_GAME]`` may appear because the unified
-    prompt mentions it, but it does not terminate datagen games (the
-    base ``end_round`` grades it without applying a board action). The
-    next player question then says the token is unavailable in this
-    mode. Analyst prompts are left as-is until training switches
-    (FUTURE_GOALS goal 10).
+    Sealed one-gold (default): eating gold wins; ``[END_GAME]`` is graded
+    and the session continues (the next player question says the token is
+    unavailable). Multi-gold (``--multi-gold``): eating gold does not end
+    the game; ``[END_GAME]`` ends the session (won iff sealed empty) and
+    walking out (agent disc contacts the unit-square boundary) ends it
+    (won iff no gold remains).
 
     Each round asks either the default move request or (with probability
     ``--question-rate``, drawn from ``qrng``) a perception question --
@@ -411,14 +522,14 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
     game_records: list[dict] = []
     analyst_records: list[dict] = []
     won = False
+    win_kind: str | None = None
+    multi = bool(getattr(args, "multi_gold", False))
+    room = "multi-gold" if multi else "sealed"
     for move_idx in range(args.max_moves):
         if not shared.take_generation():
             break
         settings_before = game_io.game_to_settings_dict(session.game)
         dist_before = _dist_to_gold(settings_before)
-        # Engine-oracle facts for THIS position (before the move executes);
-        # raw facts only, classified train-side (_oracle_meta docstring).
-        oracle = _oracle_meta(settings_before)
         question = _sample_perception_question(qrng, args.question_rate)
         is_perception = question is not None
         if question is None:
@@ -435,10 +546,19 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
 
         analyst = session.ask_analyst(session.DEFAULT_ANALYST_QUESTION)
         session_analyses.append(analyst["analysis"])
+        oracle = _oracle_meta(settings_before, analyst["target"])
+        # Missing TARGET line on a MOVE round gets the missing-RATING
+        # treatment (GameTraceSource drops the record). A perception
+        # round's analyst grades a prose answer -- no geometry, no TARGET
+        # required -- so it is stamped False (excused), and old corpora
+        # lack the key entirely (falsy -> kept).
+        target_missing = analyst["target"] is None and not is_perception
         outcome = session.end_round()
         # After the pending move propagated: dist_before - dist_to_gold_after
         # > 0 means this round moved the player toward the gold.
-        dist_after = _dist_to_gold(game_io.game_to_settings_dict(session.game))
+        settings_after = game_io.game_to_settings_dict(session.game)
+        dist_after = _dist_to_gold(settings_after)
+        exited = session.game.agent_exited()
 
         record = {
             "messages": player["messages"],
@@ -465,6 +585,11 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
                 "move_index": move_idx,
                 "session_id": player["session_id"],
                 "question": question,
+                "perception": is_perception,
+                "target_missing": target_missing,
+                "room": room,
+                "n_gold": len(settings_before.get("gold") or []),
+                "n_openings": len(settings_before.get("openings") or []),
             },
         }
         n_imgs = _rewrite_image_urls(
@@ -529,6 +654,12 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
                 shared.stats["moves"] += 1
             if is_perception:
                 shared.stats["perception_rounds"] += 1
+            if target_missing:
+                shared.stats["target_missing"] += 1
+            elif analyst["target"] is not None and not oracle["oracle_target_ok"]:
+                # Present but invalid (wrong kind for the board / OOB
+                # index): the oracle fell back to the engine target.
+                shared.stats["target_invalid"] += 1
 
         # Degeneracy fuse: no parseable RATING anywhere in the analysis AND
         # no parseable move token in the reply (bare or bracketed) means
@@ -539,8 +670,18 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
             and not player["action"] and not player["bare_move"]
         )
 
-        if outcome["gold_remaining"] == 0:
+        if multi:
+            stop, this_won, kind = _multi_gold_stop(
+                settings_before, settings_after, outcome.get("action"),
+                exited,
+            )
+            if stop:
+                won = this_won
+                win_kind = kind
+                break
+        elif outcome["gold_remaining"] == 0:
             won = True
+            win_kind = "gold"
             break
 
     # Stamp the outcome and flush the game (one writer at a time).
@@ -548,6 +689,7 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
     with shared.lock:
         for i, record in enumerate(game_records):
             record["meta"]["game_won"] = won
+            record["meta"]["win_kind"] = win_kind
             record["meta"]["moves_from_end"] = (last - i) if won else None
             shared.out.write(json.dumps(record, ensure_ascii=False) + "\n")
             shared.records.append(record)
@@ -562,8 +704,9 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
         shared.stats["games_won" if won else "games_lost"] += 1
         n_gen = shared.stats["generations"]
     logger.info(
-        "game %d done: %s in %d round(s) (total generations: %d)",
+        "game %d done: %s in %d round(s) (total generations: %d)%s",
         game_idx, "WON" if won else "lost", len(game_records), n_gen,
+        f" via {win_kind}" if win_kind else "",
     )
 
 
@@ -603,13 +746,30 @@ def _worker(worker_id: int, session: Any, block: list[int], shared: _Shared,
             dispatcher.worker_finished()
 
 
+def _make_session(label: str, worker_id: int, multi_gold: bool) -> Any:
+    """One datagen worker session. Multi-gold uses random 0–3 golds and
+    ``opening="any"`` (sealed empty rooms exist, so ``[END_GAME]`` is
+    sometimes the correct terminal). The class default is ``opening=
+    "require"``, which would never produce a sealed board."""
+    log_label = f"datagen_{label}_w{worker_id}"
+    if multi_gold:
+        from agent.multi_gold_session import MultiGoldSelfEvalSession
+        return MultiGoldSelfEvalSession(
+            n_gold=None,
+            opening="any",
+            end_on_clear=False,
+            log_label=log_label,
+        )
+    from agent.self_eval_session import InteractiveSelfEvalSession
+    return InteractiveSelfEvalSession(log_label=log_label)
+
+
 def run_generation(args: argparse.Namespace) -> dict[str, Any]:
     """The loop. Split from main() so a run script / notebook cell can call
     it with a Namespace built by hand."""
     # from agent import memory as mem  # only used by commented ensure_core_tips
     from agent.model import get_model, set_default_checkpoint
     from agent.parallel_gen import BatchingProxy, GenerationDispatcher
-    from agent.self_eval_session import InteractiveSelfEvalSession
 
     t_start = time.perf_counter()
     set_default_checkpoint(args.checkpoint)
@@ -626,9 +786,14 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
     images_dir.mkdir(parents=True, exist_ok=True)
 
     n_workers = max(1, args.parallel)
+    multi_gold = bool(getattr(args, "multi_gold", False))
+    logger.info(
+        "room: %s",
+        "multi-gold (0–3 gold, openings any, END_GAME terminal)"
+        if multi_gold else "sealed one-gold (eat-gold win)",
+    )
     sessions = [
-        InteractiveSelfEvalSession(log_label=f"datagen_{args.label}_w{i}")
-        for i in range(n_workers)
+        _make_session(args.label, i, multi_gold) for i in range(n_workers)
     ]
     dispatcher: GenerationDispatcher | None = None
     if n_workers > 1:
@@ -747,6 +912,7 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
         # THE number to compare across --parallel settings (model load
         # included; identical either way, so it cancels in the comparison).
         "wall_seconds": round(wall_s, 1),
+        "room": "multi-gold" if multi_gold else "sealed",
         "seconds_per_generation": round(wall_s / n_gen, 2) if n_gen else None,
     }
     (out_dir / "generation_stats.json").write_text(
@@ -757,6 +923,13 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
         logger.warning(
             "%d record(s) have no parseable RATING and will be DROPPED by "
             "GameTraceSource at load time.", shared.stats["rating_missing"],
+        )
+    if shared.stats["target_missing"]:
+        logger.warning(
+            "%d move-round record(s) have no parseable TARGET line and "
+            "will be DROPPED by GameTraceSource at load time (same "
+            "contract as a missing RATING; their oracle facts fell back "
+            "to the engine target).", shared.stats["target_missing"],
         )
     try:
         from training.datagen_plots import write_datagen_plots
@@ -781,11 +954,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="games to play (default 60; volume rationale in "
                         "TRAINING_GAME_TRACES.md)")
     p.add_argument("--max-moves", type=int, default=50,
-                   help="rounds per game before it counts as lost (the "
-                        "formal game definition: gold eaten or this cap; "
-                        "default 50 -- early wandering traces carry little "
-                        "signal per round, and each round costs two "
-                        "generations)")
+                   help="rounds per game before it counts as lost (sealed: "
+                        "gold eaten or this cap; --multi-gold: walk-out / "
+                        "[END_GAME] or this cap; default 50 -- early "
+                        "wandering traces carry little signal per round, "
+                        "and each round costs two generations)")
+    p.add_argument("--multi-gold", action="store_true",
+                   help="0–3 golds, openings any, eating gold does not "
+                        "end the game; [END_GAME] and walking out do. "
+                        "Default is the sealed one-gold smoke path. "
+                        "run_weekend datagen passes this; smoke does not")
     p.add_argument("--max-generations", type=int, default=3000,
                    help="hard cap on player generations for the whole run")
     p.add_argument("--parallel", type=int, default=12,

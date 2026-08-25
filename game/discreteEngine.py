@@ -320,7 +320,18 @@ class discreteGame:
             return True
         else:
             return False
-      
+
+    def agent_exited(self):
+        """True when the agent's disc touches or passes the unit-square
+        boundary. Radius is applied toward each edge (x-r vs 0, x+r vs 1,
+        same for y). Sealed rooms cannot trigger this: boundary walls are
+        thicker than agent_r, so the disc is blocked at the inner face
+        and never reaches the true edge -- contact is reachable only
+        through an opening."""
+        s = self.settings
+        return (s.agent_x - s.agent_r <= 0.0 or s.agent_x + s.agent_r >= 1.0 or
+                s.agent_y - s.agent_r <= 0.0 or s.agent_y + s.agent_r >= 1.0)
+
     def full_wall_check(self, test_x, test_y, walls=None, agent_r=None):
         if walls is None: # This is also used for random level generation, placing both gold and the agent, hence the ambiguity
             walls = self.settings.walls

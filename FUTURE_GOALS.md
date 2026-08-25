@@ -39,17 +39,15 @@ walls + 1 gold piece). Targets:
 This requires the agent to handle obstacles (wall-avoidance) and
 sequential gold collection. The `ACTION_MAP` and per-move recording
 machinery in `agent/game_io.py` and `agent/modes.py` already generalise;
-only the level-creation call and the stop condition
-(`gold_remaining == 0`) need widening.
+only interior walls (and an engine-native walk-out terminal) remain.
 
 **2026-08-12 notebook-only cut:** `agent/game_io.new_multi_gold_game` +
 `boundary_openings` (non-AI oracle of boundary gaps) +
 `MultiGoldSelfEvalSession` (`notebooks/multi_gold_eval.ipynb`) exercise
 0–3 golds, sealed vs open rooms, target commitment (`TARGET:` line),
 walking out an opening, and `[END_GAME]` when the room is sealed and
-empty. The existing self-eval / datagen critical path is unchanged
-(`[END_GAME]` is not in `game_io.ACTIONS`). Wiring this into training is
-goal 10 — do not touch `generate_game_traces` until that is picked up.
+empty. **2026-08-25:** training datagen uses that factory (`--multi-gold`);
+weekend smoke stays sealed one-gold. See goal 10.
 
 ## 3. Audio and video modalities of Gemma 4 — *Exploring*
 
@@ -254,27 +252,35 @@ about a missing notepad, either inject the recorded notepad into the
 debrief builder or gate that one sentence out of the debrief
 composition.
 
-## 10. Align training with multi-gold / target-exit play — *Not started*
+## 10. Align training with multi-gold / target-exit play — *In progress*
 
 The 2026-08-19 mode unification put target commitment, openings, and
-`[END_GAME]` into every player/analyst prompt, but datagen and the
-reward path still run sealed one-gold eat-to-win games: `[END_GAME]` is
-graded as a no-op (oracle `unknown`, action-balance pinned at 1.0) and
-does not end the session. The player is told after that token that it
-is unavailable in this mode. Training should catch up so the corpus
-matches the prompt (goal 2's notebook cut is the mechanics to copy):
+`[END_GAME]` into every player/analyst prompt. **2026-08-25 training
+datagen cut:** `run_weekend` datagen passes `--multi-gold`
+(`MultiGoldSelfEvalSession`, `n_gold=None` → uniform {0,1,2,3},
+`opening="any"`, `end_on_clear=False`). Eating gold does not end the
+game. A win is a correct `[END_GAME]` on a sealed empty board, or walking
+out so the agent disc contacts the unit-square boundary with no gold
+remaining (`discreteGame.agent_exited`; datagen queries it after
+`end_round()`). The oracle aims at remaining gold, then at opening
+centers, then `END_GAME`, using the engine-validated `TARGET:` line;
+`oracle_verdict` grades a quit as correct/wrong instead of unknown.
+Analyst prompts already include the `openings` dict entry; player context
+still strips it.
 
-* datagen uses `new_multi_gold_game` (0–3 golds, sealed vs open rooms);
-* `[END_GAME]` is a real terminal action on a sealed empty room (and a
-  graded mistake otherwise);
-* oracle / action-balance / win-boost stop treating eat-last-gold as
-  the only success;
-* drop the player-facing "END_GAME is not available in this mode"
-  notice once the mode actually supports it.
+Weekend **smoke** is unchanged: sealed one-gold, eat-gold win, so those
+win rates stay comparable to earlier runs. t5/t8/t9 stay on that default
+too.
 
-Do not start this while a sealed-room training run is in flight. The
-analyst prompt can stay as-is until this lands — it already describes
-the target-exit rules.
+Still open:
+
+* action-balance still pins `[END_GAME]` at 1.0 (inverse-frequency would
+  amplify a handful of quits);
+* walk-out is `discreteGame.agent_exited` (disc contact with the
+  unit-square boundary; sealed rooms cannot fire it because boundary
+  walls are thicker than `agent_r`);
+* drop the player-facing "END_GAME is not available in this mode" notice
+  on the sealed smoke path (still correct there).
 
 ## 11. Agent-written core tips (the "always after" plan) — *Not started*
 

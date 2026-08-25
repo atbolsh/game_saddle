@@ -476,13 +476,15 @@ class InteractiveSelfEvalSession(InteractiveSession):
         # the analyst forgot the line -- the datagen loop drops such records
         # loudly.
         rating = modes.parse_rating(analysis)
+        target = modes.parse_target(analysis)
 
         logger.info(
             "analyst exchange %d done (%d verified / %d unverified WRONG "
-            "spans; rating=%s); round still open.",
+            "spans; rating=%s; target=%s); round still open.",
             pending["n_analyses"],
             len(wrong_spans["verified"]), len(wrong_spans["unverified"]),
             "missing" if rating is None else f"{rating:+.2f}",
+            "missing" if target is None else target,
         )
         return {
             "session_id": self.session_id,
@@ -491,6 +493,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
             "replies": replies,
             "wrong_spans": wrong_spans,
             "rating": rating,
+            "target": target,
             "player_raw": pending["raw"],
             "n_analyses": pending["n_analyses"],
             "phase": self.phase,

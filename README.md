@@ -516,10 +516,11 @@ has the high-res frame on disk for re-feeding into the model.
 
 ## Notes / limitations
 
-* Only **bare levels** (4 boundary walls + 1 gold piece, via
-  `random_bare_settings`) are generated for **datagen**. A notebook-only
-  multi-gold / openings variant lives in `notebooks/multi_gold_eval.ipynb`
-  (see `FUTURE_GOALS.md` goal 2).
+* Default **datagen** (`--multi-gold`) is 0–3 golds with openings
+  (`new_multi_gold_game`); weekend **smoke** stays sealed one-gold
+  eat-to-win so those win rates stay comparable. The notebook
+  `notebooks/multi_gold_eval.ipynb` is the interactive version
+  (see `FUTURE_GOALS.md` goals 2 and 10).
 * The agent loop uses **image + text**. Audio/video comprehension is
   measurable with `python -m training.eval_av <checkpoint>` (LibriSpeech
   WER + NExT-QA); training-side KD replay is still future
@@ -547,7 +548,7 @@ agent/
   memory.py          # NAMS MemoryClient factory; context stripping; semantic-model seed; DB dump
   modes.py           # mode_game / mode_discuss / mode_self_eval
   interactive.py     # InteractiveSession: persistent-game mode-1 for notebooks
-  multi_gold_session.py  # MultiGoldSelfEvalSession (notebook-only; 0–3 golds, openings, [END_GAME])
+  multi_gold_session.py  # MultiGoldSelfEvalSession (datagen --multi-gold + notebooks/multi_gold_eval.ipynb)
   run_logging.py     # per-run LLM-call + DB-retrieval logs (on by default)
   runner.py          # CLI
 training/
@@ -577,7 +578,7 @@ data_game/           # generated self-eval game traces + frames (git-ignored; se
 notebooks/
   play.ipynb            # interactive mode-1 play (Ask + Restart conversation)
   interactive_self_eval.ipynb # player/analyst two-phase loop (mode 3)
-  multi_gold_eval.ipynb     # multi-gold / openings self-eval (notebook-only)
+  multi_gold_eval.ipynb     # multi-gold / openings self-eval
   debrief.ipynb         # privileged post-game debrief (mode 4)
   trace_viewer.ipynb    # step through recorded datagen traces (no GPU/NAMS)
   noise_tuner.ipynb     # tune image-noise magnitudes by eye (no GPU/NAMS)

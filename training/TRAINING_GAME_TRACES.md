@@ -45,15 +45,22 @@ implemented mapping is in "The reward scheme" below.
 
 ## The implemented loop
 
-`python -m training.generate_game_traces --label iterN [--checkpoint ...]`
+`python -m training.generate_game_traces --label iterN [--checkpoint ...]
+[--multi-gold]`
 drives the EXACT self-eval machinery of the interactive notebook
-(`InteractiveSelfEvalSession`, default player and analyst questions, same
-prompts, same memory screening) headlessly: per round it asks the player,
-asks the analyst once, then ends the round so the move propagates. **A game
-is formally: the gold eaten, or `--max-moves` player rounds** (default 50),
-whichever comes first -- each round costs two generations, and early
-wandering traces carry little signal per round, so short games are the
-cheap default; raise the cap as the player gets good enough to need it.
+(default player and analyst questions, same prompts, same memory
+screening) headlessly: per round it asks the player, asks the analyst
+once, then ends the round so the move propagates.
+
+**Two room modes.** Default (no flag; weekend **smoke**, t5/t8/t9): sealed
+one-gold, a game ends when the gold is eaten or `--max-moves` (default
+50) is hit. `--multi-gold` (weekend **datagen**): 0–3 golds, openings
+`"any"`, eating gold does not end the game; a win is walking out so the
+agent disc contacts the unit-square boundary with no gold remaining, or
+`[END_GAME]` on a sealed empty board. Early wandering traces carry little
+signal per round, so the move cap stays 50; raise it as the player gets
+good enough to need it. Analyst prompts include the `openings` dict
+entry; player context strips it.
 
 **Perception-question rounds** (`--question-rate`, default 0.15): with this
 probability a round asks a perception question ("Are you facing the gold?",
@@ -88,8 +95,10 @@ One record per player generation lands in `data_game/<label>/traces.jsonl`:
   opening / `[END_GAME]` language (the unified multi-gold wording): in
   the one-gold game the single gold is the only possible target, and the
   player may write `[REMEMBER target: ...]` notes that the analyst
-  audits. **The datagen game is still sealed one-gold; eating gold still
-  wins; `[END_GAME]` is not a stop condition yet.** The multi-gold
+  audits. **Weekend datagen (`--multi-gold`) is 0–3 golds with openings;
+  eating gold does not win; `[END_GAME]` on a sealed empty board or
+  walking out does. Weekend smoke stays sealed one-gold eat-to-win so
+  those win rates stay comparable.** The multi-gold
   player prompt names gold and
   openings as two distinct objectives (never call an opening "the gold").
 - `target_text` — the raw player reply, the ONLY trainable tokens;
@@ -403,14 +412,15 @@ training on analyst-graded data alone failed to move the fixed eval.
 the aug4 spin-bot under a saturated analyst), so the crutch is now LIVE —
 deliberately, and marked ULTRAVIOLET in the code. Datagen stamps the raw
 facts per move (`_oracle_meta`: `oracle_rel_bearing`, `oracle_ray_hit`,
-`oracle_move` — exact, since bare levels have no internal walls);
+`oracle_move` — exact, since bare levels have no internal walls — aimed
+at the engine-validated object on the analyst's `TARGET:` line);
 `game_traces.oracle_verdict` classifies at train time:
 
 | verdict | geometry | effect |
 |---|---|---|
-| `correct` | matches `oracle_move` (or any turn when the gold is ≥170° behind) | move-token span **1.5** |
+| `correct` | matches `oracle_move` (or any turn when the gold is ≥170° behind; `[END_GAME]` when `oracle_move` is `END_GAME`) | move-token span **1.5** |
 | `neutral` | defensible under the instructed 20° cone (FORWARD in-cone without a ray hit) | none — the analyst's rating stands |
-| `wrong` | turn away from the shorter rotation; FORWARD outside the cone; **any turn under a ray hit** (missed forward — tightened 2026-08-11) | move-token span **−0.5** (unlikelihood) + example scale **×0.25** |
+| `wrong` | turn away from the shorter rotation; FORWARD outside the cone; **any turn under a ray hit** (missed forward — tightened 2026-08-11); `[END_GAME]` while gold or an opening remains; a board move on a sealed empty board | move-token span **−0.5** (unlikelihood) + example scale **×0.25** |
 | `unknown` | no oracle meta (old corpora) / no move | none; counted + logged |
 
 **2026-08-11 tightening + transition boost:** the aug6 11-epoch run showed
