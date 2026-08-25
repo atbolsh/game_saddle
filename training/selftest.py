@@ -1385,28 +1385,31 @@ def t1_pure() -> str:
 
     # ---- agent_exited: disc contact with the unit-square boundary.
     # Radius toward each tested edge (r=0.05: x=0.96 True, x=0.94 False).
-    g_exit = new_multi_gold_game(n_gold=0, opening="require")
-    assert abs(g_exit.settings.agent_r - 0.05) < 1e-9, g_exit.settings.agent_r
-    g_exit.settings.agent_x = 0.5
-    g_exit.settings.agent_y = 0.5
-    assert not g_exit.agent_exited()
-    g_exit.settings.agent_x = 0.96
-    assert g_exit.agent_exited()
-    g_exit.settings.agent_x = 0.94
-    assert not g_exit.agent_exited()
-    g_exit.settings.agent_x = 0.04
-    assert g_exit.agent_exited()
-    g_exit.settings.agent_x = 0.06
-    assert not g_exit.agent_exited()
-    g_exit.settings.agent_x = 0.5
-    g_exit.settings.agent_y = 0.96
-    assert g_exit.agent_exited()
-    g_exit.settings.agent_y = 0.94
-    assert not g_exit.agent_exited()
-    g_exit.settings.agent_y = 0.04
-    assert g_exit.agent_exited()
-    g_exit.settings.agent_y = 0.06
-    assert not g_exit.agent_exited()
+    # Reuse g2 (already a new_multi_gold_game). A fourth factory call here
+    # consumes RNG and shifts later rolls -- new_bare_game is not sealed
+    # by construction, and used to pass this file's openings==[] assert
+    # only because the seed stream happened to land a closed room.
+    assert abs(g2.settings.agent_r - 0.05) < 1e-9, g2.settings.agent_r
+    g2.settings.agent_x = 0.5
+    g2.settings.agent_y = 0.5
+    assert not g2.agent_exited()
+    g2.settings.agent_x = 0.96
+    assert g2.agent_exited()
+    g2.settings.agent_x = 0.94
+    assert not g2.agent_exited()
+    g2.settings.agent_x = 0.04
+    assert g2.agent_exited()
+    g2.settings.agent_x = 0.06
+    assert not g2.agent_exited()
+    g2.settings.agent_x = 0.5
+    g2.settings.agent_y = 0.96
+    assert g2.agent_exited()
+    g2.settings.agent_y = 0.94
+    assert not g2.agent_exited()
+    g2.settings.agent_y = 0.04
+    assert g2.agent_exited()
+    g2.settings.agent_y = 0.06
+    assert not g2.agent_exited()
     checks += 1
 
     from agent.multi_gold_session import MultiGoldSelfEvalSession
@@ -1511,11 +1514,13 @@ def t1_pure() -> str:
     checks += 1
 
     from agent.game_io import (
-        new_bare_game, settings_from_dict, settings_json_with_openings,
+        settings_from_dict, settings_json_with_openings,
         settings_to_dict,
     )
     from agent import memory as memmod
-    sealed = settings_to_dict(new_bare_game().settings)
+    # g0 is opening="forbid" (asserted sealed above). new_bare_game is
+    # not a sealed factory -- random_side_walls may leave a gap.
+    sealed = settings_to_dict(g0.settings)
     assert sealed["openings"] == [], sealed["openings"]
     gapped_settings = settings_from_dict({
         "gameSize": 64, "direction": 0.0, "agent_x": 0.5, "agent_y": 0.5,
