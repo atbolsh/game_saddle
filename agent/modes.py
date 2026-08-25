@@ -1273,11 +1273,17 @@ _BLOCK_TARGET_LINE = (
     "TARGET: gold, 0\n"
     "TARGET: openings, 1\n"
     "TARGET: none\n"
-    "Use 'none' only when the settings have no gold and no openings "
-    "(a sealed empty room). If the player named a gold, the kind is "
-    "gold; if an opening, exit, or gap, the kind is openings. Emit "
-    "exactly one TARGET line per analysis, on its own line, before "
-    "the RATING line. Do not invent an index that is not in the list."
+    "Report the object the player is ACTUALLY chasing, even when that "
+    "choice breaks the rules (e.g. heading for an opening while gold "
+    "remains): name it honestly, then call out the mistake in your "
+    "analysis and rating. Write 'none' when the settings have no gold "
+    "and no openings (a sealed empty room), or when the round asked "
+    "the player a QUESTION rather than a move -- a question needs no "
+    "target, so 'TARGET: none' is the correct line there. If the "
+    "player named a gold, the kind is gold; if an opening, exit, or "
+    "gap, the kind is openings. Emit exactly one TARGET line per "
+    "analysis, on its own line, before the RATING line. Never invent "
+    "an index that is not in the list."
 )
 
 _BLOCK_OPENINGS_PRIVILEGED = (
@@ -1647,9 +1653,15 @@ def parse_rating(analysis: str) -> float | None:
 # Analyst TARGET line: "TARGET: gold, 0" / "TARGET: openings, 1" /
 # "TARGET: none". Last match wins. Index is 0-based into that settings
 # JSON list. Anything else (missing line, bad kind, non-integer) is
-# None -- never guess an object (no-fuzzy-fallbacks).
+# None -- never guess an object (no-fuzzy-fallbacks). The model sometimes
+# opens its reply with an "Analyst:" self-label and puts the TARGET line
+# right after it on the same line -- an optional leading label (with or
+# without markdown bold) is accepted, still anchored to line start so
+# mid-prose mentions never match.
 TARGET_RE = re.compile(
-    r"(?im)^[^\S\n]*\**[^\S\n]*TARGET[^\S\n]*\**[^\S\n]*:[^\S\n]*\**[^\S\n]*"
+    r"(?im)^[^\S\n]*\**[^\S\n]*"
+    r"(?:ANALYST[^\S\n]*\**[^\S\n]*:[^\S\n]*\**[^\S\n]*)?"
+    r"TARGET[^\S\n]*\**[^\S\n]*:[^\S\n]*\**[^\S\n]*"
     r"(?:"
     r"(?P<none>none)"
     r"|"
@@ -1666,7 +1678,8 @@ def parse_target(analysis: str) -> dict[str, Any] | None:
     ``{"kind": "gold"|"openings"|"none", "index": int|None}`` or None
     when no well-formed line is present. ``opening`` (singular) is
     accepted as the JSON key ``openings``; any other kind is a parse
-    failure. A leading ``[ANALYST]`` on the line is stripped first."""
+    failure. A leading ``[ANALYST]`` tag or an ``Analyst:`` self-label
+    on the line is tolerated -- neither is a parse failure."""
     matches = list(TARGET_RE.finditer(_without_analyst_line_tags(analysis)))
     if not matches:
         return None

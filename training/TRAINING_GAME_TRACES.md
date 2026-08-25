@@ -413,7 +413,12 @@ the aug4 spin-bot under a saturated analyst), so the crutch is now LIVE —
 deliberately, and marked ULTRAVIOLET in the code. Datagen stamps the raw
 facts per move (`_oracle_meta`: `oracle_rel_bearing`, `oracle_ray_hit`,
 `oracle_move` — exact, since bare levels have no internal walls — aimed
-at the engine-validated object on the analyst's `TARGET:` line);
+at the engine-validated object on the analyst's `TARGET:` line). TARGET
+failures split two ways: a line naming a REAL object the rules forbid
+(an opening while gold remains) is a player mistake — the oracle aims at
+the engine target and the verdict punishes the move; a missing line or
+one naming a NONEXISTENT object is corrupted analysis — the record is
+dropped like a missing RATING (perception rounds excused).
 `game_traces.oracle_verdict` classifies at train time:
 
 | verdict | geometry | effect |

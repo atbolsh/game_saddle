@@ -69,10 +69,15 @@ SHAPE -- ``span_weights``, relative emphasis WITHIN the reply
 
 Records whose analyst forgot the RATING line are DROPPED with a warning
 count -- never trained with a guessed reward (no-fuzzy-fallbacks).
-Move-round records stamped ``target_missing`` (no parseable TARGET line)
-are DROPPED the same way. Perception rounds are excused at DATAGEN time
-(``target_missing: False`` even with no TARGET) and train as prose
-graded by rating alone; old corpora lack the key (falsy → kept).
+Move-round records stamped ``target_missing`` or ``target_invalid`` (no
+parseable TARGET line / a TARGET naming a NONEXISTENT object) are
+DROPPED the same way -- corrupted analysis. A TARGET naming a real
+object the rules forbid (an opening while gold remains) is a PLAYER
+mistake, not corruption: the record trains and the oracle facts aim at
+the engine target, so the verdict punishes the move. Perception rounds
+are excused at DATAGEN time (both stamps False -- no move requested, no
+target required) and train as prose graded by rating alone; old corpora
+lack the keys (falsy → kept).
 
 ``PlayerAnchorSource`` is the third source over the same trace file: an
 RLHF-style trust region that pins the player's distribution to the PARENT
@@ -612,7 +617,7 @@ class GameTraceSource(_TraceFileSource):
             if meta.get("rating") is None:
                 n_dropped += 1
                 continue
-            if meta.get("target_missing"):
+            if meta.get("target_missing") or meta.get("target_invalid"):
                 n_dropped_target += 1
                 continue
 
@@ -693,8 +698,9 @@ class GameTraceSource(_TraceFileSource):
             )
         if n_dropped_target:
             logger.warning(
-                "%s: DROPPED %d/%d record(s) with no parseable TARGET "
-                "line (same contract as a missing RATING).",
+                "%s: DROPPED %d/%d record(s) with a corrupted TARGET "
+                "line -- missing or naming a nonexistent object (same "
+                "contract as a missing RATING).",
                 self.name, n_dropped_target, n_seen,
             )
 

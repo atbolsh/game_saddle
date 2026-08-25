@@ -45,12 +45,14 @@ One record per player generation, in ``data_game/<label>/traces.jsonl``:
     normalized units; the rating-independent quality cross-check), the raw
     engine-oracle facts for the position the move was made from
     (``oracle_move`` / ``oracle_rel_bearing`` / ``oracle_ray_hit`` /
-    ``oracle_target_ok`` -- ``_oracle_meta``, aimed at the engine-
-    validated object on the analyst's ``TARGET:`` line; graded train-side
-    by ``game_traces.oracle_verdict``), ``perception`` /
-    ``target_missing`` (move rounds with no TARGET line are dropped
-    train-side like a missing RATING; perception rounds are excused at
-    stamp time), and the exact ``question`` the round asked.
+    ``oracle_target_ok`` / ``oracle_target_status`` -- ``_oracle_meta``,
+    aimed at the engine-validated object on the analyst's ``TARGET:``
+    line; graded train-side by ``game_traces.oracle_verdict``),
+    ``perception`` / ``target_missing`` / ``target_invalid`` (a missing
+    TARGET line or one naming a NONEXISTENT object is corrupted analysis,
+    dropped train-side like a missing RATING; a real object the rules
+    forbid is a player mistake that trains; perception rounds are excused
+    at stamp time), and the exact ``question`` the round asked.
 
 Analyst text is stored to NAMS exactly as in the notebook and never enters
 any PLAYER record's ``messages``/``target_text`` -- it exists in player
@@ -242,34 +244,50 @@ def _nearest_engine_target(settings: dict) -> tuple[str, int | None]:
 
 def _resolve_oracle_target(
     settings: dict, target: dict | None,
-) -> tuple[str, int | None, bool]:
+) -> tuple[str, int | None, str]:
     """Validate the analyst's parsed TARGET line against the board and
-    return ``(kind, index, ok)`` -- the object the oracle will actually
-    aim at.
+    return ``(kind, index, status)`` -- the object the oracle will
+    actually aim at.
 
     The analyst chooses only where the rules leave a genuine choice
     (WHICH gold while golds remain; WHICH opening on an empty open room).
-    Kind-level claims are ENGINE-CHECKED, never trusted: ``openings`` or
-    ``none`` while gold remains, ``none`` while an opening exists, and
-    out-of-range indices are analyst ERRORS -- the oracle falls back to
-    :func:`_nearest_engine_target` (nearest gold if gold remains, else
-    nearest opening, else END_GAME) with ``ok=False``. Without this check
-    the TARGET line would be a lever to launder any move into
-    oracle-correct, which is exactly what the engine oracle exists to
-    prevent."""
-    kind = (target or {}).get("kind")
-    index = (target or {}).get("index")
+    ``status`` separates two very different failures (2026-08-25):
+
+      * ``"ok"`` -- a legal objective; the oracle aims at it.
+      * ``"mismatch"`` -- the line names a REAL object (or ``none``)
+        that the rules forbid as the objective: an opening while gold
+        remains, or ``none`` while anything remains. That is a faithful
+        report of a PLAYER mistake -- the record trains, the oracle aims
+        at :func:`_nearest_engine_target`, and the verdict punishes the
+        move. Without this fallback the TARGET line would be a lever to
+        launder any move into oracle-correct.
+      * ``"corrupt"`` -- the line is missing or references an object
+        that does not exist (out-of-range index, kind absent from the
+        board). Corrupted ANALYSIS: GameTraceSource drops the record
+        like a missing RATING. Engine-target facts are still stamped
+        (the anchor sources keep the record)."""
     gold = settings.get("gold") or []
     openings = settings.get("openings") or []
+    if target is None:
+        fb_kind, fb_index = _nearest_engine_target(settings)
+        return (fb_kind, fb_index, "corrupt")
+    kind = target.get("kind")
+    index = target.get("index")
     if kind == "gold" and isinstance(index, int) and 0 <= index < len(gold):
-        return ("gold", index, True)
-    if (kind == "openings" and not gold
-            and isinstance(index, int) and 0 <= index < len(openings)):
-        return ("openings", index, True)
-    if kind == "none" and not gold and not openings:
-        return ("none", None, True)
+        return ("gold", index, "ok")
+    if (kind == "openings" and isinstance(index, int)
+            and 0 <= index < len(openings)):
+        if not gold:
+            return ("openings", index, "ok")
+        fb_kind, fb_index = _nearest_engine_target(settings)
+        return (fb_kind, fb_index, "mismatch")
+    if kind == "none":
+        if not gold and not openings:
+            return ("none", None, "ok")
+        fb_kind, fb_index = _nearest_engine_target(settings)
+        return (fb_kind, fb_index, "mismatch")
     fb_kind, fb_index = _nearest_engine_target(settings)
-    return (fb_kind, fb_index, False)
+    return (fb_kind, fb_index, "corrupt")
 
 
 def _aim_point(settings: dict, kind: str, index: int) -> tuple[float, float, float]:
@@ -299,6 +317,10 @@ def _oracle_meta(settings: dict, target: dict | None = None) -> dict:
         fallback; kind "none" = sealed empty, index None);
       * oracle_target_ok: True when the analyst's TARGET line was present
         AND valid (its object was used); False on fallback;
+      * oracle_target_status: "ok" / "mismatch" (real object, wrong
+        objective -- a player mistake that trains) / "corrupt" (missing
+        line or nonexistent object -- dropped train-side); see
+        :func:`_resolve_oracle_target`;
       * oracle_rel_bearing: signed bearing (radians, wrapped to [-pi, pi))
         from the agent's facing to that object. Compass convention:
         bearing = atan2(dx, dy), theta increases clockwise, POSITIVE =
@@ -312,11 +334,12 @@ def _oracle_meta(settings: dict, target: dict | None = None) -> dict:
 
     Always stamps oracle_move: validation guarantees an aim object (or
     the sealed-empty END_GAME) on every board."""
-    kind, index, ok = _resolve_oracle_target(settings, target)
+    kind, index, status = _resolve_oracle_target(settings, target)
     stamped: dict = {
         "oracle_kind": kind,
         "oracle_index": index,
-        "oracle_target_ok": ok,
+        "oracle_target_ok": status == "ok",
+        "oracle_target_status": status,
     }
     if kind == "none":
         stamped.update({
@@ -547,12 +570,21 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
         analyst = session.ask_analyst(session.DEFAULT_ANALYST_QUESTION)
         session_analyses.append(analyst["analysis"])
         oracle = _oracle_meta(settings_before, analyst["target"])
-        # Missing TARGET line on a MOVE round gets the missing-RATING
-        # treatment (GameTraceSource drops the record). A perception
-        # round's analyst grades a prose answer -- no geometry, no TARGET
-        # required -- so it is stamped False (excused), and old corpora
-        # lack the key entirely (falsy -> kept).
+        # TARGET failures split two ways (_resolve_oracle_target): a
+        # missing line or a nonexistent object is corrupted ANALYSIS --
+        # stamped here and dropped train-side like a missing RATING. A
+        # real object the rules forbid (opening/none while gold remains)
+        # is a PLAYER mistake: nothing is stamped, the record trains, and
+        # the oracle verdict punishes the move. Perception rounds are
+        # excused from both stamps -- no move was requested, no target
+        # required ('TARGET: none' is the sanctioned line there) -- and
+        # old corpora lack the keys entirely (falsy -> kept).
         target_missing = analyst["target"] is None and not is_perception
+        target_invalid = (
+            analyst["target"] is not None
+            and oracle["oracle_target_status"] == "corrupt"
+            and not is_perception
+        )
         outcome = session.end_round()
         # After the pending move propagated: dist_before - dist_to_gold_after
         # > 0 means this round moved the player toward the gold.
@@ -587,6 +619,7 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
                 "question": question,
                 "perception": is_perception,
                 "target_missing": target_missing,
+                "target_invalid": target_invalid,
                 "room": room,
                 "n_gold": len(settings_before.get("gold") or []),
                 "n_openings": len(settings_before.get("openings") or []),
@@ -656,10 +689,16 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
                 shared.stats["perception_rounds"] += 1
             if target_missing:
                 shared.stats["target_missing"] += 1
-            elif analyst["target"] is not None and not oracle["oracle_target_ok"]:
-                # Present but invalid (wrong kind for the board / OOB
-                # index): the oracle fell back to the engine target.
+            elif target_invalid:
+                # Present but naming a nonexistent object: corrupted
+                # analysis, dropped train-side.
                 shared.stats["target_invalid"] += 1
+            elif (not is_perception
+                    and oracle["oracle_target_status"] == "mismatch"):
+                # Real object, wrong objective (e.g. an opening while
+                # gold remains): a player mistake that TRAINS -- the
+                # oracle aimed at the engine target instead.
+                shared.stats["target_mismatch"] += 1
 
         # Degeneracy fuse: no parseable RATING anywhere in the analysis AND
         # no parseable move token in the reply (bare or bracketed) means
@@ -924,12 +963,15 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
             "%d record(s) have no parseable RATING and will be DROPPED by "
             "GameTraceSource at load time.", shared.stats["rating_missing"],
         )
-    if shared.stats["target_missing"]:
+    n_target_bad = (shared.stats["target_missing"]
+                    + shared.stats["target_invalid"])
+    if n_target_bad:
         logger.warning(
-            "%d move-round record(s) have no parseable TARGET line and "
-            "will be DROPPED by GameTraceSource at load time (same "
-            "contract as a missing RATING; their oracle facts fell back "
-            "to the engine target).", shared.stats["target_missing"],
+            "%d move-round record(s) have a corrupted TARGET line "
+            "(%d missing, %d naming a nonexistent object) and will be "
+            "DROPPED by GameTraceSource at load time (same contract as "
+            "a missing RATING).", n_target_bad,
+            shared.stats["target_missing"], shared.stats["target_invalid"],
         )
     try:
         from training.datagen_plots import write_datagen_plots

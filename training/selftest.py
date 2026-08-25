@@ -335,9 +335,15 @@ def t1_pure() -> str:
         ("TARGET: gold, 0\nTARGET: openings, 1",
          {"kind": "openings", "index": 1}),
         ("[ANALYST] TARGET: gold, 0", {"kind": "gold", "index": 0}),
+        # reply opening with an "Analyst:" self-label, TARGET on the
+        # same line (no newline between) -- not a parse failure
+        ("Analyst: TARGET: gold, 0", {"kind": "gold", "index": 0}),
+        ("**Analyst:** TARGET: none\nprose after",
+         {"kind": "none", "index": None}),
         ("TARGET: golds, 0", None),          # not a JSON key
         ("TARGET: left, 0", None),
         ("TARGET: gold", None),              # no index
+        ("we set TARGET: gold, 0 earlier", None),  # mid-prose, not a line
         ("no target here", None),
     ]:
         got = parse_target(text)
@@ -461,13 +467,17 @@ def t1_pure() -> str:
     near_gold = _oracle_meta(far_split, g0)
     assert near_gold["oracle_move"] == "ANTICLOCK", near_gold
     assert near_gold["oracle_target_ok"] is True and near_gold["oracle_index"] == 0
-    # missing / OOB -> nearest-gold fallback, ok=False (never silent unknown)
+    # missing / OOB -> nearest-gold fallback, status "corrupt" (dropped
+    # train-side; never a silent unknown)
     miss = _oracle_meta(far_split, None)
     assert miss["oracle_kind"] == "gold" and miss["oracle_index"] == 0, miss
     assert miss["oracle_move"] == "ANTICLOCK" and miss["oracle_target_ok"] is False
+    assert miss["oracle_target_status"] == "corrupt", miss
     oob = _oracle_meta(far_split, {"kind": "gold", "index": 9})
     assert oob["oracle_index"] == 0 and oob["oracle_target_ok"] is False, oob
-    # openings while gold remains: laundering case -> nearest gold
+    assert oob["oracle_target_status"] == "corrupt", oob
+    # openings while gold remains: a REAL object, wrong objective -- a
+    # player mistake ("mismatch", trains) -> oracle aims at nearest gold
     gold_and_exit = {
         **far_split,
         "openings": [{"side": "top", "center": [0.5, 1.0], "width": 0.3}],
@@ -475,11 +485,17 @@ def t1_pure() -> str:
     launder = _oracle_meta(gold_and_exit, {"kind": "openings", "index": 0})
     assert launder["oracle_kind"] == "gold" and launder["oracle_index"] == 0
     assert launder["oracle_target_ok"] is False
+    assert launder["oracle_target_status"] == "mismatch", launder
     assert launder["oracle_move"] == "ANTICLOCK", launder
-    # none while gold remains -> fallback, never END_GAME
+    # ...but an OOB opening index while gold remains is corrupt, not a
+    # mismatch (the named object does not exist)
+    launder_oob = _oracle_meta(gold_and_exit, {"kind": "openings", "index": 5})
+    assert launder_oob["oracle_target_status"] == "corrupt", launder_oob
+    # none while gold remains -> mismatch fallback, never END_GAME
     none_gold = _oracle_meta(far_split, {"kind": "none", "index": None})
     assert none_gold["oracle_move"] != "END_GAME", none_gold
     assert none_gold["oracle_kind"] == "gold" and none_gold["oracle_target_ok"] is False
+    assert none_gold["oracle_target_status"] == "mismatch", none_gold
     # empty room, two openings unequal distance: top nearer (0.4) than
     # right (0.5). Valid non-nearest pick is honored.
     two_ops = {
@@ -494,20 +510,23 @@ def t1_pure() -> str:
     near_op = _oracle_meta(two_ops, {"kind": "openings", "index": 0})
     assert near_op["oracle_move"] == "FORWARD" and near_op["oracle_target_ok"]
     assert near_op["oracle_ray_hit"], near_op
-    # none while an opening exists -> nearest-opening fallback
+    # none while an opening exists -> mismatch, nearest-opening fallback
     none_op = _oracle_meta(two_ops, {"kind": "none", "index": None})
     assert none_op["oracle_kind"] == "openings" and none_op["oracle_index"] == 0
     assert none_op["oracle_target_ok"] is False
+    assert none_op["oracle_target_status"] == "mismatch", none_op
     assert none_op["oracle_move"] == "FORWARD", none_op
-    # sealed empty: none -> END_GAME ok=True; missing -> END_GAME ok=False
+    # sealed empty: none -> END_GAME ok; missing -> END_GAME corrupt
     none_t = {"kind": "none", "index": None}
     sealed_empty = _oracle_meta({**base_settings, "gold": []}, none_t)
     assert sealed_empty["oracle_move"] == "END_GAME", sealed_empty
     assert sealed_empty["oracle_rel_bearing"] is None, sealed_empty
     assert sealed_empty["oracle_target_ok"] is True, sealed_empty
+    assert sealed_empty["oracle_target_status"] == "ok", sealed_empty
     sealed_miss = _oracle_meta({**base_settings, "gold": []}, None)
     assert sealed_miss["oracle_move"] == "END_GAME", sealed_miss
     assert sealed_miss["oracle_target_ok"] is False, sealed_miss
+    assert sealed_miss["oracle_target_status"] == "corrupt", sealed_miss
     # valid gold pick while an opening also exists still aims at gold
     gold_over_exit = _oracle_meta(
         {**base_settings, "gold": [[0.8, 0.5]],
@@ -516,7 +535,8 @@ def t1_pure() -> str:
     )
     assert gold_over_exit["oracle_move"] == "CLOCK", gold_over_exit
     assert gold_over_exit["oracle_target_ok"] is True, gold_over_exit
-    checks += 16
+    assert gold_over_exit["oracle_target_status"] == "ok", gold_over_exit
+    checks += 17
 
     # ---- action balance (TEMPORARY HACK -- the screaming block above
     # action_balance_multipliers in training/game_traces.py): inverse
@@ -759,6 +779,15 @@ def t1_pure() -> str:
                 "meta": {"rating": 0.5, "wrong_spans": [],
                          "target_missing": True},
             },
+            {   # TARGET naming a nonexistent object -> corrupted analysis,
+                # dropped exactly like target_missing
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "move?"},
+                ]}],
+                "target_text": "[ANTICLOCK]",
+                "meta": {"rating": 0.5, "wrong_spans": [],
+                         "target_invalid": True},
+            },
             {   # perception round: TARGET not required, stamped False
                 "messages": [{"role": "user", "content": [
                     {"type": "text", "text": "Are you facing the gold?"},
@@ -774,13 +803,15 @@ def t1_pure() -> str:
         src = GameTraceSource(trace_dir / "traces.jsonl", noise_strength=0.0)
         exs = list(src.examples())
         assert len(exs) == 2, (
-            f"expected 2 examples (rating-null + target_missing dropped, "
-            f"perception kept, no-key kept), got {len(exs)}"
+            f"expected 2 examples (rating-null + target_missing + "
+            f"target_invalid dropped, perception kept, no-key kept), "
+            f"got {len(exs)}"
         )
         by_text = {ex.target_text: ex for ex in exs}
         assert "thinking WRONG bit [FORWARD]" in by_text
         assert "Yes, dead ahead." in by_text
         assert "[CLOCK]" not in by_text and "[LEFT]" not in by_text
+        assert "[ANTICLOCK]" not in by_text
         ex = by_text["thinking WRONG bit [FORWARD]"]
         assert ex.loss == "ce" and ex.span_weights, ex
         assert ex.messages[0]["content"][0]["url"] == str(img), (
@@ -791,8 +822,8 @@ def t1_pure() -> str:
         # per-example normalization, train.py SHAPE VS SCALE)
         assert ex.span_weights[0][2] == 1.0, ex.span_weights
         assert ex.span_weights[1][2] == WRONG_SPAN_WEIGHT, ex.span_weights
-        # SCALE: three rated records at 0.5 (one dropped for
-        # target_missing still counts in r_bar) -> r_bar == 0.5;
+        # SCALE: every rated record sits at 0.5 (the target-dropped ones
+        # still count in the r_bar pre-pass) -> r_bar == 0.5;
         # exp(0) = 1.0 base, + 1.0 win boost at moves_from_end=0
         assert abs(src.rating_baseline - 0.5) < 1e-9, src.rating_baseline
         assert abs(ex.example_weight - 2.0) < 1e-9, ex.example_weight
@@ -960,9 +991,9 @@ def t1_pure() -> str:
         psrc = PlayerAnchorSource(trace_dir / "traces.jsonl",
                                   noise_strength=0.0)
         pexs = list(psrc.examples())
-        assert len(pexs) == 4, (
-            f"expected 4 anchor examples (rating-null KEPT, "
-            f"target_missing KEPT), got {len(pexs)}"
+        assert len(pexs) == 5, (
+            f"expected 5 anchor examples (rating-null KEPT, "
+            f"target_missing/target_invalid KEPT), got {len(pexs)}"
         )
         assert all(x.loss == "kd_anchor" and x.span_weights is None
                    for x in pexs), pexs
