@@ -180,7 +180,10 @@ def _block_aim_tolerance_review(tolerance: str, target: str) -> str:
         "and must not be penalized as imprecise aim; conversely, long "
         "rotate-only fine-tuning inside that tolerance goes against them. "
         "Measure those 20 degrees from YOUR computed |delta|, never from the "
-        "player's 'about 30 degrees' or 'within aim tolerance' claim."
+        "player's 'about 30 degrees', 'close enough', or 'within aim "
+        "tolerance' claim. 'Do not demand pixel-perfect aim' is a player "
+        "instruction about reading the screen, not a license to bless "
+        f"{_TOK_FORWARD} outside the cone."
     )
 
 
@@ -212,6 +215,13 @@ _BLOCK_GRADING_TOLERANCE = (
     "degrees (about 0.35 rad, 0.67 clock hours). A player who says "
     "'about 30 degrees off, so within aim tolerance' has failed that "
     "test -- mark the move, not the wording band.\n"
+    "Be strict. The failure mode is computing the right |delta| and then "
+    "forgiving the token: 'punishing it goes against the spirit of the "
+    "2-hour limit', 'slightly outside the 20-degree strict limit but "
+    "close enough', 'in the spirit of do-not-demand-pixel-perfect-aim', "
+    "'not a significant error', 'the player should not be penalized'. "
+    "None of those override YOUR |delta|. If the token is wrong under "
+    "the rules above, the RATING is negative.\n"
     "Two cases ARE clear-cut, and in both the overall RATING must be "
     "NEGATIVE no matter how sound the rest of the reply reads:\n"
     "  - MISSED FORWARD: the gold lies within about 10 degrees of the "
@@ -1036,8 +1046,9 @@ _BLOCK_TRUST_THE_MATH = (
     f"{_TOK_ANTICLOCK}, they are wrong -- including across the 12 o'clock "
     "seam (facing 11 o'clock with the gold at 12 o'clock is a short "
     "CLOCKWISE turn, not 30 degrees to the left). Do not write a second "
-    "player-style justification for their token. A fluent reply that "
-    "disagrees with your delta is still a bad reply."
+    "player-style justification for their token -- not 'close enough', "
+    "not 'in the spirit of the 2-hour / aim-tolerance rule'. A fluent "
+    "reply that disagrees with your delta is still a bad reply."
 )
 
 _BLOCK_DEBRIEF_RECORD = (
@@ -1529,6 +1540,19 @@ DEBRIEF_TOOL_PATTERN = (
 )
 DEBRIEF_TOOL_RE = re.compile(DEBRIEF_TOOL_PATTERN)
 
+
+def _without_analyst_line_tags(text: str) -> str:
+    """Strip a leading ``[ANALYST]`` tag from each line, if present.
+
+    The model sometimes emits the persistence tag itself. Line-start
+    extractors (RATING / WRONG / TIP) must not fail because of it.
+    Lines without the tag are unchanged. Delegates to
+    :func:`agent.memory.untag_analyst_text` so tagging and parsing share
+    one strip rule.
+    """
+    return mem.untag_analyst_text(text)
+
+
 # The 'TIP: <one line>' line that must accompany a [WRITE_TIP] call. The LAST
 # such line in the reply is the tip (the model may quote earlier proposals).
 TIP_LINE_RE = re.compile(r"(?im)^\s*TIP\s*:\s*(?P<tip>.+?)\s*$")
@@ -1561,11 +1585,13 @@ def parse_wrong_spans(analysis: str, source_text: str) -> dict[str, list[str]]:
     (no-fuzzy-fallbacks). An empty ``WRONG:`` line (no words on that line)
     is ignored: producing zero error spans is a valid analyst outcome. A
     double-quoted span keeps only the quoted words -- same-line commentary
-    after the closing quote is the reviewer talking, not the span."""
+    after the closing quote is the reviewer talking, not the span. A
+    leading ``[ANALYST]`` on the WRONG line is stripped first -- the
+    model emitting the persistence tag is not a parse failure."""
     verified: list[str] = []
     unverified: list[str] = []
     seen: set[str] = set()
-    for m in WRONG_SPAN_RE.finditer(analysis):
+    for m in WRONG_SPAN_RE.finditer(_without_analyst_line_tags(analysis)):
         span = m.group("quoted") or m.group("span") or ""
         span = span.strip().strip("\"'").strip()
         if not span or span in seen:
@@ -1590,8 +1616,10 @@ def parse_rating(analysis: str) -> float | None:
     """Extract the analyst's final ``RATING: <number>`` from ``analysis``,
     clamped to [-1.0, 1.0]. The LAST match wins (the closing verdict; earlier
     matches are quotes or revisions). Returns None when no rating line is
-    present -- callers decide how loudly to fail; never guess a number."""
-    matches = RATING_RE.findall(analysis)
+    present -- callers decide how loudly to fail; never guess a number.
+    A leading ``[ANALYST]`` on the rating line is stripped first -- the
+    model emitting the persistence tag is not a parse failure."""
+    matches = RATING_RE.findall(_without_analyst_line_tags(analysis))
     if not matches:
         return None
     return max(-1.0, min(1.0, float(matches[-1])))
@@ -1679,8 +1707,9 @@ async def record_search_tool_call(
 
 def parse_tip_line(text: str) -> str | None:
     """The tip wording from the last 'TIP: <one line>' line in ``text``, or
-    ``None`` if the reply carries no such line."""
-    matches = TIP_LINE_RE.findall(text)
+    ``None`` if the reply carries no such line. A leading ``[ANALYST]``
+    on the TIP line is stripped first."""
+    matches = TIP_LINE_RE.findall(_without_analyst_line_tags(text))
     return matches[-1].strip() if matches else None
 
 

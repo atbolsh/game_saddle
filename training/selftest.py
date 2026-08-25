@@ -248,7 +248,7 @@ def t1_pure() -> str:
         strip_analyst_lines,
         tag_analyst_text,
     )
-    from agent.modes import parse_rating
+    from agent.modes import parse_rating, parse_tip_line, parse_wrong_spans
     from training.game_traces import (
         ACTION_BALANCE_CAP,
         ADV_CAP,
@@ -290,7 +290,8 @@ def t1_pure() -> str:
 
     checks = 0
 
-    # ---- parse_rating: plain, bold variants, last-wins, clamp, absent
+    # ---- parse_rating: plain, bold variants, last-wins, clamp, absent,
+    # leading [ANALYST] (the model sometimes emits the persistence tag)
     for text, expected in [
         ("...verdict.\nRATING: 0.5", 0.5),
         ("**RATING:** -0.25", -0.25),
@@ -298,10 +299,37 @@ def t1_pure() -> str:
         ("RATING: 0.1\nrethinking...\nRATING: -0.9", -0.9),
         ("RATING: 7", 1.0),          # clamped
         ("no verdict here", None),
+        ("[ANALYST] RATING: 0.5", 0.5),
+        ("[ANALYST] **RATING:** -0.25", -0.25),
+        ("RATING: 0.1\n[ANALYST] RATING: -0.9", -0.9),
+        ("[ANALYST] no verdict here", None),
     ]:
         got = parse_rating(text)
         assert got == expected, f"parse_rating({text!r}) = {got}, want {expected}"
         checks += 1
+
+    # ---- parse_wrong_spans: quoted span, unverified kept, [ANALYST] prefix
+    src = "The gold is at 3 o'clock. [FORWARD]"
+    got = parse_wrong_spans('WRONG: "3 o\'clock"', src)
+    assert got == {"verified": ["3 o'clock"], "unverified": []}, got
+    got = parse_wrong_spans('[ANALYST] WRONG: "3 o\'clock"', src)
+    assert got == {"verified": ["3 o'clock"], "unverified": []}, got
+    got = parse_wrong_spans('[ANALYST] WRONG: "never said this"', src)
+    assert got == {"verified": [], "unverified": ["never said this"]}, got
+    got = parse_wrong_spans("no spans here", src)
+    assert got == {"verified": [], "unverified": []}, got
+    checks += 1
+
+    # ---- parse_tip_line: last-wins, [ANALYST] prefix
+    assert parse_tip_line("TIP: rotate toward the gold") == "rotate toward the gold"
+    assert parse_tip_line("[ANALYST] TIP: rotate toward the gold") == (
+        "rotate toward the gold"
+    )
+    assert parse_tip_line("TIP: draft\n[ANALYST] TIP: final wording") == (
+        "final wording"
+    )
+    assert parse_tip_line("[ANALYST] no tip here") is None
+    checks += 1
 
     # ---- rating_advantage / example_scale: the reply-wide SCALE half of
     # the 2026-08-05 shape/scale split (module docstring + postmortem in
