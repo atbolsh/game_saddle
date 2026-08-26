@@ -38,7 +38,12 @@ SCALE -- ``TrainingExample.example_weight``, "how much this reply matters":
   2. + win boost ``win_boost * win_gamma ** moves_from_end`` (ADDITIVE:
      ground truth, so it rescues even an analyst-floored reply near a
      win; 1.0 decaying by 0.95/round -- sized to outweigh anything the
-     analyst can award, wins must be clamped onto and kept);
+     analyst can award, wins must be clamped onto and kept). Same shape
+     for gold-collection: ``(win_boost/2) * win_gamma ** moves_from_eat``,
+     spike on the eat, decay backward, zero after. Derived at load from
+     ``gold_collected`` / ``move_index`` (no extra datagen stamp --
+     existing traces pick it up). Sealed eat-to-win (``win_kind=="gold"``)
+     is NOT stacked: that terminal is already the win boost;
   3. x action balance (TEMPORARY HACK, screaming block above
      :func:`action_balance_multipliers`): equal total cloning mass per
      move TYPE, capped at 4x;
@@ -53,7 +58,7 @@ SCALE -- ``TrainingExample.example_weight``, "how much this reply matters":
      drowning in continuation moves. Compounds with 5 on a missed
      forward (0.25 x 2 = 0.5, with a sharpened -0.5 token span).
 
-  A scale of exactly 0 (floored rating, no win boost) SKIPS the record.
+  A scale of exactly 0 (floored rating, no win/eat boost) SKIPS the record.
 
 SHAPE -- ``span_weights``, relative emphasis WITHIN the reply
 (:func:`build_span_weights`):
@@ -165,18 +170,46 @@ def rating_advantage(rating: float, baseline: float,
     return min(cap, math.exp((float(rating) - baseline) / beta))
 
 
+#: Eat-event scale as a fraction of ``win_boost`` (half: a pickup is
+#: ground truth but not a win). Same ``win_gamma`` as the win trajectory.
+EAT_BOOST_RATIO = 0.5
+
+
+def moves_from_eat(move_index: int | None,
+                   eat_indices: list[int]) -> int | None:
+    """Steps from this move to the next gold-eat at or after it.
+
+    0 on the eat itself; ``None`` when no later eat (post-eat wandering
+    gets no eat credit). Same backward-decay index as ``moves_from_end``.
+    Several eats in one game are segmented: each hunt credits back to
+    (but not through) the previous eat."""
+    if move_index is None or not eat_indices:
+        return None
+    mi = int(move_index)
+    future = [e for e in eat_indices if e >= mi]
+    if not future:
+        return None
+    return min(future) - mi
+
+
 def example_scale(rating: float, baseline: float, game_won: bool,
                   moves_from_end: int | None,
                   win_boost: float = 1.0,
-                  win_gamma: float = 0.95) -> float:
+                  win_gamma: float = 0.95,
+                  moves_from_eat: int | None = None,
+                  eat_boost: float | None = None) -> float:
     """Reply-wide reward scale (module docstring, SCALE steps 1-2):
-    exp-advantage base plus the additive win boost. Action balance,
-    novelty, and the oracle penalty multiply on top in GameTraceSource
-    (they need corpus / stream / oracle state a pure function can't
-    carry)."""
+    exp-advantage base plus the additive win / eat boosts. Action
+    balance, novelty, and the oracle penalty multiply on top in
+    GameTraceSource (they need corpus / stream / oracle state a pure
+    function can't carry)."""
+    if eat_boost is None:
+        eat_boost = EAT_BOOST_RATIO * win_boost
     boost = 0.0
     if game_won and moves_from_end is not None:
-        boost = win_boost * (win_gamma ** moves_from_end)
+        boost += win_boost * (win_gamma ** moves_from_end)
+    if moves_from_eat is not None:
+        boost += eat_boost * (win_gamma ** moves_from_eat)
     return rating_advantage(rating, baseline) + boost
 
 
@@ -564,17 +597,23 @@ class GameTraceSource(_TraceFileSource):
         self.win_boost = win_boost
         self.win_gamma = win_gamma
         self.novelty = novelty
-        # One pre-pass over the records that will actually train (rated
-        # records) feeds two corpus statistics:
-        #   * ACTION BALANCE counts (TEMPORARY HACK -- screaming block
-        #     above): equal total mass per move type;
-        #   * the mean rating r_bar, the baseline of the exp-advantage
-        #     scale (rating_advantage) -- "advantage" is only meaningful
-        #     relative to what this corpus considers average.
+        # One pre-pass over the file:
+        #   * eat indices per game (gold_collected, all records — the
+        #     event still happened if the eat round is later dropped);
+        #   * ACTION BALANCE counts and r_bar from rated records only.
         counts: dict[str, int] = {}
         rating_sum = 0.0
         n_rated = 0
+        eat_at: dict[tuple, list[int]] = {}
+        gold_win: set[tuple] = set()
         for _, _, _, meta in self._iter_records():
+            key = (meta.get("session_id"), meta.get("game_index"))
+            if meta.get("win_kind") == "gold":
+                gold_win.add(key)
+            if int(meta.get("gold_collected") or 0) > 0:
+                mi = meta.get("move_index")
+                if mi is not None:
+                    eat_at.setdefault(key, []).append(int(mi))
             if meta.get("rating") is None:
                 continue
             rating_sum += float(meta["rating"])
@@ -582,6 +621,9 @@ class GameTraceSource(_TraceFileSource):
             action = meta.get("action")
             if action is not None:
                 counts[action] = counts.get(action, 0) + 1
+        self._eat_at = {
+            k: sorted(set(v)) for k, v in eat_at.items() if k not in gold_win
+        }
         self.rating_baseline = rating_sum / n_rated if n_rated else 0.0
         self.action_balance = action_balance_multipliers(counts)
         if n_rated:
@@ -631,10 +673,13 @@ class GameTraceSource(_TraceFileSource):
             # SCALE (module docstring): reply-wide reward on
             # example_weight -- per-example normalization would cancel it
             # on the span weights (train.py, SHAPE VS SCALE).
+            eat_key = (meta.get("session_id"), meta.get("game_index"))
             scale = example_scale(
                 float(meta["rating"]), self.rating_baseline,
                 bool(meta.get("game_won")), meta.get("moves_from_end"),
                 self.win_boost, self.win_gamma,
+                moves_from_eat(meta.get("move_index"),
+                               self._eat_at.get(eat_key, [])),
             )
             scale *= self.action_balance.get(action, 1.0)
             scale *= novelty_mult
@@ -647,7 +692,7 @@ class GameTraceSource(_TraceFileSource):
                 # gold is dead ahead and FORWARD gates the win.
                 scale *= TRANSITION_BOOST
             if scale == 0.0:
-                # Floored rating, no win boost: teaches NOTHING -- skip
+                # Floored rating, no win/eat boost: teaches NOTHING -- skip
                 # the forward pass entirely rather than burn it on a
                 # zero-scaled loss.
                 n_floored += 1
@@ -687,7 +732,7 @@ class GameTraceSource(_TraceFileSource):
         if n_floored:
             logger.info(
                 "%s: SKIPPED %d/%d record(s) at zero example weight "
-                "(rating at/below the %.1f floor, no win boost).",
+                "(rating at/below the %.1f floor, no win/eat boost).",
                 self.name, n_floored, n_seen, RATING_FLOOR,
             )
         if n_dropped:

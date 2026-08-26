@@ -3,7 +3,7 @@
 One "epoch" here is one full expert-iteration cycle. For epoch k (1-based):
 
   1. datagen   ``python -m training.generate_game_traces --label
-     <prefix>_iter<k> --parallel <--parallel, default 12> --checkpoint
+     <prefix>_iter<k> --parallel <--parallel, default 8> --checkpoint
      <previous epoch's adapter> --multi-gold`` (0–3 golds, openings any;
      eating gold does not end the game). ``--parallel 1`` restores the
      fully serial datagen path
@@ -960,13 +960,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "knob for fitting the window (epoch datagen hours "
                         "~= this x s/gen / 3600; measured s/gen in the "
                         "module docstring)")
-    p.add_argument("--parallel", type=int, default=12,
-                   help="concurrent datagen sessions per epoch (passed to "
+    p.add_argument("--parallel", type=int, default=8,
+                    help="concurrent datagen sessions per epoch (passed to "
                         "generate_game_traces); 1 = the fully serial "
-                        "conservative path; default 12 leaves GPU headroom "
-                        "for the NAMS MiniLM embedder (16 died with "
-                        "CUBLAS_STATUS_ALLOC_FAILED on a 96 GB box, "
-                        "2026-08-17)")
+                        "conservative path; default 8 after 12 OOM'd on "
+                        "50-move multi-gold contexts (T~7k) on a 96 GB box "
+                        "(2026-08-26). 16 died with CUBLAS on shorter "
+                        "sealed games (2026-08-17)")
     p.add_argument("--seed", type=int, default=None,
                    help="base seed; each epoch and resume attempt derives "
                         "a distinct noise/question stream from it. Omit "

@@ -26,9 +26,10 @@ Two room modes:
     the ``openings`` dict entry; player context strips it.
 
 Records buffer per game and are written at game close, each stamped with
-``meta.game_won`` and ``meta.moves_from_end`` (0 = the terminal winning
-round) -- the discounted win boost is computed from these at TRAINING
-time by ``GameTraceSource``, not here; this script stores raw annotations
+``meta.game_won``, ``meta.win_kind``, ``meta.moves_from_end`` (0 = the
+terminal winning round), and per-round ``gold_collected`` -- the
+discounted win / eat boosts are computed from these at TRAINING time by
+``GameTraceSource``, not here; this script stores raw annotations
 only (rating, verified WRONG spans, outcome), so every reward ratio stays
 tunable without regenerating data.
 
@@ -86,7 +87,7 @@ so the orchestrator stops instead of burning hours on gibberish (the
 noticed). Per-move gold distances (``meta.dist_to_gold_before/after``) are
 recorded as a rating-independent quality cross-check.
 
-**Parallelism** (``--parallel``, default 12): N sessions play N games
+**Parallelism** (``--parallel``, default 8): N sessions play N games
 concurrently, one worker thread each, sharing ONE model through
 ``agent.parallel_gen`` -- concurrent generations merge into batched decode
 calls (batch-1 decode is bandwidth-bound, so extra rows are cheap).
@@ -94,7 +95,9 @@ Measured 2026-07-30 (96 GB box, base weights): serial 24.1 s/gen,
 ``--parallel 10`` 8.5, ``--parallel 24`` 6.4 -- returns diminish but never
 invert. 16 looked like VRAM headroom until 2026-08-17: 16 long KV caches
 plus the NAMS MiniLM embedder on the same GPU died with
-``CUBLAS_STATUS_ALLOC_FAILED``. Default 12 is that lesson. NAMS resets happen at
+``CUBLAS_STATUS_ALLOC_FAILED``. Default 8 is the 2026-08-26 lesson: 12
+OOM'd on 50-move multi-gold contexts (T~7k) on a 96 GB box; 16 died on
+shorter sealed games (2026-08-17). NAMS resets happen at
 BLOCK boundaries: games run in
 sequential blocks of ``--reset-every``, all workers drain between blocks,
 one session resets, all restart. Each concurrent session is invisible to
@@ -1008,13 +1011,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "run_weekend datagen passes this; smoke does not")
     p.add_argument("--max-generations", type=int, default=3000,
                    help="hard cap on player generations for the whole run")
-    p.add_argument("--parallel", type=int, default=12,
-                   help="concurrent game sessions sharing one model via "
+    p.add_argument("--parallel", type=int, default=8,
+                    help="concurrent game sessions sharing one model via "
                         "batched decode (agent/parallel_gen.py); 1 = the "
-                        "plain sequential loop; default 12 leaves GPU "
-                        "headroom for the NAMS MiniLM embedder (16 died "
-                        "with CUBLAS_STATUS_ALLOC_FAILED on a 96 GB box, "
-                        "2026-08-17; module docstring)")
+                        "plain sequential loop; default 8 after 12 OOM'd "
+                        "on 50-move multi-gold contexts (T~7k) on a 96 GB "
+                        "box (2026-08-26; 16 died CUBLAS on shorter sealed "
+                        "games, 2026-08-17; module docstring)")
     p.add_argument("--reset-every", type=int, default=100,
                    help="reset NAMS episodic memory (tips survive) every N "
                         "games (default 100 per TRAINING_EXTRA_DATASETS.md)")

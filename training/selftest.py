@@ -27,7 +27,8 @@ Stage map (rationale in the Intermission plan):
                 add_preference text round-trip (byte identity)
   * t1-pure     parse_rating, parse_target (TARGET: gold|openings, i /
                 none), ExtractorType.NONE, the shape/scale reward split
-                (rating_advantage / example_scale / build_span_weights),
+                (rating_advantage / example_scale / moves_from_eat /
+                build_span_weights),
                 oracle_verdict + _oracle_meta geometry, image noise,
                 tripwire, _rewrite_image_urls, Game/PlayerAnchor/Analyst
                 sources on fabricated dirs (example_weight, oracle
@@ -268,6 +269,7 @@ def t1_pure() -> str:
         action_balance_multipliers,
         build_span_weights,
         example_scale,
+        moves_from_eat,
         oracle_verdict,
         rating_advantage,
     )
@@ -376,7 +378,8 @@ def t1_pure() -> str:
     # ---- rating_advantage / example_scale: the reply-wide SCALE half of
     # the 2026-08-05 shape/scale split (module docstring + postmortem in
     # training/game_traces.py). Exp-advantage vs the corpus mean, hard
-    # floor at -0.5, cap at ADV_CAP, ADDITIVE win boost 1.0 * 0.95^d.
+    # floor at -0.5, cap at ADV_CAP, ADDITIVE win boost 1.0 * 0.95^d
+    # and eat boost 0.5 * 0.95^d (same gamma; no credit after the eat).
     assert abs(rating_advantage(0.6, baseline=0.6) - 1.0) < 1e-9
     assert abs(rating_advantage(0.8, baseline=0.6)
                - math.exp(0.2 / 0.3)) < 1e-9      # ~2x per +0.2 of rating
@@ -390,7 +393,23 @@ def t1_pure() -> str:
                - 0.95 ** 8) < 1e-9                # floored base, boost only
     assert example_scale(-0.5, 0.6, game_won=False,
                          moves_from_end=None) == 0.0     # floor, no rescue
-    checks += 8
+    # eat boost: half the win scale, same gamma, spike at the event
+    assert abs(example_scale(0.6, 0.6, game_won=False, moves_from_end=None,
+                             moves_from_eat=0)
+               - 1.5) < 1e-9                      # 1.0 base + 0.5 eat
+    assert abs(example_scale(-1.0, 0.6, game_won=False, moves_from_end=None,
+                             moves_from_eat=8)
+               - 0.5 * 0.95 ** 8) < 1e-9          # floored, eat-rescue
+    assert abs(example_scale(0.6, 0.6, game_won=True, moves_from_end=0,
+                             moves_from_eat=0)
+               - 2.5) < 1e-9                      # win + eat stack (exit after eat)
+    eats = [2, 5]
+    assert moves_from_eat(0, eats) == 2
+    assert moves_from_eat(2, eats) == 0
+    assert moves_from_eat(3, eats) == 2           # next eat, not the previous
+    assert moves_from_eat(5, eats) == 0
+    assert moves_from_eat(6, eats) is None        # after last eat: no credit
+    checks += 16
 
     # ---- build_span_weights: the within-reply SHAPE half -- base 1.0,
     # verified WRONG spans at WRONG_SPAN_WEIGHT (-0.5 = bounded
@@ -831,6 +850,52 @@ def t1_pure() -> str:
         assert perc.loss == "ce" and abs(perc.example_weight - 1.0) < 1e-9, perc
         checks += 8
 
+        # ---- eat boost through GameTraceSource: derived from
+        # gold_collected (no datagen stamp). Hunt to the eat is credited
+        # backward; post-eat wandering is not. Sealed eat-to-win
+        # (win_kind=gold) is NOT stacked on the win boost.
+        eat_dir = tmp_dir / "traces_eat"
+        eat_dir.mkdir()
+        eat_rows = []
+        # lost multi-gold: eat at move 2 of 0..3
+        for i in range(4):
+            eat_rows.append({
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "move?"},
+                ]}],
+                "target_text": f"hunt [{i}]",
+                "meta": {"rating": 1.0, "wrong_spans": [], "game_won": False,
+                         "moves_from_end": None, "win_kind": None,
+                         "session_id": "sEat", "game_index": 0,
+                         "move_index": i, "gold_collected": 1 if i == 2 else 0},
+            })
+        # sealed eat-to-win: eat IS the win, two-move game
+        for i in range(2):
+            eat_rows.append({
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "move?"},
+                ]}],
+                "target_text": f"sealed [{i}]",
+                "meta": {"rating": 1.0, "wrong_spans": [], "game_won": True,
+                         "moves_from_end": 1 - i, "win_kind": "gold",
+                         "session_id": "sGold", "game_index": 0,
+                         "move_index": i, "gold_collected": 1 if i == 1 else 0},
+            })
+        with open(eat_dir / "traces.jsonl", "w", encoding="utf-8") as f:
+            for r in eat_rows:
+                f.write(json.dumps(r) + "\n")
+        esrc = GameTraceSource(eat_dir / "traces.jsonl", noise_strength=0.0)
+        by_eat = {ex.target_text: ex.example_weight for ex in esrc.examples()}
+        # r_bar = 1.0 over 6 rated records -> base 1.0; + eat 0.5 * 0.95^d
+        assert abs(by_eat["hunt [0]"] - (1.0 + 0.5 * 0.95 ** 2)) < 1e-9
+        assert abs(by_eat["hunt [1]"] - (1.0 + 0.5 * 0.95)) < 1e-9
+        assert abs(by_eat["hunt [2]"] - 1.5) < 1e-9          # spike on the eat
+        assert abs(by_eat["hunt [3]"] - 1.0) < 1e-9          # after: no eat credit
+        # sealed: win boost only (1.0 * 0.95^d), no extra 0.5
+        assert abs(by_eat["sealed [0]"] - (1.0 + 0.95)) < 1e-9
+        assert abs(by_eat["sealed [1]"] - 2.0) < 1e-9
+        checks += 6
+
         # ---- novelty decay through GameTraceSource (WIP, OFF by default
         # -- novelty=True to enable): three identical consecutive moves in
         # one game -> example_weight scaled by 1.0 / 0.9 / 0.81; the
@@ -1225,6 +1290,7 @@ def t1_pure() -> str:
     assert ns.checkpoint == "aug13_iter2_step212"
     ns = wp.parse_args([])
     assert ns.checkpoint is None
+    assert ns.parallel == 8
     ns = wp.parse_args(["--train-iter", "2", "--checkpoint", "parent"])
     assert ns.train_iter == 2 and ns.checkpoint == "parent"
     for argv in (
@@ -1255,6 +1321,7 @@ def t1_pure() -> str:
     import inspect as _inspect
     gp = traces_parser()
     assert gp.parse_args(["--label", "x"]).multi_gold is False
+    assert gp.parse_args(["--label", "x"]).parallel == 8
     assert gp.parse_args(["--label", "x", "--multi-gold"]).multi_gold is True
     assert DATAGEN_ROOM_FLAG == ["--multi-gold"]
     assert "DATAGEN_ROOM_FLAG" in _inspect.getsource(_datagen)

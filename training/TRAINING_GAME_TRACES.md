@@ -104,7 +104,8 @@ One record per player generation lands in `data_game/<label>/traces.jsonl`:
 - `target_text` — the raw player reply, the ONLY trainable tokens;
 - `meta` — RAW annotations only: analyst rating, harness-verified `WRONG:`
   spans, action, game/move indices, the round's `question`, `game_won`,
-  `moves_from_end`, and the round's agent-to-gold distances
+  `win_kind`, `moves_from_end`, `gold_collected`, and the round's
+  agent-to-gold distances
   (`dist_to_gold_before` / `dist_to_gold_after`, normalized board units;
   `null` when no gold remains). The distances are a rating-INDEPENDENT
   quality signal — "did this move close in on the gold" — used to
@@ -126,7 +127,7 @@ structural — no loader reads both files.
 
 Housekeeping baked into the generator:
 
-- **Parallel sessions** (`--parallel`, default 12): N sessions play N games
+- **Parallel sessions** (`--parallel`, default 8): N sessions play N games
   concurrently, one worker thread each, sharing the ONE loaded model
   through `agent/parallel_gen.py` — concurrent generations merge into
   batched decode calls (batch-1 decode is memory-bandwidth-bound, so
@@ -134,7 +135,8 @@ Housekeeping baked into the generator:
   `--parallel 10` 8.5, `--parallel 24` 6.4 — diminishing but
   never-inverting returns). 16 looked like VRAM headroom until 2026-08-17:
   MiniLM embed + 16 KV caches on one 96 GB GPU died with
-  `CUBLAS_STATUS_ALLOC_FAILED`. Caveat for Gemma 4
+  `CUBLAS_STATUS_ALLOC_FAILED`. Default 8 after 12 OOM'd on 50-move
+  multi-gold contexts (T~7k, 2026-08-26). Caveat for Gemma 4
   Unified: a left-padded multimodal prefill is corrupted at specific
   widths (upstream transformers#47651), so `generate_batch` pads
   mixed-length rows around the poisoned widths and parity-checks every
@@ -217,10 +219,15 @@ reaches the gradient. Multiplicative chain, per reply:
    reply cannot own its batch;
 2. **+ win boost, won games only:** `1.0 * 0.95^d` (`d` = rounds from the
    winning move), ADDED to the base. The win is the loop's ONLY
-   ground-truth reward and is sized to dominate the analyst — it even
-   rescues an analyst-floored reply near a win. The ~13.5-round half-life
-   still pays the closing approach far more than a lucky game's wandering
-   prefix;
+   *terminal* ground-truth reward (correct exit / `[END_GAME]` / sealed
+   eat-to-win) and is sized to dominate the analyst — it even rescues an
+   analyst-floored reply near a win. The ~13.5-round half-life still pays
+   the closing approach far more than a lucky game's wandering prefix.
+   **Eat boost, same gamma, half the scale:** `0.5 * 0.95^d` on
+   gold-collection (`d` = rounds back to the next eat; 0 on the eat
+   itself; no credit after). Derived at load from `gold_collected` /
+   `move_index`. Not stacked on sealed eat-to-win (`win_kind=="gold"`) —
+   that terminal is already the win boost;
 3. **× action balance — TEMPORARY HACK** (`action_balance_multipliers`,
    screaming block in [game_traces.py](game_traces.py)):
    `mean_count / count(action)` over the same corpus, clamped to
@@ -244,7 +251,7 @@ reaches the gradient. Multiplicative chain, per reply:
    drowning in continuation moves; see the tightening note in the
    oracle section below.
 
-A scale of exactly 0 (floored rating, no win boost) **skips the record**
+A scale of exactly 0 (floored rating, no win/eat boost) **skips the record**
 (logged) — zero-scaled forwards teach nothing and cost real GPU time.
 
 **SHAPE — `span_weights`** (relative emphasis WITHIN the reply,
