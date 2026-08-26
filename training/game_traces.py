@@ -37,12 +37,12 @@ SCALE -- ``TrainingExample.example_weight``, "how much this reply matters":
      rating around the mean) however compressed the ratings are;
   2. + win boost ``win_boost * win_gamma ** moves_from_end`` (ADDITIVE:
      ground truth, so it rescues even an analyst-floored reply near a
-     win; 1.0 decaying by 0.95/round -- sized to outweigh anything the
-     analyst can award, wins must be clamped onto and kept). Same shape
+     win; 1.0 decaying by 0.95 per GAME-TIME step -- a counted turn
+     occupies n steps, a no-move round occupies 0). Same shape
      for gold-collection: ``(win_boost/2) * win_gamma ** moves_from_eat``,
-     spike on the eat, decay backward, zero after. Derived at load from
-     ``gold_collected`` / ``move_index`` (no extra datagen stamp --
-     existing traces pick it up). Sealed eat-to-win (``win_kind=="gold"``)
+     spike on the eat, decay backward, zero after. ``d`` is game time
+     (sum of ``move_duration``); old corpora without the key default
+     to 1 per record. Sealed eat-to-win (``win_kind=="gold"``)
      is NOT stacked: that terminal is already the win boost;
   3. x action balance (TEMPORARY HACK, screaming block above
      :func:`action_balance_multipliers`): equal total cloning mass per
@@ -70,7 +70,9 @@ SHAPE -- ``span_weights``, relative emphasis WITHIN the reply
     suppressed with a floored objective, not just masked;
   * the move token gets ``ORACLE_MATCH_SPAN`` (1.5) when it matches the
     engine oracle and ``ORACLE_WRONG_SPAN`` (-0.5) when it contradicts it
-    (neutral / no oracle meta: no modifier).
+    (neutral / no oracle meta: no modifier). ``count_off`` (right
+    direction, wrong count) puts MATCH on the whole token and WRONG on
+    the digits of a counted token; a bare undershoot gets no modifier.
 
 Records whose analyst forgot the RATING line are DROPPED with a warning
 count -- never trained with a guessed reward (no-fuzzy-fallbacks).
@@ -105,6 +107,7 @@ import json
 import logging
 import math
 import random
+import re
 import shutil
 import sys
 import tempfile
@@ -176,20 +179,34 @@ EAT_BOOST_RATIO = 0.5
 
 
 def moves_from_eat(move_index: int | None,
-                   eat_indices: list[int]) -> int | None:
-    """Steps from this move to the next gold-eat at or after it.
+                   eat_indices: list[int],
+                   durations: dict[int, int] | None = None) -> int | None:
+    """Game-time steps from this move to the next gold-eat at or after it.
 
     0 on the eat itself; ``None`` when no later eat (post-eat wandering
     gets no eat credit). Same backward-decay index as ``moves_from_end``.
     Several eats in one game are segmented: each hunt credits back to
-    (but not through) the previous eat."""
+    (but not through) the previous eat.
+
+    ``durations`` maps ``move_index -> move_duration``. Missing indices
+    count 1. ``None`` (old corpora / unit tests) is all-1s, so
+    ``e - mi`` as before.
+    """
     if move_index is None or not eat_indices:
         return None
     mi = int(move_index)
     future = [e for e in eat_indices if e >= mi]
     if not future:
         return None
-    return min(future) - mi
+    e = min(future)
+    if e == mi:
+        return 0
+    if durations is None:
+        return e - mi
+    total = 0
+    for idx in range(mi, e):
+        total += durations[idx] if idx in durations else 1
+    return total
 
 
 def example_scale(rating: float, baseline: float, game_won: bool,
@@ -236,15 +253,24 @@ def build_span_weights(
         while start != -1:
             spans.append((start, start + len(span_text), wrong_weight))
             start = target_text.find(span_text, start + 1)
-    if action and verdict in ("correct", "wrong"):
-        token = f"[{action}]"
-        start = target_text.rfind(token)
-        if start != -1:
-            spans.append((
-                start, start + len(token),
-                ORACLE_MATCH_SPAN if verdict == "correct"
-                else ORACLE_WRONG_SPAN,
-            ))
+    if action and verdict in ("correct", "wrong", "count_off"):
+        token_re = re.compile(
+            rf"\[{re.escape(action)}(?:[ ]+(\d{{1,3}}))?\]",
+            re.IGNORECASE,
+        )
+        matches = list(token_re.finditer(target_text))
+        if matches:
+            m = matches[-1]
+            start, end = m.span()
+            if verdict == "correct":
+                spans.append((start, end, ORACLE_MATCH_SPAN))
+            elif verdict == "wrong":
+                spans.append((start, end, ORACLE_WRONG_SPAN))
+            elif verdict == "count_off" and m.group(1):
+                # Direction rewarded on the whole token; digits suppressed.
+                # Bare undershoot: no modifier (analyst rating stands).
+                spans.append((start, end, ORACLE_MATCH_SPAN))
+                spans.append((m.start(1), m.end(1), ORACLE_WRONG_SPAN))
     return spans
 
 
@@ -266,10 +292,14 @@ def build_span_weights(
 # END_GAME); this block classifies a recorded move against
 # them at train time:
 #
-#   "correct" -- matches the oracle move (or turns when the gold is
-#                nearly behind, |bearing| >= 170 deg, where either turn
-#                is a correct move; or [END_GAME] on a sealed empty
+#   "correct" -- matches the oracle move AND (for turns) the count is
+#                inside tolerance (or turns when the gold is nearly
+#                behind, |bearing| >= 170 deg, where either turn is a
+#                correct *direction*; or [END_GAME] on a sealed empty
 #                board): move-token span ORACLE_MATCH_SPAN;
+#   "count_off"-- direction right, count outside max(3, 0.1 * steps);
+#                whole-token MATCH + digit-run WRONG (counted token),
+#                or no modifier (bare token). NO ORACLE_WRONG_SCALE;
 #   "neutral" -- defensible under the 20-degree aim tolerance the player
 #                is INSTRUCTED to use (FORWARD inside the cone without a
 #                ray hit): no modifier, the analyst's rating stands;
@@ -323,12 +353,13 @@ TRANSITION_BOOST = 2.0
 
 def oracle_verdict(action: str | None, oracle_move: str | None,
                    rel_bearing: float | None,
-                   ray_hit: bool | None) -> str:
+                   ray_hit: bool | None,
+                   turn_count: int | None = None) -> str:
     """Classify a recorded move against the stamped oracle facts (crutch
-    block above): "correct" | "neutral" | "wrong" | "unknown". Pure so t1
-    can enumerate the geometry; thresholds live here (train side), the
-    raw facts in the trace meta -- retuning never requires regenerating
-    data."""
+    block above): "correct" | "count_off" | "neutral" | "wrong" |
+    "unknown". Pure so t1 can enumerate the geometry; thresholds live
+    here (train side), the raw facts in the trace meta -- retuning never
+    requires regenerating data."""
     if action is None or oracle_move is None:
         return "unknown"
     if oracle_move == "END_GAME":
@@ -339,16 +370,30 @@ def oracle_verdict(action: str | None, oracle_move: str | None,
     if rel_bearing is None:
         return "unknown"
     rel = float(rel_bearing)
+    if action == "FORWARD":
+        if action == oracle_move:
+            return "correct"
+        if not ray_hit and abs(rel) <= ORACLE_CONE_RAD:
+            return "neutral"   # inside the instructed cone; analyst decides
+        return "wrong"
+    if action in ("CLOCK", "ANTICLOCK"):
+        STEP = math.pi / 30
+        direction_ok = (
+            (action == oracle_move) or abs(rel) >= ORACLE_EITHER_TURN_RAD
+        )
+        if not direction_ok:
+            return "wrong"  # includes any turn under a ray hit
+        needed = (
+            abs(rel) if ((action == "CLOCK") == (rel > 0))
+            else 2 * math.pi - abs(rel)
+        )
+        steps_correct = round(needed / STEP)
+        n = turn_count if turn_count else 1
+        if abs(n - steps_correct) <= max(3, 0.1 * steps_correct):
+            return "correct"
+        return "count_off"
     if action == oracle_move:
         return "correct"
-    if (action in ("CLOCK", "ANTICLOCK")
-            and abs(rel) >= ORACLE_EITHER_TURN_RAD):
-        return "correct"   # gold ~behind: either rotation is the move
-    if action == "FORWARD" and not ray_hit and abs(rel) <= ORACLE_CONE_RAD:
-        return "neutral"   # inside the instructed cone; analyst decides
-    # A turn under a ray hit falls through to "wrong" (2026-08-11
-    # tightening in the crutch banner: the aug5 "fine-tuning neutral"
-    # here let missed forwards escape both reward halves).
     return "wrong"
 
 
@@ -600,18 +645,27 @@ class GameTraceSource(_TraceFileSource):
         # One pre-pass over the file:
         #   * eat indices per game (gold_collected, all records — the
         #     event still happened if the eat round is later dropped);
+        #   * per-game move_duration map (dropped records still occupy
+        #     time; a stamped 0 must stay 0, not or-default to 1);
         #   * ACTION BALANCE counts and r_bar from rated records only.
         counts: dict[str, int] = {}
         rating_sum = 0.0
         n_rated = 0
         eat_at: dict[tuple, list[int]] = {}
+        dur_at: dict[tuple, dict[int, int]] = {}
         gold_win: set[tuple] = set()
         for _, _, _, meta in self._iter_records():
             key = (meta.get("session_id"), meta.get("game_index"))
+            mi = meta.get("move_index")
+            if mi is not None:
+                if "move_duration" in meta:
+                    d = int(meta["move_duration"])
+                else:
+                    d = 1
+                dur_at.setdefault(key, {})[int(mi)] = d
             if meta.get("win_kind") == "gold":
                 gold_win.add(key)
             if int(meta.get("gold_collected") or 0) > 0:
-                mi = meta.get("move_index")
                 if mi is not None:
                     eat_at.setdefault(key, []).append(int(mi))
             if meta.get("rating") is None:
@@ -624,6 +678,7 @@ class GameTraceSource(_TraceFileSource):
         self._eat_at = {
             k: sorted(set(v)) for k, v in eat_at.items() if k not in gold_win
         }
+        self._dur_at = dur_at
         self.rating_baseline = rating_sum / n_rated if n_rated else 0.0
         self.action_balance = action_balance_multipliers(counts)
         if n_rated:
@@ -647,7 +702,9 @@ class GameTraceSource(_TraceFileSource):
         n_dropped_target = 0
         n_floored = 0
         n_yielded = 0
-        verdicts = {"correct": 0, "neutral": 0, "wrong": 0, "unknown": 0}
+        verdicts = {
+            "correct": 0, "count_off": 0, "neutral": 0, "wrong": 0, "unknown": 0,
+        }
         for lineno, messages, target_text, meta in self._iter_records():
             # The streak advances on EVERY move record -- even ones dropped
             # below -- because the move still happened in the game; only
@@ -667,6 +724,7 @@ class GameTraceSource(_TraceFileSource):
             verdict = oracle_verdict(
                 action, meta.get("oracle_move"),
                 meta.get("oracle_rel_bearing"), meta.get("oracle_ray_hit"),
+                meta.get("turn_count"),
             )
             verdicts[verdict] += 1
 
@@ -678,8 +736,11 @@ class GameTraceSource(_TraceFileSource):
                 float(meta["rating"]), self.rating_baseline,
                 bool(meta.get("game_won")), meta.get("moves_from_end"),
                 self.win_boost, self.win_gamma,
-                moves_from_eat(meta.get("move_index"),
-                               self._eat_at.get(eat_key, [])),
+                moves_from_eat(
+                    meta.get("move_index"),
+                    self._eat_at.get(eat_key, []),
+                    self._dur_at.get(eat_key),
+                ),
             )
             scale *= self.action_balance.get(action, 1.0)
             scale *= novelty_mult

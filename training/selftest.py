@@ -29,7 +29,8 @@ Stage map (rationale in the Intermission plan):
                 none), ExtractorType.NONE, the shape/scale reward split
                 (rating_advantage / example_scale / moves_from_eat /
                 build_span_weights),
-                oracle_verdict + _oracle_meta geometry, image noise,
+                oracle_verdict (incl. count_off + counted-turn tolerance) +
+                _oracle_meta geometry, image noise,
                 tripwire, _rewrite_image_urls, Game/PlayerAnchor/Analyst
                 sources on fabricated dirs (example_weight, oracle
                 modifiers, novelty toggle), epoch_batches bucketing,
@@ -276,6 +277,8 @@ def t1_pure() -> str:
     from training.generate_game_traces import (
         PERCEPTION_QUESTION_GROUPS,
         _assert_no_analyst_leak,
+        _game_time_from_end,
+        _move_duration,
         _multi_gold_stop,
         _oracle_meta,
         _rewrite_image_urls,
@@ -409,7 +412,22 @@ def t1_pure() -> str:
     assert moves_from_eat(3, eats) == 2           # next eat, not the previous
     assert moves_from_eat(5, eats) == 0
     assert moves_from_eat(6, eats) is None        # after last eat: no credit
-    checks += 16
+    # duration-aware: [CLOCK 10] then eat -> 10 game-time steps
+    dur = {0: 10, 1: 1}
+    assert moves_from_eat(0, [1], dur) == 10
+    assert moves_from_eat(1, [1], dur) == 0
+    assert moves_from_eat(0, [1], None) == 1      # all-1s / old corpora
+    # duration 0 (perception) immediately before an eat shares the eat
+    assert moves_from_eat(0, [1], {0: 0, 1: 1}) == 0
+    assert _game_time_from_end([1, 10, 0, 1]) == [11, 10, 0, 0]
+    assert _game_time_from_end([1, 1, 1, 1]) == [3, 2, 1, 0]
+    assert _game_time_from_end([]) == []
+    assert _move_duration("CLOCK", 12) == 12
+    assert _move_duration("CLOCK", None) == 1
+    assert _move_duration("FORWARD", None) == 1
+    assert _move_duration("END_GAME", 1) == 1
+    assert _move_duration(None, None) == 0
+    checks += 29
 
     # ---- build_span_weights: the within-reply SHAPE half -- base 1.0,
     # verified WRONG spans at WRONG_SPAN_WEIGHT (-0.5 = bounded
@@ -431,14 +449,34 @@ def t1_pure() -> str:
                                   verdict="neutral")) == 1
     assert len(build_span_weights(tgt, wrong_spans=[], action="FORWARD",
                                   verdict="correct")) == 1
-    checks += 6
+    # counted token: last \[ACTION(?: count)?\] match; count_off splits
+    counted = "reason [CLOCK 25]"
+    off = build_span_weights(counted, wrong_spans=[], action="CLOCK",
+                             verdict="count_off")
+    tok_start = counted.rfind("[CLOCK 25]")
+    assert (tok_start, tok_start + len("[CLOCK 25]"),
+            ORACLE_MATCH_SPAN) in off, off
+    dig_start = counted.rfind("25")
+    assert (dig_start, dig_start + 2, ORACLE_WRONG_SPAN) in off, off
+    whole_ok = build_span_weights(counted, wrong_spans=[], action="CLOCK",
+                                  verdict="correct")
+    assert whole_ok[-1] == (tok_start, tok_start + len("[CLOCK 25]"),
+                            ORACLE_MATCH_SPAN), whole_ok
+    whole_bad = build_span_weights(counted, wrong_spans=[], action="CLOCK",
+                                   verdict="wrong")
+    assert whole_bad[-1][2] == ORACLE_WRONG_SPAN, whole_bad
+    bare_off = build_span_weights("reason [CLOCK]", wrong_spans=[],
+                                  action="CLOCK", verdict="count_off")
+    assert len(bare_off) == 1 and bare_off[0][2] == 1.0, bare_off
+    checks += 11
 
     # ---- oracle_verdict geometry (crutch block in game_traces.py):
     # compass convention, positive rel_bearing = gold clockwise of facing
+    STEP = math.pi / 30
     for args, want in [
         (("FORWARD", "FORWARD", 0.0, True), "correct"),   # exact match
-        (("CLOCK", "CLOCK", 0.7, False), "correct"),
-        (("ANTICLOCK", "CLOCK", 3.05, False), "correct"),  # ~behind: either
+        (("CLOCK", "CLOCK", 4 * STEP, False), "correct"),  # n=1, steps=4
+        (("ANTICLOCK", "CLOCK", 3.05, False), "count_off"),  # ~behind, n=1
         (("FORWARD", "CLOCK", 0.25, False), "neutral"),   # inside 20deg cone
         # missed forward: ANY turn under a ray hit is wrong since the
         # 2026-08-11 tightening (was the "fine-tuning" neutral)
@@ -453,6 +491,23 @@ def t1_pure() -> str:
         (("END_GAME", "END_GAME", None, False), "correct"),  # sealed empty
         (("FORWARD", "END_GAME", None, False), "wrong"),  # should have quit
         ((None, "END_GAME", None, False), "unknown"),     # perception on empty
+        # counted turns: in-tolerance / out / floor 3 / 10% / either-turn
+        (("CLOCK", "CLOCK", 0.7, False), "count_off"),    # ~7 steps, n=1
+        (("CLOCK", "CLOCK", 0.7, False, 7), "correct"),
+        (("CLOCK", "CLOCK", 0.7, False, 25), "count_off"),
+        (("CLOCK", "CLOCK", 5 * STEP, False), "count_off"),  # n=1, steps=5
+        (("CLOCK", "CLOCK", 10 * STEP, False, 7), "correct"),
+        (("CLOCK", "CLOCK", 10 * STEP, False, 13), "correct"),
+        (("CLOCK", "CLOCK", 10 * STEP, False, 6), "count_off"),
+        (("CLOCK", "CLOCK", 10 * STEP, False, 14), "count_off"),
+        (("CLOCK", "CLOCK", 50 * STEP, False, 45), "correct"),
+        (("CLOCK", "CLOCK", 50 * STEP, False, 55), "correct"),
+        (("CLOCK", "CLOCK", 50 * STEP, False, 44), "count_off"),
+        (("CLOCK", "ANTICLOCK", -0.8, False, 52), "wrong"),  # long way
+        (("ANTICLOCK", "CLOCK", 3.05, False, 31), "correct"),
+        (("ANTICLOCK", "CLOCK", 3.05, False, 30), "correct"),
+        (("CLOCK", "CLOCK", 0.47, False, 5), "correct"),  # prompt worked example
+        (("CLOCK", "CLOCK", 0.47, False, 25), "count_off"),
     ]:
         got = oracle_verdict(*args)
         assert got == want, f"oracle_verdict{args} = {got}, want {want}"
@@ -895,6 +950,62 @@ def t1_pure() -> str:
         assert abs(by_eat["sealed [0]"] - (1.0 + 0.95)) < 1e-9
         assert abs(by_eat["sealed [1]"] - 2.0) < 1e-9
         checks += 6
+
+        # Counted-turn duration: [CLOCK 10] then eat uses 0.95**10, not
+        # 0.95**1. All-duration-1 (no move_duration key) reproduces today's
+        # round-count numbers (the hunt rows above).
+        dur_dir = tmp_dir / "traces_duration"
+        dur_dir.mkdir()
+        dur_rows = []
+        for i, (duration, collected) in enumerate([(10, 0), (1, 1)]):
+            dur_rows.append({
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "move?"},
+                ]}],
+                "target_text": f"bigturn [{i}]",
+                "meta": {"rating": 1.0, "wrong_spans": [], "game_won": False,
+                         "moves_from_end": None, "win_kind": None,
+                         "session_id": "sDur", "game_index": 0,
+                         "move_index": i,
+                         "action": "CLOCK" if i == 0 else "FORWARD",
+                         "turn_count": 10 if i == 0 else None,
+                         "move_duration": duration,
+                         "gold_collected": collected},
+            })
+        with open(dur_dir / "traces.jsonl", "w", encoding="utf-8") as f:
+            for r in dur_rows:
+                f.write(json.dumps(r) + "\n")
+        dsrc = GameTraceSource(dur_dir / "traces.jsonl", noise_strength=0.0)
+        by_dur = {ex.target_text: ex.example_weight for ex in dsrc.examples()}
+        assert abs(by_dur["bigturn [0]"] - (1.0 + 0.5 * 0.95 ** 10)) < 1e-9
+        assert abs(by_dur["bigturn [1]"] - 1.5) < 1e-9
+        checks += 2
+
+        # count_off: no ORACLE_WRONG_SCALE; counted token MATCH + digits WRONG
+        coff_dir = tmp_dir / "traces_count_off"
+        coff_dir.mkdir()
+        with open(coff_dir / "traces.jsonl", "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "move?"},
+                ]}],
+                "target_text": "turning [CLOCK 25]",
+                "meta": {"action": "CLOCK", "turn_count": 25,
+                         "oracle_move": "CLOCK", "oracle_rel_bearing": 0.47,
+                         "oracle_ray_hit": False, "rating": 0.0,
+                         "wrong_spans": [], "game_won": False,
+                         "moves_from_end": None, "session_id": "sOff",
+                         "game_index": 0, "move_index": 0},
+            }) + "\n")
+        csrc = GameTraceSource(coff_dir / "traces.jsonl", noise_strength=0.0)
+        cexs = list(csrc.examples())
+        assert len(cexs) == 1, len(cexs)
+        # r_bar = 0.0; single CLOCK so balance = 1.0; no WRONG_SCALE
+        assert abs(cexs[0].example_weight
+                   - rating_advantage(0.0, csrc.rating_baseline)) < 1e-9
+        assert cexs[0].span_weights[-2][2] == ORACLE_MATCH_SPAN
+        assert cexs[0].span_weights[-1][2] == ORACLE_WRONG_SPAN
+        checks += 1
 
         # ---- novelty decay through GameTraceSource (WIP, OFF by default
         # -- novelty=True to enable): three identical consecutive moves in
@@ -1365,9 +1476,13 @@ def t1_pure() -> str:
     # ---- boundary_openings + new_multi_gold_game (2026-08-12 multi-gold mode)
     from agent.game_io import (
         _SIDE_WALL_WIDTH,
+        PLAYER_STOP_PATTERN,
         board_update_line,
         boundary_openings,
+        find_bare_move,
+        find_invalid_move_token,
         new_multi_gold_game,
+        parse_move,
         parse_remember_notes,
         truncate_at_first_move_token,
     )
@@ -1379,6 +1494,39 @@ def t1_pure() -> str:
     )
     checks += 1
     assert truncate_at_first_move_token("no token here") == "no token here"
+    checks += 1
+    # Counted-turn parse / stop / truncate / invalid tokens.
+    assert parse_move("aim [CLOCK 12]") == ("CLOCK", 12)
+    assert parse_move("nudge [CLOCK]") == ("CLOCK", 1)
+    assert parse_move("nudge [ANTICLOCK]") == ("ANTICLOCK", 1)
+    assert parse_move("[FORWARD 10] then [CLOCK 3]") == ("CLOCK", 3)
+    assert parse_move("[FORWARD 10] alone") is None
+    assert parse_move("[CLOCK 0]") is None
+    assert parse_move("[CLOCK 90]") is None
+    assert parse_move("[CLOCK 61]") is None
+    assert parse_move("[clock 8]") == ("CLOCK", 8)
+    assert parse_move("[FORWARD]") == ("FORWARD", 1)
+    assert parse_move("[ANTICLOCK 60]") == ("ANTICLOCK", 60)
+    assert find_invalid_move_token("x [FORWARD 10] y") == "[FORWARD 10]"
+    assert find_invalid_move_token("[CLOCK 0]") == "[CLOCK 0]"
+    assert find_invalid_move_token("[CLOCK 90]") == "[CLOCK 90]"
+    assert find_invalid_move_token("[CLOCK 12]") is None
+    assert find_bare_move("[FORWARD 10]") is None
+    assert find_bare_move("I should ANTICLOCK now") == "ANTICLOCK"
+    assert (
+        truncate_at_first_move_token("[FORWARD 10] skip [CLOCK 3] junk")
+        == "[FORWARD 10] skip [CLOCK 3]"
+    )
+    import re as _re_stop
+    for tok in ("[CLOCK 12]", "[ANTICLOCK 60]", "[CLOCK]", "[FORWARD]",
+                "[END_GAME]"):
+        assert _re_stop.search(PLAYER_STOP_PATTERN, tok), tok
+    for tok in ("[FORWARD 10]", "[CLOCK 0]", "[CLOCK 61]", "[CLOCK 90]"):
+        assert _re_stop.search(PLAYER_STOP_PATTERN, tok) is None, tok
+    counted_line = board_update_line("CLOCK", 0, 3, count=12)
+    assert "[CLOCK 12]" in counted_line and "[CLOCK]" not in counted_line.replace(
+        "[CLOCK 12]", ""
+    )
     checks += 1
     # Session scratchpad: [REMEMBER key: value] parser, last-one-wins
     # ordering, truncation interplay, board-update line, notepad render.
@@ -1510,6 +1658,23 @@ def t1_pure() -> str:
     assert not g2.agent_exited()
     checks += 1
 
+    # Counted swivel: one n-step call equals n sequential swivels; position
+    # never changes (out of real time).
+    d0 = g2.settings.direction
+    x0, y0 = g2.settings.agent_x, g2.settings.agent_y
+    g2.swivel_clock_n(7)
+    assert abs(g2.settings.agent_x - x0) < 1e-12
+    assert abs(g2.settings.agent_y - y0) < 1e-12
+    n_dir = g2.settings.direction
+    assert abs(n_dir - g2.mod2pi(d0 + 7 * math.pi / 30)) < 1e-9
+    g2.settings.direction = d0
+    for _ in range(7):
+        g2.swivel_clock()
+    assert abs(g2.settings.direction - n_dir) < 1e-9
+    g2.swivel_anticlock_n(7)
+    assert abs(g2.mod2pi(g2.settings.direction) - g2.mod2pi(d0)) < 1e-9
+    checks += 1
+
     from agent.multi_gold_session import MultiGoldSelfEvalSession
     from agent.self_eval_session import InteractiveSelfEvalSession
     stub = object.__new__(MultiGoldSelfEvalSession)
@@ -1524,6 +1689,15 @@ def t1_pure() -> str:
     assert InteractiveSelfEvalSession._parse_player_action(
         base_stub, "TARGET: none\n[END_GAME]", "answer"
     ) == "END_GAME"
+    assert InteractiveSelfEvalSession._parse_player_action(
+        base_stub, "aiming [CLOCK 12]", "move"
+    ) == "CLOCK"
+    assert InteractiveSelfEvalSession._parse_player_move(
+        base_stub, "aiming [CLOCK 12]", "move"
+    ) == ("CLOCK", 12)
+    assert InteractiveSelfEvalSession._parse_player_move(
+        base_stub, "nudge [ANTICLOCK]", "move"
+    ) == ("ANTICLOCK", 1)
     checks += 1
 
     from agent import modes
@@ -1560,9 +1734,11 @@ def t1_pure() -> str:
 
     assert "PICK ONE TARGET AND COMMIT" in play_dump
     assert "Making a move does NOT end your turn" not in play_dump
+    assert "[CLOCK n]" in play_dump
     assert "TARGET: gold, 0" in analyst_dump
     assert "TARGET: openings, 1" in analyst_dump
     assert "TARGET: none" in analyst_dump
+    assert "GRADING TURN COUNTS" in analyst_dump
     assert "RATING:" in debrief_dump
     assert "overall_score" not in debrief_dump
     checks += 1

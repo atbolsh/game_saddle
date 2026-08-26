@@ -27,7 +27,11 @@ Two room modes:
 
 Records buffer per game and are written at game close, each stamped with
 ``meta.game_won``, ``meta.win_kind``, ``meta.moves_from_end`` (0 = the
-terminal winning round), and per-round ``gold_collected`` -- the
+terminal winning round, in GAME TIME: a counted turn occupies n steps, a
+no-move round occupies 0 -- a counted turn is deciding a rotation and
+executing it eyes-closed, not a teleport), per-round ``gold_collected``,
+``turn_count`` (applied CLOCK/ANTICLOCK n, else None), and
+``move_duration`` (the game-time occupancy of the round). The
 discounted win / eat boosts are computed from these at TRAINING time by
 ``GameTraceSource``, not here; this script stores raw annotations
 only (rating, verified WRONG spans, outcome), so every reward ratio stays
@@ -222,6 +226,33 @@ def _dist_to_gold(settings: dict) -> float | None:
         return None
     ax, ay = settings["agent_x"], settings["agent_y"]
     return round(min(math.hypot(gx - ax, gy - ay) for gx, gy in gold), 4)
+
+
+def _move_duration(action: str | None, turn_count: int | None) -> int:
+    """Game-time occupancy of one round. A counted turn occupies n steps;
+    FORWARD / END_GAME occupy 1; a round that applied no move occupies 0
+    (the world did not evolve). Missing turn_count on a turn defaults to 1."""
+    if action in ("CLOCK", "ANTICLOCK"):
+        return int(turn_count) if turn_count else 1
+    if action in ("FORWARD", "END_GAME"):
+        return 1
+    return 0
+
+
+def _game_time_from_end(durations: list[int]) -> list[int]:
+    """``moves_from_end`` in GAME TIME. ``durations[i]`` is record i's
+    ``move_duration``. ``t_i = sum(d_j for j in range(i, L))`` with L the
+    last index: the last record gets 0; a duration-0 record shares the
+    following record's value. All-1s reproduces ``last - i``."""
+    n = len(durations)
+    out = [0] * n
+    if n == 0:
+        return out
+    acc = 0
+    for i in range(n - 2, -1, -1):
+        acc += durations[i]
+        out[i] = acc
+    return out
 
 
 def _nearest_engine_target(settings: dict) -> tuple[str, int | None]:
@@ -603,6 +634,10 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
                 "wrong_spans": analyst["wrong_spans"]["verified"],
                 "unverified_spans": analyst["wrong_spans"]["unverified"],
                 "action": player["action"],
+                "turn_count": player.get("turn_count"),
+                "move_duration": _move_duration(
+                    player["action"], player.get("turn_count"),
+                ),
                 "bare_move": player["bare_move"],
                 "searches": [
                     {"query": s["query"], "thought": s["thought"]}
@@ -688,6 +723,10 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
             shared.stats["wrong_spans"] += len(analyst["wrong_spans"]["verified"])
             if player["action"]:
                 shared.stats["moves"] += 1
+            tc = player.get("turn_count")
+            if (player["action"] in ("CLOCK", "ANTICLOCK")
+                    and tc is not None and int(tc) > 1):
+                shared.stats["counted_turns"] += 1
             if is_perception:
                 shared.stats["perception_rounds"] += 1
             if target_missing:
@@ -727,12 +766,15 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
             break
 
     # Stamp the outcome and flush the game (one writer at a time).
-    last = len(game_records) - 1
+    durations = [rec["meta"].get("move_duration", 1) for rec in game_records]
+    from_end = _game_time_from_end(durations) if won else None
     with shared.lock:
         for i, record in enumerate(game_records):
             record["meta"]["game_won"] = won
             record["meta"]["win_kind"] = win_kind
-            record["meta"]["moves_from_end"] = (last - i) if won else None
+            record["meta"]["moves_from_end"] = (
+                from_end[i] if from_end is not None else None
+            )
             shared.out.write(json.dumps(record, ensure_ascii=False) + "\n")
             shared.records.append(record)
         shared.out.flush()

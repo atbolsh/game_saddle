@@ -21,10 +21,10 @@ COORDINATE CONVENTION (single source of truth, engine and prompts agree):
     predates the flip). All bare-game walls have angle 0, so this never
     surfaces in current levels.
 
-Moves exposed to the agent map directly onto same-named engine methods:
-  - ``CLOCK``    -> ``swivel_clock``     (turn clockwise on screen)
-  - ``ANTICLOCK``-> ``swivel_anticlock`` (turn counter-clockwise on screen)
-  - ``FORWARD``  -> ``stepForward``      (advance one step)
+Moves exposed to the agent map onto engine methods:
+  - ``CLOCK`` / ``CLOCK n``     -> ``swivel_clock`` / ``swivel_clock_n``
+  - ``ANTICLOCK`` / ``ANTICLOCK n`` -> ``swivel_anticlock`` / ``swivel_anticlock_n``
+  - ``FORWARD``                 -> ``stepForward``  (never takes a count)
 """
 
 from __future__ import annotations
@@ -56,14 +56,29 @@ ACTION_MAP: dict[str, str] = {
 ACTIONS = list(ACTION_MAP.keys())
 
 # Wire format the model emits to make a move: distinctive bracketed tokens
-# (e.g. ``[FORWARD]``). They never collide with ordinary prose and tokenize
-# cleanly, so we can use them as generation stop strings: the model's turn is
+# (e.g. ``[FORWARD]``, ``[CLOCK 12]``). They never collide with ordinary prose
+# and tokenize cleanly, so generation can stop on them: the model's turn is
 # a loop of "reason -> emit one move token -> we stop, apply it, re-render,
 # generate again on the new frame". Ending the turn needs no special token --
 # the model just finishes its message (its native end-of-turn/eos token)
 # without emitting a move token.
-MOVE_STOP_STRINGS = [f"[{a}]" for a in ACTIONS]  # ["[CLOCK]", "[ANTICLOCK]", "[FORWARD]"]
-_MOVE_RE = re.compile(r"\[(" + "|".join(ACTIONS) + r")\]", re.IGNORECASE)
+#
+# Counted turns: ``[CLOCK n]`` / ``[ANTICLOCK n]`` with n in 1..MAX_TURN_STEPS
+# (n steps of pi/30). Bare ``[CLOCK]`` / ``[ANTICLOCK]`` is count 1.
+# ``[FORWARD]`` never takes a count -- ``[FORWARD 10]`` is not a move.
+MAX_TURN_STEPS = 60
+# Must agree with MAX_TURN_STEPS: a valid count is 1..60.
+TURN_COUNT_ALT = r"(?:[1-9]|[1-5][0-9]|60)"
+PLAYER_STOP_PATTERN = (
+    r"\[(?:CLOCK|ANTICLOCK)(?:[ ]+" + TURN_COUNT_ALT + r")?\]"
+    r"|\[FORWARD\]|\[END_GAME\]"
+)
+# Parser (IGNORECASE): group 1 = action, group 2 = optional digits. Broader
+# than PLAYER_STOP_PATTERN so invalid counts can be detected and skipped.
+_MOVE_RE = re.compile(
+    r"\[(CLOCK|ANTICLOCK|FORWARD)(?:[ ]+(\d{1,3}))?\]",
+    re.IGNORECASE,
+)
 
 # A move word WITHOUT brackets (e.g. plain 'ANTICLOCK'). Never a move -- but
 # when a reply contains one and no bracketed token, the model almost
@@ -401,45 +416,105 @@ def render_frame_png(game: discreteGame, path: str | os.PathLike) -> tuple[int, 
     return img.size  # (width, height)
 
 
-def apply_action(game: discreteGame, action_name: str) -> int:
+def apply_action(game: discreteGame, action_name: str, count: int = 1) -> int:
     """Apply an agent action to the game; return gold collected this step.
 
-    Raises ``ValueError`` for unknown actions.
+    ``count`` is the step count for CLOCK/ANTICLOCK (1 = single swivel).
+    FORWARD does not take a count. Raises ``ValueError`` for unknown
+    actions or an out-of-range / non-1 FORWARD count.
     """
     if action_name not in ACTION_MAP:
         raise ValueError(f"Unknown action: {action_name!r}")
-    method = getattr(game, ACTION_MAP[action_name])
-    collected = method()
-    return int(collected or 0)
+    n = int(count)
+    if action_name == "FORWARD":
+        if n != 1:
+            raise ValueError(f"FORWARD does not take a count (got {n})")
+        method = getattr(game, ACTION_MAP[action_name])
+        return int(method() or 0)
+    if n < 1 or n > MAX_TURN_STEPS:
+        raise ValueError(
+            f"turn count {n} out of range 1..{MAX_TURN_STEPS}"
+        )
+    if n == 1:
+        method = getattr(game, ACTION_MAP[action_name])
+        return int(method() or 0)
+    if action_name == "CLOCK":
+        return int(game.swivel_clock_n(n) or 0)
+    return int(game.swivel_anticlock_n(n) or 0)
 
 
 def gold_remaining(game: discreteGame) -> int:
     return len(game.settings.gold)
 
 
-def parse_action(text: str) -> str | None:
-    """Return the engine action for the move token in ``text`` (one of
-    ``ACTIONS``), or ``None`` if the model emitted no move token.
+def _parsed_if_valid(m: re.Match[str]) -> tuple[str, int] | None:
+    """Action + count if ``m`` is a valid move token, else None.
 
-    Only the bracketed tokens (``[CLOCK]`` / ``[ANTICLOCK]`` / ``[FORWARD]``)
-    count as moves -- plain prose that merely mentions "forward" does not. When
-    generation is stopped via :data:`MOVE_STOP_STRINGS` the move token sits at
-    the tail, so we take the last match to be safe."""
-    matches = _MOVE_RE.findall(text)
-    if not matches:
-        return None
-    return matches[-1].upper()
+    Valid: turn action with no digits -> count 1; turn action with digits
+    in 1..MAX_TURN_STEPS -> that count; FORWARD with no digits -> count 1.
+    FORWARD-with-digits and out-of-range counts are invalid.
+    """
+    action = m.group(1).upper()
+    digits = m.group(2)
+    if digits is None:
+        return action, 1
+    n = int(digits)
+    if action in ("CLOCK", "ANTICLOCK") and 1 <= n <= MAX_TURN_STEPS:
+        return action, n
+    return None
+
+
+def parse_move(text: str) -> tuple[str, int] | None:
+    """Last VALID move token in ``text`` as ``(action, count)``, or None.
+
+    Invalid tokens (``[FORWARD 10]``, ``[CLOCK 0]``, ``[CLOCK 90]``) are
+    skipped as if they were not move tokens. Bare ``[CLOCK]`` is count 1.
+    """
+    last: tuple[str, int] | None = None
+    for m in _MOVE_RE.finditer(text):
+        parsed = _parsed_if_valid(m)
+        if parsed is not None:
+            last = parsed
+    return last
+
+
+def parse_action(text: str) -> str | None:
+    """Return the engine action for the last valid move token in ``text``,
+    or ``None`` if none. Wrapper around :func:`parse_move`."""
+    parsed = parse_move(text)
+    return None if parsed is None else parsed[0]
+
+
+def find_invalid_move_token(text: str) -> str | None:
+    """Exact text of the LAST invalid bracketed move-like token
+    (``[FORWARD 10]``, ``[CLOCK 0]``, ``[CLOCK 90]``), or None."""
+    last_invalid: str | None = None
+    for m in _MOVE_RE.finditer(text):
+        if _parsed_if_valid(m) is None:
+            last_invalid = m.group(0)
+    return last_invalid
+
+
+def first_valid_move_match(text: str) -> re.Match[str] | None:
+    """First VALID ``_MOVE_RE`` match in ``text``, or None."""
+    for m in _MOVE_RE.finditer(text):
+        if _parsed_if_valid(m) is not None:
+            return m
+    return None
 
 
 def truncate_at_first_move_token(text: str) -> str:
-    """Keep ``text`` through the first bracketed move token, drop the rest.
-
-    Notebook human-takeover: a hand-typed ``[FORWARD]`` / ``[CLOCK]`` /
-    ``[ANTICLOCK]`` ends the move the same way a generate stop-string
-    would. No token -> the string is unchanged. Uses the same
-    :data:`_MOVE_RE` as :func:`parse_action`."""
-    m = _MOVE_RE.search(text)
+    """Keep ``text`` through the first VALID bracketed move token, drop the
+    rest. Invalid tokens are skipped. No valid token -> unchanged."""
+    m = first_valid_move_match(text)
     return text[: m.end()] if m else text
+
+
+def format_move_inner(action: str, count: int = 1) -> str:
+    """Inner text of a move token: ``CLOCK 12`` or ``CLOCK`` / ``FORWARD``."""
+    if action in ("CLOCK", "ANTICLOCK") and int(count) > 1:
+        return f"{action} {int(count)}"
+    return action
 
 
 #: One scratchpad write: ``[REMEMBER key: free text]``. Key is a short
@@ -455,19 +530,21 @@ def parse_remember_notes(text: str) -> list[tuple[str, str]]:
             for m in _REMEMBER_RE.finditer(text)]
 
 
-def board_update_line(action: str, gold_collected: int, gold_remaining: int) -> str:
+def board_update_line(action: str, gold_collected: int, gold_remaining: int,
+                      count: int = 1) -> str:
     """Engine-truth one-liner for the turn after an applied move (pure
     function so t1 can cover it). ``action`` is the bare move word
-    (e.g. "FORWARD"); render it bracketed, ``[FORWARD]``."""
+    (e.g. "FORWARD"); render it bracketed, ``[CLOCK 12]`` when count > 1."""
+    token = f"[{format_move_inner(action, count)}]"
     if gold_collected > 0:
         return (
-            f"Board update: your last move ([{action}]) ATE a gold. "
+            f"Board update: your last move ({token}) ATE a gold. "
             f"{gold_remaining} gold(s) now remain. If the eaten gold was "
             "your saved target, that gold no longer exists -- pick a new "
             "target and save it with [REMEMBER target: ...] before you move."
         )
     return (
-        f"Board update: your last move ([{action}]) did not eat a gold. "
+        f"Board update: your last move ({token}) did not eat a gold. "
         f"{gold_remaining} gold(s) remain on the board."
     )
 
@@ -476,11 +553,15 @@ def find_bare_move(text: str) -> str | None:
     """Return the LAST bare (unbracketed) move word in ``text`` -- e.g.
     'ANTICLOCK' without brackets -- or ``None``.
 
-    Only meaningful when :func:`parse_action` found no bracketed token: a
-    bare word is never applied as a move, but its presence means the model
-    probably intended one and got the format wrong, and callers should say
-    so explicitly instead of treating the reply as plain prose."""
+    Only meaningful when :func:`parse_move` found no valid token and
+    :func:`find_invalid_move_token` found none either: a bare word is
+    never applied as a move, but its presence means the model probably
+    intended one and got the format wrong, and callers should say so
+    explicitly instead of treating the reply as plain prose. An invalid
+    bracketed token (``[FORWARD 10]``) is not a bare-word fumble."""
     if parse_action(text) is not None:
+        return None
+    if find_invalid_move_token(text) is not None:
         return None
     matches = BARE_MOVE_RE.findall(text)
     if not matches:

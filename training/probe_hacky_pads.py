@@ -419,8 +419,11 @@ def test3_rehearsal(model: Any, picked: list[tuple[int, dict]],
         solo = [
             model.generate(
                 msgs, max_new_tokens=96,
-                stop_strings=game_io.MOVE_STOP_STRINGS,
-                stop_regex=modes.SEARCH_TOOL_PATTERN,
+                stop_strings=None,
+                stop_regex=(
+                    game_io.PLAYER_STOP_PATTERN + "|"
+                    + modes.SEARCH_TOOL_PATTERN
+                ),
             )
             for msgs in messages
         ]
@@ -436,11 +439,12 @@ def test3_rehearsal(model: Any, picked: list[tuple[int, dict]],
                 **inputs,
                 max_new_tokens=96,
                 do_sample=False,
-                stop_strings=list(game_io.MOVE_STOP_STRINGS),
                 tokenizer=tokenizer,
                 stopping_criteria=StoppingCriteriaList([
                     RegexStopCriteria(
-                        modes.SEARCH_TOOL_PATTERN, tokenizer,
+                        game_io.PLAYER_STOP_PATTERN + "|"
+                        + modes.SEARCH_TOOL_PATTERN,
+                        tokenizer,
                         prompt_len=chosen_T,
                     )
                 ]),

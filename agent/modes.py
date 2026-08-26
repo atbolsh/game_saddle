@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # Fixing a fact in its block fixes every mode that uses it.
 
 # The move-token vocabulary is defined ONCE, in game_io (ACTION_MAP -> ACTIONS
-# -> MOVE_STOP_STRINGS -> the parser regexes). Every prompt block references
+# -> PLAYER_STOP_PATTERN / parse_move). Every prompt block references
 # it through these constants -- never as fresh string literals -- so the wire
 # format, the parser, and all prompts can only ever change together. The dict
 # lookups fail loudly at import if an action name ever changes underneath us.
@@ -44,7 +44,9 @@ _TOK = {name: f"[{name}]" for name in game_io.ACTIONS}
 _TOK_CLOCK = _TOK["CLOCK"]
 _TOK_ANTICLOCK = _TOK["ANTICLOCK"]
 _TOK_FORWARD = _TOK["FORWARD"]
-_TOK_TRIO = "/".join(_TOK.values())  # "[CLOCK]/[ANTICLOCK]/[FORWARD]"
+# Counted forms are the turn API; the `_TOK` dict lookups keep the loud-fail
+# role for the individual canonical tokens.
+_TOK_TRIO = "[CLOCK n]/[ANTICLOCK n]/[FORWARD]"
 #: Extra player token. NOT in game_io.ACTIONS -- ``apply_action`` never
 #: receives it. Self-eval parses it; play / ``mode_game`` treat it as a
 #: no-op (``parse_action`` returns None). The unified prompt mentions it;
@@ -68,15 +70,27 @@ _BLOCK_GAME_INTRO = " ".join([
 ])
 
 _BLOCK_MOVE_TOKENS = (
-    "You make moves by emitting exactly one of these move tokens:\n"
-    f"  {_TOK_CLOCK}     - turn clockwise by pi/30 (rotate in place)\n"
-    f"  {_TOK_ANTICLOCK} - turn counter-clockwise by pi/30 (rotate in place)\n"
-    f"  {_TOK_FORWARD}   - advance up to 1/16 of the board in the facing direction\n"
-    f"Only {_TOK_FORWARD} moves you; {_TOK_CLOCK} and {_TOK_ANTICLOCK} only rotate you.\n\n"
-    "IMPORTANT: ONLY those exact bracketed tokens trigger a move. Talking about "
-    "moving in prose (e.g. writing the word 'forward') does NOTHING. You may "
-    "reason in plain prose as much as you like; nothing happens until you emit "
-    "a bracketed move token, so emit one only when you truly intend that move."
+    "You make moves by emitting exactly one move token:\n"
+    "  [CLOCK n]     - turn clockwise by n steps of pi/30 (6 degrees each), "
+    "all in ONE move; e.g. [CLOCK 12] turns 72 degrees clockwise\n"
+    "  [ANTICLOCK n] - turn counter-clockwise by n steps, the same way\n"
+    f"  {_TOK_FORWARD}     - advance up to 1/16 of the board in the facing "
+    "direction\n"
+    "The count n is a whole number from 1 to 60. Anchors worth memorizing: "
+    "5 steps = one clock hour, 15 = a quarter turn, 30 = a half turn, 60 = "
+    "a full circle. Write the token exactly as shown -- one space, digits, "
+    "closing bracket. A turn token with no count, like [CLOCK], is read as "
+    "1 step -- a handy fine-adjustment nudge when you are almost aimed.\n"
+    f"Only {_TOK_FORWARD} moves you; turning only rotates you in place. "
+    f"{_TOK_FORWARD} NEVER takes a count: something like [FORWARD 10] is "
+    "NOT a move token, does nothing, and is graded as a mistake. To "
+    f"advance farther, emit plain {_TOK_FORWARD} again on the next "
+    "screen.\n\n"
+    "IMPORTANT: ONLY those exact bracketed tokens trigger a move. Talking "
+    "about moving in prose (e.g. writing the word 'forward') does NOTHING. "
+    "You may reason in plain prose as much as you like; nothing happens "
+    "until you emit a bracketed move token, so emit one only when you truly "
+    "intend that move."
 )
 
 def _block_how_to_play(target: str, obs_object: str, question_example: str) -> str:
@@ -99,10 +113,19 @@ def _block_how_to_play(target: str, obs_object: str, question_example: str) -> s
         "IF (and only if) the user asked you to play or make a move, choose the "
         "move from that reasoning:\n"
         f"  - If your eye is pointing roughly at {target}, emit {_TOK_FORWARD}.\n"
-        f"  - Otherwise, aim your eye at {target}: emit {_TOK_CLOCK} or {_TOK_ANTICLOCK}, then "
-        "check the re-rendered screen to see which way your eye swung, and keep "
-        "rotating that way (or reverse if you overshoot) until your eye lines up with "
-        f"{target} -- then emit {_TOK_FORWARD}.\n"
+        f"  - Otherwise, aim your eye at {target} in ONE counted turn: count "
+        "the clock hours from your eye direction to it the SHORT way around, "
+        "multiply by 5 to get the step count, and emit [CLOCK n] (clockwise, "
+        "toward larger clock hours) or [ANTICLOCK n] (counter-clockwise). "
+        f"Example: eye toward 12 o'clock, {target} at 4 o'clock -> 4 hours "
+        "clockwise -> [CLOCK 20].\n"
+        "  - On the next screen, VERIFY before advancing: if your eye now "
+        f"points roughly at {target}, emit {_TOK_FORWARD}; if you are still "
+        "off, correct with one more counted turn (reverse the direction if "
+        "you overshot). When you are nearly aimed, a single-step nudge like "
+        "[CLOCK] is perfectly good fine adjustment; what wastes moves is "
+        f"creeping toward a FAR-off {target} one step at a time instead of "
+        "turning once.\n"
         f"If the user instead asked a question (e.g. '{question_example}'), "
         "answer it in prose after the observation and reasoning and STOP -- "
         "emitting a move token nobody asked for is a format mistake.\n"
@@ -161,10 +184,13 @@ def _block_aim_tolerance(target: str) -> str:
     return (
         "AIM TOLERANCE: it can be hard to tell your exact facing direction from "
         "the screen, so do not demand pixel-perfect aim. If your best estimate "
-        f"is that {target} lies within about 20 degrees of your facing direction, "
-        f"{_TOK_FORWARD} is a good move -- step forward and re-assess on the new "
-        f"screen. Reserve {_TOK_CLOCK}/{_TOK_ANTICLOCK} fine-tuning for when {target} is "
-        "clearly off to one side or behind you."
+        f"is that {target} lies within about 20 degrees (3 turn steps) of your "
+        f"facing direction, {_TOK_FORWARD} is a good move -- step forward and "
+        "re-assess on the new screen. Inside that band a single fine-tuning "
+        "step like [CLOCK] is also fine play. What wastes moves is a long "
+        f"chain of tiny turns toward a {target} that is clearly off to one "
+        "side or behind you: there, estimate the full count and turn ONCE "
+        "with [CLOCK n]/[ANTICLOCK n]."
     )
 
 
@@ -552,7 +578,6 @@ async def mode_game(
     # path but this factory does not spawn them.
     game = game_io.new_bare_game(gameSize=cfg.game_size)
     turns: list[dict[str, Any]] = []
-    play_stop = game_io.MOVE_STOP_STRINGS + [_TOK_END_GAME]
 
     steps = 0
     # One reasoning trace for the whole turn; opened after the first step's user
@@ -602,10 +627,15 @@ async def mode_game(
                 over_budget = len(searches) >= cfg.memory_search_max_calls
                 raw = model.generate(
                     messages,
-                    stop_strings=play_stop,
-                    # Once the budget is spent the stop pattern is dropped, so
-                    # a stray [SEARCH] is inert prose instead of a stall.
-                    stop_regex=None if over_budget else SEARCH_TOOL_PATTERN,
+                    stop_strings=None,
+                    # Once the budget is spent the search alternative is
+                    # dropped, so a stray [SEARCH] is inert prose instead
+                    # of a stall. Counted turn tokens live in the regex.
+                    stop_regex=(
+                        game_io.PLAYER_STOP_PATTERN if over_budget
+                        else game_io.PLAYER_STOP_PATTERN + "|"
+                        + SEARCH_TOOL_PATTERN
+                    ),
                 )
                 kind, payload, text = classify_move_or_search(raw)
                 if kind != "search" or over_budget:
@@ -622,10 +652,12 @@ async def mode_game(
                 logger.info("step %d: [SEARCH %s]", steps, payload)
             for k, v in game_io.parse_remember_notes(raw):
                 await mem.set_session_note(client, session_id, k, v, steps)
-            action = game_io.parse_action(raw) if kind == "move" else None
+            parsed = game_io.parse_move(raw) if kind == "move" else None
+            action = parsed[0] if parsed else None
+            count = parsed[1] if parsed else 1
 
             if action:
-                gold_collected = game_io.apply_action(game, action)
+                gold_collected = game_io.apply_action(game, action, count=count)
             else:
                 gold_collected = 0
 
@@ -1006,8 +1038,9 @@ _BLOCK_GEOMETRY_PRIVILEGED = (
     "2*pi ~= 6.28: any diff above +3.14 or below -3.14 MUST be adjusted; "
     "one adjustment always suffices for angles in [0, 2*pi)). Call the "
     "result delta. If delta > 0, CLOCKWISE is the shorter rotation; if "
-    "delta < 0, COUNTER-CLOCKWISE is. |delta| / (pi/30) is roughly the "
-    "number of rotation steps needed. Do NOT use the mod operator here: "
+    "delta < 0, COUNTER-CLOCKWISE is. |delta| / (pi/30) is the number of "
+    "rotation steps needed -- the count the player should have emitted. "
+    "Do NOT use the mod operator here: "
     "mod of a negative number is convention-dependent and can flip your "
     "answer -- stick to the add/subtract-2*pi rule. NEVER compare raw "
     "angles without this normalization: whenever the raw gap "
@@ -1028,8 +1061,9 @@ _BLOCK_GEOMETRY_PRIVILEGED = (
     "counter-clockwise. Never eyeball this; hour-space intuition is where "
     "sign errors happen, so when in doubt fall back to the delta recipe "
     "above -- the two must agree.\n"
-    f"  - The {_TOK_CLOCK} move INCREASES theta by pi/30 (6 degrees) and rotates "
-    f"clockwise on screen; {_TOK_ANTICLOCK} decreases theta. One {_TOK_FORWARD} "
+    "  - A turn token [CLOCK n] INCREASES theta by n*pi/30 (6n degrees), "
+    "rotating clockwise on screen; [ANTICLOCK n] DECREASES theta the same "
+    "way (a token with no count is one step, 6 degrees). One [FORWARD] "
     "advances up to 1/16 of the board along the facing direction."
 )
 
@@ -1174,9 +1208,10 @@ _BLOCK_NO_GOLD_EXPLORE = (
     "walls, also called an exit -- and save it as your target:\n"
     "[REMEMBER target: the opening in the right wall]\n"
     "Name it an opening or an exit in OBS, in reasoning, and in the "
-    "notepad. Never call it 'the gold'. Then use the same "
-    f"{_TOK_TRIO} moves to rotate until the opening is roughly dead "
-    "ahead, then go FORWARD and walk out through it."
+    "notepad. Never call it 'the gold'. Then aim at it the usual way: "
+    "ONE counted turn ([CLOCK n]/[ANTICLOCK n]) to put the opening "
+    f"roughly dead ahead, then {_TOK_FORWARD} until you walk out "
+    "through it."
 )
 
 _BLOCK_END_GAME = (
@@ -1322,6 +1357,51 @@ _BLOCK_END_GAME_GRADING = (
     "and lower the RATING."
 )
 
+# Re-healed from this seed on any non-`--append` datagen run
+# (`reset_memory_to_seed`) or `bash scripts/reset_semantics.sh`.
+_BLOCK_TURN_COUNT_GRADING = (
+    "GRADING TURN COUNTS: the turn tokens may carry a step count -- "
+    "[CLOCK 12] means twelve pi/30 steps (72 degrees) clockwise in one "
+    "move; a bare [CLOCK] or [ANTICLOCK] is a count of 1. Judge a counted "
+    "turn in two separate parts:\n"
+    "  1. DIRECTION -- judged exactly as before by the sign of delta "
+    "(ROTATION DIRECTION recipe). Turning the long way around is a "
+    "direction mistake unless the target is nearly behind you.\n"
+    "  2. COUNT, GIVEN THE DIRECTION -- compute the rotation the player's "
+    "CHOSEN direction actually needed:\n"
+    "     needed = |delta| if the chosen direction matches the sign of "
+    "delta, else 2*pi - |delta| (the long way around).\n"
+    "     steps_correct = needed / (pi/30), i.e. needed in degrees / 6, "
+    "rounded to the nearest whole number.\n"
+    "     tolerance = max(3, 0.1 * steps_correct) -- the floor is the "
+    "20-degree aim cone in step units: a count that lands the facing "
+    "inside the cone did its job.\n"
+    "     The count n is CORRECT iff |n - steps_correct| <= tolerance.\n"
+    "Worked example: delta = +0.47 (clockwise shorter), player emitted "
+    "[CLOCK 5]: needed = 0.47 -> steps_correct = 0.47 / 0.105 = 4.5 -> 4; "
+    "tolerance = max(3, 0.4) = 3; |5 - 4| = 1 <= 3 -> count correct. Same "
+    "position, [CLOCK 25]: |25 - 4| = 21 > 3 -> count wrong: copy the "
+    "token into a WRONG line and lower the RATING, even though the "
+    "direction was right. State steps_correct and the tolerance "
+    "explicitly in your analysis whenever the reply contains a turn "
+    "token.\n"
+    "A correct direction with a wrong count is still a better reply than "
+    "a wrong direction: credit the direction, penalize the count. Single "
+    "small steps are NOT a defect by themselves: when the target is "
+    "within about 20 degrees of the facing, a bare [CLOCK] or "
+    "[ANTICLOCK] is legitimate fine adjustment -- exactly as good as a "
+    "counted token -- and must not be marked down. What IS a weak move "
+    "is a single-step turn toward a target MANY steps away (well "
+    "outside that band): the player was instructed to estimate the full "
+    "count (about 5 steps per clock hour) and turn once; say so and "
+    "grade it down.\n"
+    f"{_TOK_FORWARD} NEVER takes a count. If the reply contains a token "
+    "like [FORWARD 10], it is NOT a move -- the harness ignored it and "
+    "the player wasted the turn. Copy the exact token into a WRONG line "
+    "(e.g. WRONG: \"[FORWARD 10]\") and rate the reply negative. The same "
+    "applies to a turn count outside 1..60, e.g. [CLOCK 0] or [CLOCK 90]."
+)
+
 _BLOCK_RATING = (
     "Say explicitly which parts of the player's response were correct and "
     "which were incorrect, and END your final answer with a single overall "
@@ -1373,6 +1453,7 @@ CORE_ANALYST_TIPS: list[tuple[str, str]] = [
     ("core_analyst_035_trust_the_math", _BLOCK_TRUST_THE_MATH),
     ("core_analyst_040_target_grading", _BLOCK_TARGET_GRADING),
     ("core_analyst_045_target_line", _BLOCK_TARGET_LINE),
+    ("core_analyst_046_turn_counts", _BLOCK_TURN_COUNT_GRADING),
     ("core_analyst_050_openings", _BLOCK_OPENINGS_PRIVILEGED),
     ("core_analyst_060_end_game_grading", _BLOCK_END_GAME_GRADING),
     ("core_analyst_070_aim_tolerance_review", _BLOCK_AIM_TOLERANCE_REVIEW),
@@ -1475,7 +1556,16 @@ def build_scene_analyst_messages(
             "information rather than a move, this move token was NOT "
             "requested -- that is itself a format mistake to call out."
         )
-    else:
+    invalid = game_io.find_invalid_move_token(player_reply)
+    if invalid:
+        scene.append(
+            f"FORMAT ERROR (harness-verified): the reply contains the "
+            f"invalid token '{invalid}'. [FORWARD] never takes a count "
+            f"and turn counts must be 1..60; this is NOT a move and was "
+            f"ignored. Copy the exact token into a WRONG line and grade "
+            f"the wasted turn down."
+        )
+    elif not pending_action:
         bare = game_io.find_bare_move(player_reply)
         if bare:
             scene.append(
@@ -1545,14 +1635,18 @@ def build_scene_analyst_messages(
 # [^\[\]] / \W confine each match to one bracket pair, so stray brackets or
 # prose can neither trigger a stop nor corrupt a parse; an incomplete mangle
 # matches nothing and the reply simply ends the turn. Case-insensitivity is
-# inline ((?i)) so the SAME pattern string drives both this module's parser
-# and the generation-time RegexStopCriteria.
+# scoped ((?i:...)) on SEARCH_TOOL_PATTERN so the SAME pattern string drives
+# both this module's parser and generation-time RegexStopCriteria, and so
+# concatenating it with PLAYER_STOP_PATTERN does not leak IGNORECASE onto
+# the uppercase-only move-token alternatives. DEBRIEF_TOOL_PATTERN keeps a
+# whole-pattern (?i) -- it is never concatenated with a case-sensitive
+# sibling.
 
 # The SEARCH-call fragment, shared verbatim by the standalone search pattern
 # (play / discuss / scene modes) and the full debrief pattern.
 _SEARCH_CALL_FRAGMENT = r"\[\W*SEARCH\b[:\s]*(?P<search_query>[^\[\]]+?)\W*\]"
 
-SEARCH_TOOL_PATTERN = r"(?i)" + _SEARCH_CALL_FRAGMENT
+SEARCH_TOOL_PATTERN = r"(?i:" + _SEARCH_CALL_FRAGMENT + r")"
 SEARCH_TOOL_RE = re.compile(SEARCH_TOOL_PATTERN)
 
 DEBRIEF_TOOL_PATTERN = (
@@ -1727,14 +1821,14 @@ def classify_move_or_search(raw: str) -> tuple[str, Any, str]:
     present; if both somehow are (e.g. the regex stop missed by a token or
     two), the earlier one is the model's actual first decision and wins."""
     search_m = SEARCH_TOOL_RE.search(raw)
-    move_m = game_io._MOVE_RE.search(raw)
+    move_m = game_io.first_valid_move_match(raw)
     if search_m and (move_m is None or search_m.start() < move_m.start()):
         query = _clean_search_query(search_m.group("search_query"))
         if query:
             return "search", query, raw[: search_m.end()]
     if move_m:
-        # parse_action takes the LAST move token; consistent here because
-        # generation stops at the first one.
+        # parse_move takes the LAST valid token; generation stops at the
+        # first valid one, so they agree on a well-stopped reply.
         return "move", game_io.parse_action(raw), raw
     return "answer", None, raw
 
