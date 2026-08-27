@@ -1128,8 +1128,17 @@ def weighted_loss(model: Any, model_inputs: dict, weights: Any,
         del teacher
 
     # Student forward: same tail (rule 1), same 2-D gather (rule 3).
+    # Drop the ModelOutput wrapper after taking .logits -- same idea as
+    # HF generate loops -- so unused fields (hidden states, past_kv)
+    # are not kept alive by a Python reference. Do not expect this to
+    # free `logits` during training: IndexBackward saves the source
+    # until backward. `del` of a tensor that is still in the graph is
+    # how people get "freed but still needed" errors; we only drop the
+    # wrapper.
     out = model(**model_inputs, logits_to_keep=tail + 1)
-    student = out.logits[row_of, col_of].float()
+    logits = out.logits
+    del out
+    student = logits[row_of, col_of].float()
 
     wm = w[mask]
     if loss_kind == "ce":

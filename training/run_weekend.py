@@ -786,11 +786,14 @@ def train_one_epoch(k: int, prefix: str, resume: str | None,
         # just over 16k; T~7k is mostly images + that text). 128 KiB let
         # in OpenThoughts targets with ~19k-token tails; one kept-logit
         # tensor is batch x tail x 262k vocab fp32 ≈ 19 GiB and OOMs.
-        # 48k sits between: game/analyst stay (~20-35k chars); 19k-token
-        # OT at ~3-4 chars/token does not. Dense OT with a long tail but
-        # few chars can still OOM (chars are not tokens); transcripts
-        # over 48k chars get dropped (short-game bias).
-        max_example_chars=48000,
+        # 48k kept game traces (max ~22k chars) and analyst, but still
+        # admitted ~12.5k-token OT: teacher+student [N,V] fit, then
+        # log_softmax needed a third 12.3 GiB with 11.1 free (train1
+        # 2026-08-27, both attempts, after step-0 eval). 32k: this
+        # corpus loses 0 game / 0 anchor rows and 67/2999 analyst
+        # (longest games); more OT drops. Chars are not tokens -- a
+        # dense 12.5k-token row under 32k chars can still OOM.
+        max_example_chars=32000,
     )
     return run_training(sources, cfg, extra_hooks=hooks, extra_guards=guards)
 
