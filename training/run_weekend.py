@@ -782,11 +782,15 @@ def train_one_epoch(k: int, prefix: str, resume: str | None,
         resume_checkpoint=resume,
         anchor_checkpoint=resume,  # the trust region's frozen teacher
         max_steps=max_steps,  # None = the full single pass
-        # 16k chars (~4k tok at the old 4-chars/token proxy) now drops
-        # essentially every multi-gold player/analyst row (T~7k). 128 KiB
-        # still fences pathological KD dumps. Weekend trains on this GPU
-        # were never VRAM-bound (aug18/aug21 logs).
-        max_example_chars=131072,
+        # 16k dropped almost every multi-gold player/analyst row (text
+        # just over 16k; T~7k is mostly images + that text). 128 KiB let
+        # in OpenThoughts targets with ~19k-token tails; one kept-logit
+        # tensor is batch x tail x 262k vocab fp32 ≈ 19 GiB and OOMs.
+        # 48k sits between: game/analyst stay (~20-35k chars); 19k-token
+        # OT at ~3-4 chars/token does not. Dense OT with a long tail but
+        # few chars can still OOM (chars are not tokens); transcripts
+        # over 48k chars get dropped (short-game bias).
+        max_example_chars=48000,
     )
     return run_training(sources, cfg, extra_hooks=hooks, extra_guards=guards)
 
