@@ -782,6 +782,11 @@ def train_one_epoch(k: int, prefix: str, resume: str | None,
         resume_checkpoint=resume,
         anchor_checkpoint=resume,  # the trust region's frozen teacher
         max_steps=max_steps,  # None = the full single pass
+        # 16k chars (~4k tok at the old 4-chars/token proxy) now drops
+        # essentially every multi-gold player/analyst row (T~7k). 128 KiB
+        # still fences pathological KD dumps. Weekend trains on this GPU
+        # were never VRAM-bound (aug18/aug21 logs).
+        max_example_chars=131072,
     )
     return run_training(sources, cfg, extra_hooks=hooks, extra_guards=guards)
 
