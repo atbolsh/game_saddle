@@ -399,3 +399,34 @@ adapter has already internalized.
 * Parallel: T²-ish prefill. Counted-turn prompts already forced p8 → p6
   on 96 GiB. Swallow first, then re-measure parallel; do not guess T
   from char length.
+
+### Stale semantic seed prefs (not the scene prompt)
+
+The system prompt **is** loaded from NAMS. `load_scene_prompts` reads
+the `core_player_*` / `core_analyst_*` Preference rows; `ensure_core_tips`
+heals those from the `_BLOCK_*` constants in `agent/modes.py`. That path
+**was** rewritten for counted turns. Updating `modes.py` and reseeding is
+how the standing instructions change.
+
+A **second** Preference catalog lives in `_SEMANTIC_MODEL_PREFERENCES`
+in `agent/memory.py`: short rows named `controls`, `geometry`, `goal`,
+`tip_distance`, `tip_facing`, and so on. Same node type, different job.
+They are not assembled into the scene system prompt. They exist for
+mid-game similarity recall (`get_context`) and for the full dump
+`get_semantic_model` builds for privileged modes. `reset_memory_to_seed`
+does not drop them as leftovers of an old graph — it **re-writes** them
+from that constant. So after every run-start reset they come back as
+whatever `memory.py` still says.
+
+What it still says is leftover 1-step teaching. `controls` describes
+CLOCK / ANTICLOCK as one `pi/30` step each, with no `[CLOCK n]`. `goal`
+still describes eat-to-win one-gold. If `get_context` retrieves
+`controls` into a player turn, the model sees one-step language **under**
+a counted-turn system prompt. Privileged dumps include the row every
+time. That is inconsistency in memory, not a second un-updated copy of
+`modes.py`.
+
+When swallowing prompts, rewrite those seed strings to match the current
+protocol (or delete `controls` if `_BLOCK_MOVE_TOKENS` already covers
+it). Healing `core_*` from `modes.py` does not touch this list. Do not
+treat "prompts updated" as "every Preference in the graph is current."
