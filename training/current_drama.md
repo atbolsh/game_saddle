@@ -40,9 +40,25 @@ State: `data_game/aug26_counted_state.json`.
 
 ### Watch list (both boxes unless noted)
 
+Throwaway runner (not a building block; delete with this note):
+`training/test_drama.py`. From the repo root on the box:
+
+```bash
+python -m training.test_drama --traces data_game/<prefix>_iter<k>/traces.jsonl
+```
+
+Examples: `aug27_big_step_iter1` (this box), `aug26_multi-gold_iter2`
+(other box; `iter1` there is pruned — thought/remember see only the
+keepsake games; cone still uses every meta). Skips `{pruned: true}`
+rows for anything that needs `target_text`. Prints thought rate,
+remember-after-eat, cone forgive + rating hist, then the counted-turn
+extras (`turn_count>1`, `oracle_verdict` including `count_off`,
+missed-forward after a counted turn).
+
 Traces: `data_game/<prefix>_iter<k>/traces.jsonl` (one player record per
 generation). Analyst file is sibling `analyst_traces.jsonl` — not needed
-for these three.
+for these three. The inline sketches below are the same checks; prefer
+the runner.
 
 **1. `thought` / `.thought` prefix (this box first; parent if curious)**
 
