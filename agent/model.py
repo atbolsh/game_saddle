@@ -40,11 +40,18 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import re
+
+# Must precede the first CUDA allocation (``import torch``). Datagen never
+# imports training/train.py, so that file's copy does not cover inference.
+# 2026-08-28 p6 OOM: 12.37 GiB reserved-but-empty, 6.65 GiB alloc failed
+# with 5.89 GiB free. ``setdefault`` so an explicit user setting wins.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from transformers import (
@@ -228,6 +235,30 @@ ADAPTERS: dict[str, FamilyAdapter] = {
 
 
 # ====================================================== generate batching
+
+#: Late-game VRAM split (2026-08-28, ``--parallel 6``): phase-lock sent 6
+#: analyst prefills at T~8k in one ``generate_batch``; the stacked call
+#: tried to allocate 6.65 GiB with 5.89 GiB free. Keep 6 workers; only
+#: shrink the GPU batch when any encoded prompt is long. Token counts
+#: only -- encode first; ``len(text)`` is not a stand-in.
+LONG_PREFILL_TOKENS = 5000
+LONG_PREFILL_GPU_BATCH = 3
+
+
+def max_gpu_batch_for_lens(lens: list[int]) -> int:
+    """How many of these encoded rows may share one GPU generate call.
+
+    Returns ``len(lens)`` when every prompt is under
+    :data:`LONG_PREFILL_TOKENS`; otherwise at most
+    :data:`LONG_PREFILL_GPU_BATCH` (never ``B>=4`` at ``max(T)>=5000``).
+    Empty ``lens`` -> 1.
+    """
+    if not lens:
+        return 1
+    if max(lens) >= LONG_PREFILL_TOKENS:
+        return min(LONG_PREFILL_GPU_BATCH, len(lens))
+    return len(lens)
+
 
 def stack_equal_length(
     rows: list[dict[str, Any]],
@@ -970,6 +1001,13 @@ class VLModel:
         the plan excludes or rejects decode via one batch per distinct
         prompt length (zero pad -- always safe, but decode serializes
         across cohorts).
+
+        VRAM: after encode, a batch whose longest prompt is
+        ``>= LONG_PREFILL_TOKENS`` is split into chunks of
+        ``LONG_PREFILL_GPU_BATCH`` so late 50-round analyst prefills do
+        not land 6-wide on the GPU (2026-08-28 OOM). Workers stay at
+        ``--parallel``; only the GPU call shrinks. Lengths are
+        ``input_ids.shape[1]``, not characters.
         """
         if not batch:
             return []
@@ -1031,6 +1069,23 @@ class VLModel:
                     "~= 1 mod 32 corrupts under any left pad)",
                     i, length, lens[i],
                 )
+
+        gpu_b = max_gpu_batch_for_lens(lens)
+        if gpu_b < len(batch):
+            logger.info(
+                "generate_batch: VRAM split %d rows (max T=%d) into "
+                "chunks of %d",
+                len(batch), max(lens), gpu_b,
+            )
+            replies: list[str] = []
+            for start in range(0, len(batch), gpu_b):
+                replies.extend(self.generate_batch(
+                    batch[start:start + gpu_b],
+                    max_new_tokens=max_new_tokens,
+                    stop_strings=stop_strings,
+                    stop_regex=stop_regex,
+                ))
+            return replies
 
         by_len: dict[int, list[int]] = {}
         for i, length in enumerate(lens):

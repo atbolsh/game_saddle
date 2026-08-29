@@ -34,7 +34,8 @@ Stage map (rationale in the Intermission plan):
                 tripwire, _rewrite_image_urls, Game/PlayerAnchor/Analyst
                 sources on fabricated dirs (example_weight, oracle
                 modifiers, novelty toggle), epoch_batches bucketing,
-                stack_equal_length, run_weekend --checkpoint (rejects
+                stack_equal_length, max_gpu_batch_for_lens (T>=5000
+                caps GPU B at 3), run_weekend --checkpoint (rejects
                 --start-checkpoint / --resume-checkpoint), datagen
                 --multi-gold vs smoke sealed, boundary
                 openings / multi-gold / END_GAME parse (base class too);
@@ -1354,13 +1355,32 @@ def t1_pure() -> str:
     assert max(totals) < 1.1 * min(totals), f"unbalanced groups: {totals}"
     checks += 1
 
+    # ---- max_gpu_batch_for_lens: late-prefill VRAM split (encode first;
+    #      never B>=4 when max T>=5000). Then stack_equal_length.
+    import torch
+
+    from agent.model import (
+        LONG_PREFILL_GPU_BATCH,
+        LONG_PREFILL_TOKENS,
+        max_gpu_batch_for_lens,
+        stack_equal_length,
+    )
+
+    assert max_gpu_batch_for_lens([]) == 1
+    assert max_gpu_batch_for_lens([LONG_PREFILL_TOKENS - 1] * 6) == 6
+    assert max_gpu_batch_for_lens([LONG_PREFILL_TOKENS] * 6) == (
+        LONG_PREFILL_GPU_BATCH
+    )
+    assert max_gpu_batch_for_lens([8000] * 6) == 3
+    assert max_gpu_batch_for_lens([8000, 100, 100]) == 3
+    assert max_gpu_batch_for_lens([8000, 8000]) == 2
+    assert max_gpu_batch_for_lens([8000]) == 1
+    checks += 1
+
     # ---- stack_equal_length: generate_batch's equal-length-cohort
     #      collation (mixed lengths must be a hard error, not a silent pad:
     #      only the parity-checked path in _plan_padded_batch may left-pad
     #      on Gemma 4 -- see the workaround banner in agent/model.py)
-    import torch
-
-    from agent.model import stack_equal_length
 
     a = {
         "input_ids": torch.tensor([[1, 2, 3]]),
@@ -1824,7 +1844,8 @@ def t1_pure() -> str:
 
     return (
         f"{checks} unit groups passed (ratings, rewards, noise, tripwire, "
-        "source, batching, scrambler, questions, stack-eq, weekend-ckpt, "
+        "source, batching, scrambler, questions, stack-eq, vram-split, "
+        "weekend-ckpt, "
         "multi-gold datagen flag, openings, end-game parse, prompt "
         "composition, openings backfill, leak scrubber, core-tip seed)"
     )

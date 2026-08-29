@@ -124,6 +124,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import random
 import shutil
 import sys
@@ -132,6 +133,10 @@ import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
+
+# Infer-path copy of train.py's fragmentation guard. Must run before any
+# CUDA allocation; agent.model also sets this before ``import torch``.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
