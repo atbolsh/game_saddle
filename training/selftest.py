@@ -34,7 +34,7 @@ Stage map (rationale in the Intermission plan):
                 tripwire, _rewrite_image_urls, Game/PlayerAnchor/Analyst
                 sources on fabricated dirs (example_weight, oracle
                 modifiers, novelty toggle), epoch_batches bucketing,
-                stack_equal_length, max_gpu_batch_for_lens (T>=5000
+                stack_equal_length, max_gpu_batch_for_lens (T>=7000
                 caps GPU B at 3), run_weekend --checkpoint (rejects
                 --start-checkpoint / --resume-checkpoint), datagen
                 --multi-gold vs smoke sealed, boundary
@@ -285,6 +285,7 @@ def t1_pure() -> str:
         _rewrite_image_urls,
         _sample_perception_question,
         _sealed_empty,
+        _stamp_outcome_in_jsonl,
         build_parser as traces_parser,
     )
     from training.image_noise import make_image_filter, noise_image
@@ -1356,7 +1357,7 @@ def t1_pure() -> str:
     checks += 1
 
     # ---- max_gpu_batch_for_lens: late-prefill VRAM split (encode first;
-    #      never B>=4 when max T>=5000). Then stack_equal_length.
+    #      never B>=4 when max T>=7000). Then stack_equal_length.
     import torch
 
     from agent.model import (
@@ -1375,6 +1376,33 @@ def t1_pure() -> str:
     assert max_gpu_batch_for_lens([8000, 100, 100]) == 3
     assert max_gpu_batch_for_lens([8000, 8000]) == 2
     assert max_gpu_batch_for_lens([8000]) == 1
+    checks += 1
+
+    # ---- per-round persist: stamp rewrites one game; others untouched
+    with tempfile.TemporaryDirectory() as _td:
+        p = Path(_td) / "traces.jsonl"
+        rows = [
+            {"meta": {"session_id": "s1", "game_index": 0, "move_index": 0,
+                      "game_won": None, "win_kind": None,
+                      "moves_from_end": None}},
+            {"meta": {"session_id": "s1", "game_index": 0, "move_index": 1,
+                      "game_won": None, "win_kind": None,
+                      "moves_from_end": None}},
+            {"meta": {"session_id": "s2", "game_index": 0, "move_index": 0,
+                      "game_won": None}},
+        ]
+        p.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        n = _stamp_outcome_in_jsonl(
+            p, "s1", 0, won=True, win_kind="exit",
+            from_end_by_move={0: 10, 1: 0},
+        )
+        assert n == 2, n
+        got = [json.loads(line) for line in p.read_text().splitlines()]
+        assert got[0]["meta"]["game_won"] is True
+        assert got[0]["meta"]["win_kind"] == "exit"
+        assert got[0]["meta"]["moves_from_end"] == 10
+        assert got[1]["meta"]["moves_from_end"] == 0
+        assert got[2]["meta"]["game_won"] is None
     checks += 1
 
     # ---- stack_equal_length: generate_batch's equal-length-cohort
@@ -1845,7 +1873,7 @@ def t1_pure() -> str:
     return (
         f"{checks} unit groups passed (ratings, rewards, noise, tripwire, "
         "source, batching, scrambler, questions, stack-eq, vram-split, "
-        "weekend-ckpt, "
+        "persist-stamp, weekend-ckpt, "
         "multi-gold datagen flag, openings, end-game parse, prompt "
         "composition, openings backfill, leak scrubber, core-tip seed)"
     )

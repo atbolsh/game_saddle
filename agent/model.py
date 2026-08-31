@@ -241,7 +241,7 @@ ADAPTERS: dict[str, FamilyAdapter] = {
 #: tried to allocate 6.65 GiB with 5.89 GiB free. Keep 6 workers; only
 #: shrink the GPU batch when any encoded prompt is long. Token counts
 #: only -- encode first; ``len(text)`` is not a stand-in.
-LONG_PREFILL_TOKENS = 5000
+LONG_PREFILL_TOKENS = 7000
 LONG_PREFILL_GPU_BATCH = 3
 
 
@@ -250,7 +250,7 @@ def max_gpu_batch_for_lens(lens: list[int]) -> int:
 
     Returns ``len(lens)`` when every prompt is under
     :data:`LONG_PREFILL_TOKENS`; otherwise at most
-    :data:`LONG_PREFILL_GPU_BATCH` (never ``B>=4`` at ``max(T)>=5000``).
+    :data:`LONG_PREFILL_GPU_BATCH` (never ``B>=4`` at ``max(T)>=7000``).
     Empty ``lens`` -> 1.
     """
     if not lens:
