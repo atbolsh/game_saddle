@@ -285,7 +285,10 @@ def t1_pure() -> str:
         _rewrite_image_urls,
         _sample_perception_question,
         _sealed_empty,
+        _settings_after_action,
+        _settings_from_messages,
         _stamp_outcome_in_jsonl,
+        _unfinished_from_traces,
         build_parser as traces_parser,
     )
     from training.image_noise import make_image_filter, noise_image
@@ -1405,6 +1408,62 @@ def t1_pure() -> str:
         assert got[2]["meta"]["game_won"] is None
     checks += 1
 
+    # ---- --append resume: unfinished games + settings recovery
+    board = {
+        "gameSize": 64, "direction": 0.0, "agent_x": 0.5, "agent_y": 0.5,
+        "agent_r": 0.05, "gold_r": 0.03, "gold": [[0.8, 0.5]], "walls": [],
+    }
+    after = _settings_after_action(board, "CLOCK", 1)
+    assert after["direction"] != board["direction"]
+    assert after["agent_x"] == board["agent_x"]
+    assert _settings_after_action(board, None, None)["direction"] == 0.0
+    assert _settings_after_action(board, "END_GAME", 1)["direction"] == 0.0
+    blob = json.dumps(board)
+    msgs = [{"role": "user", "content": [
+        {"type": "text", "text": "Exact settings for this frame:\n" + blob
+         + "\n\nAnalyze."},
+    ]}]
+    assert _settings_from_messages(msgs)["agent_x"] == 0.5
+    assert _settings_from_messages([]) is None
+    with tempfile.TemporaryDirectory() as _td:
+        tr = Path(_td) / "traces.jsonl"
+        an = Path(_td) / "analyst.jsonl"
+        rows = [
+            {"meta": {"session_id": "u1", "game_index": 3, "move_index": 0,
+                      "game_won": None, "settings_after": after}},
+            {"meta": {"session_id": "u1", "game_index": 3, "move_index": 1,
+                      "game_won": None, "settings_after": after,
+                      "action": "FORWARD", "turn_count": 1}},
+            {"meta": {"session_id": "done", "game_index": 0, "move_index": 0,
+                      "game_won": False}},
+            {"meta": {"session_id": "orphan", "game_index": 0, "move_index": 0,
+                      "game_won": None}},
+        ]
+        tr.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        an.write_text("")
+        jobs = _unfinished_from_traces(tr, an)
+        assert len(jobs) == 1, jobs
+        assert jobs[0].session_id == "u1" and jobs[0].game_index == 3
+        assert jobs[0].next_move == 2
+        assert jobs[0].settings["agent_x"] == after["agent_x"]
+        # recover via analyst prompt when settings_after is missing
+        old = {"meta": {"session_id": "old", "game_index": 1, "move_index": 0,
+                        "game_won": None, "action": "CLOCK", "turn_count": 1}}
+        tr.write_text(json.dumps(old) + "\n")
+        an.write_text(json.dumps({
+            "messages": msgs,
+            "meta": {"session_id": "old", "game_index": 1, "move_index": 0},
+        }) + "\n")
+        jobs = _unfinished_from_traces(tr, an)
+        assert len(jobs) == 1 and jobs[0].session_id == "old"
+        assert jobs[0].settings["direction"] == after["direction"]
+    checks += 1
+    gp = traces_parser()
+    assert gp.parse_args(["--label", "x"]).resume_unfinished is True
+    assert gp.parse_args(["--label", "x", "--no-resume-unfinished"]
+                         ).resume_unfinished is False
+    checks += 1
+
     # ---- stack_equal_length: generate_batch's equal-length-cohort
     #      collation (mixed lengths must be a hard error, not a silent pad:
     #      only the parity-checked path in _plan_padded_batch may left-pad
@@ -1476,7 +1535,9 @@ def t1_pure() -> str:
     checks += 1
 
     # ---- datagen --multi-gold vs smoke sealed (2026-08-25)
-    from training.run_weekend import DATAGEN_ROOM_FLAG, _datagen, _smoke_eval
+    from training.run_weekend import (
+        DATAGEN_ROOM_FLAG, _datagen, _smoke_eval, orchestrate as _orchestrate,
+    )
     import inspect as _inspect
     gp = traces_parser()
     assert gp.parse_args(["--label", "x"]).multi_gold is False
@@ -1484,6 +1545,7 @@ def t1_pure() -> str:
     assert gp.parse_args(["--label", "x", "--multi-gold"]).multi_gold is True
     assert DATAGEN_ROOM_FLAG == ["--multi-gold"]
     assert "DATAGEN_ROOM_FLAG" in _inspect.getsource(_datagen)
+    assert "_prune_datagen(" not in _inspect.getsource(_orchestrate)
     smoke_src = _inspect.getsource(_smoke_eval)
     assert "DATAGEN_ROOM_FLAG" not in smoke_src
     assert "--multi-gold" not in smoke_src
@@ -1873,7 +1935,7 @@ def t1_pure() -> str:
     return (
         f"{checks} unit groups passed (ratings, rewards, noise, tripwire, "
         "source, batching, scrambler, questions, stack-eq, vram-split, "
-        "persist-stamp, weekend-ckpt, "
+        "persist-stamp, resume-unfinished, weekend-ckpt, "
         "multi-gold datagen flag, openings, end-game parse, prompt "
         "composition, openings backfill, leak scrubber, core-tip seed)"
     )

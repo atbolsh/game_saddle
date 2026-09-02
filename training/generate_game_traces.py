@@ -32,8 +32,12 @@ trainable, no win boost. When a game actually ends, those rows are
 rewritten in place with the outcome (``game_won``, ``win_kind``,
 ``moves_from_end`` in GAME TIME: a counted turn occupies n steps, a
 no-move round occupies 0). Per-round ``gold_collected``, ``turn_count``,
-and ``move_duration`` are stored on every write. Discounted win / eat
-boosts are computed at TRAINING time by ``GameTraceSource``, not here.
+``move_duration``, and ``settings_after`` (engine board after the move)
+are stored on every write. ``--append`` continues those unfinished games
+from the last flushed board (same ``session_id`` / ``game_index``);
+``--no-resume-unfinished`` keeps the old abandon-and-start-new behavior.
+Discounted win / eat boosts are computed at TRAINING time by
+``GameTraceSource``, not here.
 
 One record per player generation, in ``data_game/<label>/traces.jsonl``:
 
@@ -128,7 +132,8 @@ import shutil
 import sys
 import threading
 import time
-from collections import Counter
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -298,6 +303,142 @@ def _stamp_outcome_in_jsonl(
             out.write(json.dumps(obj, ensure_ascii=False) + "\n")
     os.replace(tmp, path)
     return n
+
+
+_SETTINGS_MARK = "Exact settings for this frame:\n"
+
+
+def _settings_from_messages(messages: list) -> dict | None:
+    """Pull the privileged settings JSON out of an analyst prompt.
+
+    Older traces did not store ``meta.settings_after``; the analyst user
+    message still has the exact board the player saw (settings_before).
+    Missing / unparseable -> None (caller warns and skips resume)."""
+    decoder = json.JSONDecoder()
+    for m in messages:
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "text":
+                continue
+            text = part.get("text") or ""
+            i = text.find(_SETTINGS_MARK)
+            if i < 0:
+                continue
+            blob = text[i + len(_SETTINGS_MARK):].lstrip()
+            try:
+                obj, _end = decoder.raw_decode(blob)
+            except json.JSONDecodeError:
+                return None
+            if isinstance(obj, dict) and "agent_x" in obj:
+                return obj
+            return None
+    return None
+
+
+def _settings_after_action(settings: dict, action: str | None,
+                           turn_count: int | None) -> dict:
+    """Board after applying ``action`` to ``settings``. No-ops and
+    ``END_GAME`` leave the dict unchanged (not in ACTION_MAP)."""
+    from agent import game_io
+    if not action or action not in game_io.ACTION_MAP:
+        return dict(settings)
+    game = game_io.game_from_settings_dict(settings)
+    n = int(turn_count) if turn_count is not None else 1
+    if action == "FORWARD":
+        n = 1
+    game_io.apply_action(game, action, n)
+    return game_io.game_to_settings_dict(game)
+
+
+@dataclass
+class _ResumeJob:
+    session_id: str
+    game_index: int
+    next_move: int
+    settings: dict
+    records: list[dict] = field(default_factory=list)
+
+
+def _unfinished_from_traces(
+    traces_path: Path, analyst_path: Path,
+) -> list[_ResumeJob]:
+    """Games whose every row still has ``game_won is None``.
+
+    Board to resume: ``meta.settings_after`` on the last row, else the
+    analyst prompt's settings JSON advanced by that row's action.
+    Games we cannot restore are omitted (WARNING)."""
+    if not traces_path.is_file():
+        return []
+    analyst_by_key: dict[tuple, dict] = {}
+    if analyst_path.is_file():
+        with analyst_path.open(encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                obj = json.loads(line)
+                meta = obj.get("meta") or {}
+                key = (meta.get("session_id"), meta.get("game_index"),
+                       meta.get("move_index"))
+                analyst_by_key[key] = obj
+
+    groups: dict[tuple, list[dict]] = defaultdict(list)
+    with traces_path.open(encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            obj = json.loads(line)
+            if obj.get("pruned"):
+                continue
+            meta = obj.get("meta") or {}
+            key = (meta.get("session_id"), meta.get("game_index"))
+            if key[0] is None or key[1] is None:
+                continue
+            groups[key].append(obj)
+
+    jobs: list[_ResumeJob] = []
+    for (sid, gidx), rows in groups.items():
+        if any(r.get("meta", {}).get("game_won") is not None for r in rows):
+            continue
+        rows.sort(key=lambda r: int(r.get("meta", {}).get("move_index") or 0))
+        last = rows[-1]
+        meta = last["meta"]
+        settings = meta.get("settings_after")
+        if not isinstance(settings, dict) or "agent_x" not in settings:
+            akey = (sid, gidx, meta.get("move_index"))
+            before = _settings_from_messages(
+                (analyst_by_key.get(akey) or {}).get("messages") or [],
+            )
+            if before is None:
+                logger.warning(
+                    "append: cannot restore session %s game %s "
+                    "(no settings_after, no analyst settings) -- "
+                    "leaving as unknown-win",
+                    sid, gidx,
+                )
+                continue
+            settings = _settings_after_action(
+                before, meta.get("action"), meta.get("turn_count"),
+            )
+        next_move = int(meta.get("move_index") or 0) + 1
+        jobs.append(_ResumeJob(
+            session_id=str(sid), game_index=int(gidx),
+            next_move=next_move, settings=settings, records=rows,
+        ))
+    jobs.sort(key=lambda j: (j.game_index, j.session_id))
+    return jobs
+
+
+def _install_resume(session: Any, job: _ResumeJob) -> None:
+    """Put ``job``'s board and session id on a live worker session."""
+    from agent import game_io
+    session.game = game_io.game_from_settings_dict(job.settings)
+    session.session_id = job.session_id
+    session.round_no = job.next_move
+    session.phase = "player"
+    session._pending = None
+    session._last_outcome = None
 
 
 def _nearest_engine_target(settings: dict) -> tuple[str, int | None]:
@@ -563,6 +704,8 @@ class _Shared:
         #: rating-less AND move-less generations, run-wide.
         self.degenerate_streak = 0
         self.poisoned = False
+        #: --append unfinished boards, taken by workers before new games.
+        self.resume_jobs: list[_ResumeJob] = []
 
     def close(self) -> None:
         self.out.close()
@@ -668,7 +811,8 @@ class _Shared:
 
 def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
                shared: _Shared, session_analyses: list[str],
-               qrng: random.Random) -> None:
+               qrng: random.Random, *, start_move: int = 0,
+               seed_records: list[dict] | None = None) -> None:
     """One full game on ``session``: rounds until a terminal, the move cap,
     or the run-wide generation budget. Each round is flushed to disk
     immediately (win unknown). A real terminal / move-cap end stamps the
@@ -688,15 +832,17 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
     game contract promises, and the analyst grades it as unrequested)."""
     from agent import game_io  # heavy (pygame); already loaded by the session
 
-    game_records: list[dict] = []
+    game_records: list[dict] = list(seed_records or [])
     analyst_records: list[dict] = []
     won = False
     win_kind: str | None = None
     completed = False
-    session_id: str | None = None
+    session_id: str | None = (
+        game_records[0]["meta"].get("session_id") if game_records else None
+    )
     multi = bool(getattr(args, "multi_gold", False))
     room = "multi-gold" if multi else "sealed"
-    for move_idx in range(args.max_moves):
+    for move_idx in range(start_move, args.max_moves):
         if not shared.take_generation():
             break
         settings_before = game_io.game_to_settings_dict(session.game)
@@ -775,6 +921,7 @@ def _play_game(session: Any, game_idx: int, args: argparse.Namespace,
                 "room": room,
                 "n_gold": len(settings_before.get("gold") or []),
                 "n_openings": len(settings_before.get("openings") or []),
+                "settings_after": settings_after,
             },
         }
         n_imgs = _rewrite_image_urls(
@@ -924,7 +1071,7 @@ def _worker(worker_id: int, session: Any, block: list[int], shared: _Shared,
             args: argparse.Namespace, session_analyses: list[str],
             fresh: list[bool], errors: list[BaseException],
             qrng: random.Random, dispatcher: Any = None) -> None:
-    """Pull game indices off the shared block queue until it drains, the
+    """Pull resume jobs, then new game indices, until both drain, the
     budget runs out, or any worker errored (fail the whole run, never
     silently continue with fewer workers).
 
@@ -936,12 +1083,28 @@ def _worker(worker_id: int, session: Any, block: list[int], shared: _Shared,
         dispatcher.worker_started()
     try:
         while True:
-            with shared.lock:
-                if errors or not block:
-                    return
-                game_idx = block.pop(0)
             if shared.budget_spent():
                 return
+            job: _ResumeJob | None = None
+            with shared.lock:
+                if errors:
+                    return
+                if shared.resume_jobs:
+                    job = shared.resume_jobs.pop(0)
+                    game_idx = job.game_index
+                elif not block:
+                    return
+                else:
+                    game_idx = block.pop(0)
+            if job is not None:
+                _install_resume(session, job)
+                fresh[worker_id] = False
+                _play_game(
+                    session, job.game_index, args, shared,
+                    session_analyses, qrng,
+                    start_move=job.next_move, seed_records=job.records,
+                )
+                continue
             if fresh[worker_id]:
                 fresh[worker_id] = False  # restart() already dealt the board
             else:
@@ -1023,6 +1186,17 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
         shared = _Shared(traces_path, analyst_path, images_dir,
                          args.max_generations,
                          checkpoint=args.checkpoint)
+        if (args.append
+                and getattr(args, "resume_unfinished", True)):
+            shared.resume_jobs = _unfinished_from_traces(
+                traces_path, analyst_path,
+            )
+            if shared.resume_jobs:
+                logger.info(
+                    "append: continuing %d unfinished game(s) "
+                    "(same session_id / game_index)",
+                    len(shared.resume_jobs),
+                )
         # Per-session tripwire corpora (cleared on memory reset).
         analyses: list[list[str]] = [[] for _ in range(n_workers)]
         # Per-worker question rng, persistent across blocks so no two
@@ -1203,6 +1377,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="disable inference-time frame degradation")
     p.add_argument("--append", action="store_true",
                    help="append to an existing traces.jsonl instead of failing")
+    p.add_argument("--no-resume-unfinished", dest="resume_unfinished",
+                   action="store_false", default=True,
+                   help="with --append, do not continue win-unknown games; "
+                        "start new boards only (pre-2026-09-02 behavior)")
     return p
 
 

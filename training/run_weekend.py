@@ -20,17 +20,10 @@ One "epoch" here is one full expert-iteration cycle. For epoch k (1-based):
      delta are logged and stored under ``smoke`` in the state file --
      comparable to earlier weekends. A poisoned checkpoint surfaces in
      ~15 min. ``grep smoke_eval`` on the run log for the morning review.
-  4. prune  after a SUCCESSFUL train, the consumed corpus is tombstoned
-     down to a keepsake sample (one won game if any, plus one other
-     random game): every other record in traces.jsonl /
-     analyst_traces.jsonl becomes ``{"pruned": true, "meta": ...}`` and
-     its frames are deleted, so win-rate/rating stats stay computable
-     forever while disk is reclaimed (``_prune_datagen``; summary under
-     ``pruned`` in the state file). Smoke dirs are never pruned. A
-     failed epoch keeps its full corpus for the retry-by-hand path.
-     ``--prune <label>`` (repeatable) runs the same pruning standalone
-     on any already-trained-on corpus and exits -- for dirs that predate
-     this step.
+  4. (no auto-prune)  the full ``data_game/<prefix>_iter<k>/`` corpus
+     stays on disk after train. Tombstone-to-keepsake is opt-in:
+     ``--prune <label>`` (repeatable) runs ``_prune_datagen`` standalone
+     and exits -- only for corpora that have already been trained on.
 
 Each stage is a SUBPROCESS, deliberately: the inference model is a
 process-wide singleton (agent/model.py) and training builds its own
@@ -52,9 +45,11 @@ Crash policy -- the run must survive an unattended weekend:
 
 * A crashed datagen stage is retried once with ``--append`` and the
   REMAINING generation budget (player generations already on disk are
-  counted from traces.jsonl -- one record per generation). Training then
-  runs on whatever traces exist; an epoch with zero traces skips training
-  and carries the previous checkpoint forward (logged at ERROR).
+  counted from traces.jsonl -- one record per generation). ``--append``
+  continues unfinished games (win-unknown rows) from the last flushed
+  board; see generate_game_traces. Training then runs on whatever traces
+  exist; an epoch with zero traces skips training and carries the
+  previous checkpoint forward (logged at ERROR).
 * A crashed train stage is retried once; if it fails again, the next
   epoch's datagen uses the PREVIOUS epoch's checkpoint (logged at ERROR,
   never silently -- see the no-fuzzy-fallbacks rule).
@@ -867,27 +862,6 @@ def orchestrate(args: argparse.Namespace) -> int:
         state["checkpoints"][str(k)] = new_ckpt
         _save_state(args.prefix, state)
 
-        # Disk hygiene (2026-08-06): the corpus has been consumed, so
-        # tombstone it down to a keepsake sample (one won game + one
-        # other; stats stay computable from the metas left behind).
-        # Only after a SUCCESSFUL train -- a failed epoch keeps its full
-        # corpus for the retry-by-hand path above. Smoke dirs are never
-        # pruned (tiny, and the user curates them). A pruning crash is
-        # not worth killing an unattended weekend over: log it loudly
-        # and move on.
-        if new_ckpt:
-            try:
-                pruned = _prune_datagen(f"{args.prefix}_iter{k}",
-                                        seed=args.seed + 9000 + k)
-            except Exception:
-                logger.exception("[prune iter%d] FAILED -- full corpus "
-                                 "left on disk; prune by hand if disk "
-                                 "runs low", k)
-            else:
-                if pruned:
-                    state.setdefault("pruned", {})[str(k)] = pruned
-                    _save_state(args.prefix, state)
-
         # Post-train smoke eval (STANDARD, every fresh checkpoint): 8 real
         # games -> win rate / ratings / degeneracy / distance deltas,
         # logged AND stored in the state file -- so even a run whose last
@@ -1015,11 +989,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "down to the keepsake sample (one won game if any "
                         "+ one other; every other record tombstoned to "
                         "its meta, unreferenced frames deleted) and exit "
-                        "-- no epochs run. Repeatable. Only for corpora "
-                        "that have ALREADY been trained on: a pruned "
-                        "corpus cannot be retrained. Does not touch the "
-                        "state file; idempotent on already-pruned dirs. "
-                        "The keepsake pick derives from --seed.")
+                        "-- no epochs run. The weekend loop does NOT "
+                        "prune. Repeatable. Only for corpora that have "
+                        "ALREADY been trained on: a pruned corpus cannot "
+                        "be retrained. Does not touch the state file; "
+                        "idempotent on already-pruned dirs. The keepsake "
+                        "pick derives from --seed.")
     p.add_argument("--train-iter", type=int, default=None,
                    help="INTERNAL (child mode): run epoch k's train stage "
                         "in this process and exit. Pass the adapter as "
