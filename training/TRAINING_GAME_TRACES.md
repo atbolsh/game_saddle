@@ -217,16 +217,20 @@ reaches the gradient. Multiplicative chain, per reply:
    The exponential restores contrast wherever the ratings sit: ~2× per
    +0.2 of rating above the mean, symmetric below, capped at 3.0 so one
    reply cannot own its batch;
-2. **+ win boost, won games only:** `1.0 * 0.95^d` (`d` = rounds from the
-   winning move), ADDED to the base. The win is the loop's ONLY
+  2. **+ win boost, won games only:** `1.0 * 0.95^d` (`d` = GAME-TIME
+   steps from the winning move), ADDED to the base. A counted turn
+   `[CLOCK n]` occupies n steps (the agent leaves real time: it decides
+   a rotation and executes it eyes-closed, not a teleport); a round that
+   applied no move occupies 0. The win is the loop's ONLY
    *terminal* ground-truth reward (correct exit / `[END_GAME]` / sealed
    eat-to-win) and is sized to dominate the analyst — it even rescues an
-   analyst-floored reply near a win. The ~13.5-round half-life still pays
+   analyst-floored reply near a win. The ~13.5-step half-life still pays
    the closing approach far more than a lucky game's wandering prefix.
    **Eat boost, same gamma, half the scale:** `0.5 * 0.95^d` on
-   gold-collection (`d` = rounds back to the next eat; 0 on the eat
+   gold-collection (`d` = game-time steps back to the next eat; 0 on the eat
    itself; no credit after). Derived at load from `gold_collected` /
-   `move_index`. Not stacked on sealed eat-to-win (`win_kind=="gold"`) —
+   `move_index` / `move_duration` (old corpora without the duration key
+   default to 1 per record). Not stacked on sealed eat-to-win (`win_kind=="gold"`) —
    that terminal is already the win boost;
 3. **× action balance — TEMPORARY HACK** (`action_balance_multipliers`,
    screaming block in [game_traces.py](game_traces.py)):
@@ -266,11 +270,14 @@ A scale of exactly 0 (floored rating, no win/eat boost) **skips the record**
    spans never reach training. The win boost does NOT soften these
    anymore: a verified-wrong claim stays wrong in a won game;
 3. **the move token gets the oracle's verdict** (crutch block in
-   [game_traces.py](game_traces.py)): `[MOVE]` span → **1.5** when it
-   matches the engine oracle, **−0.5** (unlikelihood) when it contradicts
-   it, untouched on "neutral" (defensible under the instructed 20° cone)
-   or "unknown" (no oracle meta — pre-2026-08-05 corpora; counted and
-   logged).
+   [game_traces.py](game_traces.py)): `[MOVE]` / `[CLOCK n]` span → **1.5**
+   when it matches the engine oracle, **−0.5** (unlikelihood) when it
+   contradicts it, untouched on "neutral" (defensible under the instructed
+   20° cone) or "unknown" (no oracle meta — pre-2026-08-05 corpora; counted
+   and logged). `"count_off"` (right direction, count outside
+   `max(3, 0.1 * steps_correct)`): whole-token **1.5** plus digit-run
+   **−0.5** on a counted token; no modifier on a bare `[CLOCK]`. No
+   `ORACLE_WRONG_SCALE` on count_off.
 
 ### The 2026-08-04 spin-bot (why the balance, oracle, and contrast exist)
 
@@ -430,7 +437,8 @@ dropped like a missing RATING (perception rounds excused).
 
 | verdict | geometry | effect |
 |---|---|---|
-| `correct` | matches `oracle_move` (or any turn when the gold is ≥170° behind; `[END_GAME]` when `oracle_move` is `END_GAME`) | move-token span **1.5** |
+| `correct` | matches `oracle_move` AND (for turns) count within `max(3, 0.1 * steps_correct)` (or any turn when the gold is ≥170° behind with count ≈30 in tolerance; `[END_GAME]` when `oracle_move` is `END_GAME`). Bare `[CLOCK]` (n=1) is correct when `steps_correct ≤ 4` | move-token span **1.5** |
+| `count_off` | right direction, count outside tolerance | counted token: whole-token **1.5** + digit-run **−0.5**; bare token: no span modifier. **No** ×0.25 scale |
 | `neutral` | defensible under the instructed 20° cone (FORWARD in-cone without a ray hit) | none — the analyst's rating stands |
 | `wrong` | turn away from the shorter rotation; FORWARD outside the cone; **any turn under a ray hit** (missed forward — tightened 2026-08-11); `[END_GAME]` while gold or an opening remains; a board move on a sealed empty board | move-token span **−0.5** (unlikelihood) + example scale **×0.25** |
 | `unknown` | no oracle meta (old corpora) / no move | none; counted + logged |

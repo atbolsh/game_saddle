@@ -335,3 +335,98 @@ When picked up:
 * training is the REMEMBER path: the write is in the reply, the analyst
   has Settings/oracle, WRONG/RATING on the span, traces become the
   rows. Unverified NER nodes must not become CE/KD data.
+
+## 13. Train VRAM / wall-clock, and swallowing prompts — *Not started*
+
+The 2026-08-27/28 weekends showed the current recipe is **unsupportable**
+as a default: counted-turn datagen at `--parallel 6` ran ~63 gens/h
+(~47 h for 3000 gens vs the old ~8–12 h at p8 / shorter prompts).
+Train1 at `max_example_chars=32000` lived (10.2 h, no rollback) but sat
+at **p50 87.3 / max 90.0 GiB** of 95 — ~35 GiB and several hours above
+the 16k-cap aug21 trains (~50 GiB, ~3 h) because OpenThoughts KD
+materializes `[tail × 262k vocab]` fp32 several times. Do not raise the
+char cap until the KD path is cheaper. Next launch should cut **prompt
+tokens** and/or **long-target KD cost**, not add GPUs (DDP does not
+split a batch-1 logit tensor; 2×32 GiB cards are worse).
+
+### Train optimization (keep reply-only)
+
+We already put loss on the **assistant reply**, not the prompt
+(`weights` are 0 on the chat prefix). That is correct — do not start
+training the board dump. What is expensive is **how** the reply is
+scored when it is long:
+
+* **CE (game, gsm8k, …):** a fused / cut-cross-entropy kernel that never
+  builds `[T × V]` logits. Game tails are short; this is a win, not the
+  OOM.
+* **KD (OpenThoughts, analyst, SlimOrca):** soft CE needs the **full
+  262k distribution** at every target position. `logits_to_keep` only
+  helps when the target is a short tail; OT's target *is* the sequence.
+  Chunk the KL (e.g. 2k positions) so teacher_probs / student /
+  `log_softmax` never coexist as three 12 GiB matrices. The 2026-08-27
+  crash was the third matrix (`log_softmax`) after step-0 eval, 12.3 GiB
+  requested / 11.1 free.
+* **`del` the `ModelOutput` wrapper** after taking `.logits` (unused
+  hidden states / past KV). Do **not** `del` tensors still in the
+  autograd graph — that is the "leaf already freed" class of bug.
+  `del out` does not free student logits until backward.
+* **Length fences in token space** (`input_ids.shape[1]`), not chars.
+  32k chars dropped the worst OT rows and 67 long analyst rows; a dense
+  12.5k-token row under 32k chars can still OOM. Encode first.
+* Leave QLoRA + 8-bit Adam + `micro_batch_cap=1` on OT; those already
+  shrank weights. The leftover is lm_head × long reply.
+
+### Prompt swallowing (keep behavior, drop bulk)
+
+Datagen time is dominated by **prefill T** (analyst contexts ~8k tokens)
+and 50-round games, not by “the model is thinking harder.” Swallowing
+means the **protocol stays** (move tokens, REMEMBER, ratings) while the
+**repeated prose** shrinks — tips, NAMS dumps, and board text the
+adapter has already internalized.
+
+* Compose from the existing `_BLOCK_*` constants; do not fork copies
+  (prompt-composition rule). Prefer dropping or compressing a block
+  over adding a new mode.
+* Do **not** stuff extra policy into `board_update_line` (mechanical
+  update only). Tip / system-block edits are the place for “re-remember
+  after eat” if that rate ever turns real.
+* Measure success in **tokens** (`apply_chat_template` →
+  `input_ids.shape[1]`), including image soft tokens. Character count
+  and `chars // 32` buckets do not predict T or VRAM.
+* A shorter prompt that changes move-token or grading behavior is a
+  failed swallow. Check drama rates (`training/test_drama.py`) and
+  `oracle verdicts` after a cut, not just gens/hour.
+* Parallel: T²-ish prefill. Counted-turn prompts already forced p8 → p6
+  on 96 GiB. Swallow first, then re-measure parallel; do not guess T
+  from char length.
+
+### Stale semantic seed prefs (not the scene prompt)
+
+The system prompt **is** loaded from NAMS. `load_scene_prompts` reads
+the `core_player_*` / `core_analyst_*` Preference rows; `ensure_core_tips`
+heals those from the `_BLOCK_*` constants in `agent/modes.py`. That path
+**was** rewritten for counted turns. Updating `modes.py` and reseeding is
+how the standing instructions change.
+
+A **second** Preference catalog lives in `_SEMANTIC_MODEL_PREFERENCES`
+in `agent/memory.py`: short rows named `controls`, `geometry`, `goal`,
+`tip_distance`, `tip_facing`, and so on. Same node type, different job.
+They are not assembled into the scene system prompt. They exist for
+mid-game similarity recall (`get_context`) and for the full dump
+`get_semantic_model` builds for privileged modes. `reset_memory_to_seed`
+does not drop them as leftovers of an old graph — it **re-writes** them
+from that constant. So after every run-start reset they come back as
+whatever `memory.py` still says.
+
+What it still says is leftover 1-step teaching. `controls` describes
+CLOCK / ANTICLOCK as one `pi/30` step each, with no `[CLOCK n]`. `goal`
+still describes eat-to-win one-gold. If `get_context` retrieves
+`controls` into a player turn, the model sees one-step language **under**
+a counted-turn system prompt. Privileged dumps include the row every
+time. That is inconsistency in memory, not a second un-updated copy of
+`modes.py`.
+
+When swallowing prompts, rewrite those seed strings to match the current
+protocol (or delete `controls` if `_BLOCK_MOVE_TOKENS` already covers
+it). Healing `core_*` from `modes.py` does not touch this list. Do not
+treat "prompts updated" as "every Preference in the graph is current."

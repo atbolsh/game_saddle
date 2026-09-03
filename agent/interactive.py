@@ -186,7 +186,6 @@ class InteractiveSession:
 
         # 3. Single generation under the unified scene-play prompt.
         #    [END_GAME] stops generation; parse_action yields None for it.
-        play_stop = game_io.MOVE_STOP_STRINGS + [modes._TOK_END_GAME]
         search_notes: list[str] = []
         searches: list[dict[str, str]] = []
         while True:
@@ -199,8 +198,12 @@ class InteractiveSession:
             raw = self.model.generate(
                 messages,
                 max_new_tokens=self.cfg.max_new_tokens,
-                stop_strings=play_stop,
-                stop_regex=None if over_budget else modes.SEARCH_TOOL_PATTERN,
+                stop_strings=None,
+                stop_regex=(
+                    game_io.PLAYER_STOP_PATTERN if over_budget
+                    else game_io.PLAYER_STOP_PATTERN + "|"
+                    + modes.SEARCH_TOOL_PATTERN
+                ),
             )
             kind, payload, text = modes.classify_move_or_search(raw)
             if kind != "search" or over_budget:
@@ -226,8 +229,12 @@ class InteractiveSession:
                 )
             )
         self.round_no += 1
-        action = game_io.parse_action(raw) if kind == "move" else None
-        gold_collected = game_io.apply_action(self.game, action) if action else 0
+        parsed = game_io.parse_move(raw) if kind == "move" else None
+        action = parsed[0] if parsed else None
+        count = parsed[1] if parsed else 1
+        gold_collected = (
+            game_io.apply_action(self.game, action, count=count) if action else 0
+        )
 
         turn = self._run(
             modes._record_step(

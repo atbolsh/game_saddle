@@ -76,7 +76,9 @@ and measured scaling (2026-07-30, 96 GB box) never inverts: serial
 (12 OOM'd on 50-move multi-gold contexts, T~7k, 2026-08-26; 16 concurrent
 KV caches plus the NAMS MiniLM embedder on the same GPU died with
 `CUBLAS_STATUS_ALLOC_FAILED` on 2026-08-17). `--parallel 1`
-restores the fully serial conservative path.
+restores the fully serial conservative path. Counted turn tokens
+`[CLOCK n]`/`[ANTICLOCK n]` occupy n game-time steps for the win/eat-boost
+gamma; `--max-moves` stays in decision rounds.
 
 Launch (remote box, NAMS up, external data downloaded, from repo root):
 

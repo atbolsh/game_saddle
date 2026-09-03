@@ -27,9 +27,10 @@ Three modes:
 | 2 discuss | `python -m agent.runner discuss …` | Open-ended chat. The agent has **full access** to the entire memory DB. Use this to bootstrap the semantic model and to evaluate the agent conversationally. |
 | 3 eval  | `python -m agent.runner eval …`  | Self-evaluation: looks at a recorded `Conversation` + its `Reasoning` traces + the `Settings` dict at each step, and writes a verdict back onto the same conversation. |
 
-Available moves in mode 1: `CLOCK` (turn clockwise by π/30),
-`ANTICLOCK` (turn counter-clockwise by π/30), `FORWARD` (advance up to
-1/16 of the board in the facing direction).
+Available moves in mode 1: `CLOCK n` / `ANTICLOCK n` (turn by n steps of
+π/30, n in 1..60; bare `CLOCK`/`ANTICLOCK` is one step), `FORWARD`
+(advance up to 1/16 of the board in the facing direction; never takes a
+count).
 
 ## Architecture
 
@@ -332,8 +333,8 @@ E4B); the wider 2026-07 candidate field, and why it lost, is recorded in
   persistent game** and **one conversation thread**. One click is **one
   generation**: the agent sees the *current* live frame plus its
   (settings-stripped) memory context and emits at most one move token
-  (`[CLOCK]`, `[ANTICLOCK]`, `[FORWARD]`). Generation is stopped early the
-  instant that token appears (HF `stop_strings`) and the move is applied.
+  (`[CLOCK n]`, `[ANTICLOCK n]`, `[FORWARD]`). Generation is stopped early the
+  instant that token appears (`PLAYER_STOP_PATTERN` regex) and the move is applied.
   Ask again for the next move. A
   **"Restart conversation"** button re-initializes the env (a fresh bare level)
   and starts a new `session_id`. To discard an unwanted conversation and get

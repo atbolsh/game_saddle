@@ -82,7 +82,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
 
     DEFAULT_PLAYER_QUESTION = DEFAULT_PLAYER_QUESTION
     DEFAULT_ANALYST_QUESTION = DEFAULT_ANALYST_QUESTION
-    PLAYER_STOP_STRINGS = game_io.MOVE_STOP_STRINGS + [modes._TOK_END_GAME]
+    PLAYER_STOP_PATTERN = game_io.PLAYER_STOP_PATTERN
     END_ON_CLEAR = True
     # Prefixed onto the next player question after a graded [END_GAME] that
     # did not end the session (legacy eat-gold / training). Multi-gold never
@@ -161,11 +161,22 @@ class InteractiveSelfEvalSession(InteractiveSession):
         }
 
     def _parse_player_action(self, raw: str, kind: str) -> str | None:
-        """Reply -> pending action. ``[END_GAME]`` is recognized even on
-        non-move replies; board tokens still require ``kind == 'move'``."""
+        """Reply -> pending action name. ``[END_GAME]`` is recognized even
+        on non-move replies; board tokens still require ``kind == 'move'``."""
+        action, _count = self._parse_player_move(raw, kind)
+        return action
+
+    def _parse_player_move(self, raw: str, kind: str) -> tuple[str | None, int]:
+        """Reply -> ``(action, count)``. Count is 1 for END_GAME / FORWARD
+        / bare turns; the applied CLOCK/ANTICLOCK n otherwise."""
         if modes._TOK_END_GAME in raw:
-            return "END_GAME"
-        return game_io.parse_action(raw) if kind == "move" else None
+            return "END_GAME", 1
+        if kind != "move":
+            return None, 1
+        parsed = game_io.parse_move(raw)
+        if parsed is None:
+            return None, 1
+        return parsed
 
     def ask(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         raise NotImplementedError(
@@ -249,8 +260,12 @@ class InteractiveSelfEvalSession(InteractiveSession):
                 raw = self.model.generate(
                     messages,
                     max_new_tokens=self.cfg.max_new_tokens,
-                    stop_strings=self.PLAYER_STOP_STRINGS,
-                    stop_regex=None if over_budget else modes.SEARCH_TOOL_PATTERN,
+                    stop_strings=None,
+                    stop_regex=(
+                        game_io.PLAYER_STOP_PATTERN if over_budget
+                        else game_io.PLAYER_STOP_PATTERN + "|"
+                        + modes.SEARCH_TOOL_PATTERN
+                    ),
                 )
                 kind, payload, text = modes.classify_move_or_search(raw)
                 if kind != "search" or over_budget:
@@ -271,7 +286,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
                 if len(searches) >= self.cfg.memory_search_max_calls:
                     search_notes.append(modes.SEARCH_BUDGET_NOTE)
                 logger.info("player: [SEARCH %s]", payload)
-        action = self._parse_player_action(raw, kind)
+        action, turn_count = self._parse_player_move(raw, kind)
         new_notes = game_io.parse_remember_notes(raw)
         for k, v in new_notes:
             self._run(
@@ -326,6 +341,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
             "question": question,
             "raw": raw,
             "action": action,
+            "turn_count": turn_count,
             "before_path": before_path,
             "settings_json": before_props.get("settings_json"),
             "assistant_msg_id": str(assistant_msg.id),
@@ -348,6 +364,9 @@ class InteractiveSelfEvalSession(InteractiveSession):
             "question": question,
             "raw": raw,
             "action": action,
+            "turn_count": (
+                turn_count if action in ("CLOCK", "ANTICLOCK") else None
+            ),
             "bare_move": bare_move,
             "before_path": before_path,
             "searches": searches,
@@ -412,7 +431,10 @@ class InteractiveSelfEvalSession(InteractiveSession):
                 )
             )
             messages = modes.build_scene_analyst_messages(
-                pending["question"], pending["raw"], pending["action"],
+                pending["question"], pending["raw"],
+                game_io.format_move_inner(
+                    pending["action"], pending.get("turn_count") or 1,
+                ) if pending["action"] else None,
                 pending["before_path"], pending["settings_json"],
                 recent, question,
                 search_results="\n\n".join(search_notes) or None,
@@ -540,6 +562,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
                 "action": "END_GAME",
                 "gold_collected": 0,
                 "gold_remaining": gold_remaining,
+                "count": 1,
             }
             self.round_no += 1
             self._pending = None
@@ -560,7 +583,10 @@ class InteractiveSelfEvalSession(InteractiveSession):
                 "phase": self.phase,
             }
 
-        gold_collected = game_io.apply_action(self.game, action) if action else 0
+        count = int(pending.get("turn_count") or 1)
+        gold_collected = (
+            game_io.apply_action(self.game, action, count=count) if action else 0
+        )
         self._run(
             mem.add_reasoning_step(
                 self.client, trace, thought=pending["raw"], action=action,
@@ -593,11 +619,15 @@ class InteractiveSelfEvalSession(InteractiveSession):
                 "action": action,
                 "gold_collected": gold_collected,
                 "gold_remaining": gold_remaining,
+                "count": count,
             }
         self.round_no += 1
         n_analyses = pending["n_analyses"]
+        action_label = action or "none"
+        if action in ("CLOCK", "ANTICLOCK") and count > 1:
+            action_label = f"{action} x{count}"
         outcome = (
-            f"scene round: action={action or 'none'}; "
+            f"scene round: action={action_label}; "
             f"gold_collected={gold_collected}; "
             f"analyst_exchanges={n_analyses}; "
             f"gold_remaining={gold_remaining}"

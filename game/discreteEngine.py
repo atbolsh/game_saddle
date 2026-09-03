@@ -500,6 +500,21 @@ class discreteGame:
         self.settings.direction = self.mod2pi(self.settings.direction - math.pi/30)
         return self.universal_update()
 
+    def swivel_clock_n(self, n):
+        """Rotate CLOCKWISE by n pi/30 steps in ONE move. Conceptually the
+        agent leaves real time: it commits to a rotation and executes it
+        eyes-closed (not a teleport -- position never changes, so nothing
+        can be eaten, hit, or exited mid-turn; one update is exactly
+        equivalent to n sequential swivels)."""
+        self.settings.direction = self.mod2pi(self.settings.direction + n * math.pi / 30)
+        return self.universal_update()
+
+    def swivel_anticlock_n(self, n):
+        """Rotate ANTICLOCKWISE by n pi/30 steps in ONE move. Same
+        out-of-real-time contract as :meth:`swivel_clock_n`."""
+        self.settings.direction = self.mod2pi(self.settings.direction - n * math.pi / 30)
+        return self.universal_update()
+
     ####### Function for "Arcade" UI   
     def humanGame(self):    
         assert (not self.envMode), "initialize with envMode = False to play"
