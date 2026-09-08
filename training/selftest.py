@@ -1390,6 +1390,7 @@ def t1_pure() -> str:
         PAD_POISON_MOD,
         PAD_POISON_RESIDUE,
         clean_stack_width,
+        expand_kv_cache,
         system_only_messages,
     )
     from training.token_fence import (
@@ -1415,6 +1416,37 @@ def t1_pure() -> str:
     assert system_only_messages(
         [{"role": "user", "content": [{"type": "text", "text": "x"}]}]
     ) is None
+    checks += 1
+
+    # HF 5.x DynamicCache shape: layers[].keys / .values, not key_cache.
+    class _Layer:
+        def __init__(self, keys, values):
+            self.keys = keys
+            self.values = values
+
+        def batch_repeat_interleave(self, repeats: int) -> None:
+            self.keys = self.keys.repeat_interleave(repeats, dim=0)
+            self.values = self.values.repeat_interleave(repeats, dim=0)
+
+    class _DynCache:
+        def __init__(self, layers):
+            self.layers = layers
+
+        def batch_repeat_interleave(self, repeats: int) -> None:
+            for layer in self.layers:
+                layer.batch_repeat_interleave(repeats)
+
+    k0 = torch.arange(8, dtype=torch.float32).reshape(1, 2, 2, 2)
+    v0 = k0 + 10
+    cache = _DynCache([_Layer(k0.clone(), v0.clone())])
+    solo = expand_kv_cache(cache, 1)
+    assert solo is not cache
+    assert solo.layers[0].keys.shape[0] == 1
+    solo.layers[0].keys[0, 0, 0, 0] = -1
+    assert float(cache.layers[0].keys[0, 0, 0, 0]) == 0
+    waved = expand_kv_cache(cache, 3)
+    assert waved.layers[0].keys.shape[0] == 3
+    assert cache.layers[0].keys.shape[0] == 1
     checks += 1
 
     fence_ex = TrainingExample(

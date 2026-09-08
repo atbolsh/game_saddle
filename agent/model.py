@@ -515,6 +515,11 @@ def expand_kv_cache(cache: Any, batch_size: int) -> Any:
     the resident prefix cache must not be the object that generate sees.
     Unsupported cache types raise -- no silent full-prefill fallback here;
     the caller decides whether to drop to left-pad.
+
+    transformers 5.x ``DynamicCache`` stores tensors on ``layers[i].keys`` /
+    ``.values`` (and may mix sliding-window layers). The old
+    ``key_cache`` / ``value_cache`` lists are gone; treating that as
+    "unsupported DynamicCache" is what crashed t6.
     """
     if batch_size < 1:
         raise ValueError(f"expand_kv_cache: batch_size {batch_size}")
@@ -531,10 +536,53 @@ def expand_kv_cache(cache: Any, batch_size: int) -> Any:
             )
         return t.expand(batch_size, *t.shape[1:]).contiguous()
 
-    if hasattr(cache, "key_cache") and hasattr(cache, "value_cache"):
+    # HF 5 Cache: layers of CacheLayerMixin (DynamicCache, hybrid/sliding).
+    if getattr(cache, "layers", None) is not None:
+        try:
+            new = copy.deepcopy(cache)
+        except Exception as exc:
+            raise RuntimeError(
+                f"expand_kv_cache: deepcopy of {type(cache).__name__} "
+                f"failed ({type(exc).__name__}: {exc})"
+            ) from exc
+        if batch_size == 1:
+            return new
+        if hasattr(new, "batch_repeat_interleave"):
+            new.batch_repeat_interleave(batch_size)
+            return new
+        n_kv = 0
+        for i, layer in enumerate(new.layers):
+            for name in ("keys", "values"):
+                t = getattr(layer, name, None)
+                if isinstance(t, torch.Tensor):
+                    setattr(layer, name, _expand_tensor(t))
+                    n_kv += 1
+        if n_kv == 0:
+            raise RuntimeError(
+                f"expand_kv_cache: {type(cache).__name__} has "
+                f"{len(new.layers)} layer(s) but no keys/values tensors"
+            )
+        return new
+
+    # Encoder-decoder wrapper (recurse into the two inner caches).
+    if (hasattr(cache, "self_attention_cache")
+            and hasattr(cache, "cross_attention_cache")):
         new = copy.copy(cache)
-        new.key_cache = [_expand_tensor(k) for k in cache.key_cache]
-        new.value_cache = [_expand_tensor(v) for v in cache.value_cache]
+        new.self_attention_cache = expand_kv_cache(
+            cache.self_attention_cache, batch_size
+        )
+        new.cross_attention_cache = expand_kv_cache(
+            cache.cross_attention_cache, batch_size
+        )
+        return new
+
+    # Older transformers: lists on the cache object itself.
+    key_cache = getattr(cache, "key_cache", None)
+    value_cache = getattr(cache, "value_cache", None)
+    if isinstance(key_cache, list) and isinstance(value_cache, list):
+        new = copy.copy(cache)
+        new.key_cache = [_expand_tensor(k) for k in key_cache]
+        new.value_cache = [_expand_tensor(v) for v in value_cache]
         return new
 
     if isinstance(cache, (tuple, list)):
@@ -550,7 +598,8 @@ def expand_kv_cache(cache: Any, batch_size: int) -> Any:
         return type(cache)(layers) if isinstance(cache, tuple) else layers
 
     raise RuntimeError(
-        f"expand_kv_cache: unsupported cache type {type(cache).__name__}"
+        f"expand_kv_cache: unsupported cache type {type(cache).__name__} "
+        f"(attrs={ [a for a in dir(cache) if not a.startswith('_')][:24] })"
     )
 
 
