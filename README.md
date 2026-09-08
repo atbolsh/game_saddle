@@ -452,9 +452,10 @@ finishes by writing signal-check plots to `logs/datagen_stats_<label>_*/`
 (look at the rating histogram before spending training hours). Training
 runs micro-batched (`micro_batch=4` x `grad_accum=4` = the same effective
 batch 16), caps held-out eval at 100 examples per source, drops overlong
-examples loudly (`max_example_chars`), and aborts after `--max-rollbacks`
+examples loudly (`max_example_tokens`, encode-first; chars are not a
+proxy), and aborts after `--max-rollbacks`
 (default 3) rollbacks instead of oscillating. The formal verification
-protocol is `python -m training.selftest <t0..t9|all>` — ordered stages
+protocol is `python -m training.selftest <t0..t11|all>` — ordered stages
 printing `TEST <id> PASS/FAIL` lines; see
 [training/TO_TEST.md](training/TO_TEST.md).
 

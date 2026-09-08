@@ -16,14 +16,44 @@ lines back for review. On a FAIL, also paste the traceback that precedes it.
 | 3 | `python -m training.selftest t3` | minutes | 4-bit QLoRA load; LoRA target discovery + projector resolution; terminator id; one collated forward+backward per loss kind (image example included); fresh-adapter KD loss equals teacher entropy (the `disable_adapter()` teacher path); kd_anchor with NO anchor adapter loaded equals kd (the epoch-1 base fallback); `example_weight` ×0.1 scales the loss by EXACTLY 0.1 (the 2026-08-05 shape/scale regression — the old code normalized reply-wide reward away); the negative-span smoke example yields a FINITE NON-NEGATIVE loss (bounded unlikelihood, not negative CE); `kd` with negative span weights raises ValueError |
 | 4 | `python -m training.selftest t4` | ~15–30 min | batch-4 vs batch-1 per-example loss parity (mixed CE/KD/image/negative-span buckets); CLI smoke train lands a checkpoint + `eval_log.jsonl` rows (INCLUDING the new step-0 baseline eval); destructive-LR variant fires the rollback path via the HARD tier (`--hard-multiplier 1.0` pins any regression to hard) AND must now END EARLY on the second consecutive rollback (2026-08-05): asserts a `consecutive_rollback_stop` event, exit 0, and a `done` event carrying `ended_early` + a usable `last_good_checkpoint` (the orchestrator hand-off contract) |
 | 5 | `python -m training.selftest t5` | ~10–20 min | datagen 2 games x 5 moves at `--parallel 2`: traces + stored frames + stats + plots written, one record per generation, tripwire silent, ratings parsed; `analyst_traces.jsonl` has one record per round (minus counted truncated-search skips), analyses nonempty, frames shared with player records |
-| 6 | `python -m training.selftest t6` | minutes | equal-length identical-prompt true GPU batch vs solo; variable-length via the VERIFIED LEFT-PAD workaround vs solo (must byte-match AND must actually take the padded path, not the cohort fallback) |
+| 6 | `python -m training.selftest t6` | minutes | equal-length identical-prompt true GPU batch vs solo; variable-length via leftover left-pad **or** prefix-KV mid-pad vs solo (must byte-match AND must actually take that path, not the cohort fallback). Does **not** require `"padded batch verified clean"` unless `GS_PAD_PARITY=1` |
 | 7 | `python -m training.selftest t7` | minutes | t5's traces through `GameTraceSource` + `PlayerAnchorSource` + `AnalystTraceSource` and real train steps (RL weights + player trust region + KD-vs-base analyst anchor, mixed ce/kd/kd_anchor buckets, per-run noised frames, finite losses; the tiny epoch is drained so every KD bucket is guaranteed to train) |
-| 8 | `python -m training.selftest t8` | ~15–40 min | REAL serial datagen timing: the shared workload (3 games × 4 moves, `--parallel 1`) through the actual session harness with the model pre-loaded/warmed (startup excluded); reports `seconds_per_generation` and the serial wall-clock a default epoch (3000 gens) implies. Its `generation_stats.json` is t9's baseline (t9 checks the game count and refuses a stale one) |
-| 9 | `python -m training.selftest t9` | ~10–25 min | t8's EXACT workload at `--parallel 3` (run t8 first — its stats file is the serial baseline), compared on `seconds_per_generation`; asserts parallel is not ≫ slower, REPORTS the speedup (expect a real one now: phase-locking dispatcher + verified left-pad batching) |
-| 10 | `python -m training.selftest t10` | ~20–30 min | 4 timed train micro-batches from EVERY loss category (player CE/RL, player-anchor kd_anchor, analyst-anchor KD — both incl. the teacher forward — each manifest source) on the real overnight corpus (`data_game/overnight_iter1`, override `T10_DATAGEN_LABEL`); per-category peak VRAM (asserts < 88 GiB — the 2026-07-31 OOM tripwire) and a whole-epoch train-time estimate; saves NO checkpoint |
+| 8 | `python -m training.selftest t8` | ~15–40 min | REAL **serial** datagen timing (3 games × 4 moves, `--parallel 1`): diagnosis / control. Reports warmup vs steady and a 3000-gen number. Extrapolating t8 × 3000 is the *serial* epoch, not the overnight. Its `generation_stats.json` is t9's baseline |
+| 9 | `python -m training.selftest t9` | ~10–25 min | t8's EXACT workload at `--parallel 3` (run t8 first). Answers “did phase-lock + padded / prefix-KV batch actually engage?” Speedup vs t8 is reported; only asserts no ≥1.6× slowdown. t8+t9 together can exceed 1h and are **not** the weekend estimate (`run_weekend` default `--parallel 8`) |
+| 10 | `python -m training.selftest t10` | ~20–30 min | 4 warmed micro-batches/source on the real overnight corpus (`T10_DATAGEN_LABEL`); token fence 8192 / analyst 12288; peak VRAM < 88 GiB; warmup vs steady + epoch formula (setup + Σ n_batches × steady + opt steps). Two held-outs at `save_steps=400` on a ~300-step epoch are **not** inside the number — measure one hook and ×2. Saves NO checkpoint |
+| 11 | `python -m training.selftest t11` | ~25–45 min | Weekend-shaped datagen estimate: **8 games × 4 moves at `--parallel 8`**. Does **not** require t8. Prints warmup + steady + `warmup_s + (3000 − n_warmup) × steady`. 8×3 is ramp-dominated (same failure mode the suite already documented for 2×3) |
 
 (`python -m training.selftest all` runs everything in order; the exit code
 is the number of failures.)
+
+### How to read the estimators (warmup vs steady)
+
+Do **not** report a single blended s/gen as the overnight number. Every
+timed stage prints both, and the full-run number uses both:
+
+* **Datagen (t8 / t9 / t11 / `bench_speed --what infer`):** warmup is the
+  first wave(s) after the CUDA warmup generate (prefix-KV miss, phase-lock
+  not settled, allocator / autotune). Steady is later gens. 3000-gen
+  estimate = `warmup_s + (3000 − warmup_gens) × steady_s_per_gen`. A
+  blended `3000 × mean` over-weights the ramp. Analyst time is already
+  amortized inside s/gen.
+* **t8** = serial s/gen (diagnosis / control). **t9** = “did phase-lock +
+  batch engage?” **t11** = the <1h **weekend-shaped** datagen estimate.
+* **Train (t10 / `bench_speed --what train`):** warmup = materialize +
+  model load + one untimed micro-batch + one opt step. Steady = later
+  micro-batches. Epoch = setup + Σ (n_epoch_batches × steady) +
+  (total / grad_accum) × opt_s. Eval hooks: two held-outs at
+  `save_steps=400` — measure one and ×2; do not pad a vague 10–15%.
+* **Comparison script** (same corpus / same workload, flags only):
+
+      python -m training.bench_speed --what infer --modes control,bc
+      python -m training.bench_speed --what train --modes control,opt
+
+  Infer `control` = `GS_PREFIX_KV=0` (parity still off). `bc` = defaults.
+  Optional `parity` is a third column (`GS_PAD_PARITY=1`), not the control.
+  Train holds the **token-fenced set fixed**; `control` =
+  `GS_CHUNKED_KD=0 GS_TRAIN_PREFIX_KV=0`. Fence drop counts are a separate
+  line from materialize, not two different corpora.
 
 To wipe selftest leftovers (failed / Ctrl-C mid-run) and re-start cleanly::
 
@@ -54,16 +84,19 @@ poisoned at 32/32 pads and validated the rescue: one harmless filler
 token (" .") moves it off the residue and it pads cleanly, with a
 content-identical greedy reply. So `generate_batch` NUDGES unpaddable
 rows off the residue (POISON MODE 2 RESCUE — serving-stack-only, traces
-keep the un-nudged prompt; ~1/32 of mixed-length rows), left-pads to the
-longest length (never ≡ 1 mod 32 by construction — mode 1 dodged), and
-parity-checks each padded row's prefill against its solo prefill before
-decoding; rows the nudge cannot move (WARNING) or that the parity check
-rejects (an UNCATALOGUED third mode — WARNING) decode via cohorts. t6
-picks its prompt lengths at runtime around this arithmetic, compares the
-nudged row against the NUDGED prompt's solo reply, and FAILS if the
-padded path or the rescue did not engage: a silent cohort fallback would
-pass equality while quietly serializing parallel datagen. Equal-length
-early divergence is a true-batch bug.
+keep the un-nudged prompt; ~1/32 of mixed-length rows) and then either
+(B) mid-pads suffixes after a resident system-prefix KV or (C leftover)
+left-pads to the longest remaining length. Both stacks dodge mode 1
+(never a total width ≡ 1 mod 32) and mode 2 (a row whose own `L ≡ 1`
+is nudged or excluded). The solo+batch `prefill_last_logits` loop is a
+**third-mode tripwire**, not what dodges 1-mod-32; it is **off** unless
+`GS_PAD_PARITY=1` (or `VLModel.verify_pad_parity`). Production does not
+pay N solo prefills plus a batched prefill before `generate()` prefills
+again. t6 asserts the padded / prefix-KV path **engaged** and greedy
+batch==solo. It does not require `"padded batch verified clean"` unless
+parity is on. A silent cohort fallback would pass equality while
+quietly serializing parallel datagen. Equal-length early divergence is
+a true-batch bug.
 
 Stage 8/9 note: these two stages measure, they mostly don't judge — the
 decision they feed is "is serial datagen fast enough for an overnight
@@ -90,28 +123,26 @@ entries confirm the stage-6 workaround engaged; (3) frequent
 `hold-timeout` reasons mean a worker keeps stalling >120 s in non-GPU
 work (NAMS?). The only assertion is that `--parallel 3` is not ≥1.6x
 SLOWER per generation than serial, which would indicate dispatcher
-pathology. NOTE for this rerun: `prefill_last_logits` now passes
-`logits_to_keep=1` (kwarg assumed present in transformers 5.14 — a
-rename fails loudly as TypeError in t6); without it the parity check
-transiently materialized multi-GB full-vocab logits, which is what would
-have made `--parallel 3` VRAM-tight. With it, batch 3 adds only ~0.5 GB
-of KV cache per extra row at game-size contexts.
+pathology. NOTE: `prefill_last_logits` still passes `logits_to_keep=1` when
+parity is on (kwarg assumed present in transformers 5.14 — a rename
+fails loudly as TypeError in t6). Default production no longer runs
+that loop. Diagnosis for a low t9 number is unchanged: `dispatch: group
+of N` then `batch_mode` (`prefix-kv(...)` or `padded(...)`).
 
-KV reuse: attempted, REVERTED — do not retry. The "obvious" optimization
-of handing the parity check's KV cache to `generate` (skipping the
-second prefill, ~10% of round time) fails on two hard transformers 5.14
-facts, both observed on the remote box 2026-07-30: (1)
-`DynamicSlidingWindowLayer.crop` raises ValueError once a sliding layer
-has seen more tokens than its window, so "crop the cache by one so
-generate has an uncached token" is impossible at game-size prompts; (2)
-Gemma 4 Unified's `generate` passes `pixel_values` into its first
-forward even when a cache is supplied, and the model hard-errors with
-"Image features and image tokens do not match, tokens: 0, features:
-768" when the remaining input has no image tokens. A workaround exists
-(prefill T-1 tokens, deepcopy the cache for the parity step, strip
-`pixel_values`, shift the mod-32 rule to T-1) but was judged not worth
-the complexity for ~10%. The parity forward now runs `use_cache=False`
-and the padded batch is prefilled twice, deliberately.
+KV reuse — two different things:
+
+* **Do not retry the 2026-07-30 trick** of handing a *full-prompt*
+  parity-check cache to `generate`. That failed on
+  `DynamicSlidingWindowLayer.crop` and on `pixel_values` vs “tokens: 0,
+  features: 768” when the remaining input had no image tokens.
+* **B (in play)** caches only the **byte-identical system dump**
+  (`scene_play` / `scene_analyst`), once per role per run, expands B=1
+  KV to the wave, and passes **suffix-only** `input_ids` + mid-sequence
+  pads so every row ends at the same last index. Images live in the
+  suffix. This is not a crop of a sliding-window full-prompt cache.
+  `GS_PREFIX_KV=0` disables B (leftover left-pad, C: no parity by
+  default). Isolated B is probably ~10%; combined B+C ~30–45% is mostly
+  C. Do not treat the two as additive.
 
 Both stages share t9's caveat: sampled replies make single runs noisy —
 treat ±15% as measurement error, rerun before drawing conclusions from
@@ -119,37 +150,31 @@ small differences.
 
 Stage 10 note: t10 exists because training OOM'd three times on
 2026-07-31 (the overnight run, then t10 itself twice — each crash exposed
-a different memory bug). `weighted_loss` is now written around four VRAM
-rules, spelled out in its docstring; the short version: (1) both forwards
-pass `logits_to_keep=tail+1` so full-sequence `[batch, seq, 262k-vocab]`
-logit tensors are never materialized (the cut happens inside the model —
-slicing in loss code is too late); (2) for KD the teacher forward runs
-BEFORE the student and is reduced to probabilities first, so the two
-sides' multi-GiB tensors never coexist; (3) weighted positions are
-gathered by 2-D index, never `[:, :-1, :].reshape(...)` — that reshape
-silently copies the whole non-contiguous tensor; (4) sources whose target
-spans nearly the whole sequence (openthoughts) get `micro_batch_cap` in
-`datasets.json` (→ `TrainingExample.batch_cap` → `epoch_batches`), which
-per-example loss normalization makes mathematically free. Two supporting
-pieces: `train.py` sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
-at import (variable tail sizes fragment the default allocator — one crash
-had 14 GiB stranded as reserved-but-unallocated; an explicit env setting
-wins over the setdefault), and `weighted_loss` logs a WARNING whenever a
-batch's kept-logit tensor would exceed ~10 GiB — the early alarm for a
-new long-target source or a bad char-based length bucket.
+a different memory bug). `weighted_loss` is written around those VRAM
+rules plus **chunked KD** (`GS_CHUNKED_KD`, default on): one teacher
+backbone + one student backbone, then `lm_head` in chunks of 1024 with
+Gemma's logit softcap applied (a bare `lm_head(hidden)` that skips
+softcap silently shifts KD targets). Never materialize
+`[B, tail, 262144]` fp32. `GS_CHUNKED_KD=0` restores the two-logit-tensor
+path. Token fence is encode-first:
+`n_tokens = len(tokenizer(templated_text)) + n_images × pinned_soft_tokens`
+(plus target + terminator); `max_example_tokens=8192`, analyst 12288.
+Chars are not a proxy; `--max-example-chars` is a loud reject. Train
+prefix-KV (`GS_TRAIN_PREFIX_KV`) caches the system dump only, refresh
+every optimizer step by default; windowing makes steps source-homogeneous
+(a dynamics change — if held-out drifts vs control, suspect windowing
+before the KV math). `save_steps=400` so a ~300-step epoch evals at
+step 0 + final only.
 
-**Verified 2026-07-31 18:05** on the overnight corpus: all 12 sources
-pass, worst peak 39.1 GiB (analyst KD; tripwire 88), epoch estimate ~2.0h
-plus setup. Reading t10: it times 4 micro-batches per source, so it
-samples rather than proves — the single worst batch of a real epoch can
-run somewhat hotter than the printed peaks (bounded by
-`max_example_chars` and the 1.5x length buckets). The epoch estimate
-excludes save-time eval hooks (~3–5 min per save) and bucket-remainder
-short batches; pad it ~10–15% when fitting the weekend window. After ANY
-change to `weighted_loss` or collation, rerun t3 and t4 first (the loss
-correctness tests: fresh-adapter KD equals teacher entropy; batch-4 vs
-batch-1 parity), then t10. A `logits_to_keep` rename in a future
-transformers fails loudly as TypeError in t3/t4/t10 — never silently
+Reading t10: warmup (materialize + load + one untimed batch) vs
+steady-state (later batches) separately. The epoch number uses both, plus
+opt-step time. Two held-out hooks at `save_steps=400` are **not** inside
+that number — time one and ×2. Per-source peaks should drop on analyst/OT
+KD after chunked KD + the token fence. After ANY change to
+`weighted_loss` or collation, rerun t3 and t4 first (fresh-adapter KD
+equals teacher entropy **on the chunked+softcap path**; batch-4 vs
+batch-1 parity — prefix expand must not change per-example loss), then
+t10. A `logits_to_keep` rename fails loudly as TypeError — never silently
 fall back to full-sequence logits.
 
 Collapse-proofing note (2026-08-03, after the weekend collapse — full

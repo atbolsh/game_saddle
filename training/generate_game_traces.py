@@ -706,6 +706,9 @@ class _Shared:
         self.poisoned = False
         #: --append unfinished boards, taken by workers before new games.
         self.resume_jobs: list[_ResumeJob] = []
+        #: ``perf_counter`` when each player generation was written
+        #: (warmup vs steady-state estimators).
+        self.gen_completed_at: list[float] = []
 
     def close(self) -> None:
         self.out.close()
@@ -725,6 +728,7 @@ class _Shared:
             )
             self.out.flush()
             self.records.append(player_record)
+            self.gen_completed_at.append(time.perf_counter())
             if analyst_record is not None:
                 self.analyst_out.write(
                     json.dumps(analyst_record, ensure_ascii=False) + "\n"
@@ -1299,7 +1303,26 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
         "wall_seconds": round(wall_s, 1),
         "room": "multi-gold" if multi_gold else "sealed",
         "seconds_per_generation": round(wall_s / n_gen, 2) if n_gen else None,
+        "t_start": t_start,
+        "gen_completed_at": list(shared.gen_completed_at),
     }
+    from training.timing_est import estimate_full_run, from_completion_times, hours
+    split = from_completion_times(
+        t_start, shared.gen_completed_at, n_warmup=max(1, n_workers),
+    )
+    summary["warmup_s"] = round(split["warmup_s"], 2)
+    summary["warmup_gens"] = split["n_warmup"]
+    summary["steady_s_per_gen"] = (
+        None if split["steady_per_item"] is None
+        else round(split["steady_per_item"], 2)
+    )
+    est3000 = estimate_full_run(
+        split["warmup_s"], split["n_warmup"],
+        split["steady_per_item"], 3000,
+    )
+    summary["epoch_3000_hours"] = (
+        None if est3000 is None else round(hours(est3000), 2)
+    )
     (out_dir / "generation_stats.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
     )

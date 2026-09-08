@@ -38,7 +38,9 @@ models (:func:`switch_default`) unloads the old weights from the GPU first.
 
 from __future__ import annotations
 
+import copy
 import gc
+import hashlib
 import logging
 import os
 from dataclasses import dataclass
@@ -46,6 +48,8 @@ from pathlib import Path
 from typing import Any
 
 import re
+
+from .speed_flags import pad_parity_enabled, prefix_kv_enabled
 
 # Must precede the first CUDA allocation (``import torch``). Datagen never
 # imports training/train.py, so that file's copy does not cover inference.
@@ -367,11 +371,14 @@ def stack_equal_length(
 #       natural-width equal-length cohorts (always safe);
 #   (2) the remaining rows are left-padded to the longest of THEIR lengths
 #       (which is ~= 1 mod 32 by construction impossible -- mode 1 dodged);
-#   (3) before any decode, the prefill-parity tripwire: each row's
-#       padded-batch prefill logits must match its solo prefill logits
-#       within PAD_PARITY_DLOGIT with no argmax flip. Rows that fail
-#       (a THIRD poison mode we have not met yet => WARNING) are demoted
-#       to cohorts individually; the survivors decode as one batch.
+#   (3) OPTIONAL prefill-parity tripwire (GS_PAD_PARITY=1, default OFF):
+#       each padded row's prefill logits must match its solo prefill
+#       within PAD_PARITY_DLOGIT with no argmax flip. A third poison
+#       mode we have not met. Production does not pay N solo prefills
+#       for this hunt; 1-mod-32 arithmetic is what dodges modes 1 and 2.
+# The prefix-KV path (B) uses mid-sequence pads (pads BETWEEN a shared
+# system prefix and each suffix) so generate() can share a last index.
+# Same residue dodge: suffix L ≢ 1 mod 32, and P+pads+L_suffix ≢ 1.
 # Remove all of this ONLY when the upstream bug is fixed AND
 # training/probe_hacky_pads.py passes on the fixed version with padding
 # to total % 32 == 1.
@@ -413,8 +420,9 @@ def left_pad_row(
     CORRUPTED at padded totals ~= 1 mod 32 AND for rows whose own length
     is ~= 1 mod 32 (see the KNOWN TRANSFORMERS BUG WORKAROUND banner
     above). Never decode from a padded batch except through
-    :meth:`VLModel._plan_padded_batch`, which dodges both modes and runs
-    the prefill-parity check.
+    :meth:`VLModel._plan_padded_batch` or the prefix-KV mid-pad path,
+    both of which dodge both residue modes. The logit-parity tripwire
+    is optional (``GS_PAD_PARITY``).
     """
     if pad_len <= 0:
         return dict(enc)
@@ -441,10 +449,10 @@ def left_pad_stack(
     stack them. Returns ``(batch, pads)`` where ``pads[i]`` is row i's pad
     amount; ``target_len`` defaults to the longest row (zero pad there).
 
-    This is the HACKY_ANSWER path: padding is only trustworthy when the
-    target dodges the poisoned widths and the batch passes the
-    prefill-parity check -- see the KNOWN TRANSFORMERS BUG WORKAROUND
-    banner above and :meth:`VLModel._plan_padded_batch`.
+    This is the leftover left-pad path (C): the target must dodge the
+    poisoned widths. Prefill-parity is optional (``GS_PAD_PARITY``).
+    See the KNOWN TRANSFORMERS BUG WORKAROUND banner and
+    :meth:`VLModel._plan_padded_batch`.
     """
     lens = [int(r["input_ids"].shape[1]) for r in rows]
     target = max(lens) if target_len is None else target_len
@@ -453,6 +461,117 @@ def left_pad_stack(
     pads = [target - n for n in lens]
     padded = [left_pad_row(r, p, pad_token_id) for r, p in zip(rows, pads)]
     return stack_equal_length(padded), pads
+
+
+def clean_stack_width(min_width: int, *extra_offsets: int) -> int:
+    """Smallest ``T >= min_width`` that dodges poison mode 1.
+
+    ``T % 32 != 1``, and for every offset ``P`` in ``extra_offsets``,
+    ``(P + T) % 32 != 1``. Used for leftover left-pad (``T`` is the
+    full width) and prefix-KV mid-pad (``T`` is the suffix width,
+    ``P`` is the cached prefix length).
+    """
+    if min_width < 0:
+        raise ValueError(f"clean_stack_width: min_width {min_width}")
+    t = int(min_width)
+    for _ in range(PAD_POISON_MOD + 2):
+        if t % PAD_POISON_MOD == PAD_POISON_RESIDUE:
+            t += 1
+            continue
+        if any((int(p) + t) % PAD_POISON_MOD == PAD_POISON_RESIDUE
+               for p in extra_offsets):
+            t += 1
+            continue
+        return t
+    raise RuntimeError(
+        f"clean_stack_width: no residue-clean T >= {min_width} "
+        f"with extras {extra_offsets} in {PAD_POISON_MOD + 2} steps"
+    )
+
+
+def system_only_messages(messages: list[dict]) -> list[dict] | None:
+    """The single system turn, or None if the prompt has no cacheable prefix.
+
+    Prefix KV caches only this turn (core dump), never NAMS / image /
+    board / settings. Zero or several system turns -> None (loud skip,
+    not a guess at which turn is the dump).
+    """
+    sys_msgs = [m for m in messages if m.get("role") == "system"]
+    if len(sys_msgs) != 1:
+        return None
+    return [{"role": "system", "content": sys_msgs[0].get("content")}]
+
+
+def prefix_ids_hash(input_ids: torch.Tensor) -> str:
+    """Stable key for a B=1 prefix ``input_ids`` row."""
+    row = input_ids[0] if input_ids.dim() == 2 else input_ids
+    return hashlib.sha256(row.detach().cpu().contiguous().numpy().tobytes()).hexdigest()
+
+
+def expand_kv_cache(cache: Any, batch_size: int) -> Any:
+    """Repeat a B=1 KV cache along the batch dim without mutating ``cache``.
+
+    ``generate`` appends decode tokens onto the object it is given, so
+    the resident prefix cache must not be the object that generate sees.
+    Unsupported cache types raise -- no silent full-prefill fallback here;
+    the caller decides whether to drop to left-pad.
+    """
+    if batch_size < 1:
+        raise ValueError(f"expand_kv_cache: batch_size {batch_size}")
+    if cache is None:
+        raise RuntimeError("expand_kv_cache: cache is None")
+
+    def _expand_tensor(t: torch.Tensor) -> torch.Tensor:
+        if t.shape[0] == batch_size:
+            return t.clone()
+        if t.shape[0] != 1:
+            raise RuntimeError(
+                f"expand_kv_cache: tensor batch {t.shape[0]}, expected 1 "
+                f"or {batch_size}"
+            )
+        return t.expand(batch_size, *t.shape[1:]).contiguous()
+
+    if hasattr(cache, "key_cache") and hasattr(cache, "value_cache"):
+        new = copy.copy(cache)
+        new.key_cache = [_expand_tensor(k) for k in cache.key_cache]
+        new.value_cache = [_expand_tensor(v) for v in cache.value_cache]
+        return new
+
+    if isinstance(cache, (tuple, list)):
+        layers = []
+        for i, layer in enumerate(cache):
+            if not (isinstance(layer, (tuple, list)) and len(layer) >= 2):
+                raise RuntimeError(
+                    f"expand_kv_cache: layer {i} is {type(layer)}, "
+                    "expected (k, v, ...)"
+                )
+            k, v, *rest = layer
+            layers.append((_expand_tensor(k), _expand_tensor(v), *rest))
+        return type(cache)(layers) if isinstance(cache, tuple) else layers
+
+    raise RuntimeError(
+        f"expand_kv_cache: unsupported cache type {type(cache).__name__}"
+    )
+
+
+def slice_seq_suffix(enc: dict[str, Any], prefix_len: int) -> dict[str, Any]:
+    """Drop the leading ``prefix_len`` positions from sequence-aligned ints.
+
+    Floating / non-sequence tensors (``pixel_values``, ...) pass through.
+    """
+    seq_len = int(enc["input_ids"].shape[1])
+    if prefix_len < 0 or prefix_len > seq_len:
+        raise ValueError(
+            f"slice_seq_suffix: prefix_len {prefix_len} vs seq {seq_len}"
+        )
+    out: dict[str, Any] = {}
+    for k, v in enc.items():
+        if (isinstance(v, torch.Tensor) and not v.dtype.is_floating_point
+                and v.dim() == 2 and v.shape[1] == seq_len):
+            out[k] = v[:, prefix_len:]
+        else:
+            out[k] = v
+    return out
 
 
 # ============================================================ stop criteria
@@ -540,6 +659,25 @@ class VLModel:
         self.model: Any = None
         self.processor: Any = None
         self._loaded = False
+        #: Resident system-prefix KV, keyed by sha256 of prefix input_ids.
+        #: One entry per role (player / analyst) per run. generate() mutates
+        #: a COPY -- this dict stays at prefix length P.
+        self._prefix_kv: dict[str, Any] = {}
+        self._prefix_kv_len: dict[str, int] = {}
+        #: None = follow ``GS_PAD_PARITY``. Set True/False to override.
+        self._verify_pad_parity: bool | None = None
+
+    @property
+    def verify_pad_parity(self) -> bool:
+        """Logit-parity tripwire (third-mode hunt). Default follows
+        ``GS_PAD_PARITY`` (off). Does not change 1-mod-32 arithmetic."""
+        if self._verify_pad_parity is not None:
+            return self._verify_pad_parity
+        return pad_parity_enabled()
+
+    @verify_pad_parity.setter
+    def verify_pad_parity(self, value: bool) -> None:
+        self._verify_pad_parity = bool(value)
 
     def load(self) -> "VLModel":
         if self._loaded:
@@ -640,6 +778,8 @@ class VLModel:
         self.model = None
         self.processor = None
         self._loaded = False
+        self._prefix_kv.clear()
+        self._prefix_kv_len.clear()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -662,20 +802,29 @@ class VLModel:
         return out
 
     # ---------------------------------------------------- encode / device
-    def encode_messages(self, messages: list[dict]) -> dict[str, Any]:
+    def encode_messages(
+        self,
+        messages: list[dict],
+        add_generation_prompt: bool = True,
+    ) -> dict[str, Any]:
         """One prompt -> processor tensors (batch dim 1), same path as
         :meth:`generate`. Used by :meth:`generate_batch` so batched rows are
-        byte-identical to solo encodings before left-pad collate."""
+        byte-identical to solo encodings before left-pad collate.
+
+        ``add_generation_prompt=False`` is the system-only prefix encode
+        (no assistant turn marker). The trained prompt still uses True
+        -- keep that call in lockstep with training's Collator.build.
+        """
         if not self._loaded:
             self.load()
         norm = self.adapter.prepare_messages(messages)
-        # NOTE: keep this call in lockstep with training's Collator.build
+        # NOTE: keep the True call in lockstep with training's Collator.build
         # (training/train.py) -- the trained prompt must stay byte-identical
         # to this one. Any new template kwarg goes in BOTH places.
         return self.processor.apply_chat_template(
             norm,
             tokenize=True,
-            add_generation_prompt=True,
+            add_generation_prompt=add_generation_prompt,
             return_dict=True,
             return_tensors="pt",
         )
@@ -723,6 +872,109 @@ class VLModel:
             out[k] = v
         return out
 
+    def _prepare_generate_inputs(
+        self, messages: list[dict]
+    ) -> tuple[dict[str, Any], int, Any]:
+        """Encode one prompt; attach resident prefix KV when the system dump
+        is a literal prefix of the full encoding.
+
+        Returns ``(device_inputs, decode_prompt_len, past_key_values|None)``.
+        ``decode_prompt_len`` is the width of ``input_ids`` passed to
+        ``generate`` (suffix width when the cache hits, else full width).
+        """
+        full = self.encode_messages(messages)
+        if not prefix_kv_enabled():
+            return self._move_inputs_to_model(full), int(full["input_ids"].shape[-1]), None
+        split = self._try_prefix_split(messages, full)
+        if split is None:
+            return self._move_inputs_to_model(full), int(full["input_ids"].shape[-1]), None
+        pref_enc, p_len, key = split
+        cache = self._get_prefix_kv(pref_enc, key, p_len)
+        suffix = slice_seq_suffix(full, p_len)
+        suf_len = int(suffix["input_ids"].shape[1])
+        if suf_len < 1:
+            return self._move_inputs_to_model(full), int(full["input_ids"].shape[-1]), None
+        # Solo row: no mid-pad. Dodge residue on suffix width AND P+suffix
+        # in case a later batch-mate would need it -- solo has pad=0 so
+        # T_suf = L_suf; if L_suf ≡ 1 we leave the prefix path (mode 2
+        # on the suffix tensor) rather than invent a pad on a single row.
+        if (suf_len % PAD_POISON_MOD == PAD_POISON_RESIDUE
+                or (p_len + suf_len) % PAD_POISON_MOD == PAD_POISON_RESIDUE):
+            logger.info(
+                "prefix-kv: solo suffix L=%d P=%d hits residue -- full prefill",
+                suf_len, p_len,
+            )
+            return self._move_inputs_to_model(full), int(full["input_ids"].shape[-1]), None
+        inputs = self._move_inputs_to_model(suffix)
+        mask = inputs["attention_mask"]
+        pos = torch.arange(
+            p_len, p_len + suf_len, device=mask.device
+        ).unsqueeze(0).expand(mask.shape[0], -1)
+        inputs["position_ids"] = pos
+        # generate() wants attention_mask over past + new tokens.
+        prefix_ones = torch.ones(
+            mask.shape[0], p_len, dtype=mask.dtype, device=mask.device
+        )
+        inputs["attention_mask"] = torch.cat([prefix_ones, mask], dim=1)
+        logger.info("prefix-kv: solo hit P=%d suffix=%d", p_len, suf_len)
+        return inputs, suf_len, expand_kv_cache(cache, 1)
+
+    def _try_prefix_split(
+        self, messages: list[dict], full: dict[str, Any]
+    ) -> tuple[dict[str, Any], int, str] | None:
+        """If ``full`` begins with the system-only encoding, return it."""
+        sys_msgs = system_only_messages(messages)
+        if sys_msgs is None:
+            return None
+        pref_enc = self.encode_messages(sys_msgs, add_generation_prompt=False)
+        pref_ids = pref_enc["input_ids"]
+        # Prefix must be text-only. An image in the system dump would put
+        # pixel_values on the cached forward and break suffix image counts.
+        if any(
+            isinstance(v, torch.Tensor) and v.dtype.is_floating_point
+            for v in pref_enc.values()
+        ):
+            logger.warning(
+                "prefix-kv: system-only encode produced a floating tensor "
+                "-- system dump is not text-only; skipping cache"
+            )
+            return None
+        p_len = int(pref_ids.shape[1])
+        full_ids = full["input_ids"]
+        if full_ids.shape[1] <= p_len:
+            return None
+        if not torch.equal(full_ids[0, :p_len].cpu(), pref_ids[0].cpu()):
+            logger.info(
+                "prefix-kv: system-only tokens are not a prefix of the "
+                "full template (P=%d, full=%d) -- skipping cache",
+                p_len, int(full_ids.shape[1]),
+            )
+            return None
+        return pref_enc, p_len, prefix_ids_hash(pref_ids)
+
+    def _get_prefix_kv(
+        self, pref_enc: dict[str, Any], key: str, p_len: int
+    ) -> Any:
+        hit = self._prefix_kv.get(key)
+        if hit is not None:
+            return hit
+        inputs = self._move_inputs_to_model(pref_enc)
+        inputs.pop("pixel_values", None)
+        mask = inputs["attention_mask"]
+        inputs["position_ids"] = (mask.long().cumsum(-1) - 1).clamp(min=0)
+        with torch.inference_mode():
+            out = self.model(**inputs, use_cache=True, logits_to_keep=1)
+        cache = out.past_key_values
+        if cache is None:
+            raise RuntimeError(
+                "prefix-kv: system forward returned no past_key_values "
+                "(use_cache ignored?)"
+            )
+        self._prefix_kv[key] = cache
+        self._prefix_kv_len[key] = p_len
+        logger.info("prefix-kv: cached system prefix P=%d key=%s", p_len, key[:12])
+        return cache
+
     # ---------------------------------------------------------- generate
     def generate(
         self,
@@ -743,12 +995,11 @@ class VLModel:
         reply that emits no stop token simply ends the turn."""
         if not self._loaded:
             self.load()
-        inputs = self._move_inputs_to_model(self.encode_messages(messages))
+        inputs, prompt_len, past_kv = self._prepare_generate_inputs(messages)
         gen_kwargs: dict[str, Any] = {
             "max_new_tokens": max_new_tokens or self.cfg.max_new_tokens,
             **self._sampling_kwargs(),
         }
-        prompt_len = inputs["input_ids"].shape[-1]
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
         if stop_strings:
             # StopStringCriteria requires the tokenizer to be passed to generate.
@@ -758,6 +1009,9 @@ class VLModel:
             gen_kwargs["stopping_criteria"] = StoppingCriteriaList([
                 RegexStopCriteria(stop_regex, tokenizer, prompt_len=prompt_len)
             ])
+        if past_kv is not None:
+            gen_kwargs["past_key_values"] = past_kv
+            gen_kwargs["use_cache"] = True
 
         reply: str | None = None
         err: str | None = None
@@ -806,13 +1060,14 @@ class VLModel:
         max_new_tokens: int | None,
         stop_strings: list[str] | None,
         stop_regex: str | None,
+        past_key_values: Any = None,
     ) -> list[str]:
         """Decode one prepared (device-resident) stacked batch.
 
-        ``prompt_len`` is the stacked width; with left-padded rows every
-        generated token still lands after that index for EVERY row, so the
-        decode slicing and RegexStopCriteria's single prompt_len stay
-        correct whether the rows were equal-length or verified-padded."""
+        ``prompt_len`` is the stacked width of ``input_ids`` (suffix width
+        when ``past_key_values`` is the system prefix). Generated tokens
+        land after that index for every row, so decode slicing and
+        RegexStopCriteria stay correct for left-pad and mid-pad."""
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
         gen_kwargs: dict[str, Any] = {
             "max_new_tokens": max_new_tokens or self.cfg.max_new_tokens,
@@ -826,6 +1081,9 @@ class VLModel:
             gen_kwargs["stopping_criteria"] = StoppingCriteriaList([
                 RegexStopCriteria(stop_regex, tokenizer, prompt_len=prompt_len)
             ])
+        if past_key_values is not None:
+            gen_kwargs["past_key_values"] = past_key_values
+            gen_kwargs["use_cache"] = True
         with torch.inference_mode():
             out = self.model.generate(**inputs, **gen_kwargs)
         return [
@@ -909,17 +1167,13 @@ class VLModel:
         2. The target width is the longest remaining row's length, which
            by construction is NOT ~= 1 mod 32 -- poison mode 1 dodged
            without any search.
-        3. The prefill-parity tripwire: each padded row's prefill logits
-           must match its solo prefill (no argmax flip, max delta <=
-           PAD_PARITY_DLOGIT). Rows that fail are a poison mode we have
-           NOT catalogued yet -- logged at WARNING and demoted to
-           cohorts individually; the survivors are re-planned and must
-           pass before any decode.
+        3. OPTIONAL prefill-parity tripwire (``GS_PAD_PARITY=1``): each
+           padded row's prefill logits must match its solo prefill (no
+           argmax flip, max delta <= PAD_PARITY_DLOGIT). Default OFF --
+           this is a third-mode hunt, not what dodges 1-mod-32.
 
-        Steady-state cost: one solo prefill per paddable row (what serial
-        would have spent anyway) plus one batched prefill per planning
-        round (exactly one when no new poison mode fires) -- small next
-        to the decode loop this unlocks batching for.
+        When parity is off the leftover left-pad path is one stacked
+        generate (no N solo prefills). 1-mod-32 arithmetic is unchanged.
         """
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
         pad_id = tokenizer.pad_token_id
@@ -941,14 +1195,29 @@ class VLModel:
                 excluded, [lens[i] for i in excluded],
                 PAD_POISON_MOD, PAD_POISON_RESIDUE,
             )
+        if len(cand) < 2 or len({lens[i] for i in cand}) < 2:
+            return None  # cohorts already handle this optimally
+        raw_target = max(lens[i] for i in cand)
+        target = clean_stack_width(raw_target)
+        stacked, pads = left_pad_stack(
+            [rows[i] for i in cand], pad_id, target_len=target
+        )
+        if not self.verify_pad_parity:
+            logger.info(
+                "generate_batch: padded batch at T=%d "
+                "(rows %s, pads %s, parity off)", target, cand, pads,
+            )
+            return self._move_inputs_to_model(stacked), list(cand), pads
+
         solo: dict[int, torch.Tensor] = {}
         while True:
             if len(cand) < 2 or len({lens[i] for i in cand}) < 2:
-                return None  # cohorts already handle this optimally
+                return None
             for i in cand:
                 if i not in solo:
                     solo[i] = self.prefill_last_logits(rows[i])[0]
-            target = max(lens[i] for i in cand)
+            raw_target = max(lens[i] for i in cand)
+            target = clean_stack_width(raw_target)
             stacked, pads = left_pad_stack(
                 [rows[i] for i in cand], pad_id, target_len=target
             )
@@ -976,6 +1245,126 @@ class VLModel:
             rejected = {b[0] for b in bad}
             cand = [i for i in cand if i not in rejected]
 
+    def _plan_prefix_kv_batch(
+        self,
+        batch: list[dict],
+        rows: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], list[int], list[int], Any] | None:
+        """Mid-pad suffixes after a shared resident system prefix.
+
+        Returns ``(device_inputs, row_indices, pads, past_kv)`` or None
+        if the batch cannot share one system prefix. 1-mod-32: suffix
+        ``L ≢ 1``, stacked ``T_suf ≢ 1``, ``P + T_suf ≢ 1``.
+        """
+        if not prefix_kv_enabled():
+            return None
+        splits: list[tuple[dict[str, Any], int, str]] = []
+        for item, enc in zip(batch, rows):
+            split = self._try_prefix_split(item["messages"], enc)
+            if split is None:
+                return None
+            splits.append(split)
+        keys = {s[2] for s in splits}
+        p_lens = {s[1] for s in splits}
+        if len(keys) != 1 or len(p_lens) != 1:
+            logger.info(
+                "prefix-kv: mixed system prefixes in one batch "
+                "(%d hashes, P=%s) -- leftover left-pad",
+                len(keys), sorted(p_lens),
+            )
+            return None
+        key = next(iter(keys))
+        p_len = next(iter(p_lens))
+        pref_enc = splits[0][0]
+
+        suffix_lens = [int(r["input_ids"].shape[1]) - p_len for r in rows]
+        cand = [
+            i for i, sl in enumerate(suffix_lens)
+            if sl > 0 and sl % PAD_POISON_MOD != PAD_POISON_RESIDUE
+        ]
+        excluded = [i for i in range(len(rows)) if i not in cand]
+        if excluded:
+            logger.info(
+                "prefix-kv: row(s) %s have residue suffix lengths %s "
+                "(L %% %d == %d) -> leftover path",
+                excluded, [suffix_lens[i] for i in excluded],
+                PAD_POISON_MOD, PAD_POISON_RESIDUE,
+            )
+        if len(cand) < 2:
+            return None
+        tokenizer = getattr(self.processor, "tokenizer", self.processor)
+        pad_id = tokenizer.pad_token_id
+        if pad_id is None:
+            return None
+        min_suf = max(suffix_lens[i] for i in cand)
+        target = clean_stack_width(min_suf, p_len)
+        suffixes = [slice_seq_suffix(rows[i], p_len) for i in cand]
+        stacked, pads = left_pad_stack(suffixes, pad_id, target_len=target)
+        inputs = self._move_inputs_to_model(stacked)
+        mask = inputs["attention_mask"]
+        bsz, t_suf = mask.shape
+        pos = torch.zeros(bsz, t_suf, dtype=torch.long, device=mask.device)
+        for j, i in enumerate(cand):
+            sl = suffix_lens[i]
+            pad = target - sl
+            if sl:
+                pos[j, pad:] = torch.arange(
+                    p_len, p_len + sl, device=mask.device
+                )
+        inputs["position_ids"] = pos
+        prefix_ones = torch.ones(
+            bsz, p_len, dtype=mask.dtype, device=mask.device
+        )
+        inputs["attention_mask"] = torch.cat([prefix_ones, mask], dim=1)
+
+        if self.verify_pad_parity:
+            # Compare suffix-last-token logits: mid-pad batch vs each
+            # row's solo full prefill (same last token). Hunt switch.
+            solo: dict[int, torch.Tensor] = {}
+            for i in cand:
+                solo[i] = self.prefill_last_logits(rows[i])[0]
+            # Build a temporary full-width encoding for the stacked
+            # suffix so prefill_last_logits sees the same last token
+            # without a prefix cache (parity is a tripwire, not the
+            # fast path). Re-encode would drift; concat prefix ids.
+            pref_ids = pref_enc["input_ids"].to(inputs["input_ids"].device)
+            pref_rep = pref_ids.expand(bsz, -1)
+            probe = {
+                k: v for k, v in inputs.items()
+                if k not in ("input_ids", "attention_mask", "position_ids")
+            }
+            probe["input_ids"] = torch.cat(
+                [pref_rep, inputs["input_ids"]], dim=1
+            )
+            probe_mask = torch.cat([prefix_ones, mask], dim=1)
+            probe["attention_mask"] = probe_mask
+            probe["position_ids"] = (probe_mask.long().cumsum(-1) - 1).clamp(min=0)
+            # Move pixel tensors already on device.
+            batch_logits = self.prefill_last_logits(probe)
+            bad: list[tuple[int, float, bool]] = []
+            for j, i in enumerate(cand):
+                delta = float((batch_logits[j] - solo[i]).abs().max())
+                flipped = (int(batch_logits[j].argmax())
+                           != int(solo[i].argmax()))
+                if flipped or delta > PAD_PARITY_DLOGIT:
+                    bad.append((i, round(delta, 3), flipped))
+            if bad:
+                logger.warning(
+                    "prefix-kv: parity REJECTED row(s) %s -- leftover "
+                    "left-pad (GS_PAD_PARITY hunt)",
+                    bad,
+                )
+                return None
+
+        cache = self._get_prefix_kv(pref_enc, key, p_len)
+        past = expand_kv_cache(cache, bsz)
+        logger.info(
+            "generate_batch: prefix-kv batch P=%d T_suf=%d "
+            "(rows %s, pads %s)",
+            p_len, target, cand, pads,
+        )
+        return inputs, list(cand), pads, past
+
     def generate_batch(
         self,
         batch: list[dict],
@@ -990,17 +1379,15 @@ class VLModel:
         image counts are refused.
 
         KNOWN TRANSFORMERS BUG WORKAROUND in play here (module banner,
-        transformers#47651): mixed-length rows ARE left-padded into one
-        true GPU batch. Naturally-unpaddable rows (L ~= 1 mod 32, poison
-        mode 2) are first NUDGED off the residue with one harmless
-        filler token (:meth:`_nudge_unpaddable`; serving-stack-only, the
-        caller's messages are not altered). Then :meth:`_plan_padded_batch`
-        excludes any row still unpaddable, pads to a width that dodges
-        poison mode 1 (total ~= 1 mod 32), and verifies every padded
-        row's prefill against its solo prefill before any decode. Rows
-        the plan excludes or rejects decode via one batch per distinct
-        prompt length (zero pad -- always safe, but decode serializes
-        across cohorts).
+        transformers#47651): mixed-length rows batch via (B) resident
+        system-prefix KV + mid-sequence pads when every row shares one
+        system dump, else (C leftover) left-pad. Naturally-unpaddable
+        rows (L ~= 1 mod 32, poison mode 2) are first NUDGED off the
+        residue with one harmless filler token (:meth:`_nudge_unpaddable`;
+        serving-stack-only). Both paths dodge poison mode 1 (total ~= 1
+        mod 32). The logit-parity tripwire is off unless ``GS_PAD_PARITY=1``.
+        Rows a plan excludes decode via one batch per distinct prompt
+        length (zero pad -- always safe, but decode serializes).
 
         VRAM: after encode, a batch whose longest prompt is
         ``>= LONG_PREFILL_TOKENS`` is split into chunks of
@@ -1104,28 +1491,51 @@ class VLModel:
         err: str | None = None
         mode = "cohorts"
         try:
-            plan = (self._plan_padded_batch(rows)
-                    if len(by_len) > 1 else None)
             done: set[int] = set()
-            if plan is not None:
-                inputs, idxs, pads = plan
-                mode = (f"padded(T={int(inputs['input_ids'].shape[-1])},"
+            pk = self._plan_prefix_kv_batch(batch, rows)
+            if pk is not None:
+                inputs, idxs, pads, past = pk
+                mode = (f"prefix-kv(T_suf={int(inputs['input_ids'].shape[-1])},"
                         f"rows={idxs},pads={pads})")
                 sub_replies = self._generate_stacked(
                     inputs, len(idxs),
                     max_new_tokens=max_new_tokens,
                     stop_strings=stop_strings,
                     stop_regex=stop_regex,
+                    past_key_values=past,
                 )
                 for i, reply in zip(idxs, sub_replies):
                     replies[i] = reply
                 done.update(idxs)
+            plan = None
+            leftover_rows = [i for i in range(len(rows)) if i not in done]
+            if leftover_rows and (
+                len({lens[i] for i in leftover_rows}) > 1
+            ):
+                # Left-pad only the leftover encodings (index remap).
+                sub = [rows[i] for i in leftover_rows]
+                plan = self._plan_padded_batch(sub)
+                if plan is not None:
+                    inputs, local_idxs, pads = plan
+                    idxs = [leftover_rows[j] for j in local_idxs]
+                    tag = (f"padded(T={int(inputs['input_ids'].shape[-1])},"
+                           f"rows={idxs},pads={pads})")
+                    mode = tag if pk is None else mode + "+" + tag
+                    sub_replies = self._generate_stacked(
+                        inputs, len(idxs),
+                        max_new_tokens=max_new_tokens,
+                        stop_strings=stop_strings,
+                        stop_regex=stop_regex,
+                    )
+                    for i, reply in zip(idxs, sub_replies):
+                        replies[i] = reply
+                    done.update(idxs)
             leftover = {
                 length: [i for i in indices if i not in done]
                 for length, indices in by_len.items()
             }
             leftover = {L: idx for L, idx in leftover.items() if idx}
-            if leftover and plan is not None:
+            if leftover and (plan is not None or pk is not None):
                 mode += "+cohorts"
             for _length, indices in leftover.items():
                 sub_rows = [rows[i] for i in indices]

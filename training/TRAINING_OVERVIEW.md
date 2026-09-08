@@ -93,10 +93,13 @@ with a stored `base_seed` is a hard error. Crash-resume of the same prefix
 reuses the stored seed so `--append` stays on one stream.
 
 **Fitting the window.** One epoch costs roughly
-`--max-generations x s/gen` of datagen (~6 h at default parallelism,
-~20 h serial, per the measurements above) plus one train stage
-(measured ~2 h + setup on the 3000-generation overnight corpus, selftest
-t10 2026-07-31; pad ~10–15% for save-time eval hooks);
+`--max-generations x s/gen` of datagen (use **t11** / `bench_speed --what
+infer` for the weekend-shaped number — t8 is serial, t8+t9 can exceed 1h)
+plus one train stage (t10 / `bench_speed --what train`: warmup + steady,
+token fence 8192 / analyst 12288, `save_steps=400` so a ~300-step epoch
+evals at step 0 + final; measure one held-out hook and ×2 — do not pad a
+vague 10–15%). Re-measure after the speed-overhaul; the 2026-07-31 ~2 h
+figure predates chunked KD / prefix-KV / the token fence;
 `--max-generations` (default 3000) is the knob. `--epochs`, `--games`,
 `--parallel`, `--checkpoint`, and `--prefix` are also flags.
 `--checkpoint NAME` is how epoch 1 starts from an existing adapter

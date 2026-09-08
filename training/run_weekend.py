@@ -777,18 +777,11 @@ def train_one_epoch(k: int, prefix: str, resume: str | None,
         resume_checkpoint=resume,
         anchor_checkpoint=resume,  # the trust region's frozen teacher
         max_steps=max_steps,  # None = the full single pass
-        # 16k dropped almost every multi-gold player/analyst row (text
-        # just over 16k; T~7k is mostly images + that text). 128 KiB let
-        # in OpenThoughts targets with ~19k-token tails; one kept-logit
-        # tensor is batch x tail x 262k vocab fp32 ≈ 19 GiB and OOMs.
-        # 48k kept game traces (max ~22k chars) and analyst, but still
-        # admitted ~12.5k-token OT: teacher+student [N,V] fit, then
-        # log_softmax needed a third 12.3 GiB with 11.1 free (train1
-        # 2026-08-27, both attempts, after step-0 eval). 32k: this
-        # corpus loses 0 game / 0 anchor rows and 67/2999 analyst
-        # (longest games); more OT drops. Chars are not tokens -- a
-        # dense 12.5k-token row under 32k chars can still OOM.
-        max_example_chars=32000,
+        # Token fence (encode first). 8192 drops the ~12.5k-token
+        # OpenThoughts tails that OOM'd under the old 32k-char cap.
+        # Analyst traces get 12288 (image soft tokens + long dumps).
+        max_example_tokens=8192,
+        max_example_tokens_analyst=12288,
     )
     return run_training(sources, cfg, extra_hooks=hooks, extra_guards=guards)
 

@@ -230,6 +230,15 @@ class TrainingExample:
     meta: dict = field(default_factory=dict)
     batch_cap: int | None = None
     example_weight: float = 1.0
+    #: Token length of the trained sequence (prompt + target + terminator).
+    #: Set by materialize (encode-first). 0 means "not measured" --
+    #: fabricated selftest examples may leave it 0; the fence then does
+    #: not drop them. Missing-after-materialize is a hard error.
+    n_tokens: int = 0
+    #: sha256 of the system dump (or ``no-system``). Bucket + prefix-KV key.
+    prefix_hash: str = "no-system"
+    #: Token length of the system-only prefix. 0 = no cacheable prefix.
+    prefix_n_tokens: int = 0
 
     def declares_image(self) -> bool:
         for m in self.messages:
@@ -397,14 +406,34 @@ class TrainConfig:
     device: str = "cuda:0"
 
     # data hygiene
-    #: drop (LOUDLY, per-source counts) any example whose total text exceeds
-    #: this many chars (~4 chars/token, so 16k chars ~ 4k tokens): bounds the
-    #: per-sequence activation/logit memory without silent truncation.
-    max_example_chars: int = 16000
+    #: drop (LOUDLY, per-source counts) any example whose trained sequence
+    #: exceeds this many tokens (encode first; chars are not a proxy).
+    #: Weekend default matches this; AnalystTraceSource uses
+    #: ``max_example_tokens_analyst``.
+    max_example_tokens: int = 8192
+    #: Higher cap for analyst traces (~8k prompts + image soft tokens).
+    max_example_tokens_analyst: int = 12288
+    #: Rebuild frozen prefix KV after this many optimizer steps. Default 1
+    #: = every step (weights changed). Try 4 at 3e-6; do not set 200 --
+    #: stale KV after many LoRA updates is a silent training-dynamics bug.
+    #:
+    #: Gradient approximation: prefix forward is no_grad, so LoRA's
+    #: contribution *through prefix positions' KV* is detached. Loss is
+    #: tail-only, but tail tokens attend to that KV. t4 batch-parity and
+    #: held-out loss are the guards.
+    #:
+    #: Windowing (pack_prefix_windows) makes each optimizer step
+    #: source-homogeneous (all-player or all-analyst). That raises
+    #: per-step gradient noise vs today's shuffled mix. If held-out
+    #: drifts vs a control epoch, suspect windowing before the KV math.
+    #: Kill switch: GS_TRAIN_PREFIX_KV=0.
+    prefix_kv_refresh_steps: int = 1
+    #: Chunk size (token positions) for KD ``lm_head`` projection.
+    kd_lm_head_chunk: int = 1024
 
     # cadence + safety
     log_steps: int = 10
-    save_steps: int = 200
+    save_steps: int = 400
     holdout_fraction: float = 0.05
     #: held-out examples PER SOURCE are capped here -- the fraction is taken
     #: of the MATERIALIZED pool (~120k examples for the default manifest),
@@ -968,9 +997,247 @@ def _base_model_logits(model: Any, model_inputs: dict,
     return out.logits
 
 
+def _unwrap_base(model: Any) -> Any:
+    if hasattr(model, "get_base_model"):
+        return model.get_base_model()
+    return model
+
+
+def final_logit_softcap(model: Any) -> float | None:
+    """Gemma's post-lm_head tanh cap, or None if the config disables it.
+
+    A Gemma model with no such attribute is a hard error -- guessing the
+    formula would silently shift KD targets.
+    """
+    inner = _unwrap_base(model)
+    cfg = getattr(inner, "config", None)
+    if cfg is None:
+        raise RuntimeError(f"{type(inner)} has no config")
+    found = False
+    cap: float | None = None
+    for obj in (cfg, getattr(cfg, "text_config", None)):
+        if obj is None or not hasattr(obj, "final_logit_softcapping"):
+            continue
+        found = True
+        raw = getattr(obj, "final_logit_softcapping")
+        cap = None if raw is None else float(raw)
+        break
+    model_type = str(getattr(cfg, "model_type", "") or "").lower()
+    if (not found) and "gemma" in model_type:
+        raise RuntimeError(
+            f"Gemma config {type(cfg).__name__} has no "
+            "final_logit_softcapping -- chunked KD cannot copy the "
+            "model's logit transform"
+        )
+    return cap
+
+
+def apply_lm_head_chunked(
+    model: Any, hidden: Any, chunk: int
+) -> Any:
+    """Project hidden states through ``lm_head`` + Gemma softcap, in chunks.
+
+    ``hidden`` is ``[N, d]`` (already gathered) or ``[B, T, d]``. Never
+    materializes a full ``[B, T, vocab]`` tensor.
+    """
+    import torch
+
+    if chunk < 1:
+        raise ValueError(f"kd_lm_head_chunk must be >= 1, got {chunk}")
+    inner = _unwrap_base(model)
+    if not hasattr(inner, "lm_head"):
+        raise RuntimeError(
+            f"{type(inner).__name__} has no lm_head -- cannot chunk KD"
+        )
+    head = inner.lm_head
+    cap = final_logit_softcap(model)
+
+    def _proj(h: Any) -> Any:
+        logits = head(h)
+        if cap is not None:
+            logits = cap * torch.tanh(logits / cap)
+        return logits
+
+    if hidden.dim() == 2:
+        if hidden.shape[0] <= chunk:
+            return _proj(hidden)
+        pieces = [
+            _proj(hidden[s:s + chunk])
+            for s in range(0, hidden.shape[0], chunk)
+        ]
+        return torch.cat(pieces, dim=0)
+    if hidden.dim() != 3:
+        raise ValueError(f"apply_lm_head_chunked: bad hidden dim {hidden.dim()}")
+    b, t, d = hidden.shape
+    return apply_lm_head_chunked(model, hidden.reshape(b * t, d), chunk).view(
+        b, t, -1
+    )
+
+
+def _forward_last_hidden(
+    model: Any, model_inputs: dict, logits_to_keep: int = 1
+) -> Any:
+    """One backbone forward; return last hidden ``[B, T, d]``.
+
+    Still passes ``logits_to_keep=1`` so the model's own lm_head only
+    projects one position (tiny). The KD path then re-projects the
+    gathered tail hidden through :func:`apply_lm_head_chunked`.
+    """
+    out = model(
+        **model_inputs,
+        output_hidden_states=True,
+        logits_to_keep=logits_to_keep,
+    )
+    hs = getattr(out, "hidden_states", None)
+    if not hs:
+        raise RuntimeError(
+            f"{type(model).__name__} returned no hidden_states "
+            "(output_hidden_states ignored?)"
+        )
+    return hs[-1]
+
+
+@dataclass
+class PrefixKVRuntime:
+    """Resident train-time prefix cache for one optimizer window.
+
+    See TrainConfig.prefix_kv_refresh_steps for the gradient / windowing
+    caveats. Kill switch: GS_TRAIN_PREFIX_KV=0.
+    """
+
+    cache: Any = None
+    key: str | None = None
+    prefix_len: int = 0
+    opt_steps: int = 0
+
+
+def _same_prefix_ids(input_ids: Any, prefix_len: int) -> bool:
+    if prefix_len <= 0 or prefix_len >= int(input_ids.shape[1]):
+        return False
+    pref = input_ids[:, :prefix_len]
+    return bool((pref == pref[:1]).all().item())
+
+
+def expand_train_kv(cache: Any, batch_size: int) -> Any:
+    from agent.model import expand_kv_cache
+    return expand_kv_cache(cache, batch_size)
+
+
+def _teacher_hidden(
+    model: Any, model_inputs: dict, teacher: str = "base"
+) -> Any:
+    """Teacher last-hidden, same adapter switching as ``_base_model_logits``."""
+    import torch
+
+    if teacher not in ("base", "anchor"):
+        raise ValueError(f"_teacher_hidden: bad teacher {teacher!r}")
+    use_anchor = (teacher == "anchor"
+                  and ANCHOR_ADAPTER in getattr(model, "peft_config", {}))
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            if use_anchor:
+                try:
+                    model.set_adapter(ANCHOR_ADAPTER)
+                    hidden = _forward_last_hidden(model, model_inputs)
+                finally:
+                    model.set_adapter("default")
+            else:
+                with model.disable_adapter():
+                    hidden = _forward_last_hidden(model, model_inputs)
+    finally:
+        if was_training:
+            model.train()
+    return hidden
+
+
+def _ensure_prefix_cache(
+    model: Any,
+    model_inputs: dict,
+    prefix_kv: PrefixKVRuntime,
+    prefix_len: int,
+    prefix_hash: str,
+) -> None:
+    """B=1 no_grad prefix forward; reuse inside a grad_accum window."""
+    import torch
+
+    if (prefix_kv.cache is not None
+            and prefix_kv.key == prefix_hash
+            and prefix_kv.prefix_len == prefix_len):
+        return
+    ids = model_inputs["input_ids"][:1, :prefix_len]
+    mask = model_inputs["attention_mask"][:1, :prefix_len]
+    pref: dict[str, Any] = {
+        "input_ids": ids,
+        "attention_mask": mask,
+        "position_ids": (mask.long().cumsum(-1) - 1).clamp(min=0),
+    }
+    # Text-only prefix: drop pixel_values so the cached forward cannot
+    # claim image tokens it does not have.
+    prev = getattr(model.config, "use_cache", False)
+    was_training = model.training
+    model.config.use_cache = True
+    model.eval()
+    try:
+        with torch.no_grad():
+            out = model(**pref, use_cache=True, logits_to_keep=1)
+    finally:
+        model.config.use_cache = prev
+        if was_training:
+            model.train()
+    cache = out.past_key_values
+    if cache is None:
+        raise RuntimeError(
+            "train prefix-kv: prefix forward returned no past_key_values"
+        )
+    prefix_kv.cache = cache
+    prefix_kv.key = prefix_hash
+    prefix_kv.prefix_len = prefix_len
+    logger.info(
+        "train prefix-kv: cached P=%d hash=%s", prefix_len, prefix_hash[:12]
+    )
+
+
+def _suffix_inputs_with_cache(
+    model_inputs: dict,
+    prefix_kv: PrefixKVRuntime,
+    prefix_len: int,
+) -> dict:
+    """Suffix tensors + expanded past_key_values for the student/teacher."""
+    import torch
+
+    if prefix_kv.cache is None:
+        raise RuntimeError("train prefix-kv: cache missing after ensure")
+    ids = model_inputs["input_ids"]
+    bsz = int(ids.shape[0])
+    seq = int(ids.shape[1])
+    suf: dict[str, Any] = {}
+    for k, v in model_inputs.items():
+        if (isinstance(v, torch.Tensor) and v.dim() == 2
+                and v.shape[0] == bsz and v.shape[1] == seq):
+            if k == "attention_mask":
+                continue
+            suf[k] = v[:, prefix_len:]
+        else:
+            suf[k] = v
+    suf_len = seq - prefix_len
+    suf["position_ids"] = torch.arange(
+        prefix_len, prefix_len + suf_len, device=ids.device,
+    ).unsqueeze(0).expand(bsz, -1)
+    # HF wants attention over past + new.
+    suf["attention_mask"] = model_inputs["attention_mask"]
+    suf["past_key_values"] = expand_train_kv(prefix_kv.cache, bsz)
+    return suf
+
+
 def weighted_loss(model: Any, model_inputs: dict, weights: Any,
                   loss_kind: str = "ce", return_per_example: bool = False,
-                  example_weight: Any = None):
+                  example_weight: Any = None,
+                  prefix_kv: PrefixKVRuntime | None = None,
+                  prefix_len: int = 0,
+                  prefix_hash: str = "",
+                  kd_chunk: int = 1024):
     """Per-token weighted loss over one collated micro-batch.
 
     Each example is normalized by ITS OWN sum of ABSOLUTE weights (so
@@ -1107,38 +1374,100 @@ def weighted_loss(model: Any, model_inputs: dict, weights: Any,
             "(batch %d x tail %d x vocab %d, fp32) -- a batch mixing "
             "short and long prompts, or very long targets, defeats the "
             "logits_to_keep saving; consider a micro_batch_cap for this "
-            "source (see docstring), or check the collator's char-based "
-            "length bins (tokens != chars) if the mix looks wrong",
+            "source (see docstring), or check the collator's token-length "
+            "bins if the mix looks wrong",
             kept_gib, n_rows, tail + 1, vocab,
         )
 
-    teacher_probs = None
-    if loss_kind in ("kd", "kd_anchor"):
-        # VRAM rules 2 + 3: teacher first, gathered by 2-D index, reduced
-        # to probabilities; both big teacher tensors are gone before the
-        # student forward starts. "kd" distills to the frozen base,
-        # "kd_anchor" to the parent checkpoint's adapter.
-        teacher_logits = _base_model_logits(
-            model, model_inputs, logits_to_keep=tail + 1,
-            teacher="anchor" if loss_kind == "kd_anchor" else "base",
-        )
-        teacher = teacher_logits[row_of, col_of].float()
-        del teacher_logits
-        teacher_probs = F.softmax(teacher, dim=-1)
-        del teacher
+    from agent.speed_flags import chunked_kd_enabled, train_prefix_kv_enabled
 
-    # Student forward: same tail (rule 1), same 2-D gather (rule 3).
-    # Drop the ModelOutput wrapper after taking .logits -- same idea as
-    # HF generate loops -- so unused fields (hidden states, past_kv)
-    # are not kept alive by a Python reference. Do not expect this to
-    # free `logits` during training: IndexBackward saves the source
-    # until backward. `del` of a tensor that is still in the graph is
-    # how people get "freed but still needed" errors; we only drop the
-    # wrapper.
-    out = model(**model_inputs, logits_to_keep=tail + 1)
-    logits = out.logits
-    del out
-    student = logits[row_of, col_of].float()
+    fwd_inputs = model_inputs
+    if (train_prefix_kv_enabled() and prefix_kv is not None
+            and prefix_len > 0):
+        if _same_prefix_ids(input_ids, prefix_len):
+            _ensure_prefix_cache(
+                model, model_inputs, prefix_kv, prefix_len, prefix_hash,
+            )
+            fwd_inputs = _suffix_inputs_with_cache(
+                model_inputs, prefix_kv, prefix_len,
+            )
+        else:
+            logger.warning(
+                "train prefix-kv: micro-batch prefixes are not identical "
+                "(hash=%s P=%d) -- skipping cache this batch",
+                prefix_hash or "?", prefix_len,
+            )
+
+    _use_cache = "past_key_values" in fwd_inputs
+    prev_cache = getattr(model.config, "use_cache", False)
+    if _use_cache:
+        model.config.use_cache = True
+        suf_w = int(fwd_inputs["input_ids"].shape[1])
+        if suf_w < tail + 1:
+            raise RuntimeError(
+                f"train prefix-kv: suffix width {suf_w} < tail+1 "
+                f"{tail + 1} -- weighted labels overlap the cached prefix"
+            )
+
+    teacher_probs = None
+    try:
+        if loss_kind in ("kd", "kd_anchor"):
+            # VRAM rules 2 + 3: teacher first, gathered by 2-D index,
+            # reduced to probabilities; both big teacher tensors are gone
+            # before the student forward starts. "kd" distills to the
+            # frozen base, "kd_anchor" to the parent checkpoint's adapter.
+            teacher_name = "anchor" if loss_kind == "kd_anchor" else "base"
+            if chunked_kd_enabled():
+                teacher_h = _teacher_hidden(
+                    model, fwd_inputs, teacher=teacher_name,
+                )
+                # hidden is full sequence (or suffix if prefix-KV).
+                # Align gather to the TAIL of whatever was forwarded.
+                if int(teacher_h.shape[1]) < tail + 1:
+                    raise RuntimeError(
+                        f"chunked KD: teacher hidden T="
+                        f"{int(teacher_h.shape[1])} < tail+1 {tail + 1} "
+                        "(logits_to_keep sliced hidden_states?)"
+                    )
+                th_tail = teacher_h[:, -(tail + 1):, :]
+                gathered = th_tail[row_of, col_of]
+                teacher = apply_lm_head_chunked(
+                    model, gathered, kd_chunk
+                ).float()
+                del teacher_h, th_tail, gathered
+                teacher_probs = F.softmax(teacher, dim=-1)
+                del teacher
+            else:
+                teacher_logits = _base_model_logits(
+                    model, fwd_inputs, logits_to_keep=tail + 1,
+                    teacher=teacher_name,
+                )
+                teacher = teacher_logits[row_of, col_of].float()
+                del teacher_logits
+                teacher_probs = F.softmax(teacher, dim=-1)
+                del teacher
+
+        # Student forward: same tail (rule 1), same 2-D gather (rule 3).
+        if chunked_kd_enabled() and loss_kind in ("kd", "kd_anchor"):
+            hidden = _forward_last_hidden(model, fwd_inputs, logits_to_keep=1)
+            if int(hidden.shape[1]) < tail + 1:
+                raise RuntimeError(
+                    f"chunked KD: student hidden T="
+                    f"{int(hidden.shape[1])} < tail+1 {tail + 1} "
+                    "(logits_to_keep sliced hidden_states?)"
+                )
+            st_tail = hidden[:, -(tail + 1):, :]
+            gathered = st_tail[row_of, col_of]
+            student = apply_lm_head_chunked(model, gathered, kd_chunk).float()
+            del hidden, st_tail, gathered
+        else:
+            out = model(**fwd_inputs, logits_to_keep=tail + 1)
+            logits = out.logits
+            del out
+            student = logits[row_of, col_of].float()
+    finally:
+        if _use_cache:
+            model.config.use_cache = prev_cache
 
     wm = w[mask]
     if loss_kind == "ce":
@@ -1383,39 +1712,68 @@ def load_adapter_state(model: Any, ckpt_dir: Path) -> None:
 
 # ============================================================== the trainer
 
-def _example_chars(ex: TrainingExample) -> int:
-    """Total text size of an example (all message text parts + target):
-    the cheap stand-in for token count (~4 chars/token) used by the
-    overlong-example guard."""
-    n = len(ex.target_text)
-    for m in ex.messages:
-        content = m.get("content")
-        if isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    n += len(part.get("text") or "")
-    return n
+def materialize(
+    sources: list[DataSource],
+    cfg: "TrainConfig | None" = None,
+    *,
+    processor: Any = None,
+    image_soft_tokens: int = 0,
+    max_example_tokens: int = 0,
+    max_example_tokens_analyst: int = 0,
+) -> dict[str, list[TrainingExample]]:
+    """Load every source into memory. Token-fence oversized rows (encode
+    first) with a per-source WARNING count -- never silent truncation.
 
+    ``processor`` + ``image_soft_tokens`` are required when a cap is
+    active (or always, so ``n_tokens`` / ``prefix_hash`` are set).
+    """
+    from training.token_fence import (
+        count_example_tokens,
+        count_prefix_tokens,
+        system_prefix_hash,
+    )
 
-def materialize(sources: list[DataSource],
-                max_example_chars: int = 0,
-                ) -> dict[str, list[TrainingExample]]:
-    """Load every source into memory. With ``max_example_chars > 0``,
-    oversized examples (mostly long OpenThoughts KD rows) are dropped with a
-    per-source WARNING count -- bounding per-sequence activation/logit
-    memory without ever silently truncating anyone's text."""
+    if cfg is not None:
+        max_example_tokens = cfg.max_example_tokens
+        max_example_tokens_analyst = cfg.max_example_tokens_analyst
+    tokenizer = getattr(processor, "tokenizer", processor) if processor else None
+    if processor is None or tokenizer is None:
+        raise ValueError(
+            "materialize: processor is required (token fence is encode-first)"
+        )
+    if image_soft_tokens < 1:
+        raise ValueError(
+            f"materialize: image_soft_tokens must be measured (>=1), "
+            f"got {image_soft_tokens}"
+        )
+
     by_source: dict[str, list[TrainingExample]] = {}
     for src in sources:
         exs = list(src.examples())
-        if max_example_chars > 0:
-            kept = [ex for ex in exs
-                    if _example_chars(ex) <= max_example_chars]
+        for ex in exs:
+            ex.n_tokens = count_example_tokens(
+                ex, tokenizer, processor, image_soft_tokens,
+            )
+            ex.prefix_hash = system_prefix_hash(ex.messages)
+            ex.prefix_n_tokens = count_prefix_tokens(
+                ex.messages, tokenizer, processor,
+            )
+            if ex.n_tokens < 1:
+                raise RuntimeError(
+                    f"materialize: {src.name} example tokenized to "
+                    f"{ex.n_tokens} tokens -- fence count is broken"
+                )
+        cap = (max_example_tokens_analyst
+               if src.name.startswith("analyst")
+               else max_example_tokens)
+        if cap > 0:
+            kept = [ex for ex in exs if ex.n_tokens <= cap]
             if len(kept) < len(exs):
                 logger.warning(
                     "source %s: DROPPED %d/%d example(s) over "
-                    "max_example_chars=%d",
-                    src.name, len(exs) - len(kept), len(exs),
-                    max_example_chars,
+                    "max_example_tokens=%d (longest kept would have been "
+                    "token-fenced; chars are not a proxy)",
+                    src.name, len(exs) - len(kept), len(exs), cap,
                 )
             exs = kept
         if not exs:
@@ -1446,22 +1804,25 @@ def epoch_order(by_source: dict[str, list[TrainingExample]],
 
 def _batch_bucket_key(ex: TrainingExample) -> tuple:
     """Examples may share a micro-batch iff these match: loss kind (KD needs
-    the extra teacher forward), batch_cap (capped sources must not fill a
-    bucket past their cap), image count (pixel tensors must stack), and
-    a coarse length bin (padding waste stays bounded; chars ~ 4x tokens is
-    plenty accurate for binning)."""
+    the extra teacher forward), batch_cap, image count, token-length bin,
+    and system-prefix hash (train prefix-KV expands one B=1 cache to B)."""
     n_images = sum(
         1
         for m in ex.messages
         for part in (m.get("content") or [])
         if isinstance(part, dict) and part.get("type") == "image"
     )
-    chars = _example_chars(ex)
+    if ex.n_tokens is None:
+        raise RuntimeError(
+            "TrainingExample.n_tokens is unset -- materialize must "
+            "count tokens before epoch_batches (chars are not a proxy)"
+        )
+    n_tok = int(ex.n_tokens)
     length_bin, edge = 0, 512
-    while chars > edge:
+    while n_tok > edge:
         edge = int(edge * 1.5)
         length_bin += 1
-    return (ex.loss, ex.batch_cap, n_images, length_bin)
+    return (ex.loss, ex.batch_cap, n_images, length_bin, ex.prefix_hash)
 
 
 def epoch_batches(order: list[TrainingExample], micro_batch: int,
@@ -1494,6 +1855,45 @@ def epoch_batches(order: list[TrainingExample], micro_batch: int,
     return batches
 
 
+def pack_prefix_windows(
+    batches: list[list[TrainingExample]],
+    grad_accum: int,
+    rng: random.Random,
+) -> list[list[TrainingExample]]:
+    """Group micro-batches into optimizer windows that share a prefix hash.
+
+    Each window of ``grad_accum`` batches can reuse one prefix KV (weights
+    unchanged until the optimizer step). Remainders stay hash-homogeneous
+    but shorter than ``grad_accum``. Windows are shuffled so one prefix
+    does not occupy a long contiguous stretch of the epoch.
+
+    This makes each optimizer step source-homogeneous -- a training-
+    dynamics change, not just a speed change. See TrainConfig.
+    """
+    if grad_accum <= 1 or not batches:
+        return batches
+    by_h: dict[str, list[list[TrainingExample]]] = {}
+    for b in batches:
+        by_h.setdefault(b[0].prefix_hash, []).append(b)
+    windows: list[list[list[TrainingExample]]] = []
+    tails: list[list[list[TrainingExample]]] = []
+    for group in by_h.values():
+        i = 0
+        while i + grad_accum <= len(group):
+            windows.append(group[i:i + grad_accum])
+            i += grad_accum
+        if i < len(group):
+            tails.append(group[i:])
+    rng.shuffle(windows)
+    rng.shuffle(tails)
+    out: list[list[TrainingExample]] = []
+    for w in windows:
+        out.extend(w)
+    for t in tails:
+        out.extend(t)
+    return out
+
+
 def run_training(
     sources: list[DataSource],
     cfg: TrainConfig,
@@ -1519,7 +1919,25 @@ def run_training(
     logger.info("run dir: %s", tlog.run_dir)
 
     # ------------------------------------------------------------- data
-    by_source = materialize(sources, max_example_chars=cfg.max_example_chars)
+    import tempfile
+
+    from PIL import Image
+    from transformers import AutoProcessor
+
+    from training.token_fence import measure_image_soft_tokens
+
+    fence_proc = AutoProcessor.from_pretrained(
+        spec.hf_id,
+        token=CONFIG.hf_token,
+        trust_remote_code=spec.trust_remote_code,
+    )
+    with tempfile.TemporaryDirectory(prefix="token_fence_") as _td:
+        _img = Path(_td) / "measure.png"
+        Image.new("RGB", (32, 32), (18, 18, 18)).save(_img)
+        image_soft = measure_image_soft_tokens(fence_proc, str(_img))
+    by_source = materialize(
+        sources, cfg, processor=fence_proc, image_soft_tokens=image_soft,
+    )
     src_weights = {s.name: s.weight for s in sources}
 
     # Held-out slice: a fixed fraction, drawn proportionally from every
@@ -1876,6 +2294,10 @@ def run_training(
                 break
             order = epoch_order(by_source, src_weights, rng)
             batches = epoch_batches(order, cfg.micro_batch, rng)
+            from agent.speed_flags import train_prefix_kv_enabled
+            if train_prefix_kv_enabled():
+                batches = pack_prefix_windows(batches, cfg.grad_accum, rng)
+            prefix_state = PrefixKVRuntime()
             optimizer.zero_grad(set_to_none=True)
             for i, exs in enumerate(batches):
                 built = collator.build_batch(exs)
@@ -1890,6 +2312,10 @@ def run_training(
                     model, built["model_inputs"], built["weights"],
                     loss_kind=exs[0].loss, return_per_example=True,
                     example_weight=built["example_weight"],
+                    prefix_kv=prefix_state if train_prefix_kv_enabled() else None,
+                    prefix_len=exs[0].prefix_n_tokens,
+                    prefix_hash=exs[0].prefix_hash,
+                    kd_chunk=cfg.kd_lm_head_chunk,
                 )
                 (loss / cfg.grad_accum).backward()
                 scaled_loss_sum += float(loss.detach())
@@ -1905,6 +2331,12 @@ def run_training(
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                     step += 1
+                    prefix_state.opt_steps += 1
+                    if (cfg.prefix_kv_refresh_steps > 0
+                            and prefix_state.opt_steps
+                            % cfg.prefix_kv_refresh_steps == 0):
+                        prefix_state.cache = None
+                        prefix_state.key = None
 
                     if step % cfg.log_steps == 0:
                         per_src = {
@@ -2035,10 +2467,23 @@ def build_parser() -> argparse.ArgumentParser:
                         "'none' to train LoRA only")
     p.add_argument("--seed", type=int, default=d.seed)
     p.add_argument("--device", default=d.device)
-    # data hygiene
-    p.add_argument("--max-example-chars", type=int, default=d.max_example_chars,
-                   help="drop (loudly) examples whose total text exceeds "
-                        "this many chars; 0 disables")
+    # data hygiene (token space -- chars are not a proxy)
+    p.add_argument("--max-example-tokens", type=int,
+                   default=d.max_example_tokens,
+                   help="drop (loudly) examples whose trained sequence "
+                        "exceeds this many tokens; 0 disables")
+    p.add_argument("--max-example-tokens-analyst", type=int,
+                   default=d.max_example_tokens_analyst,
+                   help="token cap for analyst_* sources")
+    p.add_argument("--prefix-kv-refresh-steps", type=int,
+                   default=d.prefix_kv_refresh_steps,
+                   help="rebuild train prefix KV every N optimizer steps "
+                        "(default 1; try 4 at 3e-6; do not set 200)")
+    p.add_argument("--kd-lm-head-chunk", type=int,
+                   default=d.kd_lm_head_chunk,
+                   help="token positions per lm_head chunk for KD")
+    p.add_argument("--max-example-chars", type=int, default=None,
+                   help="REMOVED -- use --max-example-tokens")
     # cadence + safety
     p.add_argument("--log-steps", type=int, default=d.log_steps)
     p.add_argument("--save-steps", type=int, default=d.save_steps)
@@ -2066,6 +2511,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     configure_logging()
     args = build_parser().parse_args(argv)
+    if args.max_example_chars is not None:
+        raise SystemExit(
+            "--max-example-chars is removed; use --max-example-tokens "
+            "(encode-first token count, not characters)"
+        )
     sources: list[DataSource] = [parse_data_arg(a) for a in args.data]
     cfg = TrainConfig(**{
         f.name: getattr(args, f.name)

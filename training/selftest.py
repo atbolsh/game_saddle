@@ -14,6 +14,7 @@ finished::
     python -m training.selftest t8     # ~15-40m   real serial datagen timing
     python -m training.selftest t9     # ~10-25m   same workload at --parallel 3
     python -m training.selftest t10    # ~20-30m   timed train batches + epoch est.
+    python -m training.selftest t11    # ~25-45m   weekend-shaped p8 datagen est.
 
 or everything in order with ``python -m training.selftest all``. Every stage
 prints exactly one line ``TEST <id> PASS/FAIL: <evidence>`` (paste those
@@ -65,6 +66,8 @@ Stage map (rationale in the Intermission plan):
                 real overnight corpus (T10_DATAGEN_LABEL to change), peak
                 VRAM per category (tripwire vs the 2026-07-31 OOM), and a
                 whole-epoch train-time estimate; saves NO checkpoint
+  * t11-weekend  8 games × 4 moves at --parallel 8; warmup vs steady
+                3000-gen estimate (the weekend-shaped number; t8 is serial)
 """
 
 from __future__ import annotations
@@ -303,6 +306,7 @@ def t1_pure() -> str:
         MetricGuard,
         TrainingExample,
         epoch_batches,
+        pack_prefix_windows,
     )
 
     checks = 0
@@ -1381,6 +1385,93 @@ def t1_pure() -> str:
     assert max_gpu_batch_for_lens([8000]) == 1
     checks += 1
 
+    # ---- 1-mod-32 dodge + prefix-KV helpers (no GPU)
+    from agent.model import (
+        PAD_POISON_MOD,
+        PAD_POISON_RESIDUE,
+        clean_stack_width,
+        system_only_messages,
+    )
+    from training.token_fence import (
+        count_example_tokens,
+        n_images_in,
+        system_prefix_hash,
+    )
+
+    assert 33 % PAD_POISON_MOD == PAD_POISON_RESIDUE
+    assert clean_stack_width(33) == 34
+    assert clean_stack_width(32) == 32
+    assert clean_stack_width(1) == 2
+    # suffix width T plus prefix P must also dodge residue
+    assert clean_stack_width(31, 2) != 31  # 2+31=33 ≡ 1
+    assert (2 + clean_stack_width(31, 2)) % PAD_POISON_MOD != PAD_POISON_RESIDUE
+    checks += 1
+
+    sys_m = system_only_messages([
+        {"role": "system", "content": [{"type": "text", "text": "dump"}]},
+        {"role": "user", "content": [{"type": "text", "text": "go"}]},
+    ])
+    assert sys_m is not None and sys_m[0]["role"] == "system"
+    assert system_only_messages(
+        [{"role": "user", "content": [{"type": "text", "text": "x"}]}]
+    ) is None
+    checks += 1
+
+    fence_ex = TrainingExample(
+        [{"role": "system", "content": [{"type": "text", "text": "S"}]},
+         {"role": "user", "content": [{"type": "text", "text": "q"}]}],
+        "ans",
+    )
+    assert n_images_in(fence_ex.messages) == 0
+    assert system_prefix_hash(fence_ex.messages) != "no-system"
+    assert system_prefix_hash(
+        [{"role": "user", "content": [{"type": "text", "text": "q"}]}]
+    ) == "no-system"
+
+    class _Tok:
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [1] * max(1, len(text) // 4)}
+
+    class _Proc:
+        def apply_chat_template(self, messages, tokenize=False,
+                                add_generation_prompt=True):
+            return "T" * 16
+
+    n_tok = count_example_tokens(fence_ex, _Tok(), _Proc(), image_soft_tokens=7)
+    # prompt 16//4=4, target "ans" 3//4=1, +7*0 images + terminator
+    assert n_tok == 4 + 0 + 1 + 1, n_tok
+    img_ex = TrainingExample(
+        [{"role": "user", "content": [
+            {"type": "image"}, {"type": "text", "text": "q"},
+        ]}],
+        "ans",
+    )
+    assert n_images_in(img_ex.messages) == 1
+    assert count_example_tokens(
+        img_ex, _Tok(), _Proc(), image_soft_tokens=7
+    ) == 4 + 7 + 1 + 1
+    from training.timing_est import estimate_full_run, from_completion_times
+    assert estimate_full_run(10.0, 2, 1.0, 5) == 13.0
+    split = from_completion_times(100.0, [101.0, 102.0, 104.0, 106.0], 2)
+    assert split["n_warmup"] == 2 and split["warmup_s"] == 2.0
+    assert split["steady_per_item"] == 2.0
+    checks += 1
+
+    p1 = TrainingExample(
+        [{"role": "user", "content": [{"type": "text", "text": "q"}]}],
+        "a", prefix_hash="aaa",
+    )
+    p2 = TrainingExample(
+        [{"role": "user", "content": [{"type": "text", "text": "q"}]}],
+        "a", prefix_hash="bbb",
+    )
+    packed = pack_prefix_windows([[p1]] * 5 + [[p2]] * 3, 4, random.Random(0))
+    assert len(packed) == 8
+    # one window of 4 sharing aaa, then leftover 1+3
+    hashes = [b[0].prefix_hash for b in packed]
+    assert hashes.count("aaa") == 5 and hashes.count("bbb") == 3
+    checks += 1
+
     # ---- per-round persist: stamp rewrites one game; others untouched
     with tempfile.TemporaryDirectory() as _td:
         p = Path(_td) / "traces.jsonl"
@@ -2039,7 +2130,10 @@ def t3_model() -> str:
             # disable_adapter() is not returning the base distribution.
             import torch.nn.functional as F
 
-            from training.train import _base_model_logits
+            from training.train import (
+                _teacher_hidden,
+                apply_lm_head_chunked,
+            )
 
             ex = by_kind["kd"]
             built = collator.build(ex)
@@ -2047,12 +2141,24 @@ def t3_model() -> str:
                 model, built["model_inputs"], built["weights"], loss_kind="kd"
             ).detach())
             with torch.no_grad():
-                t_logits = _base_model_logits(model, built["model_inputs"])
-                w = built["weights"][:, 1:].reshape(-1)
+                # Same gather + chunked lm_head + softcap as weighted_loss.
+                wts = built["weights"]
+                ids = built["model_inputs"]["input_ids"]
+                seq_len = int(ids.shape[1])
+                nz = wts[:, 1:] != 0
+                first = int(nz.float().argmax(dim=1).min()) + 1
+                tail = seq_len - first
+                w = wts[:, -tail:].reshape(-1)
                 mask = w != 0
-                t = t_logits[:, :-1, :].reshape(
-                    -1, t_logits.shape[-1]
-                )[mask].float()
+                mask_idx = mask.nonzero(as_tuple=True)[0]
+                n_pos = tail
+                row_of = mask_idx // n_pos
+                col_of = mask_idx % n_pos
+                hidden = _teacher_hidden(
+                    model, built["model_inputs"], teacher="base",
+                )
+                gathered = hidden[:, -(tail + 1):, :][row_of, col_of]
+                t = apply_lm_head_chunked(model, gathered, 1024).float()
                 entropy = float(
                     (-(F.softmax(t, -1) * F.log_softmax(t, -1)).sum(-1)
                      * w[mask]).sum()
@@ -2513,10 +2619,11 @@ def t6_ab() -> str:
             model._sampling_kwargs = original
 
     padded_engaged = any(
-        "padded batch verified clean" in line for line in cap.lines
+        ("padded batch" in line or "prefix-kv batch" in line)
+        for line in cap.lines
     )
     assert padded_engaged, (
-        "variable-length batch did NOT take the verified-padded path "
+        "variable-length batch did NOT take the padded / prefix-kv path "
         "(KNOWN TRANSFORMERS BUG WORKAROUND, transformers#47651) -- it "
         "fell back to length cohorts, which kills parallel-datagen "
         "throughput. generate_batch log: " + " | ".join(cap.lines)
@@ -2544,9 +2651,8 @@ def t6_ab() -> str:
         )
     )
     assert not mism_var, (
-        "variable-length VERIFIED-PADDED batch != solo (the parity check "
-        "passed but decode diverged -- transformers#47651 workaround "
-        "assumption broken?): "
+        "variable-length padded / prefix-kv batch != solo "
+        "(transformers#47651 workaround assumption broken?): "
         + "; ".join(
             f"[{i}] solo={s!r} batched={b!r}" for i, s, b in mism_var
         )
@@ -2556,10 +2662,61 @@ def t6_ab() -> str:
         if unpaddable
         else " (no unpaddable length on the filler grid this run)"
     )
+
+    # Shared system dump so prefix-KV can engage (B). Same image, two
+    # distinct user lengths. Own tempdir: the earlier t6 with-block is gone.
+    with tempfile.TemporaryDirectory(prefix="selftest_t6pk_") as tmp2:
+        img2 = _tiny_png(Path(tmp2) / "board.png", seed=9)
+        pk_q = ("Answer briefly: is the grid mostly empty? Explain in "
+                "one sentence why you think so.")
+        sys = {"role": "system", "content": [{"type": "text", "text":
+               "You are the scene player. Reply in one short sentence."}]}
+        pk_prompts = [
+            [sys, {"role": "user", "content": [
+                {"type": "image", "url": str(img2)},
+                {"type": "text", "text": pk_q + " again" * k},
+            ]}]
+            for k in (0, 12)
+        ]
+        original = model._sampling_kwargs
+        model._sampling_kwargs = lambda: {"do_sample": False}
+        try:
+            solo_pk = [model.generate(p, max_new_tokens=48) for p in pk_prompts]
+            cap2 = _Capture()
+            _logging.getLogger("agent.model").addHandler(cap2)
+            try:
+                batched_pk = model.generate_batch(
+                    [{"messages": p} for p in pk_prompts], max_new_tokens=48,
+                )
+            finally:
+                _logging.getLogger("agent.model").removeHandler(cap2)
+        finally:
+            model._sampling_kwargs = original
+    pk_engaged = any("prefix-kv batch" in line for line in cap2.lines)
+    # If the chat template does not keep system tokens as a prefix of
+    # the full encode, B correctly skips. That is a skip, not a silent
+    # left-pad-while-claiming-B.
+    if pk_engaged:
+        mism_pk = [
+            (i, s, b) for i, (s, b) in enumerate(zip(solo_pk, batched_pk))
+            if s != b
+        ]
+        assert not mism_pk, (
+            "prefix-kv batch != solo: "
+            + "; ".join(f"[{i}] solo={s!r} batched={b!r}"
+                        for i, s, b in mism_pk)
+        )
+        pk_note = "prefix-kv engaged"
+    else:
+        pk_note = (
+            "prefix-kv skipped (system tokens not a template prefix; "
+            "leftover path used): " + " | ".join(cap2.lines[-4:])
+        )
+
     return (
         f"equal-len 3/3 identical (true batch); var-len "
         f"{len(var_prompts)}/{len(var_prompts)} identical, padded rows "
-        f"{paddable[0]}+{paddable[-1]}{hybrid}; "
+        f"{paddable[0]}+{paddable[-1]}{hybrid}; {pk_note}; "
         f"e.g. same0={solo_same[0][:50]!r}"
     )
 
@@ -2622,11 +2779,20 @@ _TIMING_GAMES = 3
 _TIMING_MOVES = 4
 _TIMING_WORKLOAD = ["--games", str(_TIMING_GAMES),
                     "--max-moves", str(_TIMING_MOVES), "--seed", "11"]
+#: Weekend-shaped estimator (t11): occupy ``--parallel 8`` with 8 games
+#: and 4 moves so the measurement is not ramp-dominated.
+_T11_GAMES = 8
+_T11_MOVES = 4
+_T11_PARALLEL = 8
 
 
-def _warmed_timed_datagen(label: str, parallel: int) -> dict:
-    """Run the shared timing workload through the REAL datagen harness with
-    startup excluded: the process-singleton model is loaded and warmed (one
+def _warmed_timed_datagen(
+    label: str,
+    parallel: int,
+    extra_args: list[str] | None = None,
+) -> dict:
+    """Run a datagen workload through the REAL harness with startup
+    excluded: the process-singleton model is loaded and warmed (one
     untimed generation) before run_generation's wall clock starts."""
     from agent.model import get_model
     from training.generate_game_traces import build_parser, run_generation
@@ -2642,8 +2808,9 @@ def _warmed_timed_datagen(label: str, parallel: int) -> dict:
     out_dir = REPO_ROOT / "data_game" / label
     if out_dir.exists():
         shutil.rmtree(out_dir)
+    workload = extra_args if extra_args is not None else _TIMING_WORKLOAD
     args = build_parser().parse_args(
-        ["--label", label, "--parallel", str(parallel)] + _TIMING_WORKLOAD
+        ["--label", label, "--parallel", str(parallel)] + list(workload)
     )
     summary = run_generation(args)
     assert summary["generations"] > 0, summary
@@ -2651,27 +2818,47 @@ def _warmed_timed_datagen(label: str, parallel: int) -> dict:
     return summary
 
 
+def _format_datagen_timing(summary: dict, *, serial_note: str = "") -> str:
+    from training.timing_est import estimate_full_run, hours
+
+    s_gen = summary["seconds_per_generation"]
+    warm = summary.get("warmup_s")
+    steady = summary.get("steady_s_per_gen")
+    est_h = summary.get("epoch_3000_hours")
+    if est_h is None and warm is not None:
+        est = estimate_full_run(
+            warm, summary.get("warmup_gens") or 1,
+            steady, 3000,
+        )
+        est_h = hours(est)
+    blended_h = 3000 * s_gen / 3600
+    parts = [
+        f"blended {s_gen:.1f}s/gen over {summary['generations']} gens "
+        f"({summary['wall_seconds']:.0f}s wall{serial_note})",
+    ]
+    if warm is not None:
+        parts.append(
+            f"warmup {warm:.0f}s / {summary.get('warmup_gens')} gens"
+        )
+    if steady is not None:
+        parts.append(f"steady {steady:.1f}s/gen")
+    if est_h is not None:
+        parts.append(f"3000-gen estimate {est_h:.1f}h (warmup+steady)")
+    else:
+        parts.append(f"3000-gen blended {blended_h:.1f}h (no leftover)")
+    return "; ".join(parts)
+
+
 def t8_timing() -> str:
     """Per-generation timing of REAL serial datagen + epoch extrapolation.
     GPU + NAMS required.
 
-    No synthetic prompts: this plays the tiny shared workload through the
-    actual session harness (--parallel 1) and reads
-    ``seconds_per_generation`` from generation_stats.json. Startup (model
-    load, CUDA warmup) is excluded; what remains is the true per-episode
-    cost -- prompt building, NAMS retrieval, image noise, the analyst
-    generation -- amortized per PLAYER generation, which is exactly the
-    unit ``--max-generations`` caps. t9 reuses this run as its serial
-    baseline.
+    Reports warmup vs steady-state separately. The 3000-gen number is
+    ``warmup + (3000 - n_warmup) * steady``, not ``3000 * mean``. t9
+    reuses this run as its serial baseline.
     """
     summary = _warmed_timed_datagen("selftest_t8_serial", parallel=1)
-    s_gen = summary["seconds_per_generation"]
-    epoch_h = 3000 * s_gen / 3600
-    return (
-        f"{s_gen:.1f}s/gen over {summary['generations']} real player gens "
-        f"({summary['wall_seconds']:.0f}s wall, serial); default epoch "
-        f"(--max-generations 3000) ~= {epoch_h:.1f}h serial"
-    )
+    return _format_datagen_timing(summary, serial_note=", serial")
 
 
 def t9_parallel() -> str:
@@ -2714,11 +2901,28 @@ def t9_parallel() -> str:
     return (
         f"serial {s_ser:.1f}s/gen ({serial['generations']} gens, "
         f"{serial['wall_seconds']:.0f}s wall) vs --parallel 3 "
-        f"{s_par:.1f}s/gen ({summary['generations']} gens, "
-        f"{summary['wall_seconds']:.0f}s wall): speedup x{speedup:.2f} "
-        "(low? check 'dispatch: group of N' log lines and batch_mode in "
-        "llm_calls.jsonl)"
+        + _format_datagen_timing(summary)
+        + f"; speedup x{speedup:.2f} (low? check 'dispatch: group of N' "
+        "and batch_mode in llm_calls.jsonl)"
     )
+
+
+def t11_weekend_est() -> str:
+    """Weekend-shaped datagen estimate: 8 games × 4 moves at --parallel 8.
+
+    Does not require t8. Prints warmup vs steady and the 3000-gen
+    estimate ``warmup + (3000 - n_warmup) * steady``. Target wall
+    ~25-45 min after the CUDA warmup generate.
+    """
+    extra = [
+        "--games", str(_T11_GAMES),
+        "--max-moves", str(_T11_MOVES),
+        "--seed", "11",
+    ]
+    summary = _warmed_timed_datagen(
+        "selftest_t11_p8", parallel=_T11_PARALLEL, extra_args=extra,
+    )
+    return "weekend-shaped p8: " + _format_datagen_timing(summary)
 
 
 #: t10 profiles the train loop on a REAL datagen corpus. Default: the
@@ -2773,6 +2977,7 @@ def t10_traintime() -> str:
     )
     from training.train import (
         Collator,
+        PrefixKVRuntime,
         TrainConfig,
         attach_neftune,
         build_model,
@@ -2802,9 +3007,25 @@ def t10_traintime() -> str:
 
     print(f"[t10] corpus {traces_dir.name} + {len(sources) - 3} manifest "
           "source(s); materializing (expect ~10-15 min: game-frame "
-          "noising + manifest loading)...", flush=True)
+          "noising + manifest loading + token fence)...", flush=True)
     t0 = time.perf_counter()
-    by_source = materialize(sources, max_example_chars=cfg.max_example_chars)
+    from PIL import Image
+    from transformers import AutoProcessor
+
+    from training.token_fence import measure_image_soft_tokens
+
+    spec = spec_for(cfg.architecture or CONFIG.model_key)
+    fence_proc = AutoProcessor.from_pretrained(
+        spec.hf_id, token=CONFIG.hf_token,
+        trust_remote_code=spec.trust_remote_code,
+    )
+    with tempfile.TemporaryDirectory(prefix="t10_fence_") as _td:
+        _img = Path(_td) / "m.png"
+        Image.new("RGB", (32, 32), (18, 18, 18)).save(_img)
+        image_soft = measure_image_soft_tokens(fence_proc, str(_img))
+    by_source = materialize(
+        sources, cfg, processor=fence_proc, image_soft_tokens=image_soft,
+    )
     setup_data_s = time.perf_counter() - t0
     assert by_source, "materialize produced no sources"
     print(f"[t10] materialized {sum(len(v) for v in by_source.values())} "
@@ -2813,7 +3034,6 @@ def t10_traintime() -> str:
           flush=True)
 
     t0 = time.perf_counter()
-    spec = spec_for(cfg.architecture or CONFIG.model_key)
     model, processor, _targets, _proj = build_model(spec, cfg, CONFIG.hf_token)
     attach_neftune(model, cfg.neftune_alpha)
     terminator = resolve_terminator_id(
@@ -2836,8 +3056,14 @@ def t10_traintime() -> str:
         torch.cuda.synchronize()
         t = time.perf_counter()
         built = collator.build_batch(exs)
-        loss = weighted_loss(model, built["model_inputs"], built["weights"],
-                             loss_kind=exs[0].loss)
+        loss = weighted_loss(
+            model, built["model_inputs"], built["weights"],
+            loss_kind=exs[0].loss,
+            prefix_kv=prefix_state,
+            prefix_len=exs[0].prefix_n_tokens,
+            prefix_hash=exs[0].prefix_hash,
+            kd_chunk=cfg.kd_lm_head_chunk,
+        )
         assert torch.isfinite(loss), f"non-finite loss on {exs[0].source}"
         (loss / cfg.grad_accum).backward()
         torch.cuda.synchronize()
@@ -2856,6 +3082,7 @@ def t10_traintime() -> str:
     per_source: dict[str, dict] = {}
     opt_s: float | None = None
     warmed = False
+    prefix_state = PrefixKVRuntime()
     for name, exs in sorted(by_source.items()):
         batches = epoch_batches(list(exs), cfg.micro_batch, rng)
         assert batches, f"source {name} materialized but produced no batches"
@@ -2869,6 +3096,11 @@ def t10_traintime() -> str:
         times = [_one_batch(b)
                  for b in batches[:_T10_BATCHES_PER_SOURCE]]
         step_s = _opt_step()
+        prefix_state.opt_steps += 1
+        if (cfg.prefix_kv_refresh_steps > 0
+                and prefix_state.opt_steps % cfg.prefix_kv_refresh_steps == 0):
+            prefix_state.cache = None
+            prefix_state.key = None
         opt_s = step_s if opt_s is None else min(opt_s, step_s)
         peak_gib = torch.cuda.max_memory_allocated() / 2**30
         # run_training's own arithmetic for this source's share of an epoch
@@ -2905,9 +3137,11 @@ def t10_traintime() -> str:
         for name, s in per_source.items()
     ]
     return (
-        f"epoch estimate ~{epoch_h:.1f}h ({total_batches} micro-batches + "
-        f"setup {(setup_data_s + setup_model_s) / 60:.0f}min; excludes "
-        "save-time eval hooks) -- " + "; ".join(lines)
+        f"epoch estimate ~{epoch_h:.1f}h (warmup setup "
+        f"{(setup_data_s + setup_model_s) / 60:.0f}min + "
+        f"{total_batches} steady micro-batches; two held-out hooks at "
+        f"save_steps={cfg.save_steps} not timed -- measure one and "
+        f"multiply by 2) -- " + "; ".join(lines)
     )
 
 
@@ -2926,6 +3160,8 @@ STAGES: list[tuple[str, str, "callable"]] = [
     ("t9-parallel", "t8's workload at --parallel 3, compared", t9_parallel),
     ("t10-traintime", "timed train batches per loss category + epoch "
                       "estimate", t10_traintime),
+    ("t11-weekend", "8x4 at --parallel 8 weekend datagen estimate",
+     t11_weekend_est),
 ]
 
 
