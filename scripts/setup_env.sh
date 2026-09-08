@@ -24,6 +24,13 @@
 #   SKIP_TORCH      (unset)  -- if set, do NOT let requirements.txt pull torch;
 #                              install torch yourself first (see the CUDA note in
 #                              requirements.txt for driver < 580 / CUDA <= 12.x).
+#                              The SGLang step below still upgrades torch to
+#                              2.13.0 (required by the pin); use SKIP_SGLANG=1
+#                              if you must keep a custom torch and will serve
+#                              via SGLANG_HTTP_URL instead.
+#   SKIP_SGLANG     (unset)  -- if set, skip scripts/install_sglang.sh.
+#   SGLANG_CUDA     (unset)  -- 12 or 13; default is nvidia-smi CUDA major.
+#   SGLANG_PIN      (unset)  -- default sglang==0.5.19 (gemma4_unified).
 
 set -euo pipefail
 
@@ -49,6 +56,16 @@ if [ -n "${SKIP_TORCH:-}" ]; then
 fi
 log "installing Python dependencies from ${REQ_FILE}"
 python -m pip install -r "${REQ_FILE}"
+
+# ---------------------------------------------------------- 1b. SGLang
+# Gemma 4 Unified lives in sglang 0.5.19+ (not in requirements.txt: CUDA
+# indexes + torch==2.13.0 + pre-release kernel wheels). Fail loud if the
+# pin cannot import Engine / gemma4_unified -- no HF fallback.
+if [ -n "${SKIP_SGLANG:-}" ]; then
+  log "SKIP_SGLANG set: not installing sglang"
+else
+  bash "${REPO_ROOT}/scripts/install_sglang.sh"
+fi
 
 # -------------------------------------------------------- 2. spaCy model dl
 # `spacy download` fetches the model wheel matching the installed spaCy version.

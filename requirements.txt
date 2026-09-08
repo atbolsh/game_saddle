@@ -96,3 +96,10 @@ ipywidgets>=8.0.0
 # (avoids the "Failed to load model class 'GraphModel'" labextension issue).
 pyvis>=0.3.2
 
+# SGLang is NOT listed here. The 0.5.19 pin wants torch==2.13.0,
+# flashinfer/sglang-kernel CUDA indexes, and pre-release wheels; a
+# requirements line would either clobber SKIP_TORCH or silently land an
+# old 0.5.9 that cannot load gemma-4-12B-it. scripts/setup_env.sh (and
+# scripts/install_sglang.sh alone) install sglang==0.5.19 after this
+# file. transformers stays in the >=5.10,<5.15 floor (sglang pins 5.12.1).
+

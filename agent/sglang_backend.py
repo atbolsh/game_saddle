@@ -221,9 +221,10 @@ def _get_engine(model_path: str) -> Any:
     except ImportError as exc:
         raise RuntimeError(
             "INFER_BACKEND=sglang: sglang is not importable in this venv "
-            f"({exc}). Install a recent/nightly pin that loads "
-            "gemma-4-12B-it, or run a second venv + "
-            "`python -m sglang.launch_server --model-path <merged>` and "
+            f"({exc}). Run `bash scripts/install_sglang.sh` (sglang==0.5.19, "
+            "gemma4_unified), or a second venv + "
+            "`python -m sglang.launch_server --model-path "
+            "weights/gemma-4-12b/merged_aug27_big_step_iter1_step313` and "
             "set SGLANG_HTTP_URL. This backend will not fall back to HF."
         ) from exc
     if not hasattr(sgl, "Engine"):
