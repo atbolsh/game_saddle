@@ -76,6 +76,12 @@ sentence-transformers>=2.7.0
 # from HuggingFace -- setup_env.sh does both downloads.
 spacy>=3.7.0
 gliner>=0.2.5
+# GLiNER's encoder is microsoft/deberta-v3-base. transformers 5.10+ converts
+# that slow SentencePiece tokenizer to the native format at from_pretrained
+# and needs protobuf (SentencePieceExtractor). Without it, setup_env.sh's
+# GLiNER prefetch falls through to a tiktoken extractor and dies.
+protobuf>=4.25.0
+sentencepiece>=0.2.0
 
 # Pydantic v2 (NAMS SecretStr / settings models).
 pydantic>=2.7.0
