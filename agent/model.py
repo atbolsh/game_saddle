@@ -1513,7 +1513,6 @@ class VLModel:
                 stop_regex=stop_regex,
             )
             replies = list(got)
-            logger.info("generate_batch: sglang batch n=%d", len(batch))
             return list(got)
         except Exception as exc:
             err = f"{type(exc).__name__}: {exc}"
@@ -1594,6 +1593,9 @@ class VLModel:
                 "(see agent/parallel_gen.py)"
             )
         if infer_backend() == "sglang":
+            # Log on the way in -- Engine() reconfigures the root logger
+            # and can swallow INFO after the fact; t6 watches this line.
+            logger.info("generate_batch: sglang batch n=%d", len(batch))
             return self._generate_batch_via_sglang(
                 batch,
                 max_new_tokens=max_new_tokens,

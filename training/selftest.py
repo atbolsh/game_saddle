@@ -2546,6 +2546,31 @@ def t6_ab() -> str:
     )
     from agent.speed_flags import infer_backend
 
+    class _Capture(_logging.Handler):
+        def __init__(self) -> None:
+            super().__init__(level=_logging.DEBUG)
+            self.lines: list[str] = []
+
+        def emit(self, record: _logging.LogRecord) -> None:
+            self.lines.append(record.getMessage())
+
+    def _attach(cap_h: _Capture) -> tuple[_logging.Logger, int, bool]:
+        # Engine() reconfigures root logging; INFO on agent.model is
+        # often filtered afterwards. Force the path-engaged line through.
+        lg = _logging.getLogger("agent.model")
+        prev = (lg, lg.level, lg.disabled)
+        lg.addHandler(cap_h)
+        lg.setLevel(_logging.INFO)
+        lg.disabled = False
+        return prev
+
+    def _detach(prev: tuple[_logging.Logger, int, bool],
+                cap_h: _Capture) -> None:
+        lg, level, disabled = prev
+        lg.removeHandler(cap_h)
+        lg.setLevel(level)
+        lg.disabled = disabled
+
     model = get_model()
     with tempfile.TemporaryDirectory(prefix="selftest_t6_") as tmp:
         img = _tiny_png(Path(tmp) / "board.png", seed=9)
@@ -2632,23 +2657,15 @@ def t6_ab() -> str:
                 else:
                     solo_var.append(model.generate(p, max_new_tokens=48))
 
-            class _Capture(_logging.Handler):
-                def __init__(self) -> None:
-                    super().__init__()
-                    self.lines: list[str] = []
-
-                def emit(self, record: _logging.LogRecord) -> None:
-                    self.lines.append(record.getMessage())
-
             cap = _Capture()
-            _logging.getLogger("agent.model").addHandler(cap)
+            prev_log = _attach(cap)
             try:
                 batched_var = model.generate_batch(
                     [{"messages": p} for p in var_prompts],
                     max_new_tokens=48,
                 )
             finally:
-                _logging.getLogger("agent.model").removeHandler(cap)
+                _detach(prev_log, cap)
         finally:
             model._sampling_kwargs = original
 
@@ -2726,13 +2743,13 @@ def t6_ab() -> str:
         try:
             solo_pk = [model.generate(p, max_new_tokens=48) for p in pk_prompts]
             cap2 = _Capture()
-            _logging.getLogger("agent.model").addHandler(cap2)
+            prev_log2 = _attach(cap2)
             try:
                 batched_pk = model.generate_batch(
                     [{"messages": p} for p in pk_prompts], max_new_tokens=48,
                 )
             finally:
-                _logging.getLogger("agent.model").removeHandler(cap2)
+                _detach(prev_log2, cap2)
         finally:
             model._sampling_kwargs = original
     pk_engaged = any("prefix-kv batch" in line for line in cap2.lines)
