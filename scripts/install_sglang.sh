@@ -10,7 +10,9 @@
 # Pin is sglang 0.5.19 (has python/sglang/srt/models/gemma4_unified.py and
 # transformers==5.12.1, inside this repo's >=5.10,<5.15 floor). Do NOT
 # install the cookbook transformers git SHA -- that would leave the
-# verified HF path.
+# verified HF path. After the wheel lands, scripts/patch_sglang_gemma4_config.py
+# replaces 0.5.19's Gemma4Config alias for gemma4_unified (sgl-project/sglang
+# #34392 / unmerged #34420) so Engine() gets Gemma4UnifiedVisionConfig.
 #
 # CUDA 13 (this project's 96G box: driver 595 / CUDA 13.2): default
 # PyPI extras (flashinfer cu13). CUDA 12: official cu129 force-reinstall
@@ -31,6 +33,7 @@
 set -euo pipefail
 
 SGLANG_PIN="${SGLANG_PIN:-sglang==0.5.19}"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 log() { printf '[install-sglang] %s\n' "$*"; }
 die() { printf '[install-sglang] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -100,6 +103,9 @@ if [ "${CUDA_MAJOR}" = "12" ]; then
     --index-url https://docs.sglang.ai/whl/cu129/ --no-deps
 fi
 
+log "patching 0.5.19 gemma4_unified config alias (sgl-project/sglang#34392)"
+python "${REPO_ROOT}/scripts/patch_sglang_gemma4_config.py"
+
 log "verifying import + Engine + gemma4_unified + transformers floor"
 python - <<'PY'
 from __future__ import annotations
@@ -120,6 +126,36 @@ except Exception as exc:
 
 if sgl is not None and not hasattr(sgl, "Engine"):
     errors.append("sglang has no sgl.Engine")
+
+try:
+    from sglang.srt.utils.hf_transformers.common import _CONFIG_REGISTRY
+    from transformers import Gemma4UnifiedConfig, Gemma4UnifiedVisionConfig
+
+    _reg = _CONFIG_REGISTRY.get("gemma4_unified")
+    if _reg is not Gemma4UnifiedConfig:
+        errors.append(
+            f"_CONFIG_REGISTRY['gemma4_unified'] is {_reg!r} "
+            "(0.5.19 Gemma4Config alias). "
+            "scripts/patch_sglang_gemma4_config.py did not stick."
+        )
+    else:
+        _vis = Gemma4UnifiedConfig(
+            vision_config={
+                "model_type": "gemma4_unified_vision",
+                "patch_size": 16,
+                "pooling_kernel_size": 3,
+                "mm_embed_dim": 3840,
+                "mm_posemb_size": 1120,
+                "output_proj_dims": 3840,
+            }
+        ).vision_config
+        if type(_vis) is not Gemma4UnifiedVisionConfig or _vis.model_patch_size != 48:
+            errors.append(
+                f"vision_config {type(_vis).__name__} "
+                f"model_patch_size={getattr(_vis, 'model_patch_size', None)!r}"
+            )
+except Exception as exc:
+    errors.append(f"gemma4_unified config probe failed: {type(exc).__name__}: {exc}")
 
 try:
     from sglang.srt.models.gemma4_unified import (

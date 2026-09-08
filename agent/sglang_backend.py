@@ -244,10 +244,12 @@ def _get_engine(model_path: str) -> Any:
     except Exception as exc:
         raise RuntimeError(
             f"sgl.Engine failed to load {model_path!r} "
-            f"({type(exc).__name__}: {exc}). Need a pin that knows "
-            "gemma-4-12B-it (cookbook + transformers SHA). If this "
-            "venv is transformers>=5.10 and conflicts, use a second "
-            "venv + HTTP server (SGLANG_HTTP_URL). "
+            f"({type(exc).__name__}: {exc}). If this is "
+            "'Gemma4VisionConfig' / model_patch_size, run "
+            "`python scripts/patch_sglang_gemma4_config.py` "
+            "(sglang 0.5.19 aliases gemma4_unified onto the tower "
+            "config; sgl-project/sglang#34392). Otherwise a pin that "
+            "knows gemma-4-12B-it, or SGLANG_HTTP_URL. "
             "This backend will not fall back to HF."
         ) from exc
     _ENGINE_PATH = model_path
