@@ -11,8 +11,8 @@
 # transformers==5.12.1, inside this repo's >=5.10,<5.15 floor). Do NOT
 # install the cookbook transformers git SHA -- that would leave the
 # verified HF path. After the wheel lands, scripts/patch_sglang_gemma4_config.py
-# replaces 0.5.19's Gemma4Config alias for gemma4_unified (sgl-project/sglang
-# #34392 / unmerged #34420) so Engine() gets Gemma4UnifiedVisionConfig.
+# also (1) replaces 0.5.19's Gemma4Config alias (sgl-project/sglang#34392)
+# and (2) sets lm_head_is_tied on the unified class.
 #
 # CUDA 13 (this project's 96G box: driver 595 / CUDA 13.2): default
 # PyPI extras (flashinfer cu13). CUDA 12: official cu129 force-reinstall
@@ -103,7 +103,7 @@ if [ "${CUDA_MAJOR}" = "12" ]; then
     --index-url https://docs.sglang.ai/whl/cu129/ --no-deps
 fi
 
-log "patching 0.5.19 gemma4_unified config alias (sgl-project/sglang#34392)"
+log "patching 0.5.19 gemma4_unified config alias + lm_head_is_tied"
 python "${REPO_ROOT}/scripts/patch_sglang_gemma4_config.py"
 
 log "verifying import + Engine + gemma4_unified + transformers floor"
