@@ -49,7 +49,7 @@ from typing import Any
 
 import re
 
-from .speed_flags import pad_parity_enabled, prefix_kv_enabled
+from .speed_flags import infer_backend, pad_parity_enabled, prefix_kv_enabled
 
 # Must precede the first CUDA allocation (``import torch``). Datagen never
 # imports training/train.py, so that file's copy does not cover inference.
@@ -682,6 +682,8 @@ class VLModel:
     def load(self) -> "VLModel":
         if self._loaded:
             return self
+        if infer_backend() == "sglang":
+            return self._load_sglang_processor()
         spec = self.spec
         if spec.min_transformers is not None:
             import transformers
@@ -745,6 +747,30 @@ class VLModel:
         )
         return self
 
+    def _load_sglang_processor(self) -> "VLModel":
+        """Processor only -- Engine / HTTP owns the weights.
+
+        Tokenization stays lockstep with :meth:`encode_messages` /
+        ``Collator.build``. The HF 12B is not loaded (VRAM).
+        """
+        spec = self.spec
+        logger.info(
+            "INFER_BACKEND=sglang: loading processor %s (no HF weights)",
+            spec.hf_id,
+        )
+        self.processor = AutoProcessor.from_pretrained(
+            spec.hf_id,
+            token=self.cfg.hf_token or None,
+            trust_remote_code=spec.trust_remote_code,
+            padding_side="left",
+        )
+        tok = getattr(self.processor, "tokenizer", self.processor)
+        if hasattr(tok, "padding_side"):
+            tok.padding_side = "left"
+        self.model = None
+        self._loaded = True
+        return self
+
     def _apply_checkpoint(self) -> None:
         """Stack the named PEFT adapter on the freshly loaded base. Missing
         or malformed folders are hard errors (no-fuzzy-fallbacks): silently
@@ -780,6 +806,8 @@ class VLModel:
         self._loaded = False
         self._prefix_kv.clear()
         self._prefix_kv_len.clear()
+        from .sglang_backend import shutdown as _sglang_shutdown
+        _sglang_shutdown()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -995,6 +1023,13 @@ class VLModel:
         reply that emits no stop token simply ends the turn."""
         if not self._loaded:
             self.load()
+        if infer_backend() == "sglang":
+            return self._generate_via_sglang(
+                messages,
+                max_new_tokens=max_new_tokens,
+                stop_strings=stop_strings,
+                stop_regex=stop_regex,
+            )
         inputs, prompt_len, past_kv = self._prepare_generate_inputs(messages)
         gen_kwargs: dict[str, Any] = {
             "max_new_tokens": max_new_tokens or self.cfg.max_new_tokens,
@@ -1046,6 +1081,49 @@ class VLModel:
                     "top_k": gen_kwargs.get("top_k"),
                     "stop_strings": stop_strings,
                     "stop_regex": stop_regex,
+                    "backend": "hf",
+                },
+                response=None if reply is None else {"raw": reply},
+                error=err,
+            )
+
+    def _generate_via_sglang(
+        self,
+        messages: list[dict],
+        *,
+        max_new_tokens: int | None,
+        stop_strings: list[str] | None,
+        stop_regex: str | None,
+    ) -> str:
+        from . import sglang_backend
+
+        reply: str | None = None
+        err: str | None = None
+        rendered = None
+        try:
+            rendered = sglang_backend.render_prompt(self, messages)
+            reply = sglang_backend.generate_one(
+                self, messages,
+                max_new_tokens=max_new_tokens,
+                stop_strings=stop_strings,
+                stop_regex=stop_regex,
+            )
+            return reply
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            run_logging.log_llm_call(
+                model=f"{self.spec.key} (sglang)",
+                kind="generate",
+                request={"messages": messages, "rendered_prompt": rendered},
+                params={
+                    "max_new_tokens": max_new_tokens or self.cfg.max_new_tokens,
+                    "do_sample": self._sampling_kwargs().get("do_sample"),
+                    "stop_strings": stop_strings,
+                    "stop_regex": stop_regex,
+                    "backend": "sglang",
+                    "batch_mode": "sglang",
                 },
                 response=None if reply is None else {"raw": reply},
                 error=err,
@@ -1365,6 +1443,51 @@ class VLModel:
         )
         return inputs, list(cand), pads, past
 
+    def _generate_batch_via_sglang(
+        self,
+        batch: list[dict],
+        *,
+        max_new_tokens: int | None,
+        stop_strings: list[str] | None,
+        stop_regex: str | None,
+    ) -> list[str]:
+        from . import sglang_backend
+
+        msgs = [r["messages"] for r in batch]
+        replies: list[str | None] = [None] * len(batch)
+        err: str | None = None
+        try:
+            got = sglang_backend.generate_many(
+                self, msgs,
+                max_new_tokens=max_new_tokens,
+                stop_strings=stop_strings,
+                stop_regex=stop_regex,
+            )
+            replies = list(got)
+            logger.info("generate_batch: sglang batch n=%d", len(batch))
+            return list(got)
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            for i, r in enumerate(batch):
+                run_logging.log_llm_call(
+                    model=f"{self.spec.key} (sglang)",
+                    kind="generate_batch",
+                    request={"messages": r["messages"],
+                             "batch_size": len(batch), "batch_index": i},
+                    params={
+                        "max_new_tokens": max_new_tokens or self.cfg.max_new_tokens,
+                        "do_sample": self._sampling_kwargs().get("do_sample"),
+                        "stop_strings": stop_strings,
+                        "stop_regex": stop_regex,
+                        "backend": "sglang",
+                        "batch_mode": "sglang",
+                    },
+                    response=None if replies[i] is None else {"raw": replies[i]},
+                    error=err,
+                )
+
     def generate_batch(
         self,
         batch: list[dict],
@@ -1420,6 +1543,13 @@ class VLModel:
                 "generate_batch: mixed image counts in one batch "
                 f"({sorted(image_counts)}) -- group requests by image count "
                 "(see agent/parallel_gen.py)"
+            )
+        if infer_backend() == "sglang":
+            return self._generate_batch_via_sglang(
+                batch,
+                max_new_tokens=max_new_tokens,
+                stop_strings=stop_strings,
+                stop_regex=stop_regex,
             )
 
         rows = [self.encode_messages(r["messages"]) for r in batch]
@@ -1614,6 +1744,17 @@ def get_model(cfg: AgentConfig | None = None) -> VLModel:
             spec_for(cfg.model_key), cfg, checkpoint=_default_checkpoint(cfg)
         ).load()
     return _DEFAULT
+
+
+def reset_default() -> None:
+    """Unload the process-wide model so the next get_model rebuilds.
+
+    Used when flipping ``INFER_BACKEND`` (HF vs SGLang) in one process.
+    """
+    global _DEFAULT
+    if _DEFAULT is not None:
+        _DEFAULT.unload()
+        _DEFAULT = None
 
 
 def switch_default(

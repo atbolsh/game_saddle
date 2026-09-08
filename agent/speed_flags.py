@@ -6,6 +6,7 @@ Defaults match production after the B+C / train 1+3+4 land:
 * ``GS_PREFIX_KV`` — on. Resident system-prefix KV at inference.
 * ``GS_CHUNKED_KD`` — on. Hidden-then-chunked ``lm_head`` for KD.
 * ``GS_TRAIN_PREFIX_KV`` — on. Frozen system-prefix KV at train time.
+* ``INFER_BACKEND`` — ``hf`` (default) or ``sglang`` (infer-sglang branch).
 
 Read at call time (not import time) so a bench script can flip them
 between modes in one process. Empty / ``0`` / ``false`` / ``no`` / ``off``
@@ -38,3 +39,13 @@ def chunked_kd_enabled() -> bool:
 
 def train_prefix_kv_enabled() -> bool:
     return env_flag("GS_TRAIN_PREFIX_KV", True)
+
+
+def infer_backend() -> str:
+    """``hf`` (B+C) or ``sglang``. Unknown values raise — no silent HF."""
+    raw = (os.environ.get("INFER_BACKEND") or "hf").strip().lower()
+    if raw not in ("hf", "sglang"):
+        raise RuntimeError(
+            f"INFER_BACKEND={raw!r} -- want hf or sglang"
+        )
+    return raw

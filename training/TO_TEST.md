@@ -55,6 +55,39 @@ timed stage prints both, and the full-run number uses both:
   `GS_CHUNKED_KD=0 GS_TRAIN_PREFIX_KV=0`. Fence drop counts are a separate
   line from materialize, not two different corpora.
 
+### Branch `infer-sglang` (backend D)
+
+`INFER_BACKEND=hf|sglang` (default **hf**). Left-pad / 1-mod-32 / B are
+HF-only; the dispatcher stays. Tokenization is
+`apply_chat_template(..., tokenize=False)` — same contract as
+`Collator.build`. No silent HF fallback inside the sglang backend.
+
+1. Merge LoRA + `embed_vision` (PEFT `modules_to_save` cannot load):
+
+       python scripts/export_merged_checkpoint.py \
+           --architecture gemma-4-12b --checkpoint <name> \
+           --out weights/gemma-4-12b/merged_<name> --compare
+
+   `--compare` is greedy PEFT vs merged **under HF**. Do this before
+   blaming SGLang for drift.
+
+2. HF vs SGLang greedy (sequential; not two 12B copies):
+
+       INFER_BACKEND=hf python scripts/compare_infer_greedy.py --write /tmp/hf.json
+       INFER_BACKEND=sglang SGLANG_MODEL_PATH=weights/gemma-4-12b/merged_<name> \
+           python scripts/compare_infer_greedy.py --against /tmp/hf.json
+
+3. t6 with `INFER_BACKEND=sglang` (batch==solo on the Engine / HTTP path).
+
+4. Infer bench third column:
+
+       python -m training.bench_speed --what infer --modes control,bc,sglang
+
+   Engine in-process if the pin loads `gemma-4-12B-it`; otherwise a second
+   venv + `python -m sglang.launch_server --model-path <merged>` and
+   `SGLANG_HTTP_URL`. Missing Engine / Gemma 4 / `stop_regex` / images
+   raises with the exact piece — it does not fall back to HF.
+
 To wipe selftest leftovers (failed / Ctrl-C mid-run) and re-start cleanly::
 
     bash scripts/clean_selftest.sh

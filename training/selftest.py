@@ -2512,6 +2512,7 @@ def t6_ab() -> str:
         get_model,
         stack_equal_length,
     )
+    from agent.speed_flags import infer_backend
 
     model = get_model()
     with tempfile.TemporaryDirectory(prefix="selftest_t6_") as tmp:
@@ -2582,7 +2583,8 @@ def t6_ab() -> str:
             )
             solo_var = []
             for n, p in zip(var_lens, var_prompts):
-                if n % PAD_POISON_MOD == PAD_POISON_RESIDUE:
+                if (n % PAD_POISON_MOD == PAD_POISON_RESIDUE
+                        and infer_backend() != "sglang"):
                     # The padded batch decodes the NUDGED prompt (POISON
                     # MODE 2 RESCUE, banner in agent/model.py), so this
                     # row's byte-parity reference is the nudged prompt's
@@ -2618,17 +2620,26 @@ def t6_ab() -> str:
         finally:
             model._sampling_kwargs = original
 
-    padded_engaged = any(
-        ("padded batch" in line or "prefix-kv batch" in line)
-        for line in cap.lines
-    )
-    assert padded_engaged, (
-        "variable-length batch did NOT take the padded / prefix-kv path "
-        "(KNOWN TRANSFORMERS BUG WORKAROUND, transformers#47651) -- it "
-        "fell back to length cohorts, which kills parallel-datagen "
-        "throughput. generate_batch log: " + " | ".join(cap.lines)
-    )
-    if unpaddable:
+    if infer_backend() == "sglang":
+        sgl_engaged = any("sglang batch" in line for line in cap.lines)
+        assert sgl_engaged, (
+            "INFER_BACKEND=sglang but generate_batch did not log "
+            "'sglang batch' -- silent HF fallback? log: "
+            + " | ".join(cap.lines)
+        )
+        padded_engaged = True
+    else:
+        padded_engaged = any(
+            ("padded batch" in line or "prefix-kv batch" in line)
+            for line in cap.lines
+        )
+        assert padded_engaged, (
+            "variable-length batch did NOT take the padded / prefix-kv path "
+            "(KNOWN TRANSFORMERS BUG WORKAROUND, transformers#47651) -- it "
+            "fell back to length cohorts, which kills parallel-datagen "
+            "throughput. generate_batch log: " + " | ".join(cap.lines)
+        )
+    if unpaddable and infer_backend() != "sglang":
         assert any("POISON MODE 2 RESCUE" in line for line in cap.lines), (
             f"row of length {unpaddable[0]} (~= "
             f"{PAD_POISON_RESIDUE} mod {PAD_POISON_MOD}) was NOT nudged "
@@ -2696,7 +2707,18 @@ def t6_ab() -> str:
     # If the chat template does not keep system tokens as a prefix of
     # the full encode, B correctly skips. That is a skip, not a silent
     # left-pad-while-claiming-B.
-    if pk_engaged:
+    if infer_backend() == "sglang":
+        mism_pk = [
+            (i, s, b) for i, (s, b) in enumerate(zip(solo_pk, batched_pk))
+            if s != b
+        ]
+        assert not mism_pk, (
+            "sglang batch != solo: "
+            + "; ".join(f"[{i}] solo={s!r} batched={b!r}"
+                        for i, s, b in mism_pk)
+        )
+        pk_note = "prefix-kv is HF-only (sglang uses radix cache)"
+    elif pk_engaged:
         mism_pk = [
             (i, s, b) for i, (s, b) in enumerate(zip(solo_pk, batched_pk))
             if s != b

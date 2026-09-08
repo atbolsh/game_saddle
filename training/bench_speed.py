@@ -9,7 +9,8 @@ Infer:
 * ``bc`` = production B+C defaults.
 * ``parity`` (optional third column) = leftover left-pad + ``GS_PAD_PARITY=1``.
   Not the control.
-* ``sglang`` is added on the ``infer-sglang`` branch.
+* ``sglang`` = ``INFER_BACKEND=sglang`` (merged checkpoint via
+  ``SGLANG_MODEL_PATH``; Engine or ``SGLANG_HTTP_URL``).
 
 Train: one token-fenced corpus, then vary only the compute flags.
 
@@ -45,10 +46,8 @@ def _set_flags(mode: str, what: str) -> None:
             os.environ["GS_PREFIX_KV"] = "0"
             os.environ["GS_PAD_PARITY"] = "1"
         elif mode == "sglang":
-            raise SystemExit(
-                "sglang mode is not on this branch -- check out "
-                "infer-sglang and use --modes control,bc,sglang"
-            )
+            os.environ["INFER_BACKEND"] = "sglang"
+            os.environ["GS_PREFIX_KV"] = "0"
         else:
             raise SystemExit(f"unknown infer mode {mode!r}")
         return
@@ -90,10 +89,12 @@ def _run_infer(modes: list[str]) -> list[dict]:
     out: list[dict] = []
     for mode in modes:
         _set_flags(mode, "infer")
-        from agent.model import get_model
+        from agent.model import get_model, reset_default
+        reset_default()
         model = get_model()
-        model._prefix_kv.clear()
-        model._prefix_kv_len.clear()
+        if getattr(model, "_prefix_kv", None) is not None:
+            model._prefix_kv.clear()
+            model._prefix_kv_len.clear()
         if hasattr(model, "verify_pad_parity"):
             model._verify_pad_parity = None
         label = f"bench_infer_{mode}"
