@@ -417,10 +417,13 @@ class TrainConfig:
     #: = every step (weights changed). Try 4 at 3e-6; do not set 200 --
     #: stale KV after many LoRA updates is a silent training-dynamics bug.
     #:
-    #: Gradient approximation: prefix forward is no_grad, so LoRA's
-    #: contribution *through prefix positions' KV* is detached. Loss is
-    #: tail-only, but tail tokens attend to that KV. t4 batch-parity and
-    #: held-out loss are the guards.
+    #: Teacher (eval) uses the cache. The student does not: Gemma4Unified
+    #: drops ``past_key_values`` under gradient checkpointing + train
+    #: (2026-09-09: suffix T vs full-width mask). Student stays on the
+    #: checkpointed full sequence. Gradient approximation: prefix
+    #: forward is no_grad, so LoRA's contribution *through prefix
+    #: positions' KV* is detached on the teacher path. t4 batch-parity
+    #: and held-out loss are the guards.
     #:
     #: Windowing (pack_prefix_windows) makes each optimizer step
     #: source-homogeneous (all-player or all-analyst). That raises
@@ -1099,10 +1102,10 @@ def _forward_last_hidden(
 
 @dataclass
 class PrefixKVRuntime:
-    """Resident train-time prefix cache for one optimizer window.
+    """Resident train-time prefix cache for the teacher (eval) forward.
 
-    See TrainConfig.prefix_kv_refresh_steps for the gradient / windowing
-    caveats. Kill switch: GS_TRAIN_PREFIX_KV=0.
+    The student stays on a checkpointed full sequence -- see
+    TrainConfig.prefix_kv_refresh_steps. Kill switch: GS_TRAIN_PREFIX_KV=0.
     """
 
     cache: Any = None
@@ -1381,14 +1384,18 @@ def weighted_loss(model: Any, model_inputs: dict, weights: Any,
 
     from agent.speed_flags import chunked_kd_enabled, train_prefix_kv_enabled
 
-    fwd_inputs = model_inputs
+    # Teacher (eval) may use suffix+cache. Student always gets the full
+    # sequence: Gemma4Unified nulls past_key_values under checkpointing
+    # + train (2026-09-09 probe). Tail gather is from the end of
+    # whichever T was forwarded, so the two sides still align.
+    teacher_inputs = model_inputs
     if (train_prefix_kv_enabled() and prefix_kv is not None
-            and prefix_len > 0):
+            and prefix_len > 0 and loss_kind in ("kd", "kd_anchor")):
         if _same_prefix_ids(input_ids, prefix_len):
             _ensure_prefix_cache(
                 model, model_inputs, prefix_kv, prefix_len, prefix_hash,
             )
-            fwd_inputs = _suffix_inputs_with_cache(
+            teacher_inputs = _suffix_inputs_with_cache(
                 model_inputs, prefix_kv, prefix_len,
             )
         else:
@@ -1398,11 +1405,11 @@ def weighted_loss(model: Any, model_inputs: dict, weights: Any,
                 prefix_hash or "?", prefix_len,
             )
 
-    _use_cache = "past_key_values" in fwd_inputs
+    _use_cache = "past_key_values" in teacher_inputs
     prev_cache = getattr(model.config, "use_cache", False)
     if _use_cache:
         model.config.use_cache = True
-        suf_w = int(fwd_inputs["input_ids"].shape[1])
+        suf_w = int(teacher_inputs["input_ids"].shape[1])
         if suf_w < tail + 1:
             raise RuntimeError(
                 f"train prefix-kv: suffix width {suf_w} < tail+1 "
@@ -1419,7 +1426,7 @@ def weighted_loss(model: Any, model_inputs: dict, weights: Any,
             teacher_name = "anchor" if loss_kind == "kd_anchor" else "base"
             if chunked_kd_enabled():
                 teacher_h = _teacher_hidden(
-                    model, fwd_inputs, teacher=teacher_name,
+                    model, teacher_inputs, teacher=teacher_name,
                 )
                 # hidden is full sequence (or suffix if prefix-KV).
                 # Align gather to the TAIL of whatever was forwarded.
@@ -1439,7 +1446,7 @@ def weighted_loss(model: Any, model_inputs: dict, weights: Any,
                 del teacher
             else:
                 teacher_logits = _base_model_logits(
-                    model, fwd_inputs, logits_to_keep=tail + 1,
+                    model, teacher_inputs, logits_to_keep=tail + 1,
                     teacher=teacher_name,
                 )
                 teacher = teacher_logits[row_of, col_of].float()
@@ -1447,9 +1454,12 @@ def weighted_loss(model: Any, model_inputs: dict, weights: Any,
                 teacher_probs = F.softmax(teacher, dim=-1)
                 del teacher
 
-        # Student forward: same tail (rule 1), same 2-D gather (rule 3).
+        # Student forward: full sequence, checkpointing on. Same tail
+        # (rule 1), same 2-D gather (rule 3).
         if chunked_kd_enabled() and loss_kind in ("kd", "kd_anchor"):
-            hidden = _forward_last_hidden(model, fwd_inputs, logits_to_keep=1)
+            hidden = _forward_last_hidden(
+                model, model_inputs, logits_to_keep=1,
+            )
             if int(hidden.shape[1]) < tail + 1:
                 raise RuntimeError(
                     f"chunked KD: student hidden T="
@@ -1461,7 +1471,7 @@ def weighted_loss(model: Any, model_inputs: dict, weights: Any,
             student = apply_lm_head_chunked(model, gathered, kd_chunk).float()
             del hidden, st_tail, gathered
         else:
-            out = model(**fwd_inputs, logits_to_keep=tail + 1)
+            out = model(**model_inputs, logits_to_keep=tail + 1)
             logits = out.logits
             del out
             student = logits[row_of, col_of].float()
