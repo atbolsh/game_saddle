@@ -404,7 +404,9 @@ def _pick_length_grid(
     return chosen
 
 
-def _build_player_prompts(session: Any, model: Any, rt: dict) -> list[list[dict]]:
+def _build_player_prompts(
+    session: Any, model: Any, rt: dict, n: int | None = None,
+) -> list[list[dict]]:
     settings = _plant(session, GOLD_AHEAD, rt)
     del settings
     frame = session.current_frame_path()
@@ -416,10 +418,12 @@ def _build_player_prompts(session: Any, model: Any, rt: dict) -> list[list[dict]
             sys_p, frame, "", base + " again" * k, notepad=None,
         )
 
-    return _pick_length_grid(model, make, _PLAYER_N, rt)
+    return _pick_length_grid(model, make, n if n is not None else _PLAYER_N, rt)
 
 
-def _build_analyst_prompts(session: Any, model: Any, rt: dict) -> list[list[dict]]:
+def _build_analyst_prompts(
+    session: Any, model: Any, rt: dict, n: int | None = None,
+) -> list[list[dict]]:
     settings = _plant(session, GOLD_AHEAD, rt)
     frame = session.current_frame_path()
     planted = "The gold is straight ahead.\n[FORWARD]"
@@ -438,7 +442,7 @@ def _build_analyst_prompts(session: Any, model: Any, rt: dict) -> list[list[dict
             player_notepad=None,
         )
 
-    return _pick_length_grid(model, make, _ANALYST_N, rt)
+    return _pick_length_grid(model, make, n if n is not None else _ANALYST_N, rt)
 
 
 def _time_serial(
@@ -493,6 +497,7 @@ def run_speed(rt: dict, replies_dir: Path, model: Any) -> int:
     original = _force_greedy(model)
     failures: list[str] = []
     table: list[dict[str, Any]] = []
+    watch = None
     try:
         print()
         print("######## SPEED: leftover-pad (control) vs prefix-KV (bc) ########")
@@ -503,6 +508,9 @@ def run_speed(rt: dict, replies_dir: Path, model: Any) -> int:
             "serial = N solos, diagnostic only, not the old system."
         )
         print("Timed waves are greedy so control vs bc is the same work.")
+        from training.bench_speed import VramWatch
+        watch = VramWatch()
+        watch.__enter__()
         stop_player = rt["game_io"].PLAYER_STOP_PATTERN
 
         print()
@@ -590,7 +598,15 @@ def run_speed(rt: dict, replies_dir: Path, model: Any) -> int:
             "bc above 1.00x is B on the same mixed-length batch. "
             "serial below 1.00x only confirms the batch beat N solos."
         )
+        vram = watch.snapshot()
+        print(
+            f"VRAM: peak nvidia-smi={vram['peak_smi_GiB']} GiB  "
+            f"end smi={vram['end_smi_GiB']} GiB  "
+            f"torch allocator peak={vram['peak_torch_GiB']} GiB"
+        )
     finally:
+        if watch is not None:
+            watch.__exit__(None, None, None)
         model._sampling_kwargs = original
         session.close()
 

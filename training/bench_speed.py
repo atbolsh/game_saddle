@@ -18,18 +18,100 @@ Train: one token-fenced corpus, then vary only the compute flags.
 Fence drop counts print once from materialize, not by comparing two corpora.
 
 Pretty-prints a table. GPU + (for infer) NAMS. Remote only.
+
+Infer also samples VRAM: ``peak_smi_GiB`` is ``nvidia-smi`` memory.used
+(the box topline -- Gemma + MiniLM + fragmentation); ``peak_torch_GiB``
+is this process's caching allocator. The previous infer bench did not
+record either; train already printed ``peak_GiB``.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
+import threading
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+
+def nvidia_smi_used_mib() -> int | None:
+    """Box-wide used MiB, or None if nvidia-smi is missing/unparseable."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    total = 0
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            total += int(line)
+        except ValueError:
+            return None
+    return total
+
+
+class VramWatch:
+    """Sample nvidia-smi while a block runs; also torch allocator peak."""
+
+    def __init__(self, interval_s: float = 2.0):
+        self.interval_s = interval_s
+        self.peak_smi_mib = 0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> "VramWatch":
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        mib = nvidia_smi_used_mib()
+        if mib is not None:
+            self.peak_smi_mib = mib
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._loop, name="vram-watch", daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            mib = nvidia_smi_used_mib()
+            if mib is not None:
+                self.peak_smi_mib = max(self.peak_smi_mib, mib)
+            self._stop.wait(self.interval_s)
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+    def snapshot(self) -> dict[str, float | None]:
+        import torch
+        torch_gib = None
+        if torch.cuda.is_available():
+            torch_gib = round(torch.cuda.max_memory_allocated() / 2**30, 1)
+        end = nvidia_smi_used_mib()
+        peak = self.peak_smi_mib or end
+        return {
+            "peak_smi_GiB": (
+                None if peak is None else round(peak / 1024.0, 1)
+            ),
+            "end_smi_GiB": None if end is None else round(end / 1024.0, 1),
+            "peak_torch_GiB": torch_gib,
+        }
 
 
 def _set_flags(mode: str, what: str) -> None:
@@ -97,9 +179,11 @@ def _run_infer(modes: list[str]) -> list[dict]:
         if hasattr(model, "verify_pad_parity"):
             model._verify_pad_parity = None
         label = f"bench_infer_{mode}"
-        summary = _warmed_timed_datagen(
-            label, parallel=_T11_PARALLEL, extra_args=extra,
-        )
+        with VramWatch() as watch:
+            summary = _warmed_timed_datagen(
+                label, parallel=_T11_PARALLEL, extra_args=extra,
+            )
+        vram = watch.snapshot()
         out.append({
             "mode": mode,
             "warmup_s": summary.get("warmup_s"),
@@ -108,6 +192,8 @@ def _run_infer(modes: list[str]) -> list[dict]:
             "3000_h": summary.get("epoch_3000_hours"),
             "wall_s": summary.get("wall_seconds"),
             "gens": summary.get("generations"),
+            "peak_smi_GiB": vram["peak_smi_GiB"],
+            "peak_torch_GiB": vram["peak_torch_GiB"],
         })
     return out
 
@@ -276,7 +362,8 @@ def main(argv: list[str] | None = None) -> int:
                  if m.strip()]
         rows = _run_infer(modes)
         keys = ["mode", "warmup_s", "steady_s/gen", "blended_s/gen",
-                "3000_h", "wall_s", "gens"]
+                "3000_h", "wall_s", "gens", "peak_smi_GiB",
+                "peak_torch_GiB"]
     else:
         modes = [m.strip() for m in (args.modes or "control,opt").split(",")
                  if m.strip()]
