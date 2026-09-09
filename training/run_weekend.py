@@ -779,9 +779,9 @@ def train_one_epoch(k: int, prefix: str, resume: str | None,
         max_steps=max_steps,  # None = the full single pass
         # Token fence (encode first). 8192 drops the ~12.5k-token
         # OpenThoughts tails that OOM'd under the old 32k-char cap.
-        # Analyst traces get 12288 (image soft tokens + long dumps).
+        # Analyst matches that cap (12288 at B=4 peaked 94.8 GiB).
         max_example_tokens=8192,
-        max_example_tokens_analyst=12288,
+        max_example_tokens_analyst=8192,
     )
     return run_training(sources, cfg, extra_hooks=hooks, extra_guards=guards)
 

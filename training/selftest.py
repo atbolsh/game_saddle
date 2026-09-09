@@ -268,6 +268,7 @@ def t1_pure() -> str:
         ORACLE_WRONG_SPAN,
         TRANSITION_BOOST,
         WRONG_SPAN_WEIGHT,
+        ANALYST_BATCH_CAP,
         AnalystTraceSource,
         GameTraceSource,
         NoveltyTracker,
@@ -1230,6 +1231,9 @@ def t1_pure() -> str:
             f"expected 2 analyst examples (1 dropped), got {len(aexs)}"
         )
         assert all(x.loss == "kd" and x.span_weights is None for x in aexs)
+        assert all(x.batch_cap == ANALYST_BATCH_CAP for x in aexs), (
+            "analyst micro-batch cap missing (2026-09-09 VRAM)"
+        )
         assert aexs[0].messages[0]["content"][0]["url"] == str(img), (
             "analyst image url not resolved against the trace dir"
         )

@@ -811,6 +811,11 @@ class GameTraceSource(_TraceFileSource):
             )
 
 
+#: Analyst KD at B=4 / T~12k was the 94.8 GiB train-probe peak
+#: (2026-09-09). Cap the micro-batch; fence is the other half.
+ANALYST_BATCH_CAP = 2
+
+
 class AnalystTraceSource(_TraceFileSource):
     """The analyst KD anchor (rationale in the module docstring and
     TRAINING_EXTRA_DATASETS.md).
@@ -888,6 +893,9 @@ class AnalystTraceSource(_TraceFileSource):
                 loss="kd",
                 source=self.name,
                 meta=meta,
+                # B=4 x T~12k analyst KD was the 94.8 GiB train-probe
+                # peak (2026-09-09). Same knob as OpenThoughts.
+                batch_cap=ANALYST_BATCH_CAP,
             )
             n_yielded += 1
         if n_dropped:

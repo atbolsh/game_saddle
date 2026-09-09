@@ -411,8 +411,10 @@ class TrainConfig:
     #: Weekend default matches this; AnalystTraceSource uses
     #: ``max_example_tokens_analyst``.
     max_example_tokens: int = 8192
-    #: Higher cap for analyst traces (~8k prompts + image soft tokens).
-    max_example_tokens_analyst: int = 12288
+    #: Analyst fence. Same 8192 as the player/replay cap: 12288 at B=4
+    #: was the 94.8 GiB probe peak (2026-09-09). Pair with
+    #: AnalystTraceSource batch_cap=2.
+    max_example_tokens_analyst: int = 8192
     #: Rebuild frozen prefix KV after this many optimizer steps. Default 1
     #: = every step (weights changed). Try 4 at 3e-6; do not set 200 --
     #: stale KV after many LoRA updates is a silent training-dynamics bug.
