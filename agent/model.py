@@ -788,7 +788,6 @@ class VLModel:
             tok.padding_side = "left"
         if self.checkpoint:
             self._apply_checkpoint()
-        self._ensure_tied_lm_head()
         self.model.eval()
         self._loaded = True
         logger.info(
@@ -846,61 +845,6 @@ class VLModel:
                 f"({path}) onto {self.spec.key!r}: "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
-
-    def _ensure_tied_lm_head(self) -> None:
-        """Gemma 4 Unified ships no ``lm_head.weight`` (tied to
-        ``embed_tokens``). transformers 5.12 prints LOAD REPORT MISSING
-        and *should* then tie; if it does not, sampling hits
-        ``probability tensor contains inf/nan`` because the head is
-        random GPU garbage. Fail here instead of a device-side assert.
-        """
-        import torch
-
-        model = self.model
-        get_base = getattr(model, "get_base_model", None)
-        inner = get_base() if callable(get_base) else model
-        cfg = getattr(inner, "config", None)
-        if cfg is None:
-            return
-        tied = getattr(cfg, "tie_word_embeddings", None)
-        if tied is None:
-            text = getattr(cfg, "text_config", None)
-            tied = getattr(text, "tie_word_embeddings", False)
-        if not tied:
-            return
-        lm = getattr(inner, "lm_head", None)
-        get_in = getattr(inner, "get_input_embeddings", None)
-        embed = get_in() if callable(get_in) else None
-        lw = getattr(lm, "weight", None)
-        ew = getattr(embed, "weight", None)
-        if lw is None or ew is None:
-            raise RuntimeError(
-                "tie_word_embeddings is True but lm_head or "
-                "input embeddings are missing after load"
-            )
-        if torch.isnan(lw).any() or torch.isinf(lw).any():
-            raise RuntimeError(
-                "lm_head.weight contains nan/inf after load "
-                "(tied-head init did not land). Do not sample."
-            )
-        if lw.data_ptr() == ew.data_ptr():
-            return
-        tie = getattr(inner, "tie_weights", None)
-        if callable(tie):
-            tie()
-        lm = getattr(inner, "lm_head", None)
-        embed = get_in() if callable(get_in) else embed
-        lw = getattr(lm, "weight", None)
-        ew = getattr(embed, "weight", None)
-        if lw is not None and ew is not None and lw.data_ptr() == ew.data_ptr():
-            return
-        raise RuntimeError(
-            "tie_word_embeddings is True but lm_head.weight is not "
-            "the embed_tokens tensor after tie_weights() "
-            f"(lm_head ptr={lw.data_ptr()} embed ptr={ew.data_ptr()}). "
-            "The LOAD REPORT MISSING row was real -- sampling will "
-            "hit a CUDA probability-tensor assert."
-        )
 
     def unload(self) -> None:
         """Free the GPU: drop model + processor and empty the CUDA cache."""

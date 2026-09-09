@@ -86,12 +86,22 @@ def _run_infer(modes: list[str]) -> list[dict]:
         "--max-moves", str(_T11_MOVES),
         "--seed", "11",
     ]
+    from agent.model import get_model, reset_default
+    from agent.speed_flags import infer_backend
+
     out: list[dict] = []
+    prev_backend: str | None = None
     for mode in modes:
         _set_flags(mode, "infer")
-        from agent.model import get_model, reset_default
-        reset_default()
+        # control / bc / parity are the same HF weights; flags are read at
+        # generate time. Unload+reload between them is how the second
+        # from_pretrained left lm_head on the meta device. Only tear down
+        # when the backend actually changes (hf ↔ sglang).
+        backend = infer_backend()
+        if prev_backend is not None and backend != prev_backend:
+            reset_default()
         model = get_model()
+        prev_backend = backend
         if getattr(model, "_prefix_kv", None) is not None:
             model._prefix_kv.clear()
             model._prefix_kv_len.clear()
