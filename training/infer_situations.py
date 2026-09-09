@@ -2,21 +2,23 @@
 
     python -m training.infer_situations          # check + speed  (~10-25 min)
     python -m training.infer_situations check    # replies only   (~3-8 min)
-    python -m training.infer_situations speed    # GPU batch vs serial
+    python -m training.infer_situations speed    # leftover-pad vs prefix-KV
 
 The first line of output is the report path. Full player/analyst text
 lives there (and under ``replies/``). The terminal keeps the table.
 
-``speed`` is the overhaul demo, not a serial smoke:
+Datagen was already mixed-length and parallel. The overhaul number is
+**bc vs control**, not vs serial:
 
-* **serial** — N solo ``generate`` calls (``GS_PREFIX_KV=0``). This is
-  the pre-overhaul cost of N sessions that never batched.
-* **control** — one ``generate_batch`` with leftover left-pad (C).
-* **bc** — one ``generate_batch`` with resident prefix-KV (B+C).
+* **control** — ``generate_batch`` leftover left-pad (C). That is the
+  old parallel path: dispatcher + mixed-length pad, no resident prefix.
+* **bc** — the same batch with resident prefix-KV (B+C).
+* **serial** — N solo ``generate`` calls. Diagnostic only (did the
+  batch actually beat N solos?). Not the pre-overhaul datagen baseline.
 
 Mixed token lengths are chosen at encode time so the pad / prefix-KV
 path must engage (same tripwire as t6). Greedy decode on the timed
-waves so serial vs batch is the same work. Check uses production
+waves so control vs bc is the same work. Check uses production
 sampling unless ``--greedy``.
 
 Budget (from the ~3.5 s player / ~14 s analyst you already measured):
@@ -117,7 +119,7 @@ def _parse_cli(argv: list[str] | None) -> argparse.Namespace:
     )
     sub = p.add_subparsers(dest="what")
     sub.add_parser("check", help="planted player/analyst replies")
-    sub.add_parser("speed", help="serial vs leftover-pad vs prefix-KV batch")
+    sub.add_parser("speed", help="leftover-pad (control) vs prefix-KV (bc)")
     sub.add_parser("all", help="check then speed (default)")
     p.set_defaults(what="all")
     return p.parse_args(argv)
@@ -473,7 +475,7 @@ def _time_batch(
 
 
 def _print_table(rows: list[dict[str, Any]]) -> None:
-    keys = ["wave", "mode", "path", "n", "wall_s", "s/row", "vs_serial"]
+    keys = ["wave", "mode", "path", "n", "wall_s", "s/row", "vs_control"]
     widths = {k: max(len(k), *(len(str(r.get(k, ""))) for r in rows))
               for k in keys}
     print()
@@ -493,13 +495,14 @@ def run_speed(rt: dict, replies_dir: Path, model: Any) -> int:
     table: list[dict[str, Any]] = []
     try:
         print()
-        print("######## SPEED: mixed-length generate_batch vs serial ########")
+        print("######## SPEED: leftover-pad (control) vs prefix-KV (bc) ########")
         print(
-            "serial = N solo generate (no B, no C).  "
-            "control = leftover left-pad (C).  "
-            "bc = prefix-KV + leftover (B+C)."
+            "control = mixed-length generate_batch, leftover left-pad (C) "
+            "-- the old parallel datagen path.  "
+            "bc = the same batch with resident prefix-KV (B+C).  "
+            "serial = N solos, diagnostic only, not the old system."
         )
-        print("Timed waves are greedy so the three columns do the same work.")
+        print("Timed waves are greedy so control vs bc is the same work.")
         stop_player = rt["game_io"].PLAYER_STOP_PATTERN
 
         print()
@@ -527,14 +530,10 @@ def run_speed(rt: dict, replies_dir: Path, model: Any) -> int:
             )
             for i, text in enumerate(serial_replies):
                 _write_reply(replies_dir, f"speed_{wave}_serial_{i}", text)
-            serial_per = serial_s / len(prompts)
-            table.append({
-                "wave": wave, "mode": "serial", "path": "solo-generate",
-                "n": len(prompts), "wall_s": round(serial_s, 2),
-                "s/row": round(serial_per, 2), "vs_serial": "1.00x",
-            })
-            print(f"{wave} serial: {serial_s:.2f}s wall  {serial_per:.2f}s/row")
+            print(f"{wave} serial: {serial_s:.2f}s wall  "
+                  f"{serial_s / len(prompts):.2f}s/row  (diagnostic)")
 
+            timed: dict[str, tuple[float, str]] = {}
             for mode in ("control", "bc"):
                 _set_infer_mode(mode)
                 _clear_prefix(model)
@@ -551,13 +550,7 @@ def run_speed(rt: dict, replies_dir: Path, model: Any) -> int:
                 for i, text in enumerate(replies):
                     _write_reply(replies_dir, f"speed_{wave}_{mode}_{i}", text)
                 print(f"{wave} {mode} log: " + " | ".join(lines[-6:]))
-                vs = (serial_s / wall) if wall > 0 else 0.0
-                table.append({
-                    "wave": wave, "mode": mode, "path": tag,
-                    "n": len(prompts), "wall_s": round(wall, 2),
-                    "s/row": round(wall / len(prompts), 2),
-                    "vs_serial": f"{vs:.2f}x",
-                })
+                timed[mode] = (wall, tag)
                 if mode == "control" and "padded" not in tag:
                     failures.append(
                         f"{wave} control did not take leftover left-pad "
@@ -570,16 +563,32 @@ def run_speed(rt: dict, replies_dir: Path, model: Any) -> int:
                         f"pad (path={tag!r}) — silent cohort fallback."
                     )
 
+            control_s = timed["control"][0]
+
+            def _vs(wall: float) -> str:
+                return f"{(control_s / wall):.2f}x" if wall > 0 else "?"
+
+            table.append({
+                "wave": wave, "mode": "serial", "path": "solo-generate",
+                "n": len(prompts), "wall_s": round(serial_s, 2),
+                "s/row": round(serial_s / len(prompts), 2),
+                "vs_control": _vs(serial_s),
+            })
+            for mode in ("control", "bc"):
+                wall, tag = timed[mode]
+                table.append({
+                    "wave": wave, "mode": mode, "path": tag,
+                    "n": len(prompts), "wall_s": round(wall, 2),
+                    "s/row": round(wall / len(prompts), 2),
+                    "vs_control": _vs(wall),
+                })
+
         _print_table(table)
         print()
         print(
-            "Read vs_serial: 2.0x means the batch finished in half the "
-            "serial wall. B+C is working if control/bc are both well "
-            "above 1x and bc's path is prefix-kv (or prefix-kv+padded)."
-        )
-        print(
-            "Isolated B is the control→bc delta (often ~10%). Most of "
-            "the win vs serial is C (one decode for N rows)."
+            "Read vs_control: 1.00x is leftover-pad (old parallel path). "
+            "bc above 1.00x is B on the same mixed-length batch. "
+            "serial below 1.00x only confirms the batch beat N solos."
         )
     finally:
         model._sampling_kwargs = original
