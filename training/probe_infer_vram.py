@@ -9,12 +9,12 @@ and one analyst ``generate_batch`` at that width. Samples nvidia-smi
 every 2 s.
 
 Budget: one model load + two short batches. About 3-8 min, not an hour.
-Does not play 8×4 games. For the 3000-gen clock use
+Does not play 12×4 games. For the 3000-gen clock use
 ``python -m training.bench_speed --what infer``.
 
-``peak_smi_GiB`` is the box topline. On 96 GiB, p12 OOM'd at T~7k and
-p16 died CUBLAS; this probe is how you see headroom before bumping
-``--parallel``.
+``peak_smi_GiB`` is the box topline. On 96 GiB, 12-wide leftover-pad
+at T~12288 peaked 93.3 GiB; p16 died CUBLAS. This probe is how you
+see headroom before bumping ``--parallel``.
 """
 
 from __future__ import annotations
@@ -76,8 +76,8 @@ def _stretch(model, prompts: list, min_tokens: int) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--parallel", type=int, default=8,
-                   help="batch width and NAMS session count (default 8)")
+    p.add_argument("--parallel", type=int, default=12,
+                   help="batch width and NAMS session count (default 12)")
     p.add_argument("--checkpoint", default=None)
     p.add_argument(
         "--min-prompt-tokens", type=int, default=0,
@@ -186,7 +186,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(
             "Read peak nvidia-smi against 96 GiB. "
-            "p8 finished the hour bench; this is the number for p10/p12.",
+            "Default datagen width is 12; 16 is still the CUBLAS death.",
             flush=True,
         )
     return 0

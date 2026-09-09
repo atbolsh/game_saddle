@@ -35,8 +35,9 @@ Stage map (rationale in the Intermission plan):
                 tripwire, _rewrite_image_urls, Game/PlayerAnchor/Analyst
                 sources on fabricated dirs (example_weight, oracle
                 modifiers, novelty toggle), epoch_batches bucketing,
-                stack_equal_length, max_gpu_batch_for_lens (T>=7000
-                caps GPU B at 3), run_weekend --checkpoint (rejects
+                stack_equal_length, partition_prefill_batches
+                (T>=8700 longs cap at 3; shorts stay one batch),
+                run_weekend --checkpoint (rejects
                 --start-checkpoint / --resume-checkpoint), datagen
                 --multi-gold vs smoke sealed, boundary
                 openings / multi-gold / END_GAME parse (base class too);
@@ -66,7 +67,7 @@ Stage map (rationale in the Intermission plan):
                 real overnight corpus (T10_DATAGEN_LABEL to change), peak
                 VRAM per category (tripwire vs the 2026-07-31 OOM), and a
                 whole-epoch train-time estimate; saves NO checkpoint
-  * t11-weekend  8 games × 4 moves at --parallel 8; warmup vs steady
+  * t11-weekend  12 games × 4 moves at --parallel 12; warmup vs steady
                 3000-gen estimate (the weekend-shaped number; t8 is serial)
 """
 
@@ -1363,26 +1364,38 @@ def t1_pure() -> str:
     assert max(totals) < 1.1 * min(totals), f"unbalanced groups: {totals}"
     checks += 1
 
-    # ---- max_gpu_batch_for_lens: late-prefill VRAM split (encode first;
-    #      never B>=4 when max T>=7000). Then stack_equal_length.
+    # ---- isolate-long VRAM split (encode first; one 12k row does not
+    #      force 4x3 or pad shorts to 12k). Then stack_equal_length.
     import torch
 
     from agent.model import (
         LONG_PREFILL_GPU_BATCH,
         LONG_PREFILL_TOKENS,
         max_gpu_batch_for_lens,
+        partition_prefill_batches,
         stack_equal_length,
     )
 
+    t_lo = LONG_PREFILL_TOKENS - 1
+    t_hi = LONG_PREFILL_TOKENS
+    cap = LONG_PREFILL_GPU_BATCH
+    assert partition_prefill_batches([]) == []
+    assert partition_prefill_batches([t_lo] * 12) == [list(range(12))]
+    assert partition_prefill_batches([t_hi] * 6) == [
+        list(range(cap)), list(range(cap, 6)),
+    ]
+    assert partition_prefill_batches([t_hi, 100, 100]) == [[1, 2], [0]]
+    assert partition_prefill_batches([100, t_hi, 100, t_hi, 100]) == [
+        [0, 2, 4], [1, 3],
+    ]
+    assert partition_prefill_batches([t_hi] * 4) == [[0, 1, 2], [3]]
+    assert partition_prefill_batches([t_hi]) == [[0]]
     assert max_gpu_batch_for_lens([]) == 1
-    assert max_gpu_batch_for_lens([LONG_PREFILL_TOKENS - 1] * 6) == 6
-    assert max_gpu_batch_for_lens([LONG_PREFILL_TOKENS] * 6) == (
-        LONG_PREFILL_GPU_BATCH
-    )
-    assert max_gpu_batch_for_lens([8000] * 6) == 3
-    assert max_gpu_batch_for_lens([8000, 100, 100]) == 3
-    assert max_gpu_batch_for_lens([8000, 8000]) == 2
-    assert max_gpu_batch_for_lens([8000]) == 1
+    assert max_gpu_batch_for_lens([t_lo] * 12) == 12
+    assert max_gpu_batch_for_lens([t_hi] * 6) == cap
+    assert max_gpu_batch_for_lens([t_hi, 100, 100]) == 2
+    assert max_gpu_batch_for_lens([t_hi, t_hi]) == 2
+    assert max_gpu_batch_for_lens([t_hi]) == 1
     checks += 1
 
     # ---- 1-mod-32 dodge + prefix-KV helpers (no GPU)
@@ -1631,7 +1644,7 @@ def t1_pure() -> str:
     assert ns.checkpoint == "aug13_iter2_step212"
     ns = wp.parse_args([])
     assert ns.checkpoint is None
-    assert ns.parallel == 8
+    assert ns.parallel == 12
     ns = wp.parse_args(["--train-iter", "2", "--checkpoint", "parent"])
     assert ns.train_iter == 2 and ns.checkpoint == "parent"
     for argv in (
@@ -1664,7 +1677,7 @@ def t1_pure() -> str:
     import inspect as _inspect
     gp = traces_parser()
     assert gp.parse_args(["--label", "x"]).multi_gold is False
-    assert gp.parse_args(["--label", "x"]).parallel == 8
+    assert gp.parse_args(["--label", "x"]).parallel == 12
     assert gp.parse_args(["--label", "x", "--multi-gold"]).multi_gold is True
     assert DATAGEN_ROOM_FLAG == ["--multi-gold"]
     assert "DATAGEN_ROOM_FLAG" in _inspect.getsource(_datagen)
@@ -2811,11 +2824,12 @@ _TIMING_GAMES = 3
 _TIMING_MOVES = 4
 _TIMING_WORKLOAD = ["--games", str(_TIMING_GAMES),
                     "--max-moves", str(_TIMING_MOVES), "--seed", "11"]
-#: Weekend-shaped estimator (t11): occupy ``--parallel 8`` with 8 games
-#: and 4 moves so the measurement is not ramp-dominated.
-_T11_GAMES = 8
+#: Weekend-shaped estimator (t11): occupy ``--parallel 12`` with 12 games
+#: and 4 moves so the measurement is not ramp-dominated (8x4 at p12
+#: would leave four workers idle).
+_T11_GAMES = 12
 _T11_MOVES = 4
-_T11_PARALLEL = 8
+_T11_PARALLEL = 12
 
 
 def _warmed_timed_datagen(
@@ -2940,11 +2954,11 @@ def t9_parallel() -> str:
 
 
 def t11_weekend_est() -> str:
-    """Weekend-shaped datagen estimate: 8 games × 4 moves at --parallel 8.
+    """Weekend-shaped datagen estimate: 12 games × 4 moves at --parallel 12.
 
     Does not require t8. Prints warmup vs steady and the 3000-gen
     estimate ``warmup + (3000 - n_warmup) * steady``. Target wall
-    ~25-45 min after the CUDA warmup generate.
+    under an hour after the CUDA warmup generate.
     """
     extra = [
         "--games", str(_T11_GAMES),
@@ -2952,9 +2966,9 @@ def t11_weekend_est() -> str:
         "--seed", "11",
     ]
     summary = _warmed_timed_datagen(
-        "selftest_t11_p8", parallel=_T11_PARALLEL, extra_args=extra,
+        "selftest_t11_p12", parallel=_T11_PARALLEL, extra_args=extra,
     )
-    return "weekend-shaped p8: " + _format_datagen_timing(summary)
+    return "weekend-shaped p12: " + _format_datagen_timing(summary)
 
 
 #: t10 profiles the train loop on a REAL datagen corpus. Default: the
@@ -3192,7 +3206,7 @@ STAGES: list[tuple[str, str, "callable"]] = [
     ("t9-parallel", "t8's workload at --parallel 3, compared", t9_parallel),
     ("t10-traintime", "timed train batches per loss category + epoch "
                       "estimate", t10_traintime),
-    ("t11-weekend", "8x4 at --parallel 8 weekend datagen estimate",
+    ("t11-weekend", "12x4 at --parallel 12 weekend datagen estimate",
      t11_weekend_est),
 ]
 

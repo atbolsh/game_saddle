@@ -240,19 +240,21 @@ ADAPTERS: dict[str, FamilyAdapter] = {
 
 # ====================================================== generate batching
 
-#: Late-game VRAM split (2026-08-28, ``--parallel 6``): phase-lock sent 6
-#: analyst prefills at T~8k in one ``generate_batch``; the stacked call
-#: tried to allocate 6.65 GiB with 5.89 GiB free. Keep 6 workers; only
-#: shrink the GPU batch when any encoded prompt is long. Token counts
-#: only -- encode first; ``len(text)`` is not a stand-in.
-LONG_PREFILL_TOKENS = 7000
+#: Late-prefill VRAM split. 12-wide leftover-pad at the analyst fence
+#: (T~12288, 256 new tokens) peaked 93.3 / 96 GiB; the same width at
+#: T~8k was 57.5 GiB. Body of real analyst gens sits at 7-8.5k
+#: (aug27 iters + the 8x4 bench, max 8596). Isolate rows at
+#: ``T >= 8700`` into GPU chunks of at most 3; shorts stay one batch
+#: so one fat SEARCH dump does not pad eleven 8k rows to 12k or turn
+#: the wave into 4x3. Token counts only -- encode first.
+LONG_PREFILL_TOKENS = 8700
 LONG_PREFILL_GPU_BATCH = 3
 
 
 def _long_prefill_limits() -> tuple[int, int]:
-    """``(T_threshold, max_B)``. Env overrides are process-local so a
-    VRAM probe can disable the 7000→B=3 split without editing defaults.
-    Unset / empty = the 2026-08-28 constants. Bad values raise.
+    """``(T_threshold, long_cap)``. Env overrides are process-local so a
+    VRAM probe can disable the isolate split without editing defaults.
+    Unset / empty = the 8700 / B=3 constants. Bad values raise.
     """
     raw_t = os.environ.get("GS_LONG_PREFILL_TOKENS")
     raw_b = os.environ.get("GS_LONG_PREFILL_GPU_BATCH")
@@ -265,21 +267,38 @@ def _long_prefill_limits() -> tuple[int, int]:
     return t, b
 
 
-def max_gpu_batch_for_lens(lens: list[int]) -> int:
-    """How many of these encoded rows may share one GPU generate call.
+def partition_prefill_batches(lens: list[int]) -> list[list[int]]:
+    """Index groups for sequential GPU generate calls.
 
-    Returns ``len(lens)`` when every prompt is under
-    :data:`LONG_PREFILL_TOKENS`; otherwise at most
-    :data:`LONG_PREFILL_GPU_BATCH` (never ``B>=4`` at ``max(T)>=7000``).
-    Empty ``lens`` -> 1. ``GS_LONG_PREFILL_TOKENS`` /
-    ``GS_LONG_PREFILL_GPU_BATCH`` override for one process only.
+    Shorts (``T < LONG_PREFILL_TOKENS``) stay one group at full width.
+    Longs are chunked into groups of at most
+    :data:`LONG_PREFILL_GPU_BATCH`. A single 12k row is B=1, not a
+    3-wide stack that pads two shorts up to 12k. Empty ``lens`` -> ``[]``.
+    ``GS_LONG_PREFILL_TOKENS`` / ``GS_LONG_PREFILL_GPU_BATCH`` override
+    for one process only.
     """
     if not lens:
-        return 1
+        return []
     threshold, cap = _long_prefill_limits()
-    if max(lens) >= threshold:
-        return min(cap, len(lens))
-    return len(lens)
+    shorts = [i for i, length in enumerate(lens) if length < threshold]
+    longs = [i for i, length in enumerate(lens) if length >= threshold]
+    groups: list[list[int]] = []
+    if shorts:
+        groups.append(shorts)
+    for start in range(0, len(longs), cap):
+        groups.append(longs[start:start + cap])
+    return groups
+
+
+def max_gpu_batch_for_lens(lens: list[int]) -> int:
+    """Largest GPU batch :func:`partition_prefill_batches` would emit.
+
+    Empty ``lens`` -> 1.
+    """
+    groups = partition_prefill_batches(lens)
+    if not groups:
+        return 1
+    return max(len(g) for g in groups)
 
 
 def stack_equal_length(
@@ -1456,12 +1475,13 @@ class VLModel:
         Rows a plan excludes decode via one batch per distinct prompt
         length (zero pad -- always safe, but decode serializes).
 
-        VRAM: after encode, a batch whose longest prompt is
-        ``>= LONG_PREFILL_TOKENS`` is split into chunks of
-        ``LONG_PREFILL_GPU_BATCH`` so late 50-round analyst prefills do
-        not land 6-wide on the GPU (2026-08-28 OOM). Workers stay at
-        ``--parallel``; only the GPU call shrinks. Lengths are
-        ``input_ids.shape[1]``, not characters.
+        VRAM: after encode, rows with ``T >= LONG_PREFILL_TOKENS`` are
+        peeled off and generated in chunks of at most
+        ``LONG_PREFILL_GPU_BATCH``; shorter rows stay one batch. One
+        12k analyst does not pad the rest of a p12 wave to 12k
+        (leftover left-pad) or force 4x3. Workers stay at
+        ``--parallel``. Lengths are ``input_ids.shape[1]``, not
+        characters.
         """
         if not batch:
             return []
@@ -1524,22 +1544,28 @@ class VLModel:
                     i, length, lens[i],
                 )
 
-        gpu_b = max_gpu_batch_for_lens(lens)
-        if gpu_b < len(batch):
+        groups = partition_prefill_batches(lens)
+        if len(groups) > 1:
+            threshold, cap = _long_prefill_limits()
+            n_long = sum(1 for length in lens if length >= threshold)
             logger.info(
-                "generate_batch: VRAM split %d rows (max T=%d) into "
-                "chunks of %d",
-                len(batch), max(lens), gpu_b,
+                "generate_batch: VRAM isolate %d long / %d short "
+                "(max T=%d, long_cap=%d) -> %s",
+                n_long, len(lens) - n_long, max(lens), cap,
+                [len(g) for g in groups],
             )
-            replies: list[str] = []
-            for start in range(0, len(batch), gpu_b):
-                replies.extend(self.generate_batch(
-                    batch[start:start + gpu_b],
+            replies: list[str | None] = [None] * len(batch)
+            for idxs in groups:
+                sub_replies = self.generate_batch(
+                    [batch[i] for i in idxs],
                     max_new_tokens=max_new_tokens,
                     stop_strings=stop_strings,
                     stop_regex=stop_regex,
-                ))
-            return replies
+                )
+                for i, reply in zip(idxs, sub_replies):
+                    replies[i] = reply
+            assert all(r is not None for r in replies)
+            return list(replies)  # type: ignore[arg-type]
 
         by_len: dict[int, list[int]] = {}
         for i, length in enumerate(lens):

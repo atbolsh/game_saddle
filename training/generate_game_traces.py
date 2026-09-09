@@ -93,7 +93,7 @@ so the orchestrator stops instead of burning hours on gibberish (the
 noticed). Per-move gold distances (``meta.dist_to_gold_before/after``) are
 recorded as a rating-independent quality cross-check.
 
-**Parallelism** (``--parallel``, default 8): N sessions play N games
+**Parallelism** (``--parallel``, default 12): N sessions play N games
 concurrently, one worker thread each, sharing ONE model through
 ``agent.parallel_gen`` -- concurrent generations merge into batched decode
 calls (batch-1 decode is bandwidth-bound, so extra rows are cheap).
@@ -101,10 +101,12 @@ Measured 2026-07-30 (96 GB box, base weights): serial 24.1 s/gen,
 ``--parallel 10`` 8.5, ``--parallel 24`` 6.4 -- returns diminish but never
 invert. 16 looked like VRAM headroom until 2026-08-17: 16 long KV caches
 plus the NAMS MiniLM embedder on the same GPU died with
-``CUBLAS_STATUS_ALLOC_FAILED``. Default 8 is the 2026-08-26 lesson: 12
-OOM'd on 50-move multi-gold contexts (T~7k) on a 96 GB box; 16 died on
-shorter sealed games (2026-08-17). NAMS resets happen at
-BLOCK boundaries: games run in
+``CUBLAS_STATUS_ALLOC_FAILED``. Default 12 is the 2026-09-09 VRAM
+probe: 12-wide at T~8k is 57.5 GiB; 12-wide leftover-pad at the
+12288 fence is 93.3 GiB, so ``generate_batch`` isolates ``T>=8700``
+into GPU chunks of 3 and leaves shorter rows one batch. 16 is still
+the CUBLAS death (2026-08-17). NAMS resets happen at
+block boundaries: games run in
 sequential blocks of ``--reset-every``, all workers drain between blocks,
 one session resets, all restart. Each concurrent session is invisible to
 the others' players exactly as PAST sessions are (current-session
@@ -1377,13 +1379,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "run_weekend datagen passes this; smoke does not")
     p.add_argument("--max-generations", type=int, default=3000,
                    help="hard cap on player generations for the whole run")
-    p.add_argument("--parallel", type=int, default=8,
+    p.add_argument("--parallel", type=int, default=12,
                     help="concurrent game sessions sharing one model via "
                         "batched decode (agent/parallel_gen.py); 1 = the "
-                        "plain sequential loop; default 8 after 12 OOM'd "
-                        "on 50-move multi-gold contexts (T~7k) on a 96 GB "
-                        "box (2026-08-26; 16 died CUBLAS on shorter sealed "
-                        "games, 2026-08-17; module docstring)")
+                        "plain sequential loop; default 12 (12-wide T~8k "
+                        "is 57.5 GiB; 12x12288 leftover-pad is 93.3 GiB "
+                        "so T>=8700 isolates to GPU B<=3; 16 died CUBLAS "
+                        "2026-08-17; module docstring)")
     p.add_argument("--reset-every", type=int, default=100,
                    help="reset NAMS episodic memory (tips survive) every N "
                         "games (default 100 per TRAINING_EXTRA_DATASETS.md)")

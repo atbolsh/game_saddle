@@ -53,7 +53,7 @@ deviations and calls the loop — copy
 
 `python -m training.run_weekend` chains **3 expert-iteration epochs**
 unattended: for each epoch k it runs datagen
-(`generate_game_traces --label weekend_iter<k> --parallel 8 --multi-gold`,
+(`generate_game_traces --label weekend_iter<k> --parallel 12 --multi-gold`,
 on the previous epoch's adapter — walk-out is disc contact with the
 unit-square boundary; the oracle aims at the engine-validated `TARGET:`
 line), trains on that epoch's traces (reward-weighted
@@ -72,9 +72,10 @@ parallel by default: the Gemma 4 left-pad prefill bug
 ([huggingface/transformers#47651](https://github.com/huggingface/transformers/issues/47651))
 has a verified workaround (stage-6 notes in [TO_TEST.md](TO_TEST.md)),
 and measured scaling (2026-07-30, 96 GB box) never inverts: serial
-24.1 s/gen, `--parallel 10` 8.5, `--parallel 24` 6.4. The default is 8
-(12 OOM'd on 50-move multi-gold contexts, T~7k, 2026-08-26; 16 concurrent
-KV caches plus the NAMS MiniLM embedder on the same GPU died with
+24.1 s/gen, `--parallel 10` 8.5, `--parallel 24` 6.4. The default is 12
+(12-wide T~8k is 57.5 GiB; 12×12288 leftover-pad is 93.3 GiB, so
+`T>=8700` isolates to GPU B≤3; 16 concurrent KV caches plus the NAMS
+MiniLM embedder on the same GPU died with
 `CUBLAS_STATUS_ALLOC_FAILED` on 2026-08-17). `--parallel 1`
 restores the fully serial conservative path. Counted turn tokens
 `[CLOCK n]`/`[ANTICLOCK n]` occupy n game-time steps for the win/eat-boost
