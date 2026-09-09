@@ -249,18 +249,36 @@ LONG_PREFILL_TOKENS = 7000
 LONG_PREFILL_GPU_BATCH = 3
 
 
+def _long_prefill_limits() -> tuple[int, int]:
+    """``(T_threshold, max_B)``. Env overrides are process-local so a
+    VRAM probe can disable the 7000→B=3 split without editing defaults.
+    Unset / empty = the 2026-08-28 constants. Bad values raise.
+    """
+    raw_t = os.environ.get("GS_LONG_PREFILL_TOKENS")
+    raw_b = os.environ.get("GS_LONG_PREFILL_GPU_BATCH")
+    t = LONG_PREFILL_TOKENS if not raw_t or not raw_t.strip() else int(raw_t)
+    b = LONG_PREFILL_GPU_BATCH if not raw_b or not raw_b.strip() else int(raw_b)
+    if t < 1 or b < 1:
+        raise ValueError(
+            f"GS_LONG_PREFILL_TOKENS/GPU_BATCH must be >= 1, got T={t} B={b}"
+        )
+    return t, b
+
+
 def max_gpu_batch_for_lens(lens: list[int]) -> int:
     """How many of these encoded rows may share one GPU generate call.
 
     Returns ``len(lens)`` when every prompt is under
     :data:`LONG_PREFILL_TOKENS`; otherwise at most
     :data:`LONG_PREFILL_GPU_BATCH` (never ``B>=4`` at ``max(T)>=7000``).
-    Empty ``lens`` -> 1.
+    Empty ``lens`` -> 1. ``GS_LONG_PREFILL_TOKENS`` /
+    ``GS_LONG_PREFILL_GPU_BATCH`` override for one process only.
     """
     if not lens:
         return 1
-    if max(lens) >= LONG_PREFILL_TOKENS:
-        return min(LONG_PREFILL_GPU_BATCH, len(lens))
+    threshold, cap = _long_prefill_limits()
+    if max(lens) >= threshold:
+        return min(cap, len(lens))
     return len(lens)
 
 
