@@ -1982,7 +1982,8 @@ def t1_pure() -> str:
         modes.ROLE_DEBRIEF, analyst_map, modes.DEBRIEF_EXCLUDE,
     )
 
-    assert "PICK ONE TARGET AND COMMIT" in play_dump
+    assert "EACH TURN" in play_dump
+    assert "PICK ONE TARGET AND COMMIT" not in play_dump
     assert "Making a move does NOT end your turn" not in play_dump
     assert "[CLOCK n]" in play_dump
     assert "TARGET: gold, 0" in analyst_dump

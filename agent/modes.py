@@ -182,15 +182,8 @@ def _block_aim_tolerance(target: str) -> str:
     that prompt's reviewer, so player and judge always share one wording.
     """
     return (
-        "AIM TOLERANCE: it can be hard to tell your exact facing direction from "
-        "the screen, so do not demand pixel-perfect aim. If your best estimate "
-        f"is that {target} lies within about 20 degrees (3 turn steps) of your "
-        f"facing direction, {_TOK_FORWARD} is a good move -- step forward and "
-        "re-assess on the new screen. Inside that band a single fine-tuning "
-        "step like [CLOCK] is also fine play. What wastes moves is a long "
-        f"chain of tiny turns toward a {target} that is clearly off to one "
-        "side or behind you: there, estimate the full count and turn ONCE "
-        "with [CLOCK n]/[ANTICLOCK n]."
+        "Target within about 20 degrees (3 steps) of your facing? "
+        f"{_TOK_FORWARD}. Do not demand pixel-perfect aim; step and re-assess."
     )
 
 
@@ -1423,7 +1416,82 @@ _BLOCK_SCENE_ANALYST_SCOPE = (
 )
 
 # Role statements stay hardcoded -- the one thing not stored as a tip.
-ROLE_SCENE_PLAY = _BLOCK_GAME_INTRO
+# Play-only rewrite; analyst / debrief keep _BLOCK_GAME_INTRO.
+ROLE_SCENE_PLAY = (
+    "You are an agent playing a 2D discrete game on a square board, "
+    "seen as an image. The board is the unit square framed by four walls; "
+    "walls may have an OPENING (a gap leading out). Up to 3 GOLD pieces "
+    "(small yellow circles) may be present, or none. You are the green "
+    "circle; the red eye shows your facing direction."
+)
+
+_BLOCK_PLAYER_GOAL = (
+    "GOAL: eat gold while any remains (eating one does NOT end the "
+    "session -- go for the next). When no gold remains, walk out through "
+    "the opening. If there is neither, end the session. Gold and openings "
+    "are different things; never call an opening gold, never chase an "
+    "opening while gold remains."
+)
+
+_BLOCK_PLAYER_MOVE_TOKENS = (
+    "MOVE TOKENS (exactly one per move; only exact bracketed tokens act "
+    "-- prose does nothing):\n"
+    "  [CLOCK n] / [ANTICLOCK n] - turn n steps of 6 degrees (n = 1-60; "
+    "5 steps = one clock hour, 15 = quarter turn, 30 = half turn) "
+    "clockwise / counter-clockwise, all in ONE move. Bare [CLOCK] = 1 "
+    "step, a fine nudge.\n"
+    f"  {_TOK_FORWARD} - advance up to 1/16 of the board where the eye "
+    "points. Never takes a count; [FORWARD 10] does nothing and is "
+    "graded as a mistake. Emit again next screen to keep going.\n"
+    f"  {_TOK_END_GAME} - only when the room has no gold AND no opening "
+    "(save [REMEMBER target: none -- room is sealed and empty] first), "
+    "or when the question explicitly asks you to end."
+)
+
+# Step-4 first dash is _BLOCK_AIM_TOLERANCE, not a second copy of that
+# sentence, so the analyst review quote stays in lockstep.
+_BLOCK_EACH_TURN = (
+    "EACH TURN, do this in order:\n"
+    "1. LOOK at the CURRENT screen -- never recycle a past observation; "
+    "every move changes the screen. Start your reply:\n"
+    "   OBS: I am at <where>; my eye points toward <clock direction, "
+    "e.g. 4 o'clock>; my target, <a remaining gold | an opening/exit>, "
+    "is at <where>, toward <clock direction> of me.\n"
+    "   (12 o'clock is up-screen, 3 right, 6 down, 9 left.)\n"
+    "2. CHECK your target note. Your notepad's 'target' names what you "
+    "chase: a gold while any remains (several visible: pick ONE -- 'the "
+    "left one', 'the near one' -- and stick with it), else an opening. "
+    "Save [REMEMBER target: ...] ONLY if the note is missing, or the "
+    "gold it names was eaten or vanished (pick a new target: golds "
+    "first, then opening). Otherwise write NO [REMEMBER] line -- "
+    "re-saving an unchanged note is a graded mistake.\n"
+    "3. REASON in a sentence or two: where is the target relative to "
+    "your eye?\n"
+    "4. MOVE (only if asked to move; if asked a question like 'are you "
+    "facing your target?', answer in prose and STOP -- no token):\n"
+    f"   - {_BLOCK_AIM_TOLERANCE}\n"
+    "   - Otherwise turn ONCE: clock hours to the target the SHORT way, "
+    "times 5 -> [CLOCK n] (toward larger hours) or [ANTICLOCK n]. "
+    "Example: eye at 12, target at 4 -> [CLOCK 20]. Never creep toward "
+    "a far-off target in single steps.\n"
+    f"   - Next screen, verify: aimed -> {_TOK_FORWARD}; overshot -> "
+    "one counted turn back; nearly aimed -> a bare [CLOCK]/[ANTICLOCK] "
+    "nudge is fine."
+)
+
+_BLOCK_NOTEPAD_RULES = (
+    "NOTEPAD RULES: '[REMEMBER key: one-line note]' saves; the same key "
+    "overwrites; every note is shown back to you each turn and is your "
+    "only memory that survives -- but it must come BEFORE your move "
+    "token, because the move ends your turn and later text is lost."
+)
+
+_BLOCK_MEMORY_SEARCH = (
+    "MEMORY SEARCH: you may end a reply with one '[SEARCH <query>]' "
+    "token (nothing after it); results return to your context and you "
+    "continue. Never a substitute for reading the current screen."
+)
+
 ROLE_SCENE_ANALYST = (
     "You are reviewing ONE RECORDED reply from a 2D discrete game. "
     + _BLOCK_REVIEWER_STANCE
@@ -1438,17 +1506,11 @@ ROLE_DEBRIEF = (
 # Numbers below 500 are reserved for this seed (FUTURE_GOALS goal 11:
 # agent-written tips use 500+).
 CORE_PLAYER_TIPS: list[tuple[str, str]] = [
-    ("core_player_010_multi_gold_rules", _BLOCK_MULTI_GOLD_RULES),
-    ("core_player_020_move_tokens", _BLOCK_MOVE_TOKENS),
-    ("core_player_030_scene_scope", _BLOCK_SCENE_SCOPE),
-    ("core_player_040_how_to_play", _BLOCK_HOW_TO_PLAY),
-    ("core_player_050_notepad", _BLOCK_NOTEPAD),
-    ("core_player_060_target_commit", _BLOCK_TARGET_COMMIT),
-    ("core_player_070_no_gold_explore", _BLOCK_NO_GOLD_EXPLORE),
-    ("core_player_080_end_game", _BLOCK_END_GAME),
-    ("core_player_090_aim_tolerance", _BLOCK_AIM_TOLERANCE),
-    ("core_player_100_current_screen", _BLOCK_CURRENT_SCREEN),
-    ("core_player_110_search_tool", _search_tool_block(_SEARCH_SCOPE_PLAY)),
+    ("core_player_010_goal", _BLOCK_PLAYER_GOAL),
+    ("core_player_020_move_tokens", _BLOCK_PLAYER_MOVE_TOKENS),
+    ("core_player_040_each_turn", _BLOCK_EACH_TURN),
+    ("core_player_050_notepad_rules", _BLOCK_NOTEPAD_RULES),
+    ("core_player_110_search_tool", _BLOCK_MEMORY_SEARCH),
 ]
 CORE_ANALYST_TIPS: list[tuple[str, str]] = [
     ("core_analyst_010_privileged_view", _BLOCK_PRIVILEGED_VIEW),
