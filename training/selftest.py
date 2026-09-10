@@ -2017,7 +2017,7 @@ def t1_pure() -> str:
     )
     extra_lines = extra_dump.split("\n")
     assert "[core_player_500_note]" in extra_lines
-    assert extra_dump.index("[core_player_110_search_tool]") < extra_dump.index(
+    assert extra_dump.index("[core_player_090_aim_tolerance]") < extra_dump.index(
         "[core_player_500_note]"
     )
     from agent.memory import _is_agent_written_core_tip

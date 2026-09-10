@@ -142,25 +142,11 @@ _BLOCK_HOW_TO_PLAY = _block_how_to_play(
 )
 
 _BLOCK_NOTEPAD = (
-    "YOUR NOTEPAD: you have a small notepad that persists for THIS game "
-    "session only. To save a note, write a line of this exact form in your "
-    "reply, BEFORE your move token:\n"
-    "[REMEMBER key: short note]\n"
-    "  - 'key' is one short word (letters, digits, underscores); the note is "
-    "free text on one line (avoid ']' inside it).\n"
-    "  - Every saved note is shown back to you on EVERY future turn in the "
-    "'Your notepad' section.\n"
-    "  - Saving with a key you already used OVERWRITES that note. That is how "
-    "you change your mind on the record.\n"
-    "  - Anything written after your move token is LOST -- the move ends your "
-    "turn. Save first, then move.\n"
-    "Your notepad is the only memory that reliably survives between turns; "
-    "older messages scroll away. If a fact matters for future moves, save it. "
-    "But write a [REMEMBER] line ONLY when it CHANGES the notepad -- a first "
-    "save, or a genuine update. The notepad is shown back to you every turn; "
-    "re-saving a note that already says the same thing does nothing, clutters "
-    "your reply, and is graded as a mistake. Most turns need NO [REMEMBER] "
-    "line at all."
+    "YOUR NOTEPAD (this session only): '[REMEMBER key: short note]' BEFORE "
+    "your move token (text after it is LOST); same key overwrites; notes "
+    "are shown back every turn and are your only surviving memory. Write "
+    "one ONLY when it changes the notepad -- re-saving the same thing is "
+    "a graded mistake; most turns need none."
 )
 
 def _block_current_screen(target: str) -> str:
@@ -182,15 +168,10 @@ def _block_aim_tolerance(target: str) -> str:
     that prompt's reviewer, so player and judge always share one wording.
     """
     return (
-        "AIM TOLERANCE: it can be hard to tell your exact facing direction from "
-        "the screen, so do not demand pixel-perfect aim. If your best estimate "
-        f"is that {target} lies within about 20 degrees (3 turn steps) of your "
-        f"facing direction, {_TOK_FORWARD} is a good move -- step forward and "
-        "re-assess on the new screen. Inside that band a single fine-tuning "
-        "step like [CLOCK] is also fine play. What wastes moves is a long "
-        f"chain of tiny turns toward a {target} that is clearly off to one "
-        "side or behind you: there, estimate the full count and turn ONCE "
-        "with [CLOCK n]/[ANTICLOCK n]."
+        f"AIM TOLERANCE: if your best estimate puts {target} within about "
+        f"20 degrees (3 turn steps) of your facing direction, {_TOK_FORWARD} "
+        "is a good move -- do not demand pixel-perfect aim; step forward "
+        "and re-assess on the new screen."
     )
 
 
@@ -1161,77 +1142,37 @@ _BLOCK_SCENE_SCOPE = (
 # Shared by the unified scene-play / scene-analyst / debrief prompts.
 
 _BLOCK_MULTI_GOLD_RULES = (
-    "THIS SESSION'S VARIANT RULES: "
-    "this room may contain SEVERAL golds (up to 3), or NONE at all. "
-    "Eating a gold does NOT end the session -- after you eat one, keep "
-    "playing and go for another gold if any remain. The boundary walls "
-    "may have an OPENING (a gap leading out of the room); if the room "
-    "has no gold left, or never had any, your goal is to find the "
-    "opening and walk out through it. Gold and openings are two "
-    "different objectives: a gold is a yellow circle you eat; an "
-    "opening is a gap in a wall you walk through. Never describe an "
-    "opening as gold, and never chase an opening while gold remains."
+    "THIS SESSION'S VARIANT RULES: this room may hold up to 3 golds, "
+    "or none. Eating a gold does NOT end the session -- go for another "
+    "while any remain. With no gold left, your goal is the OPENING "
+    "(a gap in a boundary wall): walk out through it. Never describe "
+    "an opening as gold; never chase an opening while gold remains."
 )
 
 _BLOCK_TARGET_COMMIT = (
-    "PICK ONE TARGET AND COMMIT: your notepad's 'target' note is the "
-    "thing you are chasing this turn. There are two kinds, and they "
-    "are not interchangeable -- name the kind in the note:\n"
-    "  - a GOLD (a yellow circle), while any gold remains;\n"
-    "  - an OPENING / EXIT (a gap in a wall), only when no gold remains.\n"
-    "When more than one gold is visible, choose exactly ONE of them to "
-    "eat first -- for example 'the left one' (the leftmost gold on "
-    "screen), 'the right one', or 'the near one' (closest to you). Save "
-    "your choice in your notepad under the key 'target':\n"
-    "[REMEMBER target: the left gold, near the top wall]\n"
-    "Your notepad shows your current target every turn. Pursue THAT "
-    "target and do NOT switch mid-chase, even if another gold briefly "
-    "looks closer.\n"
-    "WHEN to write a [REMEMBER target: ...] line -- in exactly these "
-    "three situations:\n"
-    "  - your notepad has NO 'target' note and a gold or an opening is "
-    "visible: pick one and save it. That is your FIRST job that turn.\n"
-    "  - the Board update says a gold was EATEN. The eaten gold is "
-    "usually your target: check the screen, and if the gold your note "
-    "describes is gone, save a NEW target -- another gold if any remain, "
-    "otherwise an opening (see WHEN THE ROOM HAS NO GOLD).\n"
-    "  - your saved target has disappeared from the screen for any other "
-    "reason: same rule -- golds first, then an opening; if the room is "
-    "sealed and empty, follow ENDING THE SESSION.\n"
-    "WHEN NOT to write one -- every other turn. While you are still "
-    "chasing the target your notepad already names, just chase it: no "
-    "[REMEMBER] line. Re-saving the target you already have, even in "
-    "different words, is a real mistake -- it shows you did not read "
-    "your own notepad, and the analyst grades it DOWN. On a normal "
-    "chasing turn your reply is observation, reasoning, move -- nothing "
-    "else."
+    "PICK ONE TARGET AND COMMIT: the notepad's 'target' note is what "
+    "you chase -- a GOLD while any remains, an OPENING/EXIT only when "
+    "none does; name the kind. Several golds: pick exactly ONE ('the "
+    "left one', 'the near one'), save [REMEMBER target: the left gold, "
+    "near the top wall], and do not switch mid-chase. Save a target "
+    "line only when (1) there is no 'target' note yet, (2) the Board "
+    "update says a gold was eaten and yours is gone, or (3) your "
+    "target otherwise vanished -- pick golds first, else an opening. "
+    "All other turns: no [REMEMBER]; observation, reasoning, move."
 )
 
 _BLOCK_NO_GOLD_EXPLORE = (
-    "WHEN THE ROOM HAS NO GOLD: your objective has changed. You are "
-    "no longer chasing gold -- there is none. Do not wander. Scan the "
-    "boundary walls for an opening -- a visible gap in one of the four "
-    "walls, also called an exit -- and save it as your target:\n"
-    "[REMEMBER target: the opening in the right wall]\n"
-    "Name it an opening or an exit in OBS, in reasoning, and in the "
-    "notepad. Never call it 'the gold'. Then aim at it the usual way: "
-    "ONE counted turn ([CLOCK n]/[ANTICLOCK n]) to put the opening "
-    f"roughly dead ahead, then {_TOK_FORWARD} until you walk out "
-    "through it."
+    "WHEN THE ROOM HAS NO GOLD: scan the four walls, save the opening "
+    "as your target, call it an opening -- never 'the gold' -- one "
+    f"counted turn to aim, then {_TOK_FORWARD} until you walk out."
 )
 
 _BLOCK_END_GAME = (
-    "ENDING THE SESSION: you have one extra move in this variant: "
-    f"{_TOK_END_GAME}. Emit it exactly like a move token. Use it in "
-    "exactly two situations:\n"
-    "  - the room has NO gold left AND NO opening in any wall: there "
-    "is nothing left to do. Save [REMEMBER target: none -- room is "
-    f"sealed and empty] and emit {_TOK_END_GAME}.\n"
-    "  - the question you were given EXPLICITLY asks you to end the "
-    f"game: emit {_TOK_END_GAME} regardless of what is on the board.\n"
-    "Do NOT end the session while a gold or an opening remains and "
-    "nobody asked you to stop -- finishing the job matters more than "
-    "finishing quickly."
+    f"ENDING THE SESSION: {_TOK_END_GAME} is an extra move token for "
+    "exactly two cases: no gold AND no opening remain (save "
+    "[REMEMBER target: none -- room is sealed and empty], then emit "
+    "it), or the question explicitly asks you to end the game. Never "
+    "end early otherwise."
 )
 
 _BLOCK_TARGET_GRADING = (
@@ -1440,15 +1381,12 @@ ROLE_DEBRIEF = (
 CORE_PLAYER_TIPS: list[tuple[str, str]] = [
     ("core_player_010_multi_gold_rules", _BLOCK_MULTI_GOLD_RULES),
     ("core_player_020_move_tokens", _BLOCK_MOVE_TOKENS),
-    ("core_player_030_scene_scope", _BLOCK_SCENE_SCOPE),
     ("core_player_040_how_to_play", _BLOCK_HOW_TO_PLAY),
     ("core_player_050_notepad", _BLOCK_NOTEPAD),
     ("core_player_060_target_commit", _BLOCK_TARGET_COMMIT),
     ("core_player_070_no_gold_explore", _BLOCK_NO_GOLD_EXPLORE),
     ("core_player_080_end_game", _BLOCK_END_GAME),
     ("core_player_090_aim_tolerance", _BLOCK_AIM_TOLERANCE),
-    ("core_player_100_current_screen", _BLOCK_CURRENT_SCREEN),
-    ("core_player_110_search_tool", _search_tool_block(_SEARCH_SCOPE_PLAY)),
 ]
 CORE_ANALYST_TIPS: list[tuple[str, str]] = [
     ("core_analyst_010_privileged_view", _BLOCK_PRIVILEGED_VIEW),
