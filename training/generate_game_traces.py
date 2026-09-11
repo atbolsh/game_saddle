@@ -1234,10 +1234,10 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
                 "NAMS hygiene: run-start reset deleted %d episodic "
                 "node(s): %s", sum(deleted.values()), deleted,
             )
-        # Core-tip healing is reset-only (reset_memory_to_seed above).
-        # load_scene_prompts is read-only, so concurrent workers cannot
-        # race on first-run Preference inserts.
-        # sessions[0]._run(mem.ensure_core_tips(sessions[0].client))
+        # Core-tip healing also runs inside load_scene_prompts (session
+        # init, sequential) so a checkout that changed the seed *set*
+        # cannot fail the strict read before this reset. Reset still
+        # re-heals after the episodic wipe. Workers do not race inserts.
         for s in sessions:
             s.restart()
         fresh = [True] * n_workers

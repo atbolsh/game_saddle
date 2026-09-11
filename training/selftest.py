@@ -2020,12 +2020,23 @@ def t1_pure() -> str:
     assert extra_dump.index("[core_player_090_aim_tolerance]") < extra_dump.index(
         "[core_player_500_note]"
     )
-    from agent.memory import _is_agent_written_core_tip
+    from agent.memory import (
+        _is_agent_written_core_tip, _unexpected_core_tip_categories,
+    )
     assert _is_agent_written_core_tip("core_player_", "core_player_500_note")
     assert _is_agent_written_core_tip("core_analyst_", "core_analyst_500_note")
     assert not _is_agent_written_core_tip("core_player_", "core_player_110_search_tool")
     assert not _is_agent_written_core_tip("core_player_", "core_analyst_500_note")
     assert not _is_agent_written_core_tip("core_player_", "tip_learned_1")
+    assert _unexpected_core_tip_categories(
+        "core_player_",
+        {"core_player_010_x"},
+        {
+            "core_player_010_x",
+            "core_player_030_scene_scope",
+            "core_player_500_note",
+        },
+    ) == ["core_player_030_scene_scope"]
     checks += 1
 
     analyst_cats = {c for c, _ in modes.CORE_ANALYST_TIPS}

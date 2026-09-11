@@ -854,10 +854,16 @@ async def ensure_core_tips(client: Any) -> dict[str, int]:
     Analyst seed text is stored with :func:`tag_analyst_text` applied.
     Seed text that already contains :data:`ANALYST_TAG` raises -- the
     tag is a storage marker, not prompt prose.
+
+    Leftover seed-range (``<500``) categories that are not in the
+    running code seed are deleted -- a branch that drops or renames
+    tip rows must not leave the previous set in NAMS, or
+    :func:`get_core_tips` fails the strict set check. Well-formed
+    500+ extras stay.
     """
     from . import modes  # local: modes imports this module at top level
 
-    added = healed = unchanged = 0
+    added = healed = unchanged = removed = 0
     for category, text in modes.CORE_PLAYER_TIPS:
         if ANALYST_TAG in text:
             raise RuntimeError(
@@ -886,11 +892,27 @@ async def ensure_core_tips(client: Any) -> dict[str, int]:
             healed += 1
         else:
             unchanged += 1
+    for prefix in ("core_player_", "core_analyst_"):
+        expected = {c for c, _ in _core_tip_seed_for_prefix(prefix)}
+        found = set(await _core_tip_categories(client, prefix))
+        for cat in _unexpected_core_tip_categories(prefix, expected, found):
+            await client.graph.execute_write(
+                "MATCH (p:Preference {category: $cat}) DETACH DELETE p",
+                {"cat": cat},
+            )
+            logger.warning(
+                "core tip %s is not in the running code seed; deleted",
+                cat,
+            )
+            removed += 1
     logger.info(
-        "ensure_core_tips: added=%d healed=%d unchanged=%d",
-        added, healed, unchanged,
+        "ensure_core_tips: added=%d healed=%d unchanged=%d removed=%d",
+        added, healed, unchanged, removed,
     )
-    return {"added": added, "healed": healed, "unchanged": unchanged}
+    return {
+        "added": added, "healed": healed, "unchanged": unchanged,
+        "removed": removed,
+    }
 
 
 # Category shape shared with t1: core_(player|analyst)_NNN_slug, NNN zero-padded.
@@ -911,6 +933,31 @@ def _is_agent_written_core_tip(prefix: str, category: str) -> bool:
     if not category.startswith(prefix):
         return False
     return int(m.group(2)) >= 500
+
+
+def _unexpected_core_tip_categories(
+    prefix: str, expected: set[str], found: set[str],
+) -> list[str]:
+    """Categories in ``found`` that are not the code seed and not a
+    well-formed 500+ extra. Same set ``get_core_tips`` rejects."""
+    return sorted(
+        cat for cat in found - expected
+        if not _is_agent_written_core_tip(prefix, cat)
+    )
+
+
+async def _core_tip_categories(client: Any, prefix: str) -> list[str]:
+    rows = await client.query.cypher(
+        "MATCH (p:Preference) WHERE p.category STARTS WITH $prefix "
+        "RETURN p.category AS category",
+        {"prefix": prefix},
+    ) or []
+    cats: list[str] = []
+    for r in rows:
+        cat = dict(r).get("category")
+        if cat:
+            cats.append(cat)
+    return cats
 
 
 async def get_core_tips(client: Any, prefix: str) -> dict[str, str]:
@@ -948,9 +995,8 @@ async def get_core_tips(client: Any, prefix: str) -> dict[str, str]:
             )
         found[cat] = pref
     missing = sorted(expected - set(found))
-    unexpected = sorted(
-        cat for cat in set(found) - expected
-        if not _is_agent_written_core_tip(prefix, cat)
+    unexpected = _unexpected_core_tip_categories(
+        prefix, expected, set(found),
     )
     if dupes or missing or unexpected:
         raise RuntimeError(
@@ -1286,11 +1332,12 @@ async def build_semantic_model(client: Any) -> dict[str, int]:
 
     logger.info(
         "Seeded semantic model: %d entities, %d preferences, %d relationships, "
-        "core tips added=%d healed=%d unchanged=%d.",
+        "core tips added=%d healed=%d unchanged=%d removed=%d.",
         n_ent, n_pref, n_rel,
         core_counts.get("added", 0),
         core_counts.get("healed", 0),
         core_counts.get("unchanged", 0),
+        core_counts.get("removed", 0),
     )
     return {
         "entities": n_ent, "preferences": n_pref, "relationships": n_rel,

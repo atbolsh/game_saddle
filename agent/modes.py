@@ -1438,12 +1438,13 @@ async def load_scene_prompts(client: Any) -> dict[str, str]:
     """Read core-tip Preference rows and assemble the three scene system
     prompts as role + labeled NAMS dump.
     """
-    # Healing belongs at seed / reset_memory_to_seed, not here: this
-    # path is read-only so the dump is whatever NAMS holds at this
-    # moment (including any future agent-written 500+ rows). If a later
-    # agent becomes over-eager at editing tip nodes, restore the line
-    # below so load-time reconcile can overwrite drift again.
-    # await mem.ensure_core_tips(client)
+    # Reconcile first: session __init__ loads prompts BEFORE the
+    # datagen run-start reset, and Preference rows survive that reset.
+    # A branch that drops or renames seed categories would otherwise
+    # fail get_core_tips' strict set check against the previous
+    # checkout's rows. 500+ extras are kept; seed text is healed to
+    # the running code (code is source of truth).
+    await mem.ensure_core_tips(client)
     player = await mem.get_core_tips(client, "core_player_")
     analyst = await mem.get_core_tips(client, "core_analyst_")
     return {
