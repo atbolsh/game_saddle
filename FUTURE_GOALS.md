@@ -336,7 +336,7 @@ When picked up:
   has Settings/oracle, WRONG/RATING on the span, traces become the
   rows. Unverified NER nodes must not become CE/KD data.
 
-## 13. Train VRAM / wall-clock, and context distillation — *Not started*
+## 13. Train VRAM / wall-clock, and context distillation — *In progress*
 
 The 2026-08-27/28 weekends showed the current recipe is **unsupportable**
 as a default: counted-turn datagen at `--parallel 6` ran ~63 gens/h
@@ -378,6 +378,12 @@ scored when it is long:
 
 ### Context distillation (keep behavior, drop bulk)
 
+This is the same item that used to be called **prompt swallowing** —
+behavior stays, bulk context goes. **In progress (2026-09-12):**
+`training/context_distill.py` + `scripts/distill_prep.py` run a 2-epoch
+hard-CE clone (player + analyst traces, plus the analyst KD leash) from
+`aug27_big_step_iter1_step313`. First labeled run: `sep12_frankenstein`.
+
 Datagen time is dominated by **prefill T** (analyst contexts ~8k tokens)
 and 50-round games, not by “the model is thinking harder.” Context
 distillation means the **protocol stays** (move tokens, REMEMBER, ratings)
@@ -399,6 +405,30 @@ adapter has already internalized.
 * Parallel: T²-ish prefill. Counted-turn prompts already forced p8 → p6
   on 96 GiB. Distill first, then re-measure parallel; do not guess T
   from char length.
+
+### Additional experiments for distillation efficiency
+
+The first distill recipe reused the weekend RL pair (`lr=1e-5`,
+`max_grad_norm=0.1`). Distill is uniform hard CE (`example_weight=1.0`,
+no span weights, no unlikelihood). The 0.1 clip exists so a noisy
+**reward** batch cannot spike an update (2026-08-05; was 1.0). That
+path is not in this mix.
+
+On `sep12_frankenstein` the logged `grad_norm` sat at **15–35** every
+step — clip-saturated. `clip_grad_norm_` records the unclipped global
+L2, then scales the update to 0.1. Two-digit values are expected under
+a 0.1 cap (~181M LoRA params, RMS ~0.002); they are not a blow-up.
+Raising the cap to 1.0 at the same `1e-5` is ~**10×** the current
+update, not “switch to the SFT default.”
+
+After the in-flight run finishes (do not retune mid-epoch), ablate:
+
+* weekend pair: `3e-6` + clip 0.1
+* hard-CE pair: clip **1.0** with a still-low LR (`3e-6` or `1e-5`)
+* do **not** return to `1e-4` (aug4 drift)
+
+Score by held-out CE, analyst gate, and smoke / drama / gens-per-hour —
+not by whether pre-clip L2 looks small.
 
 ### Stale semantic seed prefs (not the scene prompt)
 
