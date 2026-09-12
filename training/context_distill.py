@@ -62,6 +62,16 @@ DEFAULT_SMOKE_SEED = 20260910
 DEFAULT_LR = 1e-5
 DEFAULT_EPOCHS = 2
 
+#: CE fence (player + analyst clone). 8192 dropped 2351/2924 analyst-CE
+#: rows on the frankenstein corpus -- the long TARGET/WRONG writeups.
+#: 12288 is the old analyst cap; it OOMed only as KD at B=4 / T~12k
+#: (94.8 GiB). Fused CE does not build [T x 262k], so 12k CE on 96 GiB
+#: is the safe "keep the analyses" number.
+DISTILL_CE_TOKEN_CAP = 12288
+#: KD leash stays at the weekend fence. AnalystTraceSource already
+#: batch_cap=2; do not feed it 12k rows.
+DISTILL_KD_TOKEN_CAP = 8192
+
 
 class DistillTraceSource(_TraceFileSource):
     """Plain-CE clone of every record in a (usually preprocessed) trace file.
@@ -183,8 +193,8 @@ def train_one_epoch(
         epochs=1,
         lr=lr,
         resume_checkpoint=resume,
-        max_example_tokens=8192,
-        max_example_tokens_analyst=8192,
+        max_example_tokens=DISTILL_CE_TOKEN_CAP,
+        max_example_tokens_analyst=DISTILL_KD_TOKEN_CAP,
     )
     return run_training(sources, cfg, extra_hooks=hooks, extra_guards=guards)
 
