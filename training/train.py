@@ -124,10 +124,16 @@ generate, not just score.
 LOGGING. ``logs/train_<label>_<stamp>/``: config.json (resolved config +
 seed + git rev + discovered LoRA target modules), train_log.jsonl + .txt
 (per-step loss, per-source loss, LR, grad norm), events.jsonl (saves, evals,
-rollbacks), and eval_log.jsonl -- ONE FLAT ROW PER EVALUATION with every
+rollbacks), eval_log.jsonl -- ONE FLAT ROW PER EVALUATION with every
 metric (each source's held-out loss, each probe accuracy) as its own key,
 so plotting any metric over training is a one-liner
-(``pandas.read_json(..., lines=True)``).
+(``pandas.read_json(..., lines=True)``) -- plus three crash-forensics
+files flushed and fsynced on every write so a SIGKILL still leaves the
+last successful record: ``heartbeat.json`` (the in-flight micro-batch:
+sources, token lengths, packed B/T, GPU MiB), ``last_step.json`` (every
+optimizer step, not every ``log_steps``), and ``crash.txt`` (traceback
+when Python lives long enough to raise). Non-finite loss or grad_norm
+aborts with a ``nonfinite_*`` event; they are not a silent continue.
 
 NOTE (remote-environment rule): this file cannot be executed on the local
 editing box (no torch/transformers/GPU). The default ``--projector-module``
@@ -170,6 +176,7 @@ import os
 import random
 import subprocess
 import sys
+import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -470,10 +477,15 @@ class TrainConfig:
 
 class TrainLogger:
     """One run directory under logs/: config.json, train_log.{jsonl,txt},
-    events.jsonl, eval_log.jsonl. Same spirit as agent.run_logging:
-    machine-readable + human-readable, and logging failures must never kill
-    a run that is burning GPU-hours (they degrade to a one-time console
-    warning)."""
+    events.jsonl, eval_log.jsonl, heartbeat.json, last_step.json,
+    crash.txt. Same spirit as agent.run_logging: machine-readable +
+    human-readable, and logging failures must never kill a run that is
+    burning GPU-hours (they degrade to a one-time console warning).
+
+    Appends fsync. ``heartbeat.json`` / ``last_step.json`` are replaced
+    atomically so a mid-write kill cannot leave a truncated file as the
+    only forensic record.
+    """
 
     def __init__(self, label: str, base_dir: str | Path = "logs"):
         stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -483,13 +495,36 @@ class TrainLogger:
         self.txt = self.run_dir / "train_log.txt"
         self.events = self.run_dir / "events.jsonl"
         self.eval_jsonl = self.run_dir / "eval_log.jsonl"
+        self.heartbeat_path = self.run_dir / "heartbeat.json"
+        self.last_step_path = self.run_dir / "last_step.json"
+        self.crash_path = self.run_dir / "crash.txt"
         self._warned = False
 
     def _append(self, path: Path, text: str) -> None:
         try:
             with open(path, "a", encoding="utf-8") as f:
                 f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
         except Exception as exc:  # logging must not break training
+            if not self._warned:
+                self._warned = True
+                print(f"[train] logging disabled after write failure: {exc}")
+
+    def _write_json(self, path: Path, obj: dict) -> None:
+        try:
+            payload = json.dumps(
+                {"ts": datetime.datetime.now().isoformat(timespec="seconds"),
+                 **obj},
+                default=str,
+            )
+            tmp = path.with_name(path.name + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp.replace(path)
+        except Exception as exc:
             if not self._warned:
                 self._warned = True
                 print(f"[train] logging disabled after write failure: {exc}")
@@ -501,6 +536,30 @@ class TrainLogger:
             )
         except Exception as exc:
             print(f"[train] could not write config.json: {exc}")
+
+    def heartbeat(self, record: dict) -> None:
+        """In-flight micro-batch. Overwritten every forward; last write
+        is whichever batch was running when the process died."""
+        self._write_json(self.heartbeat_path, record)
+
+    def last_step(self, record: dict) -> None:
+        """Every optimizer step (not gated on ``log_steps``)."""
+        self._write_json(self.last_step_path, record)
+
+    def record_crash(self, exc: BaseException, **fields: Any) -> None:
+        """Persist the traceback, then the caller re-raises."""
+        tb = traceback.format_exc()
+        self.event("crash", type=type(exc).__name__, msg=str(exc), **fields)
+        try:
+            with open(self.crash_path, "w", encoding="utf-8") as f:
+                f.write(tb)
+                if fields:
+                    f.write("\nfields: "
+                            + json.dumps(fields, default=str) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception:
+            print(tb, file=sys.stderr)
 
     def step(self, record: dict) -> None:
         record = {"ts": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -531,6 +590,75 @@ class TrainLogger:
         self._append(self.txt, f"== {kind}: "
                      + json.dumps(fields, default=str) + "\n")
         logger.info("event %s: %s", kind, fields)
+
+
+def _nvidia_smi_used_mi() -> int | None:
+    """Topline used-MiB summed over GPUs. None if nvidia-smi is unusable."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode != 0:
+            return None
+        return sum(int(line.strip())
+                   for line in out.stdout.splitlines() if line.strip())
+    except Exception:
+        return None
+
+
+def _gpu_mem_snapshot() -> dict[str, Any]:
+    """Allocator view + nvidia-smi topline. Must never raise."""
+    snap: dict[str, Any] = {}
+    smi = _nvidia_smi_used_mi()
+    if smi is not None:
+        snap["nvidia_smi_used_mi"] = smi
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            snap["cuda"] = False
+            return snap
+        i = torch.cuda.current_device()
+        free, total = torch.cuda.mem_get_info(i)
+        snap.update({
+            "cuda": True,
+            "device": int(i),
+            "allocated_mi": round(torch.cuda.memory_allocated(i) / 1024**2, 1),
+            "reserved_mi": round(torch.cuda.memory_reserved(i) / 1024**2, 1),
+            "free_mi": round(free / 1024**2, 1),
+            "total_mi": round(total / 1024**2, 1),
+        })
+    except Exception as exc:
+        snap["cuda_error"] = str(exc)
+    return snap
+
+
+def _batch_diag(exs: list[TrainingExample],
+                built: dict[str, Any] | None = None) -> dict[str, Any]:
+    """What was on the GPU when we died -- sources, lengths, packed shape."""
+    rows = [{
+        "source": ex.source,
+        "loss": ex.loss,
+        "n_tokens": ex.n_tokens,
+        "prefix_n_tokens": ex.prefix_n_tokens,
+        "batch_cap": ex.batch_cap,
+        "example_weight": ex.example_weight,
+        "has_image": ex.declares_image(),
+    } for ex in exs]
+    out: dict[str, Any] = {
+        "n": len(exs),
+        "loss_kind": exs[0].loss if exs else None,
+        "max_n_tokens": max((ex.n_tokens for ex in exs), default=0),
+        "sum_n_tokens": sum(ex.n_tokens for ex in exs),
+        "examples": rows,
+    }
+    if built is not None:
+        ids = built.get("model_inputs", {}).get("input_ids")
+        if ids is not None:
+            out["packed_B"] = int(ids.shape[0])
+            out["packed_T"] = int(ids.shape[1])
+    return out
 
 
 def _git_rev() -> str:
@@ -2313,6 +2441,16 @@ def run_training(
             optimizer.zero_grad(set_to_none=True)
             for i, exs in enumerate(batches):
                 built = collator.build_batch(exs)
+                batch_diag = _batch_diag(exs, built)
+                tlog.heartbeat({
+                    "phase": "pre_forward",
+                    "step_completed": step,
+                    "epoch": epoch,
+                    "microbatch": i,
+                    "n_microbatches": len(batches),
+                    "batch": batch_diag,
+                    "gpu": _gpu_mem_snapshot(),
+                })
                 # weighted_loss means over the batch's per-example
                 # normalized losses scaled by each example's reward
                 # (example_weight; SHAPE VS SCALE in its docstring), so
@@ -2329,16 +2467,44 @@ def run_training(
                     prefix_hash=exs[0].prefix_hash,
                     kd_chunk=cfg.kd_lm_head_chunk,
                 )
+                loss_f = float(loss.detach())
+                per_ex = per_example.detach()
+                if not math.isfinite(loss_f) or not bool(torch.isfinite(per_ex).all()):
+                    tlog.event(
+                        "nonfinite_loss", step_completed=step, epoch=epoch,
+                        microbatch=i, loss=loss_f,
+                        per_example=per_ex.tolist(),
+                        batch=batch_diag, gpu=_gpu_mem_snapshot(),
+                    )
+                    raise RuntimeError(
+                        f"non-finite loss {loss_f} at epoch {epoch} "
+                        f"microbatch {i} (completed optimizer steps "
+                        f"{step}); sources="
+                        f"{[ex.source for ex in exs]} "
+                        f"n_tokens={[ex.n_tokens for ex in exs]}"
+                    )
                 (loss / cfg.grad_accum).backward()
-                scaled_loss_sum += float(loss.detach())
+                scaled_loss_sum += loss_f
                 scaled_loss_n += 1
-                for ex, lv in zip(exs, per_example.tolist()):
+                for ex, lv in zip(exs, per_ex.tolist()):
                     src_loss_sum[ex.source] = src_loss_sum.get(ex.source, 0.0) + lv
                     src_loss_n[ex.source] = src_loss_n.get(ex.source, 0) + 1
 
                 if (i + 1) % cfg.grad_accum == 0 or i == len(batches) - 1:
                     grad_norm = float(torch.nn.utils.clip_grad_norm_(
                         params, cfg.max_grad_norm))
+                    if not math.isfinite(grad_norm):
+                        tlog.event(
+                            "nonfinite_grad", step_completed=step,
+                            epoch=epoch, microbatch=i,
+                            grad_norm=grad_norm, last_loss=loss_f,
+                            batch=batch_diag, gpu=_gpu_mem_snapshot(),
+                        )
+                        raise RuntimeError(
+                            f"non-finite grad_norm {grad_norm} at "
+                            f"epoch {epoch} microbatch {i} "
+                            f"(completed optimizer steps {step})"
+                        )
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
@@ -2349,6 +2515,14 @@ def run_training(
                             % cfg.prefix_kv_refresh_steps == 0):
                         prefix_state.cache = None
                         prefix_state.key = None
+                    tlog.last_step({
+                        "step": step, "epoch": epoch,
+                        "last_microbatch_loss": loss_f,
+                        "grad_norm": grad_norm,
+                        "lr": scheduler.get_last_lr()[0],
+                        "batch": batch_diag,
+                        "gpu": _gpu_mem_snapshot(),
+                    })
 
                     if step % cfg.log_steps == 0:
                         per_src = {
@@ -2402,6 +2576,14 @@ def run_training(
         # as a normal, early 'done' standing behind last_good_ckpt, so
         # the orchestrator hands the right weights to the next epoch.
         ended_early = f"consecutive rollbacks (hard regression on {exc.args[0]})"
+    except BaseException as exc:
+        tlog.record_crash(
+            exc, step=step,
+            last_good_checkpoint=str(last_good_ckpt),
+            last_checkpoint=str(last_ckpt),
+            gpu=_gpu_mem_snapshot(),
+        )
+        raise
 
     tlog.event("done", steps=step, final_checkpoint=str(last_ckpt),
                last_good_checkpoint=str(last_good_ckpt),

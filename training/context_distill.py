@@ -23,6 +23,14 @@ Per epoch ``e`` (child label ``<label>_e<e>``):
   3. Sealed one-gold smoke (same knobs as the sep10 arms).
 
 State file: ``data_game/<label>_state.json`` (skip-done resume).
+
+Logs (always on disk, nohup not required for persistence):
+
+* ``data_game/<label>_orchestrator.log`` -- parent INFO/ERROR
+* ``data_game/<label>_vram.jsonl`` -- same 1/min ``nvidia-smi`` monitor
+  as ``run_weekend``
+* ``data_game/<label>_stages/<stage>.log`` -- teed child stdout+stderr
+* ``data_game/<label>_stages/<stage>.exit.json`` -- exit / signal
 """
 
 from __future__ import annotations
@@ -33,6 +41,7 @@ import json
 import logging
 import os
 import random
+import signal
 import subprocess
 import sys
 import time
@@ -72,6 +81,12 @@ DISTILL_CE_TOKEN_CAP = 12288
 #: KD leash stays at the weekend fence. AnalystTraceSource already
 #: batch_cap=2; do not feed it 12k rows.
 DISTILL_KD_TOKEN_CAP = 8192
+
+#: Set by orchestrate(); _run_stage tags the VRAM monitor and tees
+#: children under ``data_game/<label>_stages/``.
+_MONITOR = None
+_STAGE_LOG_DIR: Path | None = None
+_LAST_STAGE_REPORT: dict | None = None
 
 
 class DistillTraceSource(_TraceFileSource):
@@ -155,17 +170,139 @@ def _save_state(label: str, state: dict) -> None:
     path.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
+def _attach_orchestrator_log(label: str) -> Path:
+    """Parent file log. Independent of the tty / nohup."""
+    path = DATA_GAME_DIR / f"{label}_orchestrator.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = logging.FileHandler(path, encoding="utf-8")
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s",
+    ))
+    logging.getLogger().addHandler(fh)
+    logger.info("orchestrator log: %s", path)
+    return path
+
+
+def _exit_report(rc: int) -> dict:
+    """Decode subprocess.wait status. Negative rc is -signal."""
+    if rc < 0:
+        sig = -rc
+        try:
+            name = signal.Signals(sig).name
+        except ValueError:
+            name = f"SIG{sig}"
+        return {
+            "exit": rc,
+            "ok": False,
+            "signaled": True,
+            "signal": sig,
+            "signal_name": name,
+            "note": (
+                f"child killed by {name} ({sig}); no Python traceback. "
+                "SIGKILL is the OOM killer or an external kill; "
+                "SIGTERM is pkill/timeout. CUDA OOM is a Python "
+                "exception (exit 1) and does not appear in dmesg."
+            ),
+        }
+    return {
+        "exit": rc,
+        "ok": rc == 0,
+        "signaled": False,
+        "signal": None,
+        "signal_name": None,
+        "note": None if rc == 0 else (
+            "child exited with a process status; the stage .log has "
+            "stdout+stderr (CUDA OOM is typically exit 1 + "
+            "RuntimeError and does not appear in dmesg)."
+        ),
+    }
+
+
 def _run_stage(cmd: list[str], stage: str) -> int:
+    """Run a child, tee stdout+stderr to disk, record exit/signal.
+
+    VRAM monitor is tagged for the duration (same ``VramMonitor`` as
+    ``run_weekend``). ``PYTHONUNBUFFERED=1`` so the child's prints
+    reach the tee before a crash.
+    """
+    global _LAST_STAGE_REPORT
     logger.info("[%s] starting: %s", stage, " ".join(cmd))
+    if _MONITOR is not None:
+        _MONITOR.set_stage(stage)
     t0 = time.perf_counter()
-    proc = subprocess.run(cmd, cwd=REPO_ROOT)
-    hours = (time.perf_counter() - t0) / 3600
-    if proc.returncode == 0:
+    child_log = None
+    if _STAGE_LOG_DIR is not None:
+        _STAGE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        child_log = _STAGE_LOG_DIR / f"{stage}.log"
+        logger.info("[%s] child log: %s", stage, child_log)
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    rc = 1
+    child: subprocess.Popen[str] | None = None
+    try:
+        if child_log is None:
+            proc = subprocess.run(cmd, cwd=REPO_ROOT, env=env)
+            rc = proc.returncode
+        else:
+            header = (
+                f"=== {stage} start "
+                f"{_dt.datetime.now().isoformat(timespec='seconds')}\n"
+                f"cwd={REPO_ROOT}\n"
+                f"cmd={' '.join(cmd)}\n\n"
+            )
+            with open(child_log, "a", encoding="utf-8") as lf:
+                lf.write(header)
+                lf.flush()
+                child = subprocess.Popen(
+                    cmd, cwd=REPO_ROOT, env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                assert child.stdout is not None
+                for line in child.stdout:
+                    lf.write(line)
+                    lf.flush()
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                rc = child.wait()
+    except BaseException:
+        if child is not None and child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                child.kill()
+        raise
+    finally:
+        hours = (time.perf_counter() - t0) / 3600
+        if _MONITOR is not None:
+            _MONITOR.set_stage(None)
+    report = _exit_report(rc)
+    report.update({
+        "stage": stage,
+        "hours": round(hours, 4),
+        "cmd": cmd,
+        "log": str(child_log) if child_log else None,
+    })
+    _LAST_STAGE_REPORT = report
+    if child_log is not None:
+        exit_path = child_log.with_suffix(".exit.json")
+        exit_path.write_text(
+            json.dumps(report, indent=2, default=str), encoding="utf-8",
+        )
+        report["exit_path"] = str(exit_path)
+    if rc == 0:
         logger.info("[%s] finished in %.2fh", stage, hours)
     else:
-        logger.error("[%s] FAILED (exit %d) after %.2fh",
-                     stage, proc.returncode, hours)
-    return proc.returncode
+        logger.error(
+            "[%s] FAILED after %.2fh: exit=%s signaled=%s "
+            "signal=%s log=%s -- %s",
+            stage, hours, report["exit"], report["signaled"],
+            report["signal_name"], report["log"], report["note"],
+        )
+    return rc
 
 
 def train_one_epoch(
@@ -228,6 +365,7 @@ def _train_epoch(e: int, resume: str | None,
         cmd += ["--analyst-anchor", str(args.analyst_anchor)]
     rc = _run_stage(cmd, f"train{e}")
     args.last_train_exit = rc
+    args.last_train_report = _LAST_STAGE_REPORT
     if rc != 0:
         return None
     ckpt = _train_result_checkpoint(child_label)
@@ -310,7 +448,8 @@ def _resolve_analyst_path(
 
 
 def orchestrate(args: argparse.Namespace) -> int:
-    from training.run_weekend import _sweep_noise_dirs
+    global _MONITOR, _STAGE_LOG_DIR
+    from training.run_weekend import VramMonitor
 
     data = Path(args.data)
     if not data.is_file():
@@ -332,6 +471,12 @@ def orchestrate(args: argparse.Namespace) -> int:
     logger.info("analyst CE: %s", args.analyst_data or "skipped")
     logger.info("analyst KD leash: %s", args.analyst_anchor or "skipped")
 
+    _STAGE_LOG_DIR = DATA_GAME_DIR / f"{args.label}_stages"
+    _STAGE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _MONITOR = VramMonitor(args.label)
+    logger.info("VRAM trace: %s (1/min nvidia-smi, same as weekend)",
+                _MONITOR.path)
+
     state = _load_state(args.label)
     state.setdefault("done", [])
     state.setdefault("checkpoints", {})
@@ -345,11 +490,28 @@ def orchestrate(args: argparse.Namespace) -> int:
     state["analyst_kd"] = (
         str(args.analyst_anchor) if args.analyst_anchor else None
     )
+    state["orchestrator_log"] = str(
+        DATA_GAME_DIR / f"{args.label}_orchestrator.log"
+    )
+    state["vram_trace"] = str(_MONITOR.path)
+    state["stage_logs"] = str(_STAGE_LOG_DIR)
     _save_state(args.label, state)
     logger.info("state file: %s", _state_path(args.label))
 
     resume = args.checkpoint
     failures = 0
+    try:
+        return _orchestrate_epochs(args, state, resume, failures)
+    finally:
+        if _MONITOR is not None:
+            _MONITOR.finish()
+            _MONITOR = None
+
+
+def _orchestrate_epochs(
+    args: argparse.Namespace, state: dict, resume: str, failures: int,
+) -> int:
+    from training.run_weekend import _sweep_noise_dirs
 
     for e in range(1, args.epochs + 1):
         logger.info("=== distill epoch %d/%d (resume %r) ===",
@@ -374,18 +536,26 @@ def orchestrate(args: argparse.Namespace) -> int:
                 state["checkpoints"].pop(str(e), None)
                 _save_state(args.label, state)
             ckpt = _train_epoch(e, resume, args)
+            state["last_child"] = getattr(args, "last_train_report", None)
             if not ckpt:
                 failures += 1
+                report = getattr(args, "last_train_report", None)
                 state["phase"] = f"train{e}_failed"
                 state["last_train_exit"] = getattr(args, "last_train_exit", None)
+                state["last_child"] = report
                 _save_state(args.label, state)
                 logger.error(
-                    "STOPPING: train%d produced no checkpoint. The "
-                    "child died or left no last_good_checkpoint. Do not "
-                    "advance to the next epoch. Inspect "
-                    "logs/train_%s_e%d_*/ (train_log.txt, events.jsonl) "
-                    "and the parent stderr for the exit.",
-                    e, args.label, e,
+                    "STOPPING: train%d produced no checkpoint. "
+                    "exit=%s signal=%s. Inspect: %s ; "
+                    "logs/train_%s_e%d_*/{heartbeat.json,last_step.json,"
+                    "crash.txt,events.jsonl,train_log.txt} ; "
+                    "%s_vram.jsonl",
+                    e,
+                    (report or {}).get("exit"),
+                    (report or {}).get("signal_name"),
+                    (report or {}).get("log"),
+                    args.label, e,
+                    args.label,
                 )
                 return failures
             state["done"].append(f"train{e}")
@@ -507,6 +677,8 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     args = build_parser().parse_args(argv)
+    if args.train_epoch is None:
+        _attach_orchestrator_log(args.label)
     if args.train_epoch is not None:
         if not args.checkpoint:
             raise SystemExit("--train-epoch requires --checkpoint")

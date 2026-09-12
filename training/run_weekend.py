@@ -120,6 +120,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import random
 import secrets
 import shutil
@@ -225,6 +226,8 @@ class VramMonitor:
                             "t": round(time.time(), 1),
                             "stage": stage, "mib": mib,
                         }) + "\n")
+                        f.flush()
+                        os.fsync(f.fileno())
                 except OSError as exc:
                     self._file_dead = True
                     logger.warning("VRAM trace file %s unwritable (%s) -- "
