@@ -336,7 +336,7 @@ When picked up:
   has Settings/oracle, WRONG/RATING on the span, traces become the
   rows. Unverified NER nodes must not become CE/KD data.
 
-## 13. Train VRAM / wall-clock, and swallowing prompts — *Not started*
+## 13. Train VRAM / wall-clock, and context distillation — *Not started*
 
 The 2026-08-27/28 weekends showed the current recipe is **unsupportable**
 as a default: counted-turn datagen at `--parallel 6` ran ~63 gens/h
@@ -376,12 +376,12 @@ scored when it is long:
 * Leave QLoRA + 8-bit Adam + `micro_batch_cap=1` on OT; those already
   shrank weights. The leftover is lm_head × long reply.
 
-### Prompt swallowing (keep behavior, drop bulk)
+### Context distillation (keep behavior, drop bulk)
 
 Datagen time is dominated by **prefill T** (analyst contexts ~8k tokens)
-and 50-round games, not by “the model is thinking harder.” Swallowing
-means the **protocol stays** (move tokens, REMEMBER, ratings) while the
-**repeated prose** shrinks — tips, NAMS dumps, and board text the
+and 50-round games, not by “the model is thinking harder.” Context
+distillation means the **protocol stays** (move tokens, REMEMBER, ratings)
+while the **repeated prose** shrinks — tips, NAMS dumps, and board text the
 adapter has already internalized.
 
 * Compose from the existing `_BLOCK_*` constants; do not fork copies
@@ -394,10 +394,10 @@ adapter has already internalized.
   `input_ids.shape[1]`), including image soft tokens. Character count
   and `chars // 32` buckets do not predict T or VRAM.
 * A shorter prompt that changes move-token or grading behavior is a
-  failed swallow. Check drama rates (`training/test_drama.py`) and
+  failed distillation. Check drama rates (`training/test_drama.py`) and
   `oracle verdicts` after a cut, not just gens/hour.
 * Parallel: T²-ish prefill. Counted-turn prompts already forced p8 → p6
-  on 96 GiB. Swallow first, then re-measure parallel; do not guess T
+  on 96 GiB. Distill first, then re-measure parallel; do not guess T
   from char length.
 
 ### Stale semantic seed prefs (not the scene prompt)
@@ -426,7 +426,8 @@ a counted-turn system prompt. Privileged dumps include the row every
 time. That is inconsistency in memory, not a second un-updated copy of
 `modes.py`.
 
-When swallowing prompts, rewrite those seed strings to match the current
-protocol (or delete `controls` if `_BLOCK_MOVE_TOKENS` already covers
-it). Healing `core_*` from `modes.py` does not touch this list. Do not
-treat "prompts updated" as "every Preference in the graph is current."
+When distilling context into a shorter prompt, rewrite those seed strings
+to match the current protocol (or delete `controls` if `_BLOCK_MOVE_TOKENS`
+already covers it). Healing `core_*` from `modes.py` does not touch this
+list. Do not treat "prompts updated" as "every Preference in the graph is
+current."
