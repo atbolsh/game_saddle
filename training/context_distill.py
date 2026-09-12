@@ -14,9 +14,10 @@ share one.
 
 Per epoch ``e`` (child label ``<label>_e<e>``):
 
-  1. Train child: ``DistillTraceSource`` (plain CE, uniform weight 1.0,
-     rating-null kept) + optional ``AnalystTraceSource`` KD anchor.
-     Final save is the epoch checkpoint, unconditional, before gate/smoke.
+  1. Train child: player CE + analyst CE (clone the recorded analyses)
+     + the usual ``AnalystTraceSource`` KD leash (~150/epoch vs frozen
+     base). Final save is the epoch checkpoint, unconditional, before
+     gate/smoke.
   2. Analyst gate on that checkpoint. Fail does NOT skip smoke and does
      NOT stop the loop unless ``--stop-on-gate-fail``.
   3. Sealed one-gold smoke (same knobs as the sep10 arms).
@@ -27,8 +28,10 @@ State file: ``data_game/<label>_state.json`` (skip-done resume).
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import json
 import logging
+import os
 import random
 import subprocess
 import sys
@@ -66,6 +69,11 @@ class DistillTraceSource(_TraceFileSource):
     Uniform ``example_weight=1.0``, no span weights, no reward machinery.
     Records with ``rating: null`` are KEPT -- rating is irrelevant here.
     Standard noised-frame handling is inherited from ``_TraceFileSource``.
+
+    ``name`` defaults to ``distill_<stem>`` so player
+    (``traces_distill``) and analyst (``analyst_traces_distill``) in the
+    same directory stay distinct held-out meters. ``drop_unverified``
+    skips analyst records whose WRONG spans failed substring checks.
     """
 
     def __init__(
@@ -73,16 +81,23 @@ class DistillTraceSource(_TraceFileSource):
         path: str | Path,
         noise_strength: float = TRAINING_STRENGTH,
         noise_seed: int | None = None,
+        name: str | None = None,
+        drop_unverified: bool = False,
     ):
         super().__init__(path, noise_strength, noise_seed)
-        self.name = f"distill_{self.trace_dir.name}"
+        self.name = name or f"distill_{self.path.stem}"
         self.weight = 1.0
+        self.drop_unverified = drop_unverified
 
     def examples(self) -> Iterator[TrainingExample]:
         rng = random.Random(self.noise_seed)
         noise_dir = _make_noise_dir(f"{self.name}_noise_")
         n_yielded = 0
+        n_dropped = 0
         for lineno, messages, target_text, meta in self._iter_records():
+            if self.drop_unverified and meta.get("unverified_spans"):
+                n_dropped += 1
+                continue
             self._rewrite_frames(messages, rng, noise_dir, lineno)
             yield TrainingExample(
                 messages=messages,
@@ -99,6 +114,12 @@ class DistillTraceSource(_TraceFileSource):
             "(rating-null kept; no span weights)",
             self.name, n_yielded,
         )
+        if n_dropped:
+            logger.warning(
+                "%s: DROPPED %d/%d record(s) whose analysis quoted "
+                "unverified WRONG spans (drop_unverified=True).",
+                self.name, n_dropped, n_dropped + n_yielded,
+            )
 
 
 def _state_path(label: str) -> Path:
@@ -139,7 +160,8 @@ def train_one_epoch(
     epoch: int,
     resume: str | None,
     lr: float,
-    analyst_anchor: Path | None,
+    analyst_ce: Path | None,
+    analyst_kd: Path | None,
 ) -> int:
     """In-process train child (``--train-epoch``)."""
     from training.game_traces import AnalystTraceSource
@@ -148,8 +170,12 @@ def train_one_epoch(
 
     configure_logging()
     sources: list = [DistillTraceSource(data)]
-    if analyst_anchor is not None:
-        sources.append(AnalystTraceSource(analyst_anchor))
+    if analyst_ce is not None:
+        sources.append(DistillTraceSource(
+            analyst_ce, drop_unverified=True,
+        ))
+    if analyst_kd is not None:
+        sources.append(AnalystTraceSource(analyst_kd))
     hooks, guards = build_probe_hooks()
     child_label = f"{label}_e{epoch}"
     cfg = TrainConfig(
@@ -177,6 +203,10 @@ def _train_epoch(e: int, resume: str | None,
     ]
     if resume:
         cmd += ["--checkpoint", resume]
+    if args.no_analyst_ce:
+        cmd.append("--no-analyst-ce")
+    elif args.analyst_data:
+        cmd += ["--analyst-data", str(args.analyst_data)]
     if args.no_analyst_anchor:
         cmd.append("--no-analyst-anchor")
     elif args.analyst_anchor:
@@ -239,16 +269,27 @@ def _smoke(e: int, checkpoint: str, args: argparse.Namespace) -> dict | None:
     return _summarize_traces(smoke_label)
 
 
-def _resolve_anchor(args: argparse.Namespace) -> Path | None:
-    if args.no_analyst_anchor:
+def _sibling_analyst(data: Path) -> Path | None:
+    """Prefer the prepped analyst file, fall back to the raw traces."""
+    parent = Path(data).parent
+    for name in ("analyst_traces_distill.jsonl", "analyst_traces.jsonl"):
+        path = parent / name
+        if path.is_file():
+            return path
+    return None
+
+
+def _resolve_analyst_path(
+    explicit: str | None, *, skip: bool, data: Path, flag: str,
+) -> Path | None:
+    if skip:
         return None
-    if args.analyst_anchor is not None:
-        path = Path(args.analyst_anchor)
+    if explicit is not None:
+        path = Path(explicit)
         if not path.is_file():
-            raise SystemExit(f"--analyst-anchor is not a file: {path}")
+            raise SystemExit(f"{flag} is not a file: {path}")
         return path
-    sibling = Path(args.data).parent / "analyst_traces.jsonl"
-    return sibling if sibling.is_file() else None
+    return _sibling_analyst(data)
 
 
 def orchestrate(args: argparse.Namespace) -> int:
@@ -262,21 +303,42 @@ def orchestrate(args: argparse.Namespace) -> int:
     if not args.label:
         raise SystemExit("--label is required")
 
-    args.analyst_anchor = (
-        None if args.no_analyst_anchor else _resolve_anchor(args)
+    args.analyst_data = _resolve_analyst_path(
+        args.analyst_data, skip=args.no_analyst_ce,
+        data=data, flag="--analyst-data",
     )
-    if args.analyst_anchor:
-        logger.info("analyst KD anchor: %s", args.analyst_anchor)
-    else:
-        logger.info("analyst KD anchor: skipped")
+    args.analyst_anchor = _resolve_analyst_path(
+        args.analyst_anchor, skip=args.no_analyst_anchor,
+        data=data, flag="--analyst-anchor",
+    )
+    logger.info("player CE: %s", data)
+    logger.info("analyst CE: %s", args.analyst_data or "skipped")
+    logger.info("analyst KD leash: %s", args.analyst_anchor or "skipped")
 
     state = _load_state(args.label)
+    state.setdefault("done", [])
+    state.setdefault("checkpoints", {})
+    state["started"] = state.get("started") or _dt.datetime.now().isoformat(
+        timespec="seconds",
+    )
+    state["pid"] = os.getpid()
+    state["phase"] = "starting"
+    state["player_ce"] = str(data)
+    state["analyst_ce"] = str(args.analyst_data) if args.analyst_data else None
+    state["analyst_kd"] = (
+        str(args.analyst_anchor) if args.analyst_anchor else None
+    )
+    _save_state(args.label, state)
+    logger.info("state file: %s", _state_path(args.label))
+
     resume = args.checkpoint
     failures = 0
 
     for e in range(1, args.epochs + 1):
         logger.info("=== distill epoch %d/%d (resume %r) ===",
                     e, args.epochs, resume)
+        state["phase"] = f"train{e}"
+        _save_state(args.label, state)
         _sweep_noise_dirs()
 
         if f"train{e}" in state["done"]:
@@ -301,6 +363,8 @@ def orchestrate(args: argparse.Namespace) -> int:
             continue
 
         if f"analyst_gate{e}" not in state["done"]:
+            state["phase"] = f"analyst_gate{e}"
+            _save_state(args.label, state)
             verdict = _gate(e, ckpt, args)
             state.setdefault("analyst_gate", {})[str(e)] = verdict
             state["done"].append(f"analyst_gate{e}")
@@ -319,6 +383,8 @@ def orchestrate(args: argparse.Namespace) -> int:
                             "exit": verdict.get("exit")})
 
         if f"smoke{e}" not in state["done"]:
+            state["phase"] = f"smoke{e}"
+            _save_state(args.label, state)
             summary = _smoke(e, ckpt, args)
             if summary is None:
                 failures += 1
@@ -342,6 +408,8 @@ def orchestrate(args: argparse.Namespace) -> int:
         if ckpt:
             resume = ckpt
 
+    state["phase"] = "done"
+    _save_state(args.label, state)
     logger.info("distill run complete: %d epoch(s), %d failed stage(s), "
                 "final checkpoint %r", args.epochs, failures, resume)
     return failures
@@ -365,13 +433,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lr", type=float, default=DEFAULT_LR)
     p.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     p.add_argument(
+        "--analyst-data", default=None,
+        help="analyst jsonl for CE clone of recorded analyses; default = "
+             "sibling analyst_traces_distill.jsonl, else analyst_traces.jsonl",
+    )
+    p.add_argument(
+        "--no-analyst-ce", action="store_true",
+        help="skip analyst CE (KD leash can still run)",
+    )
+    p.add_argument(
         "--analyst-anchor", default=None,
-        help="analyst_traces.jsonl for the KD anchor; default = sibling "
-             "of --data if that file exists",
+        help="analyst jsonl for the KD-to-base leash; same sibling default "
+             "as --analyst-data",
     )
     p.add_argument(
         "--no-analyst-anchor", action="store_true",
-        help="skip the analyst KD anchor even if a sibling file exists",
+        help="skip the analyst KD leash even if a sibling file exists",
     )
     p.add_argument(
         "--smoke-seed", type=int, default=DEFAULT_SMOKE_SEED,
@@ -402,10 +479,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.train_epoch is not None:
         if not args.checkpoint:
             raise SystemExit("--train-epoch requires --checkpoint")
-        anchor = _resolve_anchor(args)
+        data = Path(args.data)
+        analyst_ce = _resolve_analyst_path(
+            args.analyst_data, skip=args.no_analyst_ce,
+            data=data, flag="--analyst-data",
+        )
+        analyst_kd = _resolve_analyst_path(
+            args.analyst_anchor, skip=args.no_analyst_anchor,
+            data=data, flag="--analyst-anchor",
+        )
         return train_one_epoch(
-            Path(args.data), args.label, args.train_epoch,
-            args.checkpoint, args.lr, anchor,
+            data, args.label, args.train_epoch,
+            args.checkpoint, args.lr, analyst_ce, analyst_kd,
         )
     return orchestrate(args)
 

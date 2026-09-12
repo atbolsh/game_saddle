@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Corpus-specific preprocessor for one context-distillation run.
 
-Reads ``data_game/<label>/traces.jsonl``, writes ``traces_distill.jsonl``
-into the SAME directory (relative image URLs keep resolving). Per record:
+Reads ``data_game/<label>/traces.jsonl`` and, if present,
+``analyst_traces.jsonl``. Writes ``traces_distill.jsonl`` and
+``analyst_traces_distill.jsonl`` into the SAME directory (relative image
+URLs keep resolving). Per record:
 
-  1. Replace ``messages[0]`` (system) with this checkout's composed play
-     prompt -- ``format_core_tips_dump(ROLE_SCENE_PLAY,
-     dict(CORE_PLAYER_TIPS), set())``, byte-identical to what NAMS seeds
-     here.
+  1. Replace ``messages[0]`` (system) with this checkout's composed
+     prompt -- play dump for player traces, scene-analyst dump for
+     analyst traces. Byte-identical to what NAMS seeds here.
   2. Inside any user text part starting ``Memory context:``, drop bullet
      lines that quote ``[core_player_*]`` / ``[core_analyst_*]`` (stale
      prompt text NAMS retrieval quoted). Leave ``tip_*`` / ``goal`` /
@@ -131,36 +132,17 @@ def rewrite_record(obj: dict[str, Any], system_text: str) -> int:
 
 def _resolve_dir(raw: str) -> Path:
     path = Path(raw)
-    if path.is_file() and path.name == "traces.jsonl":
+    if path.is_file() and path.name in (
+        "traces.jsonl", "analyst_traces.jsonl",
+        "traces_distill.jsonl", "analyst_traces_distill.jsonl",
+    ):
         return path.parent
     if path.is_dir():
         return path
-    raise SystemExit(f"expected data_game/<label> or traces.jsonl, got {raw}")
+    raise SystemExit(f"expected data_game/<label> or a traces jsonl, got {raw}")
 
 
-def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument(
-        "corpus",
-        help="data_game/<label> directory (or its traces.jsonl)",
-    )
-    args = p.parse_args(argv)
-
-    from agent.modes import (
-        CORE_PLAYER_TIPS,
-        ROLE_SCENE_PLAY,
-        format_core_tips_dump,
-    )
-
-    system_text = format_core_tips_dump(
-        ROLE_SCENE_PLAY, dict(CORE_PLAYER_TIPS), set(),
-    )
-    trace_dir = _resolve_dir(args.corpus)
-    src = trace_dir / "traces.jsonl"
-    dest = trace_dir / "traces_distill.jsonl"
-    if not src.is_file():
-        raise SystemExit(f"no traces.jsonl in {trace_dir}")
-
+def _rewrite_file(src: Path, dest: Path, system_text: str) -> tuple[int, int]:
     n_records = 0
     n_stripped = 0
     with src.open(encoding="utf-8") as fin, dest.open(
@@ -178,10 +160,50 @@ def main(argv: list[str] | None = None) -> int:
                 ) from exc
             fout.write(json.dumps(obj, ensure_ascii=False) + "\n")
             n_records += 1
-
     print(f"wrote {dest}")
-    print(f"records written: {n_records}")
-    print(f"core_* tip-lines stripped: {n_stripped}")
+    print(f"  records written: {n_records}")
+    print(f"  core_* tip-lines stripped: {n_stripped}")
+    return n_records, n_stripped
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument(
+        "corpus",
+        help="data_game/<label> directory (or a traces jsonl inside it)",
+    )
+    args = p.parse_args(argv)
+
+    from agent.modes import (
+        CORE_ANALYST_TIPS,
+        CORE_PLAYER_TIPS,
+        ROLE_SCENE_ANALYST,
+        ROLE_SCENE_PLAY,
+        SCENE_ANALYST_EXCLUDE,
+        format_core_tips_dump,
+    )
+
+    player_system = format_core_tips_dump(
+        ROLE_SCENE_PLAY, dict(CORE_PLAYER_TIPS), set(),
+    )
+    analyst_system = format_core_tips_dump(
+        ROLE_SCENE_ANALYST, dict(CORE_ANALYST_TIPS), SCENE_ANALYST_EXCLUDE,
+    )
+    trace_dir = _resolve_dir(args.corpus)
+    src = trace_dir / "traces.jsonl"
+    if not src.is_file():
+        raise SystemExit(f"no traces.jsonl in {trace_dir}")
+    _rewrite_file(src, trace_dir / "traces_distill.jsonl", player_system)
+
+    analyst_src = trace_dir / "analyst_traces.jsonl"
+    if analyst_src.is_file():
+        _rewrite_file(
+            analyst_src,
+            trace_dir / "analyst_traces_distill.jsonl",
+            analyst_system,
+        )
+    else:
+        print(f"no {analyst_src} -- skipped analyst rewrite")
     return 0
 
 
