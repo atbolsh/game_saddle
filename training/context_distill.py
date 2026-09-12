@@ -351,26 +351,39 @@ def orchestrate(args: argparse.Namespace) -> int:
         _save_state(args.label, state)
         _sweep_noise_dirs()
 
-        if f"train{e}" in state["done"]:
-            recorded = state["checkpoints"].get(str(e))
-            resume = recorded or resume
+        recorded = state["checkpoints"].get(str(e)) if (
+            f"train{e}" in state["done"]
+        ) else None
+        if recorded:
+            resume = recorded
             logger.info("[train%d] already complete (checkpoint %r)",
                         e, resume)
             ckpt = recorded
         else:
+            if f"train{e}" in state["done"]:
+                logger.error("[train%d] was marked done with no "
+                             "checkpoint -- retrying", e)
+                state["done"] = [x for x in state["done"] if x != f"train{e}"]
+                state["checkpoints"].pop(str(e), None)
+                _save_state(args.label, state)
             ckpt = _train_epoch(e, resume, args)
+            if not ckpt:
+                failures += 1
+                state["phase"] = f"train{e}_failed"
+                _save_state(args.label, state)
+                logger.error(
+                    "STOPPING: train%d produced no checkpoint. The "
+                    "child died or left no last_good_checkpoint. Do not "
+                    "advance to the next epoch. Inspect "
+                    "logs/train_%s_e%d_*/ (train_log.txt, events.jsonl) "
+                    "and the parent stderr for the exit.",
+                    e, args.label, e,
+                )
+                return failures
             state["done"].append(f"train{e}")
             state["checkpoints"][str(e)] = ckpt
             _save_state(args.label, state)
-            if not ckpt:
-                failures += 1
-                logger.error("[train%d] no checkpoint -- cannot gate or "
-                             "smoke this epoch", e)
-                continue
             resume = ckpt
-
-        if not ckpt:
-            continue
 
         if f"analyst_gate{e}" not in state["done"]:
             state["phase"] = f"analyst_gate{e}"
