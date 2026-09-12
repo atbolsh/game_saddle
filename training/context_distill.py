@@ -43,6 +43,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from training.game_traces import (  # noqa: E402
+    ANALYST_BATCH_CAP,
     _TraceFileSource,
     _make_noise_dir,
 )
@@ -93,11 +94,13 @@ class DistillTraceSource(_TraceFileSource):
         noise_seed: int | None = None,
         name: str | None = None,
         drop_unverified: bool = False,
+        batch_cap: int | None = None,
     ):
         super().__init__(path, noise_strength, noise_seed)
         self.name = name or f"distill_{self.path.stem}"
         self.weight = 1.0
         self.drop_unverified = drop_unverified
+        self.batch_cap = batch_cap
 
     def examples(self) -> Iterator[TrainingExample]:
         rng = random.Random(self.noise_seed)
@@ -117,6 +120,7 @@ class DistillTraceSource(_TraceFileSource):
                 source=self.name,
                 meta=meta,
                 example_weight=1.0,
+                batch_cap=self.batch_cap,
             )
             n_yielded += 1
         logger.info(
@@ -183,6 +187,7 @@ def train_one_epoch(
     if analyst_ce is not None:
         sources.append(DistillTraceSource(
             analyst_ce, drop_unverified=True,
+            batch_cap=ANALYST_BATCH_CAP,
         ))
     if analyst_kd is not None:
         sources.append(AnalystTraceSource(analyst_kd))
@@ -221,7 +226,9 @@ def _train_epoch(e: int, resume: str | None,
         cmd.append("--no-analyst-anchor")
     elif args.analyst_anchor:
         cmd += ["--analyst-anchor", str(args.analyst_anchor)]
-    if _run_stage(cmd, f"train{e}") != 0:
+    rc = _run_stage(cmd, f"train{e}")
+    args.last_train_exit = rc
+    if rc != 0:
         return None
     ckpt = _train_result_checkpoint(child_label)
     if ckpt:
@@ -370,6 +377,7 @@ def orchestrate(args: argparse.Namespace) -> int:
             if not ckpt:
                 failures += 1
                 state["phase"] = f"train{e}_failed"
+                state["last_train_exit"] = getattr(args, "last_train_exit", None)
                 _save_state(args.label, state)
                 logger.error(
                     "STOPPING: train%d produced no checkpoint. The "
