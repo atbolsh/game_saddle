@@ -13,14 +13,22 @@ One "epoch" here is one full expert-iteration cycle. For epoch k (1-based):
      the manifest replay sources, resumed from the previous epoch's
      adapter (epoch 1 starts from bare HF weights unless
      --checkpoint is given).
-  3. smoke eval  8 real **sealed one-gold** games with the FRESH
+  3. analyst gate  ``python -m training.analyst_gate --checkpoint
+     <fresh adapter>`` -- 12 planted boards, one 12-wide generate_batch,
+     sign/re-save assertions. Verdict stored under ``analyst_gate`` in
+     the state file. The train stage has already SAVED the weights;
+     the gate never deletes or rolls them back. A fail still runs this
+     epoch's smoke, then STOPS the run (a rotten grader poisons every
+     later epoch's labels). A gate crash (exit other than 0/1) is
+     logged at ERROR and does not stop the loop.
+  4. smoke eval  8 real **sealed one-gold** games with the FRESH
      checkpoint through the same generator without ``--multi-gold``
      (label ``<prefix>_smoke<k>``, never trained on): eat-gold win
      rate, mean/min rating, degeneracy fraction, and mean gold-distance
      delta are logged and stored under ``smoke`` in the state file --
      comparable to earlier weekends. A poisoned checkpoint surfaces in
      ~15 min. ``grep smoke_eval`` on the run log for the morning review.
-  4. (no auto-prune)  the full ``data_game/<prefix>_iter<k>/`` corpus
+  5. (no auto-prune)  the full ``data_game/<prefix>_iter<k>/`` corpus
      stays on disk after train. Tombstone-to-keepsake is opt-in:
      ``--prune <label>`` (repeatable) runs ``_prune_datagen`` standalone
      and exits -- only for corpora that have already been trained on.
@@ -56,16 +64,21 @@ Crash policy -- the run must survive an unattended weekend:
 * Orchestrator restart: ``data_game/<prefix>_state.json`` records finished
   stages and per-epoch checkpoints; rerunning the same command skips
   completed work and finishes partial datagen via the --append path.
-* STOP-ON-POISON is the one deliberate exception to "keep marching": a
+* STOP-ON-POISON is a deliberate exception to "keep marching": a
   datagen or smoke-eval stage exiting with code 3 means the degeneracy
   fuse tripped (generate_game_traces: the checkpoint emits gibberish with
   no parseable ratings or moves). That is deterministic, not transient --
   every later epoch would train on garbage -- so the orchestrator logs
   the broken checkpoint at ERROR, records it under ``poisoned`` in the
   state file, and STOPS the entire run. No retry, no later epochs.
+* STOP-ON-GATE-FAIL is the other: analyst_gate exit 1 means the fresh
+  checkpoint fails the planted grading checks (re-save, sign of rating,
+  TARGET parse). Smoke still runs for the reading, then the run stops
+  and records the checkpoint under ``gate_failed``. Exit 0 is pass;
+  any other exit is a crash (log ERROR, keep going).
 
 The exit code is the number of failed stages (0 = clean weekend; a
-poisoned stop adds 1).
+poisoned stop or a gate-fail stop adds 1).
 
 MONITORING: the orchestrator samples topline GPU memory (``nvidia-smi``,
 summed over GPUs) every minute, tagged with the running stage, appending
@@ -394,7 +407,7 @@ def _run_stage(cmd: list[str], stage: str) -> int:
     the per-kind hours ledger (smoke evals run the datagen path and book
     as datagen)."""
     logger.info("[%s] starting: %s", stage, " ".join(cmd))
-    kind = ("datagen" if stage.startswith(("datagen", "smoke"))
+    kind = ("datagen" if stage.startswith(("datagen", "smoke", "analyst_gate"))
             else "train")
     if _MONITOR is not None:
         _MONITOR.set_stage(stage)
@@ -623,6 +636,37 @@ SMOKE_MAX_GENERATIONS = 400
 SMOKE_QUESTION_RATE = 0.075  # half of datagen's default 0.15
 
 
+def _analyst_gate(k: int, checkpoint: str,
+                  args: argparse.Namespace) -> tuple[int, dict]:
+    """Behavioral analyst gate on epoch k's fresh checkpoint.
+
+    Returns ``(exit_code, verdict)``. Exit 0 = pass, 1 = fail (stop the
+    run AFTER smoke), anything else = crash (log, do not stop). The
+    checkpoint is already on disk; this stage never deletes it.
+    """
+    out = DATA_GAME_DIR / f"{args.prefix}_analyst_gate{k}.json"
+    cmd = [
+        sys.executable, "-m", "training.analyst_gate",
+        "--checkpoint", checkpoint,
+        "--out", str(out),
+    ]
+    rc = _run_stage(cmd, f"analyst_gate{k}")
+    verdict: dict = {"passed": rc == 0, "exit": rc, "verdict_path": str(out)}
+    if out.is_file():
+        try:
+            loaded = json.loads(out.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            logger.error("[analyst_gate%d] could not parse %s: %s",
+                         k, out, exc)
+        else:
+            if isinstance(loaded, dict):
+                loaded["passed"] = rc == 0
+                loaded["exit"] = rc
+                loaded["verdict_path"] = str(out)
+                verdict = loaded
+    return rc, verdict
+
+
 def _smoke_eval(k: int, checkpoint: str | None,
                 args: argparse.Namespace) -> str:
     """Post-train sanity check on epoch k's fresh checkpoint: a tiny run
@@ -796,6 +840,7 @@ def orchestrate(args: argparse.Namespace) -> int:
     checkpoint = args.checkpoint
     failures = 0
     poisoned = False
+    gate_failed = False
 
     def _stop_on_poison(stage: str, bad_ckpt: str | None) -> None:
         """STOP-ON-POISON: a tripped degeneracy fuse means ``bad_ckpt``
@@ -812,6 +857,23 @@ def orchestrate(args: argparse.Namespace) -> int:
             "with no parseable rating or move). No retry, no later "
             "epochs; recorded under 'poisoned' in %s. Inspect the "
             "checkpoint and data_game/ output by hand before relaunching.",
+            bad_ckpt or "<bare HF weights>", stage, _state_path(args.prefix),
+        )
+
+    def _stop_on_gate_fail(stage: str, bad_ckpt: str | None) -> None:
+        """STOP-ON-GATE-FAIL: the planted analyst checks failed. Smoke
+        has already run (or been attempted); a rotten grader would
+        poison every later epoch's labels, so the run stops HERE."""
+        nonlocal gate_failed
+        gate_failed = True
+        state["gate_failed"] = {"stage": stage, "checkpoint": bad_ckpt}
+        _save_state(args.prefix, state)
+        logger.error(
+            "STOPPING THE ENTIRE RUN: checkpoint %r failed the "
+            "behavioral analyst gate during %s -- a rotten grader "
+            "poisons every later epoch's labels. Weights are on disk "
+            "(the gate never deletes them) and the smoke reading was "
+            "attempted. Recorded under 'gate_failed' in %s.",
             bad_ckpt or "<bare HF weights>", stage, _state_path(args.prefix),
         )
 
@@ -855,13 +917,25 @@ def orchestrate(args: argparse.Namespace) -> int:
         state["checkpoints"][str(k)] = new_ckpt
         _save_state(args.prefix, state)
 
-        # Post-train smoke eval (STANDARD, every fresh checkpoint): 8 real
-        # games -> win rate / ratings / degeneracy / distance deltas,
-        # logged AND stored in the state file -- so even a run whose last
-        # stage is training (no following datagen) ends with a
-        # game-performance reading, and a poisoned checkpoint surfaces in
-        # ~15 min instead of at the next epoch's multi-hour datagen.
+        # Analyst gate THEN smoke (STANDARD, every fresh checkpoint).
+        # Train has already saved the adapter; neither stage deletes it.
+        # Gate fail still runs smoke, then stops the loop.
         if new_ckpt:
+            gate_rc, gate_verdict = _analyst_gate(k, new_ckpt, args)
+            state.setdefault("analyst_gate", {})[str(k)] = gate_verdict
+            _save_state(args.prefix, state)
+            if gate_rc == 0:
+                logger.info("[analyst_gate%d] PASS on %s", k, new_ckpt)
+            elif gate_rc == 1:
+                failures += 1
+                logger.error("[analyst_gate%d] FAIL on %s -- smoke will "
+                             "still run, then the loop stops", k, new_ckpt)
+            else:
+                logger.error("[analyst_gate%d] crashed (exit %d) -- no "
+                             "behavioral verdict for %s (the checkpoint "
+                             "itself may still be fine; run the gate by "
+                             "hand)", k, gate_rc, new_ckpt)
+
             smoke = _smoke_eval(k, new_ckpt, args)
             if smoke == "ok":
                 summary = _summarize_traces(f"{args.prefix}_smoke{k}")
@@ -878,19 +952,28 @@ def orchestrate(args: argparse.Namespace) -> int:
                              "still be fine; run the smoke eval by hand)",
                              k, new_ckpt)
 
+            if gate_rc == 1:
+                _stop_on_gate_fail(f"analyst_gate{k}", new_ckpt)
+                break
+
     if poisoned:
         logger.error("weekend run STOPPED ON POISON after %d failed "
                      "stage(s); last checkpoint %r (see 'poisoned' in the "
                      "state file)", failures, checkpoint)
+    elif gate_failed:
+        logger.error("weekend run STOPPED ON ANALYST GATE FAIL after %d "
+                     "failed stage(s); last checkpoint %r (see "
+                     "'gate_failed' in the state file)",
+                     failures, checkpoint)
     else:
         logger.info("weekend run complete: %d epoch(s), %d failed "
                     "stage(s), final checkpoint %r",
                     args.epochs, failures, checkpoint)
-    logger.info("stage time: datagen %.2fh (smoke evals included), train "
-                "%.2fh (all epochs + retries)",
+    logger.info("stage time: datagen %.2fh (smoke evals and analyst "
+                "gates included), train %.2fh (all epochs + retries)",
                 _STAGE_HOURS["datagen"], _STAGE_HOURS["train"])
     _MONITOR.finish()
-    return failures + (1 if poisoned else 0)
+    return failures + (1 if poisoned or gate_failed else 0)
 
 
 class _RejectedCheckpointFlag(argparse.Action):
