@@ -1970,9 +1970,10 @@ def epoch_batches(order: list[TrainingExample], micro_batch: int,
     """Group an epoch's example order into micro-batches: fill buckets
     (:func:`_batch_bucket_key`) in order, emit a batch whenever one fills,
     flush remainders as short batches, then shuffle the batch list so
-    sources and buckets interleave. Bucket remainders make the batch count
-    slightly larger than ``ceil(len(order) / micro_batch)`` -- the scheduler
-    estimate tolerates that (a few trailing steps at the LR floor).
+    sources and buckets interleave. Bucket remainders make the micro-batch
+    count slightly larger than the per-source ``ceil(n / cap)`` sum inside
+    :func:`estimate_steps_per_epoch`; leftover optimizer steps run at the
+    LR floor (the cosine progress clamp).
 
     An example's ``batch_cap`` lowers the fill limit for its bucket
     (batch_cap is part of the bucket key, so a bucket is cap-homogeneous):
@@ -1993,6 +1994,58 @@ def epoch_batches(order: list[TrainingExample], micro_batch: int,
             batches.append(bucket.copy())
     rng.shuffle(batches)
     return batches
+
+
+def _source_fill_limit(exs: list[TrainingExample], micro_batch: int) -> int:
+    """Tightest per-example fill limit in ``exs`` (batch_cap or micro_batch)."""
+    if not exs:
+        return micro_batch
+    return max(1, min(min(micro_batch, ex.batch_cap or micro_batch)
+                      for ex in exs))
+
+
+def estimate_steps_per_epoch(
+    by_source: dict[str, list[TrainingExample]],
+    src_weights: dict[str, float],
+    micro_batch: int,
+    grad_accum: int,
+) -> int:
+    """Lower-bound optimizer steps in one epoch.
+
+    Each source packs at ``min(micro_batch, that source's batch_cap or
+    micro_batch)``. Batch counts are summed, then divided by
+    ``grad_accum``. Still slightly low versus :func:`epoch_batches`
+    (bucket remainders add short batches); the cosine clamp holds those
+    leftover steps at the LR floor.
+    """
+    mb = max(1, int(micro_batch))
+    ga = max(1, int(grad_accum))
+    n_batches = 0
+    for name, exs in by_source.items():
+        n = max(1, round(src_weights.get(name, 1.0) * len(exs)))
+        n_batches += math.ceil(n / _source_fill_limit(exs, mb))
+    return math.ceil(n_batches / ga)
+
+
+def _clamp_cosine_scheduler(scheduler: Any, num_training_steps: int) -> Any:
+    """Pin cosine_with_min_lr at the floor after ``num_training_steps``.
+
+    HuggingFace's lambda lets ``progress`` exceed 1.0, which walks the
+    cosine back up toward the peak. Extra ``scheduler.step()`` calls
+    (bucket-remainder batches past the estimate) must stay at
+    ``lr_floor * peak``.
+    """
+    lambdas = getattr(scheduler, "lr_lambdas", None)
+    if not lambdas:
+        raise RuntimeError(
+            "cosine scheduler has no lr_lambdas; cannot clamp progress"
+        )
+    cap = int(num_training_steps)
+    scheduler.lr_lambdas = [
+        (lambda step, _fn=fn, _cap=cap: _fn(min(int(step), _cap)))
+        for fn in lambdas
+    ]
+    return scheduler
 
 
 def pack_prefix_windows(
@@ -2147,15 +2200,12 @@ def run_training(
     optimizer = bnb.optim.PagedAdamW8bit(
         params, lr=cfg.lr, weight_decay=cfg.weight_decay
     )
-    # Estimate: bucket remainders in epoch_batches add a few extra batches
-    # per epoch beyond ceil(n / micro_batch) (at most one per bucket), and
-    # micro_batch_cap sources (see TrainingExample.batch_cap) add more, so
-    # the cosine schedule may end some steps early -- those trailing steps
-    # just run at the LR floor.
-    contributions = sum(max(1, round(src_weights.get(n, 1.0) * len(v)))
-                        for n, v in by_source.items())
-    steps_per_epoch = math.ceil(
-        math.ceil(contributions / max(1, cfg.micro_batch)) / cfg.grad_accum
+    # Estimate from per-source batch_cap, not a global ceil(n / micro_batch).
+    # Bucket remainders in epoch_batches still add a few extra batches
+    # (at most one per bucket); the cosine clamp holds those leftover
+    # steps at the LR floor instead of walking LR back up.
+    steps_per_epoch = estimate_steps_per_epoch(
+        by_source, src_weights, cfg.micro_batch, cfg.grad_accum,
     )
     total_steps = cfg.max_steps or (cfg.epochs * steps_per_epoch)
     if cfg.scheduler == "cosine":
@@ -2165,6 +2215,7 @@ def run_training(
             num_training_steps=total_steps,
             scheduler_specific_kwargs={"min_lr_rate": cfg.lr_floor},
         )
+        _clamp_cosine_scheduler(scheduler, total_steps)
     else:
         scheduler = get_scheduler(
             "constant_with_warmup", optimizer,
@@ -2427,6 +2478,7 @@ def run_training(
     scaled_loss_n = 0
     done = False
     ended_early: str | None = None
+    schedule_overrun_logged = False
 
     try:
         for epoch in range(cfg.epochs):
@@ -2509,6 +2561,13 @@ def run_training(
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                     step += 1
+                    if step > total_steps and not schedule_overrun_logged:
+                        logger.info(
+                            "step %d exceeds planned total_steps=%d; "
+                            "LR held at floor",
+                            step, total_steps,
+                        )
+                        schedule_overrun_logged = True
                     prefix_state.opt_steps += 1
                     if (cfg.prefix_kv_refresh_steps > 0
                             and prefix_state.opt_steps
@@ -2585,7 +2644,8 @@ def run_training(
         )
         raise
 
-    tlog.event("done", steps=step, final_checkpoint=str(last_ckpt),
+    tlog.event("done", steps=step, planned_steps=total_steps,
+               final_checkpoint=str(last_ckpt),
                last_good_checkpoint=str(last_good_ckpt),
                best_metrics=best_metrics,
                **({"ended_early": ended_early} if ended_early else {}))

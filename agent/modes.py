@@ -165,11 +165,13 @@ _BLOCK_NOTEPAD = (
 
 def _block_current_screen(target: str) -> str:
     return (
-        "DO NOT just copy prior observations from your memories. Make sure you "
+        "DO NOT just copy prior observations from your memories. The CURRENT "
+        "screen is the only evidence for this turn's OBS. Make sure you "
         f"evaluate whether you are facing {target} *right now*. Your memories "
-        "describe PAST screens; every move changes the screen, so re-derive where "
-        f"your red eye points and where {target} is from the CURRENT image before "
-        "every single move."
+        "describe PAST screens; a memory that says you were facing the gold "
+        "does not mean you are facing it now. Every move changes the screen, "
+        f"so re-derive where your red eye points and where {target} is from "
+        "the CURRENT image before every single move."
     )
 
 
@@ -182,8 +184,11 @@ def _block_aim_tolerance(target: str) -> str:
     that prompt's reviewer, so player and judge always share one wording.
     """
     return (
-        "Target within about 20 degrees (3 steps) of your facing? "
-        f"{_TOK_FORWARD}. Do not demand pixel-perfect aim; step and re-assess."
+        f"Estimate first: is {target} within about 20 degrees (3 steps) "
+        f"of your facing? If yes, {_TOK_FORWARD} -- do not demand "
+        "pixel-perfect aim; step and re-assess. If a gold is already on "
+        "or very near the ray your eye points along, "
+        f"{_TOK_FORWARD} immediately -- do not rotate off a hit."
     )
 
 
@@ -1458,15 +1463,17 @@ _BLOCK_EACH_TURN = (
     "e.g. 4 o'clock>; my target, <a remaining gold | an opening/exit>, "
     "is at <where>, toward <clock direction> of me.\n"
     "   (12 o'clock is up-screen, 3 right, 6 down, 9 left.)\n"
-    "2. CHECK your target note. Your notepad's 'target' names what you "
+    "2. REASON in a sentence or two: where is the target relative to "
+    "your eye? Clock hours from eye to target, the SHORT way, decide "
+    "the bearing -- that number times 5 is the turn count you will "
+    "emit if you turn.\n"
+    "3. CHECK your target note. Your notepad's 'target' names what you "
     "chase: a gold while any remains (several visible: pick ONE -- 'the "
     "left one', 'the near one' -- and stick with it), else an opening. "
     "Save [REMEMBER target: ...] ONLY if the note is missing, or the "
     "gold it names was eaten or vanished (pick a new target: golds "
     "first, then opening). Otherwise write NO [REMEMBER] line -- "
     "re-saving an unchanged note is a graded mistake.\n"
-    "3. REASON in a sentence or two: where is the target relative to "
-    "your eye?\n"
     "4. MOVE (only if asked to move; if asked a question like 'are you "
     "facing your target?', answer in prose and STOP -- no token):\n"
     f"   - {_BLOCK_AIM_TOLERANCE}\n"
@@ -1508,6 +1515,7 @@ ROLE_DEBRIEF = (
 CORE_PLAYER_TIPS: list[tuple[str, str]] = [
     ("core_player_010_goal", _BLOCK_PLAYER_GOAL),
     ("core_player_020_move_tokens", _BLOCK_PLAYER_MOVE_TOKENS),
+    ("core_player_035_current_screen", _BLOCK_CURRENT_SCREEN),
     ("core_player_040_each_turn", _BLOCK_EACH_TURN),
     ("core_player_050_notepad_rules", _BLOCK_NOTEPAD_RULES),
     ("core_player_110_search_tool", _BLOCK_MEMORY_SEARCH),

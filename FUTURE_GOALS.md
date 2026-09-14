@@ -432,6 +432,8 @@ not by whether pre-clip L2 looks small.
 
 ### Stale semantic seed prefs (not the scene prompt)
 
+**Done (2026-09-14):** `controls`, `goal`, and `tip_facing` rewritten for counted turns and multi-gold / walk-out.
+
 The system prompt **is** loaded from NAMS. `load_scene_prompts` reads
 the `core_player_*` / `core_analyst_*` Preference rows; `ensure_core_tips`
 heals those from the `_BLOCK_*` constants in `agent/modes.py`. That path

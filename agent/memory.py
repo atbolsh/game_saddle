@@ -1227,11 +1227,11 @@ _SEMANTIC_MODEL_ENTITIES = [
 ]
 
 _SEMANTIC_MODEL_PREFERENCES = [
-    ("controls", "Available moves are CLOCK (turn clockwise), ANTICLOCK (turn counter-clockwise), and FORWARD (advance one step). One CLOCK/ANTICLOCK step is pi/30 radians; one FORWARD step is up to 1/16 of the board."),
+    ("controls", "Available moves are [CLOCK n] / [ANTICLOCK n] (turn n steps of 6 degrees = pi/30 radians, n = 1-60, all in one move; bare [CLOCK] / [ANTICLOCK] = 1 step) and [FORWARD] (advance one step, up to 1/16 of the board; never takes a count)."),
     ("geometry", "The board is the unit square [0,1]x[0,1] with x pointing right and y pointing UP on screen (larger y = higher, as in ordinary graphs). All coordinates are normalised; agent_r ~ 0.05, gold_r ~ 1/64."),
-    ("goal", "Collect the gold piece. In bare levels there is exactly one gold piece; the game ends for the agent once it is eaten (overlap of agent and gold circles)."),
+    ("goal", "Eat gold while any remains (eating one does not end the session -- go for the next). When no gold remains, walk out through an opening. If there is neither gold nor opening, end the session."),
     ("tip_distance", "Tip: the agent does not need to know its exact coordinates. Use the visual angle between the agent's red eye and the gold to decide CLOCK vs ANTICLOCK, then FORWARD."),
-    ("tip_facing", "Tip: if the gold is roughly in front of the agent's eye, FORWARD is the best move. If it is to the right, CLOCK until it is centered. If to the left, ANTICLOCK."),
+    ("tip_facing", "Tip: if the gold is already on or very near the ray the eye points along, FORWARD immediately -- do not rotate off a hit. If it is off to one side, emit one counted [CLOCK n] or [ANTICLOCK n] the short way to bring it inside about 20 degrees of facing, then FORWARD. Do not creep toward a far-off gold in single steps."),
     ("tip_aim_tolerance", "Tip: it can be hard to tell the exact facing direction from the screen, so do not demand pixel-perfect aim. If the gold is estimated to lie within about 20 degrees of the facing direction, FORWARD is a good move -- step forward and re-assess on the new screen."),
     ("tip_overshoot", "Tip: only FORWARD moves the agent (up to 1/16 of the board per step); CLOCK and ANTICLOCK merely rotate it in place and never move it, so they cannot collect gold on their own. FORWARD can overshoot the gold, so aim carefully with CLOCK/ANTICLOCK first, then step FORWARD."),
 ]
