@@ -2161,7 +2161,7 @@ def t1_pure() -> str:
         "persist-stamp, resume-unfinished, weekend-ckpt, "
         "multi-gold datagen flag, openings, end-game parse, prompt "
         "composition, openings backfill, leak scrubber, core-tip seed, "
-        "step estimate, cosine floor)")
+        "step estimate, cosine floor)"
     )
 
 

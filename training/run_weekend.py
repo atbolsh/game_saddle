@@ -478,9 +478,9 @@ def _summarize_traces(label: str) -> dict:
 
 #: Noised-frame temp dirs created by training/game_traces.py
 #: (_make_noise_dir): game_<label>_noise_*, player_anchor_<label>_noise_*,
-#: analyst_<label>_noise_*.
+#: analyst_<label>_noise_*, distill_<stem>_noise_* (context_distill CE).
 _NOISE_DIR_GLOBS = ("game_*_noise_*", "player_anchor_*_noise_*",
-                    "analyst_*_noise_*")
+                    "analyst_*_noise_*", "distill_*_noise_*")
 
 
 def _sweep_noise_dirs() -> None:
