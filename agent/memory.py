@@ -30,21 +30,15 @@ from . import run_logging
 
 logger = logging.getLogger(__name__)
 
-#: Returned by `[SEARCH]` when :data:`AgentConfig.nams_retrieval` is off.
-RETRIEVAL_DISABLED_NOTE = (
-    "(NAMS similarity retrieval is disabled. The system prompt and your "
-    "notepad are the memory you have; write facts you will need later with "
-    "[REMEMBER key: short note].)"
-)
-
 _RETRIEVAL_OFF_LOGGED = False
 
 
 def retrieval_enabled(cfg: AgentConfig | None = None) -> bool:
-    """Whether similarity / recency dumps may enter the model prompt.
+    """Whether automatic recency / ``get_context`` dumps may enter the prompt.
 
-    Core-tip prompt load (`load_scene_prompts`) and the session scratchpad
-    (`get_session_notes` / `[REMEMBER]`) do not consult this flag.
+    Does not gate `[SEARCH]` (that path stays live). Core-tip prompt load
+    (`load_scene_prompts`) and the session scratchpad (`get_session_notes`
+    / `[REMEMBER]`) also do not consult this flag.
     """
     return (cfg or CONFIG).nams_retrieval
 
@@ -54,8 +48,9 @@ def _log_retrieval_off() -> None:
     if not _RETRIEVAL_OFF_LOGGED:
         _RETRIEVAL_OFF_LOGGED = True
         logger.info(
-            "NAMS similarity retrieval is OFF (prompt + scratchpad only); "
-            "set NAMS_RETRIEVAL=1 to restore get_context / [SEARCH]"
+            "NAMS automatic retrieval is OFF (prompt + scratchpad + "
+            "[SEARCH] only); set NAMS_RETRIEVAL=1 to restore get_context "
+            "/ recency dumps"
         )
 
 
@@ -674,19 +669,6 @@ async def search_memory(
     visibly: WARNING log + an explicit failure line in the returned block --
     never a silent empty section (no-fuzzy-fallbacks).
     """
-    if not retrieval_enabled():
-        _log_retrieval_off()
-        run_logging.log_db_retrieval(
-            function="search_memory",
-            arguments={
-                "query": query, "tiers": list(tiers), "top_k": top_k,
-                "exclude_session": exclude_session,
-                "exclude_analyst": exclude_analyst,
-                "skipped": "nams_retrieval=off",
-            },
-            result=RETRIEVAL_DISABLED_NOTE,
-        )
-        return RETRIEVAL_DISABLED_NOTE
     unknown = set(tiers) - set(SEARCH_TIERS)
     if unknown:
         raise ValueError(f"Unknown search tiers: {sorted(unknown)}")
@@ -738,15 +720,6 @@ async def search_session_messages(
     message ids of the target session. Over-fetch so the filter still leaves
     up to ``top_k`` survivors.
     """
-    if not retrieval_enabled():
-        _log_retrieval_off()
-        run_logging.log_db_retrieval(
-            function="search_session_messages",
-            arguments={"query": query, "session_id": session_id,
-                       "skipped": "nams_retrieval=off"},
-            result=[],
-        )
-        return []
     fetch = max(top_k * 10, 50)
     msgs = await client.short_term.search_messages(
         query, session_id=session_id, limit=fetch

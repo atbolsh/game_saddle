@@ -1810,12 +1810,9 @@ def t1_pure() -> str:
         truncate_at_first_move_token,
     )
     from agent.memory import (
-        RETRIEVAL_DISABLED_NOTE,
         format_notepad,
         get_game_context,
         retrieval_enabled,
-        search_memory,
-        search_session_messages,
     )
     # Notebook human-takeover: first bracketed move token ends the reply.
     assert (
@@ -1904,14 +1901,11 @@ def t1_pure() -> str:
     assert "target: the left gold, near the top wall" in filled_pad
     assert "(updated round 4)" in filled_pad
     checks += 1
-    # Phase-2 default: similarity retrieval off; prompt + notepad stay.
+    # Phase-2 default: automatic dumps off; prompt + notepad + [SEARCH]
+    # stay. get_game_context short-circuits without touching the client.
     import asyncio
     assert retrieval_enabled() is False
     assert asyncio.run(get_game_context(None, "sid", query="x")) == ""
-    assert asyncio.run(search_memory(None, "tips")) == RETRIEVAL_DISABLED_NOTE
-    assert asyncio.run(
-        search_session_messages(None, "q", "sid", allowed_ids=set())
-    ) == []
     checks += 1
     w = _SIDE_WALL_WIDTH
     full = [

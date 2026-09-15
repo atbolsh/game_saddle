@@ -158,9 +158,11 @@ the one that matters for multi-room.
 
 - Old prompt (core-tip dump still loaded from NAMS).
 - Scratchpad (`[REMEMBER]` / `SessionNote`) stays.
-- Similarity retrieval is off: `get_context`, `[SEARCH]` results,
-  recency dumps into play / discuss / the analyst, and the privileged
-  semantic-model dump. Flip back with `NAMS_RETRIEVAL=1`.
+- Automatic dumps are off: `get_context`, recency windows in play /
+  discuss / the analyst, and the privileged semantic-model dump. Flip
+  those back with `NAMS_RETRIEVAL=1`.
+- `[SEARCH]` hits stay live (the tool the standing weights already
+  know).
 - Debrief `[SHOW]` (exact cursor on recorded play) and exact
   session-trace Cypher stay — those are not similarity search.
 - Next: notebook conversations with the standing weights, then prompt

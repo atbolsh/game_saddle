@@ -238,11 +238,11 @@ class AgentConfig:
         default_factory=lambda: _env_int("DEBRIEF_MAX_TOOL_CALLS", 64)
     )
 
-    # Similarity retrieval (`get_context`, `[SEARCH]`, recency dumps into
-    # play/discuss). Off on this branch: the model sees the NAMS-loaded
-    # scene prompt and the session scratchpad, nothing else. Exact
-    # SessionNote read/write and `load_scene_prompts` stay on.
-    # Re-enable with NAMS_RETRIEVAL=1.
+    # Automatic recency / ``get_context`` dumps into play/discuss.
+    # Off on this branch: the model sees the NAMS-loaded scene prompt,
+    # the session scratchpad, and whatever it fetches with `[SEARCH]`.
+    # Exact SessionNote read/write and `load_scene_prompts` stay on.
+    # Re-enable the dumps with NAMS_RETRIEVAL=1.
     nams_retrieval: bool = field(
         default_factory=lambda: _env_bool("NAMS_RETRIEVAL", False)
     )
