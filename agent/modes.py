@@ -732,36 +732,49 @@ async def mode_discuss(
     user_text: str,
     cfg: AgentConfig | None = None,
 ) -> dict[str, Any]:
-    """Mode 2: open-ended discussion with full memory access.
+    """Mode 2: open-ended discussion.
 
-    Like mode 1 it combines a **recency** window of the latest messages (so the
-    chat has reliable turn-to-turn continuity, which pure similarity search does
-    not guarantee) with the general **semantic** search across all memory tiers.
-    Unlike mode 1 there is NO settings stripping -- this mode is the
-    bootstrap/evaluation channel and is allowed to see everything NAMS returns.
+    When ``nams_retrieval`` is on, this combines a recency window of the
+    latest messages with semantic search across all memory tiers, unscrubbed.
+    When it is off (this branch's default), the turn is the system prompt
+    plus the user's text -- no recency dump, no ``get_context``.
     """
     cfg = cfg or CONFIG
     model = get_model(cfg)
 
     # Retrieve BEFORE storing the current message: the recency window should show
     # the PRIOR turns, and the semantic search should not just echo back the
-    # message we are about to answer.
-    recent = await mem.get_recent_messages(client, session_id, cfg.recent_messages_window)
-    ctx = await mem.retrieve_context(client, query=user_text, session_id=session_id)
-    ctx_text = ctx if isinstance(ctx, str) else json.dumps(ctx, default=str, indent=2)
-    # Same channel separation as mode 1: our recency window is the one source
-    # of recent messages; drop NAMS' built-in "Recent Conversation" section
-    # (which is ordered ASC and actually contains the OLDEST messages anyway).
-    ctx_text = mem.strip_nams_recent_conversation(ctx_text)
-
-    context_parts: list[str] = []
-    if recent:
-        context_parts.append("Recent conversation (most recent last):\n" + recent)
-    if ctx_text and ctx_text.strip() not in ("", "{}", "[]"):
-        context_parts.append(
-            "Relevant memories (semantic search across all tiers):\n" + ctx_text
+    # message we are about to answer. Off when nams_retrieval is False
+    # (prompt + scratchpad only; discuss has no notepad, so just the turn).
+    if mem.retrieval_enabled(cfg):
+        recent = await mem.get_recent_messages(
+            client, session_id, cfg.recent_messages_window,
         )
-    context_block = "\n\n".join(context_parts) if context_parts else "(no prior context)"
+        ctx = await mem.retrieve_context(
+            client, query=user_text, session_id=session_id,
+        )
+        ctx_text = ctx if isinstance(ctx, str) else json.dumps(
+            ctx, default=str, indent=2,
+        )
+        # Same channel separation as mode 1: our recency window is the one
+        # source of recent messages; drop NAMS' built-in "Recent Conversation"
+        # section (ordered ASC; actually the OLDEST messages anyway).
+        ctx_text = mem.strip_nams_recent_conversation(ctx_text)
+        context_parts: list[str] = []
+        if recent:
+            context_parts.append(
+                "Recent conversation (most recent last):\n" + recent
+            )
+        if ctx_text and ctx_text.strip() not in ("", "{}", "[]"):
+            context_parts.append(
+                "Relevant memories (semantic search across all tiers):\n"
+                + ctx_text
+            )
+        context_block = (
+            "\n\n".join(context_parts) if context_parts else "(no prior context)"
+        )
+    else:
+        context_block = ""
 
     # Now record the user message (after retrieval, so it isn't self-retrieved).
     await client.short_term.add_message(
@@ -773,9 +786,11 @@ async def mode_discuss(
     search_notes: list[str] = []
     n_searches = 0
     while True:
-        content: list[dict[str, str]] = [
-            {"type": "text", "text": f"Memory context:\n{context_block}"},
-        ]
+        content: list[dict[str, str]] = []
+        if context_block:
+            content.append(
+                {"type": "text", "text": f"Memory context:\n{context_block}"}
+            )
         if search_notes:
             content.append({
                 "type": "text",

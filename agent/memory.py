@@ -30,6 +30,34 @@ from . import run_logging
 
 logger = logging.getLogger(__name__)
 
+#: Returned by `[SEARCH]` when :data:`AgentConfig.nams_retrieval` is off.
+RETRIEVAL_DISABLED_NOTE = (
+    "(NAMS similarity retrieval is disabled. The system prompt and your "
+    "notepad are the memory you have; write facts you will need later with "
+    "[REMEMBER key: short note].)"
+)
+
+_RETRIEVAL_OFF_LOGGED = False
+
+
+def retrieval_enabled(cfg: AgentConfig | None = None) -> bool:
+    """Whether similarity / recency dumps may enter the model prompt.
+
+    Core-tip prompt load (`load_scene_prompts`) and the session scratchpad
+    (`get_session_notes` / `[REMEMBER]`) do not consult this flag.
+    """
+    return (cfg or CONFIG).nams_retrieval
+
+
+def _log_retrieval_off() -> None:
+    global _RETRIEVAL_OFF_LOGGED
+    if not _RETRIEVAL_OFF_LOGGED:
+        _RETRIEVAL_OFF_LOGGED = True
+        logger.info(
+            "NAMS similarity retrieval is OFF (prompt + scratchpad only); "
+            "set NAMS_RETRIEVAL=1 to restore get_context / [SEARCH]"
+        )
+
 
 def make_memory_settings(cfg: AgentConfig | None = None):
     """Build a NAMS ``MemorySettings`` for the bolt backend."""
@@ -380,6 +408,15 @@ async def retrieve_context(client: Any, query: str, session_id: str) -> Any:
     """Thin wrapper over NAMS ``client.get_context`` (the semantic search across
     all memory tiers) that logs the retrieval. Returns the raw context object /
     string exactly as NAMS provides it -- callers do their own scrubbing."""
+    if not retrieval_enabled():
+        _log_retrieval_off()
+        run_logging.log_db_retrieval(
+            function="client.get_context",
+            arguments={"query": query, "session_id": session_id,
+                       "skipped": "nams_retrieval=off"},
+            result="",
+        )
+        return ""
     ctx = await client.get_context(query=query, session_id=session_id)
     if isinstance(ctx, str):
         result = ctx
@@ -438,6 +475,9 @@ async def get_game_context(
     leftover prefix -- a masking-only line filter, where over-masking is
     safe and leaking is not.
     """
+    if not retrieval_enabled():
+        _log_retrieval_off()
+        return ""
     ctx = await retrieve_context(client, query=query, session_id=session_id)
     if isinstance(ctx, str):
         semantic = _strip_settings_from_text(ctx)
@@ -634,6 +674,19 @@ async def search_memory(
     visibly: WARNING log + an explicit failure line in the returned block --
     never a silent empty section (no-fuzzy-fallbacks).
     """
+    if not retrieval_enabled():
+        _log_retrieval_off()
+        run_logging.log_db_retrieval(
+            function="search_memory",
+            arguments={
+                "query": query, "tiers": list(tiers), "top_k": top_k,
+                "exclude_session": exclude_session,
+                "exclude_analyst": exclude_analyst,
+                "skipped": "nams_retrieval=off",
+            },
+            result=RETRIEVAL_DISABLED_NOTE,
+        )
+        return RETRIEVAL_DISABLED_NOTE
     unknown = set(tiers) - set(SEARCH_TIERS)
     if unknown:
         raise ValueError(f"Unknown search tiers: {sorted(unknown)}")
@@ -685,6 +738,15 @@ async def search_session_messages(
     message ids of the target session. Over-fetch so the filter still leaves
     up to ``top_k`` survivors.
     """
+    if not retrieval_enabled():
+        _log_retrieval_off()
+        run_logging.log_db_retrieval(
+            function="search_session_messages",
+            arguments={"query": query, "session_id": session_id,
+                       "skipped": "nams_retrieval=off"},
+            result=[],
+        )
+        return []
     fetch = max(top_k * 10, 50)
     msgs = await client.short_term.search_messages(
         query, session_id=session_id, limit=fetch
@@ -1095,6 +1157,9 @@ async def get_semantic_model(client: Any) -> str:
     only returns a *subset* of long-term memory. The privileged modes (2/3) that
     should reason/judge against the complete rubric want the whole thing, so we
     read it directly. Best-effort: returns "" on error."""
+    if not retrieval_enabled():
+        _log_retrieval_off()
+        return ""
     ent_rows: list[Any] = []
     pref_rows: list[Any] = []
     try:

@@ -238,6 +238,15 @@ class AgentConfig:
         default_factory=lambda: _env_int("DEBRIEF_MAX_TOOL_CALLS", 64)
     )
 
+    # Similarity retrieval (`get_context`, `[SEARCH]`, recency dumps into
+    # play/discuss). Off on this branch: the model sees the NAMS-loaded
+    # scene prompt and the session scratchpad, nothing else. Exact
+    # SessionNote read/write and `load_scene_prompts` stay on.
+    # Re-enable with NAMS_RETRIEVAL=1.
+    nams_retrieval: bool = field(
+        default_factory=lambda: _env_bool("NAMS_RETRIEVAL", False)
+    )
+
     # Agent-initiated [SEARCH <query>] memory searches. Outside debrief (which
     # has its own shared tool budget above), a single turn may run at most
     # ``memory_search_max_calls`` searches; each search returns at most

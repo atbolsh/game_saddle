@@ -45,7 +45,8 @@ Stage map (rationale in the Intermission plan):
                 backfill; leak scrubber covers openings; END_GAME oracle
                 correct/wrong + action-balance 1.0; unified prompt composition;
                 core-tip numbered categories + labeled dump shape;
-                batch-cap-aware step estimate; cosine floor clamp
+                batch-cap-aware step estimate; cosine floor clamp;
+                NAMS similarity retrieval off (prompt + scratchpad only)
   * t2-data     manifest loads, per-source counts vs meta.json, probes exist
   * t3-model    4-bit QLoRA load, terminator, CE/KD forward+backward
                 (image example included), teacher-path sanity, kd_anchor
@@ -1808,7 +1809,14 @@ def t1_pure() -> str:
         parse_remember_notes,
         truncate_at_first_move_token,
     )
-    from agent.memory import format_notepad
+    from agent.memory import (
+        RETRIEVAL_DISABLED_NOTE,
+        format_notepad,
+        get_game_context,
+        retrieval_enabled,
+        search_memory,
+        search_session_messages,
+    )
     # Notebook human-takeover: first bracketed move token ends the reply.
     assert (
         truncate_at_first_move_token("aim then [FORWARD]\njunk after")
@@ -1895,6 +1903,15 @@ def t1_pure() -> str:
     ])
     assert "target: the left gold, near the top wall" in filled_pad
     assert "(updated round 4)" in filled_pad
+    checks += 1
+    # Phase-2 default: similarity retrieval off; prompt + notepad stay.
+    import asyncio
+    assert retrieval_enabled() is False
+    assert asyncio.run(get_game_context(None, "sid", query="x")) == ""
+    assert asyncio.run(search_memory(None, "tips")) == RETRIEVAL_DISABLED_NOTE
+    assert asyncio.run(
+        search_session_messages(None, "q", "sid", allowed_ids=set())
+    ) == []
     checks += 1
     w = _SIDE_WALL_WIDTH
     full = [
@@ -2161,7 +2178,7 @@ def t1_pure() -> str:
         "persist-stamp, resume-unfinished, weekend-ckpt, "
         "multi-gold datagen flag, openings, end-game parse, prompt "
         "composition, openings backfill, leak scrubber, core-tip seed, "
-        "step estimate, cosine floor)"
+        "step estimate, cosine floor, nams retrieval off)"
     )
 
 
