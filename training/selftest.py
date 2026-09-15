@@ -44,7 +44,8 @@ Stage map (rationale in the Intermission plan):
                 universal openings on settings_to_dict; openings JSON
                 backfill; leak scrubber covers openings; END_GAME oracle
                 correct/wrong + action-balance 1.0; unified prompt composition;
-                core-tip numbered categories + labeled dump shape
+                core-tip numbered categories + labeled dump shape;
+                batch-cap-aware step estimate; cosine floor clamp
   * t2-data     manifest loads, per-source counts vs meta.json, probes exist
   * t3-model    4-bit QLoRA load, terminator, CE/KD forward+backward
                 (image example included), teacher-path sanity, kd_anchor
@@ -307,7 +308,9 @@ def t1_pure() -> str:
         DataSource,
         MetricGuard,
         TrainingExample,
+        _clamp_cosine_scheduler,
         epoch_batches,
+        estimate_steps_per_epoch,
         pack_prefix_windows,
     )
 
@@ -1282,6 +1285,75 @@ def t1_pure() -> str:
             assert len(b) <= 4
     checks += 1
 
+    # ---- estimate_steps_per_epoch: batch_cap raises the step count
+    #      above naive ceil(n / micro_batch); homogeneous buckets match
+    #      epoch_batches exactly (no remainder).
+    uncapped = [TrainingExample(
+        [{"role": "user", "content": [{"type": "text", "text": "q"}]}],
+        "a", loss="ce", n_tokens=10,
+    ) for _ in range(8)]
+    capped_src = [TrainingExample(
+        [{"role": "user", "content": [{"type": "text", "text": "q"}]}],
+        "a", loss="kd", batch_cap=2, n_tokens=10,
+    ) for _ in range(8)]
+    est = estimate_steps_per_epoch(
+        {"ce": uncapped, "kd": capped_src},
+        {"ce": 1.0, "kd": 1.0},
+        micro_batch=4, grad_accum=1,
+    )
+    assert est == 6, est  # ceil(8/4)+ceil(8/2)
+    assert est > math.ceil(16 / 4), "estimator ignored batch_cap"
+    packed = epoch_batches(uncapped + capped_src, micro_batch=4,
+                           rng=random.Random(0))
+    assert len(packed) == est, (len(packed), est)
+    assert estimate_steps_per_epoch(
+        {"ce": uncapped, "kd": capped_src},
+        {"ce": 1.0, "kd": 1.0},
+        micro_batch=4, grad_accum=2,
+    ) == 3
+    checks += 1
+
+    # ---- cosine_with_min_lr: extra steps past num_training_steps stay
+    #      at peak * lr_floor (HF's unclamped lambda walks back up).
+    import torch
+    from torch.optim import SGD
+    from transformers import get_scheduler
+    peak_lr = 1e-3
+    planned = 20
+    floor_rate = 0.10
+    dummy = torch.nn.Parameter(torch.zeros(1))
+    opt = SGD([dummy], lr=peak_lr)
+    raw = get_scheduler(
+        "cosine_with_min_lr", opt,
+        num_warmup_steps=int(planned * 0.10),
+        num_training_steps=planned,
+        scheduler_specific_kwargs={"min_lr_rate": floor_rate},
+    )
+    held = get_scheduler(
+        "cosine_with_min_lr", SGD([torch.nn.Parameter(torch.zeros(1))],
+                                  lr=peak_lr),
+        num_warmup_steps=int(planned * 0.10),
+        num_training_steps=planned,
+        scheduler_specific_kwargs={"min_lr_rate": floor_rate},
+    )
+    _clamp_cosine_scheduler(held, planned)
+    for _ in range(planned):
+        opt.step()
+        raw.step()
+        held.step()
+    want = peak_lr * floor_rate
+    assert abs(held.get_last_lr()[0] - want) < 1e-12, held.get_last_lr()
+    for _ in range(8):
+        opt.step()
+        raw.step()
+        held.step()
+        assert abs(held.get_last_lr()[0] - want) < 1e-12, held.get_last_lr()
+    assert raw.get_last_lr()[0] > want + 1e-8, (
+        "unclamped cosine did not rise after planned steps -- test is "
+        f"vacuous (raw lr={raw.get_last_lr()[0]}, floor={want})"
+    )
+    checks += 1
+
     # ---- planted-error scrambler: deterministic, one labeled change,
     #      span points at the new text
     reply = (
@@ -2088,7 +2160,8 @@ def t1_pure() -> str:
         "source, batching, scrambler, questions, stack-eq, vram-split, "
         "persist-stamp, resume-unfinished, weekend-ckpt, "
         "multi-gold datagen flag, openings, end-game parse, prompt "
-        "composition, openings backfill, leak scrubber, core-tip seed)"
+        "composition, openings backfill, leak scrubber, core-tip seed, "
+        "step estimate, cosine floor)")
     )
 
 

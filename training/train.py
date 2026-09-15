@@ -124,10 +124,16 @@ generate, not just score.
 LOGGING. ``logs/train_<label>_<stamp>/``: config.json (resolved config +
 seed + git rev + discovered LoRA target modules), train_log.jsonl + .txt
 (per-step loss, per-source loss, LR, grad norm), events.jsonl (saves, evals,
-rollbacks), and eval_log.jsonl -- ONE FLAT ROW PER EVALUATION with every
+rollbacks), eval_log.jsonl -- ONE FLAT ROW PER EVALUATION with every
 metric (each source's held-out loss, each probe accuracy) as its own key,
 so plotting any metric over training is a one-liner
-(``pandas.read_json(..., lines=True)``).
+(``pandas.read_json(..., lines=True)``) -- plus three crash-forensics
+files flushed and fsynced on every write so a SIGKILL still leaves the
+last successful record: ``heartbeat.json`` (the in-flight micro-batch:
+sources, token lengths, packed B/T, GPU MiB), ``last_step.json`` (every
+optimizer step, not every ``log_steps``), and ``crash.txt`` (traceback
+when Python lives long enough to raise). Non-finite loss or grad_norm
+aborts with a ``nonfinite_*`` event; they are not a silent continue.
 
 NOTE (remote-environment rule): this file cannot be executed on the local
 editing box (no torch/transformers/GPU). The default ``--projector-module``
@@ -170,6 +176,7 @@ import os
 import random
 import subprocess
 import sys
+import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -470,10 +477,15 @@ class TrainConfig:
 
 class TrainLogger:
     """One run directory under logs/: config.json, train_log.{jsonl,txt},
-    events.jsonl, eval_log.jsonl. Same spirit as agent.run_logging:
-    machine-readable + human-readable, and logging failures must never kill
-    a run that is burning GPU-hours (they degrade to a one-time console
-    warning)."""
+    events.jsonl, eval_log.jsonl, heartbeat.json, last_step.json,
+    crash.txt. Same spirit as agent.run_logging: machine-readable +
+    human-readable, and logging failures must never kill a run that is
+    burning GPU-hours (they degrade to a one-time console warning).
+
+    Appends fsync. ``heartbeat.json`` / ``last_step.json`` are replaced
+    atomically so a mid-write kill cannot leave a truncated file as the
+    only forensic record.
+    """
 
     def __init__(self, label: str, base_dir: str | Path = "logs"):
         stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -483,13 +495,36 @@ class TrainLogger:
         self.txt = self.run_dir / "train_log.txt"
         self.events = self.run_dir / "events.jsonl"
         self.eval_jsonl = self.run_dir / "eval_log.jsonl"
+        self.heartbeat_path = self.run_dir / "heartbeat.json"
+        self.last_step_path = self.run_dir / "last_step.json"
+        self.crash_path = self.run_dir / "crash.txt"
         self._warned = False
 
     def _append(self, path: Path, text: str) -> None:
         try:
             with open(path, "a", encoding="utf-8") as f:
                 f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
         except Exception as exc:  # logging must not break training
+            if not self._warned:
+                self._warned = True
+                print(f"[train] logging disabled after write failure: {exc}")
+
+    def _write_json(self, path: Path, obj: dict) -> None:
+        try:
+            payload = json.dumps(
+                {"ts": datetime.datetime.now().isoformat(timespec="seconds"),
+                 **obj},
+                default=str,
+            )
+            tmp = path.with_name(path.name + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp.replace(path)
+        except Exception as exc:
             if not self._warned:
                 self._warned = True
                 print(f"[train] logging disabled after write failure: {exc}")
@@ -501,6 +536,30 @@ class TrainLogger:
             )
         except Exception as exc:
             print(f"[train] could not write config.json: {exc}")
+
+    def heartbeat(self, record: dict) -> None:
+        """In-flight micro-batch. Overwritten every forward; last write
+        is whichever batch was running when the process died."""
+        self._write_json(self.heartbeat_path, record)
+
+    def last_step(self, record: dict) -> None:
+        """Every optimizer step (not gated on ``log_steps``)."""
+        self._write_json(self.last_step_path, record)
+
+    def record_crash(self, exc: BaseException, **fields: Any) -> None:
+        """Persist the traceback, then the caller re-raises."""
+        tb = traceback.format_exc()
+        self.event("crash", type=type(exc).__name__, msg=str(exc), **fields)
+        try:
+            with open(self.crash_path, "w", encoding="utf-8") as f:
+                f.write(tb)
+                if fields:
+                    f.write("\nfields: "
+                            + json.dumps(fields, default=str) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception:
+            print(tb, file=sys.stderr)
 
     def step(self, record: dict) -> None:
         record = {"ts": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -531,6 +590,75 @@ class TrainLogger:
         self._append(self.txt, f"== {kind}: "
                      + json.dumps(fields, default=str) + "\n")
         logger.info("event %s: %s", kind, fields)
+
+
+def _nvidia_smi_used_mi() -> int | None:
+    """Topline used-MiB summed over GPUs. None if nvidia-smi is unusable."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode != 0:
+            return None
+        return sum(int(line.strip())
+                   for line in out.stdout.splitlines() if line.strip())
+    except Exception:
+        return None
+
+
+def _gpu_mem_snapshot() -> dict[str, Any]:
+    """Allocator view + nvidia-smi topline. Must never raise."""
+    snap: dict[str, Any] = {}
+    smi = _nvidia_smi_used_mi()
+    if smi is not None:
+        snap["nvidia_smi_used_mi"] = smi
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            snap["cuda"] = False
+            return snap
+        i = torch.cuda.current_device()
+        free, total = torch.cuda.mem_get_info(i)
+        snap.update({
+            "cuda": True,
+            "device": int(i),
+            "allocated_mi": round(torch.cuda.memory_allocated(i) / 1024**2, 1),
+            "reserved_mi": round(torch.cuda.memory_reserved(i) / 1024**2, 1),
+            "free_mi": round(free / 1024**2, 1),
+            "total_mi": round(total / 1024**2, 1),
+        })
+    except Exception as exc:
+        snap["cuda_error"] = str(exc)
+    return snap
+
+
+def _batch_diag(exs: list[TrainingExample],
+                built: dict[str, Any] | None = None) -> dict[str, Any]:
+    """What was on the GPU when we died -- sources, lengths, packed shape."""
+    rows = [{
+        "source": ex.source,
+        "loss": ex.loss,
+        "n_tokens": ex.n_tokens,
+        "prefix_n_tokens": ex.prefix_n_tokens,
+        "batch_cap": ex.batch_cap,
+        "example_weight": ex.example_weight,
+        "has_image": ex.declares_image(),
+    } for ex in exs]
+    out: dict[str, Any] = {
+        "n": len(exs),
+        "loss_kind": exs[0].loss if exs else None,
+        "max_n_tokens": max((ex.n_tokens for ex in exs), default=0),
+        "sum_n_tokens": sum(ex.n_tokens for ex in exs),
+        "examples": rows,
+    }
+    if built is not None:
+        ids = built.get("model_inputs", {}).get("input_ids")
+        if ids is not None:
+            out["packed_B"] = int(ids.shape[0])
+            out["packed_T"] = int(ids.shape[1])
+    return out
 
 
 def _git_rev() -> str:
@@ -1842,9 +1970,10 @@ def epoch_batches(order: list[TrainingExample], micro_batch: int,
     """Group an epoch's example order into micro-batches: fill buckets
     (:func:`_batch_bucket_key`) in order, emit a batch whenever one fills,
     flush remainders as short batches, then shuffle the batch list so
-    sources and buckets interleave. Bucket remainders make the batch count
-    slightly larger than ``ceil(len(order) / micro_batch)`` -- the scheduler
-    estimate tolerates that (a few trailing steps at the LR floor).
+    sources and buckets interleave. Bucket remainders make the micro-batch
+    count slightly larger than the per-source ``ceil(n / cap)`` sum inside
+    :func:`estimate_steps_per_epoch`; leftover optimizer steps run at the
+    LR floor (the cosine progress clamp).
 
     An example's ``batch_cap`` lowers the fill limit for its bucket
     (batch_cap is part of the bucket key, so a bucket is cap-homogeneous):
@@ -1865,6 +1994,58 @@ def epoch_batches(order: list[TrainingExample], micro_batch: int,
             batches.append(bucket.copy())
     rng.shuffle(batches)
     return batches
+
+
+def _source_fill_limit(exs: list[TrainingExample], micro_batch: int) -> int:
+    """Tightest per-example fill limit in ``exs`` (batch_cap or micro_batch)."""
+    if not exs:
+        return micro_batch
+    return max(1, min(min(micro_batch, ex.batch_cap or micro_batch)
+                      for ex in exs))
+
+
+def estimate_steps_per_epoch(
+    by_source: dict[str, list[TrainingExample]],
+    src_weights: dict[str, float],
+    micro_batch: int,
+    grad_accum: int,
+) -> int:
+    """Lower-bound optimizer steps in one epoch.
+
+    Each source packs at ``min(micro_batch, that source's batch_cap or
+    micro_batch)``. Batch counts are summed, then divided by
+    ``grad_accum``. Still slightly low versus :func:`epoch_batches`
+    (bucket remainders add short batches); the cosine clamp holds those
+    leftover steps at the LR floor.
+    """
+    mb = max(1, int(micro_batch))
+    ga = max(1, int(grad_accum))
+    n_batches = 0
+    for name, exs in by_source.items():
+        n = max(1, round(src_weights.get(name, 1.0) * len(exs)))
+        n_batches += math.ceil(n / _source_fill_limit(exs, mb))
+    return math.ceil(n_batches / ga)
+
+
+def _clamp_cosine_scheduler(scheduler: Any, num_training_steps: int) -> Any:
+    """Pin cosine_with_min_lr at the floor after ``num_training_steps``.
+
+    HuggingFace's lambda lets ``progress`` exceed 1.0, which walks the
+    cosine back up toward the peak. Extra ``scheduler.step()`` calls
+    (bucket-remainder batches past the estimate) must stay at
+    ``lr_floor * peak``.
+    """
+    lambdas = getattr(scheduler, "lr_lambdas", None)
+    if not lambdas:
+        raise RuntimeError(
+            "cosine scheduler has no lr_lambdas; cannot clamp progress"
+        )
+    cap = int(num_training_steps)
+    scheduler.lr_lambdas = [
+        (lambda step, _fn=fn, _cap=cap: _fn(min(int(step), _cap)))
+        for fn in lambdas
+    ]
+    return scheduler
 
 
 def pack_prefix_windows(
@@ -2019,15 +2200,12 @@ def run_training(
     optimizer = bnb.optim.PagedAdamW8bit(
         params, lr=cfg.lr, weight_decay=cfg.weight_decay
     )
-    # Estimate: bucket remainders in epoch_batches add a few extra batches
-    # per epoch beyond ceil(n / micro_batch) (at most one per bucket), and
-    # micro_batch_cap sources (see TrainingExample.batch_cap) add more, so
-    # the cosine schedule may end some steps early -- those trailing steps
-    # just run at the LR floor.
-    contributions = sum(max(1, round(src_weights.get(n, 1.0) * len(v)))
-                        for n, v in by_source.items())
-    steps_per_epoch = math.ceil(
-        math.ceil(contributions / max(1, cfg.micro_batch)) / cfg.grad_accum
+    # Estimate from per-source batch_cap, not a global ceil(n / micro_batch).
+    # Bucket remainders in epoch_batches still add a few extra batches
+    # (at most one per bucket); the cosine clamp holds those leftover
+    # steps at the LR floor instead of walking LR back up.
+    steps_per_epoch = estimate_steps_per_epoch(
+        by_source, src_weights, cfg.micro_batch, cfg.grad_accum,
     )
     total_steps = cfg.max_steps or (cfg.epochs * steps_per_epoch)
     if cfg.scheduler == "cosine":
@@ -2037,6 +2215,7 @@ def run_training(
             num_training_steps=total_steps,
             scheduler_specific_kwargs={"min_lr_rate": cfg.lr_floor},
         )
+        _clamp_cosine_scheduler(scheduler, total_steps)
     else:
         scheduler = get_scheduler(
             "constant_with_warmup", optimizer,
@@ -2299,6 +2478,7 @@ def run_training(
     scaled_loss_n = 0
     done = False
     ended_early: str | None = None
+    schedule_overrun_logged = False
 
     try:
         for epoch in range(cfg.epochs):
@@ -2313,6 +2493,16 @@ def run_training(
             optimizer.zero_grad(set_to_none=True)
             for i, exs in enumerate(batches):
                 built = collator.build_batch(exs)
+                batch_diag = _batch_diag(exs, built)
+                tlog.heartbeat({
+                    "phase": "pre_forward",
+                    "step_completed": step,
+                    "epoch": epoch,
+                    "microbatch": i,
+                    "n_microbatches": len(batches),
+                    "batch": batch_diag,
+                    "gpu": _gpu_mem_snapshot(),
+                })
                 # weighted_loss means over the batch's per-example
                 # normalized losses scaled by each example's reward
                 # (example_weight; SHAPE VS SCALE in its docstring), so
@@ -2329,26 +2519,69 @@ def run_training(
                     prefix_hash=exs[0].prefix_hash,
                     kd_chunk=cfg.kd_lm_head_chunk,
                 )
+                loss_f = float(loss.detach())
+                per_ex = per_example.detach()
+                if not math.isfinite(loss_f) or not bool(torch.isfinite(per_ex).all()):
+                    tlog.event(
+                        "nonfinite_loss", step_completed=step, epoch=epoch,
+                        microbatch=i, loss=loss_f,
+                        per_example=per_ex.tolist(),
+                        batch=batch_diag, gpu=_gpu_mem_snapshot(),
+                    )
+                    raise RuntimeError(
+                        f"non-finite loss {loss_f} at epoch {epoch} "
+                        f"microbatch {i} (completed optimizer steps "
+                        f"{step}); sources="
+                        f"{[ex.source for ex in exs]} "
+                        f"n_tokens={[ex.n_tokens for ex in exs]}"
+                    )
                 (loss / cfg.grad_accum).backward()
-                scaled_loss_sum += float(loss.detach())
+                scaled_loss_sum += loss_f
                 scaled_loss_n += 1
-                for ex, lv in zip(exs, per_example.tolist()):
+                for ex, lv in zip(exs, per_ex.tolist()):
                     src_loss_sum[ex.source] = src_loss_sum.get(ex.source, 0.0) + lv
                     src_loss_n[ex.source] = src_loss_n.get(ex.source, 0) + 1
 
                 if (i + 1) % cfg.grad_accum == 0 or i == len(batches) - 1:
                     grad_norm = float(torch.nn.utils.clip_grad_norm_(
                         params, cfg.max_grad_norm))
+                    if not math.isfinite(grad_norm):
+                        tlog.event(
+                            "nonfinite_grad", step_completed=step,
+                            epoch=epoch, microbatch=i,
+                            grad_norm=grad_norm, last_loss=loss_f,
+                            batch=batch_diag, gpu=_gpu_mem_snapshot(),
+                        )
+                        raise RuntimeError(
+                            f"non-finite grad_norm {grad_norm} at "
+                            f"epoch {epoch} microbatch {i} "
+                            f"(completed optimizer steps {step})"
+                        )
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                     step += 1
+                    if step > total_steps and not schedule_overrun_logged:
+                        logger.info(
+                            "step %d exceeds planned total_steps=%d; "
+                            "LR held at floor",
+                            step, total_steps,
+                        )
+                        schedule_overrun_logged = True
                     prefix_state.opt_steps += 1
                     if (cfg.prefix_kv_refresh_steps > 0
                             and prefix_state.opt_steps
                             % cfg.prefix_kv_refresh_steps == 0):
                         prefix_state.cache = None
                         prefix_state.key = None
+                    tlog.last_step({
+                        "step": step, "epoch": epoch,
+                        "last_microbatch_loss": loss_f,
+                        "grad_norm": grad_norm,
+                        "lr": scheduler.get_last_lr()[0],
+                        "batch": batch_diag,
+                        "gpu": _gpu_mem_snapshot(),
+                    })
 
                     if step % cfg.log_steps == 0:
                         per_src = {
@@ -2402,8 +2635,17 @@ def run_training(
         # as a normal, early 'done' standing behind last_good_ckpt, so
         # the orchestrator hands the right weights to the next epoch.
         ended_early = f"consecutive rollbacks (hard regression on {exc.args[0]})"
+    except BaseException as exc:
+        tlog.record_crash(
+            exc, step=step,
+            last_good_checkpoint=str(last_good_ckpt),
+            last_checkpoint=str(last_ckpt),
+            gpu=_gpu_mem_snapshot(),
+        )
+        raise
 
-    tlog.event("done", steps=step, final_checkpoint=str(last_ckpt),
+    tlog.event("done", steps=step, planned_steps=total_steps,
+               final_checkpoint=str(last_ckpt),
                last_good_checkpoint=str(last_good_ckpt),
                best_metrics=best_metrics,
                **({"ended_early": ended_early} if ended_early else {}))
