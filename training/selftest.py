@@ -1811,7 +1811,7 @@ def t1_pure() -> str:
     )
     from agent.memory import (
         format_notepad,
-        get_game_context,
+        retrieve_context,
         retrieval_enabled,
     )
     # Notebook human-takeover: first bracketed move token ends the reply.
@@ -1901,11 +1901,14 @@ def t1_pure() -> str:
     assert "target: the left gold, near the top wall" in filled_pad
     assert "(updated round 4)" in filled_pad
     checks += 1
-    # Phase-2 default: automatic dumps off; prompt + notepad + [SEARCH]
-    # stay. get_game_context short-circuits without touching the client.
+    # Phase-2 default: get_context dump off; last-K recency + [SEARCH]
+    # stay. retrieve_context short-circuits without touching the client.
     import asyncio
+    from agent.config import CONFIG
     assert retrieval_enabled() is False
-    assert asyncio.run(get_game_context(None, "sid", query="x")) == ""
+    assert CONFIG.recent_messages_window == 7
+    assert CONFIG.player_recent_messages_window == 7
+    assert asyncio.run(retrieve_context(None, "q", "sid")) == ""
     checks += 1
     w = _SIDE_WALL_WIDTH
     full = [

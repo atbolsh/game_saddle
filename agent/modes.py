@@ -734,47 +734,40 @@ async def mode_discuss(
 ) -> dict[str, Any]:
     """Mode 2: open-ended discussion.
 
-    When ``nams_retrieval`` is on, this combines a recency window of the
-    latest messages with semantic search across all memory tiers, unscrubbed.
-    When it is off (this branch's default), the turn is the system prompt
-    plus the user's text -- no recency dump, no ``get_context``.
+    Always injects the last-K recency window. The ``get_context`` semantic
+    dump is added only when ``nams_retrieval`` is on (off on this branch).
     """
     cfg = cfg or CONFIG
     model = get_model(cfg)
 
-    # Retrieve BEFORE storing the current message: the recency window should show
-    # the PRIOR turns, and the semantic search should not just echo back the
-    # message we are about to answer. Off when nams_retrieval is False
-    # (prompt + scratchpad only; discuss has no notepad, so just the turn).
-    if mem.retrieval_enabled(cfg):
-        recent = await mem.get_recent_messages(
-            client, session_id, cfg.recent_messages_window,
+    # Recency BEFORE storing the current message: the window should show
+    # the PRIOR turns, not the one we are about to answer.
+    recent = await mem.get_recent_messages(
+        client, session_id, cfg.recent_messages_window,
+    )
+    context_parts: list[str] = []
+    if recent:
+        context_parts.append(
+            "Recent conversation (most recent last):\n" + recent
         )
+    if mem.retrieval_enabled(cfg):
         ctx = await mem.retrieve_context(
             client, query=user_text, session_id=session_id,
         )
         ctx_text = ctx if isinstance(ctx, str) else json.dumps(
             ctx, default=str, indent=2,
         )
-        # Same channel separation as mode 1: our recency window is the one
-        # source of recent messages; drop NAMS' built-in "Recent Conversation"
-        # section (ordered ASC; actually the OLDEST messages anyway).
+        # Recency window is the one channel for recent messages; drop
+        # NAMS' built-in "Recent Conversation" (ordered ASC = oldest).
         ctx_text = mem.strip_nams_recent_conversation(ctx_text)
-        context_parts: list[str] = []
-        if recent:
-            context_parts.append(
-                "Recent conversation (most recent last):\n" + recent
-            )
         if ctx_text and ctx_text.strip() not in ("", "{}", "[]"):
             context_parts.append(
                 "Relevant memories (semantic search across all tiers):\n"
                 + ctx_text
             )
-        context_block = (
-            "\n\n".join(context_parts) if context_parts else "(no prior context)"
-        )
-    else:
-        context_block = ""
+    context_block = (
+        "\n\n".join(context_parts) if context_parts else "(no prior context)"
+    )
 
     # Now record the user message (after retrieval, so it isn't self-retrieved).
     await client.short_term.add_message(

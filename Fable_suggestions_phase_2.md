@@ -158,13 +158,61 @@ the one that matters for multi-room.
 
 - Old prompt (core-tip dump still loaded from NAMS).
 - Scratchpad (`[REMEMBER]` / `SessionNote`) stays.
-- Automatic dumps are off: `get_context`, recency windows in play /
-  discuss / the analyst, and the privileged semantic-model dump. Flip
-  those back with `NAMS_RETRIEVAL=1`.
+- Last-K recency is on everywhere: `RECENT_MESSAGES_WINDOW=7` and
+  `PLAYER_RECENT_MESSAGES_WINDOW=7`. Verbatim last 7 session messages
+  in play, discuss, and the analyst. Older messages drop off the
+  cliff — no digest, no attention score. See below.
 - `[SEARCH]` hits stay live (the tool the standing weights already
   know).
+- `get_context` semantic dump and the privileged semantic-model dump
+  stay off. Flip those back with `NAMS_RETRIEVAL=1`.
 - Debrief `[SHOW]` (exact cursor on recorded play) and exact
   session-trace Cypher stay — those are not similarity search.
 - Next: notebook conversations with the standing weights, then prompt
   / interaction changes from what those conversations actually do.
   Custom night-time datagen only later.
+
+## Last-K now; per-token attention later (not implemented)
+
+The live policy is the old sliding window: keep the last K=7 messages
+verbatim, drop everything older. `_summarize_actions` still exists
+(`agent/modes.py`) but it is **not** in the player prompt — only the
+NAMS turn-trace outcome string and the debrief trace block use it.
+
+A better eviction rule was discussed and is **not built**: score each
+in-context message by (attention it received) + recency, knock it out
+when the score is too low. Closest published matches:
+
+- **H2O** (Zhang et al., NeurIPS 2023, “Heavy-Hitter Oracle”). Keep a
+  running sum of attention each token has *received*; when the KV
+  budget is hit, evict the lowest scorer, always retaining a recency
+  window next to the heavy hitters. Training-free. Models: OPT-6.7B /
+  30B, LLaMA-1-7B / 13B, GPT-NeoX-20B. Headline: ~20% of the full KV
+  cache loses almost nothing.
+- **TOVA** (Oren et al., 2024, “Transformers are Multi-State RNNs”).
+  Same problem, cleaner rule: at each decode step drop the token
+  whose key gets the lowest attention from the *current query only*
+  — no accumulation, so no seniority bias (H2O lets old tokens pile
+  up score just by having been around). Models: LLaMA-2-7B, Mistral-7B,
+  Yi-6B. ~1/8 of the full state matched full-context performance.
+
+Both are inference-only bolt-ons from just before flash attention
+became universal. Flash / SDPA never materialize the attention matrix,
+so getting these scores on our stack means `attn_implementation="eager"`
+(slower, more VRAM at ~8k) or a recompute pass. Attention is also a
+biased proxy: attention sinks collect weight regardless of content;
+low attention *now* is not low value *later* (the target-naming
+message ignored for ten turns). That last failure is exactly what
+the notepad is for.
+
+The research branch is alive but moved *inside* the model: GQA, MLA,
+hybrid local/global attention (Gemma 2/3’s 5:1), trained sparse
+attention (DeepSeek NSA, Kimi MoBA, DeepSeek V3.2). Production
+serving mostly chose lossless KV management (PagedAttention, prefix
+cache) over lossy score eviction.
+
+If we ever prototype the message-level version, cheaper than eager
+attention: use behavioral signals already in the run logs (`[SEARCH]`
+hit, reply reference, `[REMEMBER]` derived from it) as the “was
+attended” score, plus recency decay. Do not implement any of that
+until last-K=7 has been lived with.

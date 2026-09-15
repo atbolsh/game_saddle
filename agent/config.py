@@ -222,11 +222,11 @@ class AgentConfig:
         default_factory=lambda: _env_int("RECENT_MESSAGES_WINDOW", 7)
     )
     # Player-only recency window (self-eval PLAYER path; the analyst keeps
-    # ``recent_messages_window``). Sized from measured aug11/aug12 traces:
-    # p99 example 9.4k chars, p90 message 317 chars -- 8 messages plus the
-    # notepad + Board update blocks stays far under train.py's 16k drop cap.
+    # ``recent_messages_window``). Same last-K=7 as play; the old 8 was a
+    # token-budget headroom knob (aug11/aug12 traces), not a different
+    # memory policy.
     player_recent_messages_window: int = field(
-        default_factory=lambda: _env_int("PLAYER_RECENT_MESSAGES_WINDOW", 8)
+        default_factory=lambda: _env_int("PLAYER_RECENT_MESSAGES_WINDOW", 7)
     )
 
     # Debrief (mode 4). The context always carries exactly ONE frame -- the
@@ -238,11 +238,9 @@ class AgentConfig:
         default_factory=lambda: _env_int("DEBRIEF_MAX_TOOL_CALLS", 64)
     )
 
-    # Automatic recency / ``get_context`` dumps into play/discuss.
-    # Off on this branch: the model sees the NAMS-loaded scene prompt,
-    # the session scratchpad, and whatever it fetches with `[SEARCH]`.
-    # Exact SessionNote read/write and `load_scene_prompts` stay on.
-    # Re-enable the dumps with NAMS_RETRIEVAL=1.
+    # ``get_context`` semantic dump into play/discuss. Off on this branch:
+    # the model still gets the scene prompt, last-K recency, scratchpad,
+    # and `[SEARCH]`. Re-enable the dump with NAMS_RETRIEVAL=1.
     nams_retrieval: bool = field(
         default_factory=lambda: _env_bool("NAMS_RETRIEVAL", False)
     )

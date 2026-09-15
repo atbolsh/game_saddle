@@ -424,14 +424,12 @@ class InteractiveSelfEvalSession(InteractiveSession):
         replies: list[dict[str, Any]] = []
         n_searches = 0
         while True:
-            recent = ""
-            if mem.retrieval_enabled(self.cfg):
-                recent = self._run(
-                    mem.get_recent_messages(
-                        self.client, self.session_id,
-                        self.cfg.recent_messages_window, scrub=False,
-                    )
+            recent = self._run(
+                mem.get_recent_messages(
+                    self.client, self.session_id,
+                    self.cfg.recent_messages_window, scrub=False,
                 )
+            )
             messages = modes.build_scene_analyst_messages(
                 pending["question"], pending["raw"],
                 game_io.format_move_inner(

@@ -34,11 +34,11 @@ _RETRIEVAL_OFF_LOGGED = False
 
 
 def retrieval_enabled(cfg: AgentConfig | None = None) -> bool:
-    """Whether automatic recency / ``get_context`` dumps may enter the prompt.
+    """Whether the ``get_context`` semantic dump may enter the prompt.
 
-    Does not gate `[SEARCH]` (that path stays live). Core-tip prompt load
-    (`load_scene_prompts`) and the session scratchpad (`get_session_notes`
-    / `[REMEMBER]`) also do not consult this flag.
+    Does not gate the last-K recency window, `[SEARCH]`, core-tip prompt
+    load (`load_scene_prompts`), or the session scratchpad
+    (`get_session_notes` / `[REMEMBER]`).
     """
     return (cfg or CONFIG).nams_retrieval
 
@@ -48,9 +48,9 @@ def _log_retrieval_off() -> None:
     if not _RETRIEVAL_OFF_LOGGED:
         _RETRIEVAL_OFF_LOGGED = True
         logger.info(
-            "NAMS automatic retrieval is OFF (prompt + scratchpad + "
-            "[SEARCH] only); set NAMS_RETRIEVAL=1 to restore get_context "
-            "/ recency dumps"
+            "NAMS get_context dump is OFF (prompt + scratchpad + last-K "
+            "recency + [SEARCH] stay); set NAMS_RETRIEVAL=1 to restore "
+            "the semantic dump"
         )
 
 
@@ -469,30 +469,33 @@ async def get_game_context(
     the semantic block drops any line carrying :data:`ANALYST_TAG` or a
     leftover prefix -- a masking-only line filter, where over-masking is
     safe and leaking is not.
+
+    The recency window is always on (last-K verbatim). The semantic dump
+    is gated by :func:`retrieval_enabled`.
     """
-    if not retrieval_enabled():
-        _log_retrieval_off()
-        return ""
-    ctx = await retrieve_context(client, query=query, session_id=session_id)
-    if isinstance(ctx, str):
-        semantic = _strip_settings_from_text(ctx)
-    else:
-        cleaned = _strip_settings(ctx)
-        # NAMS may return a structured object; stringify for the prompt.
-        import json as _json
-
-        try:
-            semantic = _json.dumps(cleaned, default=str, indent=2)
-        except Exception:
-            semantic = str(cleaned)
-    # Recent moves belong to the recency window below, not the semantic block.
-    semantic = strip_nams_recent_conversation(semantic)
-    if exclude_analyst:
-        semantic = strip_analyst_lines(semantic)
-
     recent = await get_recent_messages(
         client, session_id, recent_window, exclude_analyst=exclude_analyst
     )
+    semantic = ""
+    if retrieval_enabled():
+        ctx = await retrieve_context(client, query=query, session_id=session_id)
+        if isinstance(ctx, str):
+            semantic = _strip_settings_from_text(ctx)
+        else:
+            cleaned = _strip_settings(ctx)
+            # NAMS may return a structured object; stringify for the prompt.
+            import json as _json
+
+            try:
+                semantic = _json.dumps(cleaned, default=str, indent=2)
+            except Exception:
+                semantic = str(cleaned)
+        # Recent moves belong to the recency window, not the semantic block.
+        semantic = strip_nams_recent_conversation(semantic)
+        if exclude_analyst:
+            semantic = strip_analyst_lines(semantic)
+    else:
+        _log_retrieval_off()
 
     parts: list[str] = []
     if recent:
