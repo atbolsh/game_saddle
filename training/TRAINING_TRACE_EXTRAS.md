@@ -49,8 +49,11 @@ uses, in order of commitment:
 2. **Analyst backprop under a different metric (open).** If the analyst is
    ever trained, planted-error catches are the natural training signal:
    the label is programmatic (no engine query at inference, no human), and
-   "did you catch the planted error" cannot reward agreement. Whether and
-   when to do this is an explicitly deferred decision.
+   "did you catch the planted error" cannot reward agreement. The later
+   recipe is [FUTURE_GOALS.md](../FUTURE_GOALS.md) goal 14: new situations
+   each time, regex-constructed player text (correct / partial / false),
+   multiple analyst traces, then CE or GRPO. **On ice (2026-09-16)** —
+   not the current project.
 
 Note the relationship to the engine-verification idea recorded in
 [TRAINING_GAME_TRACES.md](TRAINING_GAME_TRACES.md): planted errors need *no
