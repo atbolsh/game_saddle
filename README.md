@@ -296,8 +296,8 @@ native binary `neo4j-admin database dump` produced by `scripts/neo4j_db.sh save`
 
 ## Interactive notebooks
 
-The Jupyter notebooks live in `notebooks/`: `play` (mode-1 play),
-`interactive_self_eval` (the player/analyst loop, mode 3), `debrief`
+The Jupyter notebooks live in `notebooks/`: `play` (mode-1 play, no
+analyst), `multi_gold_eval` (the player/analyst loop), `debrief`
 (privileged post-game analysis, mode 4), `trace_viewer` (step through
 recorded datagen traces — no GPU/NAMS needed), `noise_tuner` (tune the
 image-noise magnitudes on a live board — no GPU/NAMS needed), and
@@ -309,8 +309,8 @@ from the repo root:
 jupyter notebook   # or: jupyter lab
 ```
 
-**Architecture + checkpoint dropdowns.** The play, debrief, and
-interactive-self-eval notebooks all start their control panel with a shared
+**Architecture + checkpoint dropdowns.** The play, multi-gold self-eval, and
+debrief notebooks all start their control panel with a shared
 model picker (`agent.notebook_ui.model_picker`): an **Architecture** dropdown
 over every `agent.model.MODEL_REGISTRY` entry in recommendation order (see
 `MODEL_CANDIDATES.md`), a **Checkpoint** dropdown listing `[default]` (bare
@@ -329,22 +329,32 @@ touched. The registry currently holds the two Gemma 4 variants (12B Unified,
 E4B); the wider 2026-07 candidate field, and why it lost, is recorded in
 `MODEL_CANDIDATES.md`.
 
-* **`notebooks/play.ipynb`** — interactive mode-1 play. It holds **one
-  persistent game** and **one conversation thread**. One click is **one
-  generation**: the agent sees the *current* live frame plus its
-  (settings-stripped) memory context and emits at most one move token
-  (`[CLOCK n]`, `[ANTICLOCK n]`, `[FORWARD]`). Generation is stopped early the
-  instant that token appears (`PLAYER_STOP_PATTERN` regex) and the move is applied.
-  Ask again for the next move. A
-  **"Restart conversation"** button re-initializes the env (a fresh bare level)
-  and starts a new `session_id`. To discard an unwanted conversation and get
-  back to the "semantic seeding only" state, either run the notebook's gated
-  reset cell (`session.reset_memory_to_seed()`) or, from a shell,
-  `bash scripts/reset_semantics.sh` (wipe + reseed). The heavy lifting lives in
-  [`agent/interactive.py`](agent/interactive.py) (`InteractiveSession`),
-  which runs the async NAMS client on a background event loop so the
-  synchronous ipywidgets buttons can drive it. The mode-1 privacy invariant
-  holds: the Settings dict is never fed to the model here.
+* **`notebooks/play.ipynb`** — interactive mode-1 play over a **multi-gold
+  room** (0–3 golds, openings; sealed one-gold is `Golds: 1` + `Opening:
+  forbid`). It holds **one persistent game** and **one conversation
+  thread**. One click is **one generation**: the agent sees the *current*
+  live frame plus its (settings-stripped) memory context and emits at most
+  one move token (`[CLOCK n]`, `[ANTICLOCK n]`, `[FORWARD]`,
+  `[END_GAME]`). Generation stops at the token and the move is applied.
+  `[END_GAME]` applies no board action and freezes the session until
+  **New room**. Eating gold is not a win. A live row shows the current
+  frame plus a maroon scratchpad and a teal settings editor (user-only;
+  settings never enter the player prompt). **Edit** / **Render** on those
+  cards: hand-edited `openings` are reconciled into `walls` in
+  `game_io.reconcile_walls_to_openings`, then the dict is passed to the
+  existing renderer without an `openings` key. Bad JSON stays in edit
+  mode. Generation cannot start while either card is being edited. To
+  discard an unwanted conversation, run the gated reset cell
+  (`session.reset_memory_to_seed()`) or `bash scripts/reset_semantics.sh`.
+  The session class is
+  [`agent/multi_gold_session.py`](agent/multi_gold_session.py)
+  (`MultiGoldPlaySession`).
+
+* **`notebooks/multi_gold_eval.ipynb`** — the same room controls and live
+  editors, plus the player/analyst two-phase loop. Scene/scratchpad
+  Render is refused while a round is open. Datagen still uses
+  `InteractiveSelfEvalSession` / `MultiGoldSelfEvalSession`; this notebook
+  is the interactive self-eval UI.
 
 * **`notebooks/debrief.ipynb`** — privileged post-game analysis. The analyst
   rubric matches self-eval (`RATING: -1.0..1.0`, `WRONG` spans, target /
@@ -545,12 +555,13 @@ agent/
   config.py          # env-driven AgentConfig
   model.py           # model registry + family adapters + VLModel wrapper (incl. generate_batch)
   parallel_gen.py    # cross-thread generation batching (dispatcher + session proxy)
-  game_io.py         # bare level gen, Settings <-> dict, render to PNG, apply_action; multi-gold factory + openings oracle
+  game_io.py         # bare level gen, Settings <-> dict, render to PNG, apply_action; multi-gold factory + openings oracle + reconcile_walls_to_openings
   image_store.py     # disk PNG + 64x64 thumbnail b64 + GameSnapshot node + linking
   memory.py          # NAMS MemoryClient factory; context stripping; semantic-model seed; DB dump
   modes.py           # mode_game / mode_discuss / mode_self_eval
   interactive.py     # InteractiveSession: persistent-game mode-1 for notebooks
-  multi_gold_session.py  # MultiGoldSelfEvalSession (datagen --multi-gold + notebooks/multi_gold_eval.ipynb)
+  multi_gold_session.py  # MultiGoldRoomMixin + MultiGoldSelfEvalSession (datagen) + MultiGoldPlaySession (play.ipynb)
+  notebook_ui.py     # shared notebook widgets (model picker, takeover, live editors)
   run_logging.py     # per-run LLM-call + DB-retrieval logs (on by default)
   runner.py          # CLI
 training/
@@ -578,9 +589,8 @@ weights/             # trained adapter checkpoints, weights/<architecture>/<name
 data_external/       # materialized replay datasets + probes (git-ignored; setup_env.sh)
 data_game/           # generated self-eval game traces + frames (git-ignored; setup_env.sh)
 notebooks/
-  play.ipynb            # interactive mode-1 play (Ask + Restart conversation)
-  interactive_self_eval.ipynb # player/analyst two-phase loop (mode 3)
-  multi_gold_eval.ipynb     # multi-gold / openings self-eval
+  play.ipynb            # interactive mode-1 play (multi-gold, no analyst)
+  multi_gold_eval.ipynb     # multi-gold / openings self-eval (player + analyst)
   debrief.ipynb         # privileged post-game debrief (mode 4)
   trace_viewer.ipynb    # step through recorded datagen traces (no GPU/NAMS)
   noise_tuner.ipynb     # tune image-noise magnitudes by eye (no GPU/NAMS)

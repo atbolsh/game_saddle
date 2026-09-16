@@ -1104,6 +1104,33 @@ async def clear_session_notes(client: Any, session_id: str) -> None:
         raise
 
 
+async def replace_session_notes(
+    client: Any,
+    session_id: str,
+    notes: dict[str, str],
+    round_no: int,
+) -> None:
+    """Replace this session's scratchpad with ``notes`` (key -> value).
+
+    Unchanged keys keep their previous ``updated_round``; new or edited
+    keys get ``round_no``. Empty ``notes`` leaves an empty pad. Hidden
+    from the agent until the next generation fetches the notes.
+    """
+    existing = {
+        n["key"]: n
+        for n in await get_session_notes(client, session_id)
+    }
+    await clear_session_notes(client, session_id)
+    for key, value in notes.items():
+        old = existing.get(key)
+        rnd = (
+            int(old["updated_round"])
+            if old is not None and old.get("value") == value
+            else round_no
+        )
+        await set_session_note(client, session_id, key, value, rnd)
+
+
 def format_notepad(notes: list[dict]) -> str:
     """Render the complete notepad block injected into the player prompt.
 

@@ -12,14 +12,18 @@
   training/TRAINING_OVERVIEW.md), rescanned whenever the architecture
   changes.
 - :func:`player_takeover_controls` is the sticky human-player takeover
-  used only by the two self-eval notebooks (reply box + Submit +
+  used by play and multi-gold self-eval (reply box + Submit +
   pictographic move buttons).
+- :func:`room_scenario_bar`, :func:`live_board_row`, and
+  :class:`UiBusy` are the shared gold/opening bar, floating
+  frame+scratchpad+settings editors, and generating/editing lock.
 """
 
 from __future__ import annotations
 
 import base64
 import html as _html
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -27,7 +31,7 @@ from typing import Any, Callable
 import ipywidgets as widgets
 from IPython.display import HTML, display
 
-from agent.game_io import ACTIONS
+from agent.game_io import ACTIONS, parse_notepad_edit, parse_settings_edit_json
 
 #: CSS class marking a Textarea widget as Shift-Enter-tamed.
 _TAMED_CLASS = "tame-shift-enter"
@@ -219,7 +223,7 @@ def player_takeover_controls(
     on_submit: Callable[[str], None],
     on_mode_change: Callable[[], None] | None = None,
 ) -> SimpleNamespace:
-    """Sticky human-player takeover panel for the two self-eval notebooks.
+    """Sticky human-player takeover panel for play and multi-gold self-eval.
 
     ``on_submit(raw)`` receives the reply-box text, with ``\\n\\n[TOKEN]``
     appended when a move button was pressed. Truncation at the first
@@ -394,3 +398,305 @@ def tame_shift_enter(*text_widgets) -> None:
     for w in text_widgets:
         w.add_class(_TAMED_CLASS)
     display(HTML(_SCRIPT))
+
+
+class UiBusy:
+    """Generating lock shared by play and multi-gold notebooks.
+
+    ``generating`` disables Edit / Ask / Analyze / New room / model switch.
+    Either editor in edit mode disables Ask / Analyze. Notebooks call
+    :meth:`set_on_change` with their ``_sync_phase``.
+    """
+
+    def __init__(self) -> None:
+        self.generating = False
+        self._on_change: Callable[[], None] | None = None
+
+    def set_on_change(self, fn: Callable[[], None]) -> None:
+        self._on_change = fn
+
+    def set_generating(self, on: bool) -> None:
+        self.generating = bool(on)
+        if self._on_change is not None:
+            self._on_change()
+
+
+def room_scenario_bar() -> SimpleNamespace:
+    """Gold-count + opening dropdowns, New room, End game."""
+    gold_dd = widgets.Dropdown(
+        options=[("random", None), ("0", 0), ("1", 1), ("2", 2), ("3", 3)],
+        value=None,
+        description="Golds:",
+        layout=widgets.Layout(width="220px"),
+    )
+    opening_dd = widgets.Dropdown(
+        options=[("require", "require"), ("forbid", "forbid"),
+                 ("random", "any")],
+        value="require",
+        description="Opening:",
+        layout=widgets.Layout(width="220px"),
+    )
+    new_room_btn = widgets.Button(description="New room", button_style="primary")
+    end_btn = widgets.Button(description="End game", button_style="danger")
+    return SimpleNamespace(
+        gold_dd=gold_dd,
+        opening_dd=opening_dd,
+        new_room_btn=new_room_btn,
+        end_btn=end_btn,
+        box=widgets.HBox([gold_dd, opening_dd, new_room_btn, end_btn]),
+    )
+
+
+def _card_html(
+    body: str,
+    *,
+    title: str,
+    title_color: str,
+    bg: str,
+    border: str,
+    height_px: int,
+    hint: str = "",
+) -> str:
+    escaped = _html.escape(body or "")
+    hint_html = (
+        f"<div style='font-size:11px;color:#555;margin-bottom:6px'>"
+        f"{_html.escape(hint)}</div>"
+        if hint else ""
+    )
+    return (
+        f"<div style='height:{height_px}px;overflow:auto;background:{bg};"
+        f"border:1px solid {border};border-radius:6px;padding:10px 12px;"
+        "box-sizing:border-box;font-family:monospace;white-space:pre-wrap;"
+        "font-size:13px'>"
+        f"<div style='font-weight:bold;color:{title_color};margin-bottom:4px'>"
+        f"{_html.escape(title)}</div>"
+        f"{hint_html}{escaped}</div>"
+    )
+
+
+def _editor_card(
+    *,
+    title: str,
+    title_color: str,
+    bg: str,
+    border: str,
+    height_px: int,
+    hint: str,
+) -> SimpleNamespace:
+    """View HTML + Edit/Render textarea. Edit does not clobber in-progress text."""
+    view = widgets.HTML()
+    textarea = widgets.Textarea(
+        value="",
+        layout=widgets.Layout(width="100%", height=f"{max(height_px - 36, 120)}px"),
+    )
+    textarea.layout.display = "none"
+    textarea.add_class(_TAMED_CLASS)
+    edit_btn = widgets.Button(description="Edit")
+    render_btn = widgets.Button(description="Render", button_style="success")
+    status = widgets.HTML()
+    editing = False
+
+    def _set_view(text: str) -> None:
+        view.value = _card_html(
+            text, title=title, title_color=title_color, bg=bg,
+            border=border, height_px=height_px, hint=hint,
+        )
+
+    def is_editing() -> bool:
+        return editing
+
+    def enter_edit(edit_text: str) -> None:
+        nonlocal editing
+        if not editing:
+            textarea.value = edit_text
+        editing = True
+        view.layout.display = "none"
+        textarea.layout.display = None
+        status.value = ""
+
+    def show_view(view_text: str) -> None:
+        nonlocal editing
+        editing = False
+        textarea.layout.display = "none"
+        view.layout.display = None
+        _set_view(view_text)
+        status.value = ""
+
+    def set_error(msg: str) -> None:
+        status.value = (
+            "<div style='color:#a00;font-family:monospace;white-space:pre-wrap'>"
+            f"{_html.escape(msg)}</div>"
+        )
+
+    def set_disabled(on: bool) -> None:
+        edit_btn.disabled = on
+        render_btn.disabled = on or not editing
+
+    box = widgets.VBox([
+        view,
+        textarea,
+        widgets.HBox([edit_btn, render_btn]),
+        status,
+    ], layout=widgets.Layout(
+        flex="1 1 360px",
+        min_width="320px",
+        border=f"1px solid {border}",
+        padding="6px",
+    ))
+    return SimpleNamespace(
+        view=view,
+        textarea=textarea,
+        edit_btn=edit_btn,
+        render_btn=render_btn,
+        status=status,
+        box=box,
+        is_editing=is_editing,
+        enter_edit=enter_edit,
+        show_view=show_view,
+        set_error=set_error,
+        set_disabled=set_disabled,
+        title=title,
+    )
+
+
+def live_board_row(
+    session: Any,
+    busy: UiBusy,
+    *,
+    width: int = 420,
+    on_changed: Callable[[], None] | None = None,
+) -> SimpleNamespace:
+    """Sticky frame + maroon scratchpad + teal settings (Edit/Render).
+
+    Hidden from the agent until the next generation. Generation cannot
+    start while either card is in edit mode; Edit is disabled while
+    ``busy.generating``.
+    """
+    frame = widgets.Image(format="png", width=width)
+    frame.layout = widgets.Layout(width=f"{width}px", flex=f"0 0 {width}px")
+    caption = widgets.HTML()
+
+    scratch = _editor_card(
+        title="Player's scratchpad",
+        title_color="#7a2e2e",
+        bg="#f7e6e6",
+        border="#c69c9c",
+        height_px=width,
+        hint="Edit as JSON {key: value}. Bad format stays in edit mode.",
+    )
+    settings = _editor_card(
+        title="Game settings",
+        title_color="#0d5c5c",
+        bg="#e6f4f4",
+        border="#5aa8a8",
+        height_px=width,
+        hint=(
+            "To change the boundary, edit openings. Boundary-band walls "
+            "lose if they conflict. Interior walls, gold, and pose are "
+            "taken as written. Render strips openings and rebuilds walls."
+        ),
+    )
+
+    def is_editing() -> bool:
+        return scratch.is_editing() or settings.is_editing()
+
+    def refresh(*, force_views: bool = False) -> None:
+        path = session.current_frame_path()
+        frame.value = Path(path).read_bytes()
+        caption.value = (
+            "<div style='font-family:monospace;font-size:12px;color:#444'>"
+            "current board</div>"
+        )
+        if force_views or not scratch.is_editing():
+            scratch.show_view(session.current_notepad())
+        if force_views or not settings.is_editing():
+            settings.show_view(
+                json.dumps(session.current_settings_dict(), indent=2)
+            )
+        _sync_buttons()
+        if on_changed is not None:
+            on_changed()
+
+    def _sync_buttons() -> None:
+        blocked = busy.generating
+        scratch.set_disabled(blocked)
+        settings.set_disabled(blocked)
+
+    def _on_scratch_edit(_) -> None:
+        if busy.generating:
+            return
+        scratch.enter_edit(session.current_notepad_edit_json())
+        _sync_buttons()
+        if on_changed is not None:
+            on_changed()
+
+    def _on_settings_edit(_) -> None:
+        if busy.generating:
+            return
+        settings.enter_edit(
+            json.dumps(session.current_settings_dict(), indent=2)
+        )
+        _sync_buttons()
+        if on_changed is not None:
+            on_changed()
+
+    def _on_scratch_render(_) -> None:
+        if busy.generating or not scratch.is_editing():
+            return
+        try:
+            notes = parse_notepad_edit(scratch.textarea.value)
+            session.replace_scratchpad(notes)
+        except ValueError as exc:
+            scratch.set_error(f"Error, bad format, fix input before saving.\n{exc}")
+            return
+        scratch.show_view(session.current_notepad())
+        _sync_buttons()
+        if on_changed is not None:
+            on_changed()
+
+    def _on_settings_render(_) -> None:
+        if busy.generating or not settings.is_editing():
+            return
+        try:
+            d = parse_settings_edit_json(settings.textarea.value)
+            session.apply_user_settings(d)
+        except ValueError as exc:
+            settings.set_error(
+                f"Error, bad format, fix input before saving.\n{exc}"
+            )
+            return
+        frame.value = Path(session.current_frame_path()).read_bytes()
+        settings.show_view(
+            json.dumps(session.current_settings_dict(), indent=2)
+        )
+        _sync_buttons()
+        if on_changed is not None:
+            on_changed()
+
+    scratch.edit_btn.on_click(_on_scratch_edit)
+    scratch.render_btn.on_click(_on_scratch_render)
+    settings.edit_btn.on_click(_on_settings_edit)
+    settings.render_btn.on_click(_on_settings_render)
+
+    box = widgets.HBox(
+        [
+            widgets.VBox([caption, frame], layout=widgets.Layout(
+                flex=f"0 0 {width}px",
+            )),
+            widgets.VBox(
+                [scratch.box, settings.box],
+                layout=widgets.Layout(flex="1 1 520px", min_width="320px"),
+            ),
+        ],
+        layout=widgets.Layout(width="100%", align_items="flex-start"),
+    )
+    refresh()
+    return SimpleNamespace(
+        box=box,
+        frame=frame,
+        scratch=scratch,
+        settings=settings,
+        refresh=refresh,
+        is_editing=is_editing,
+        sync_buttons=_sync_buttons,
+    )

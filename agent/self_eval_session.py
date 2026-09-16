@@ -108,11 +108,6 @@ class InteractiveSelfEvalSession(InteractiveSession):
         if path and self.image_filter is not None:
             self.image_filter(path)
 
-    def current_notepad(self) -> str:
-        """The notepad block as the player would see it right now."""
-        notes = self._run(mem.get_session_notes(self.client, self.session_id))
-        return mem.format_notepad(notes)
-
     # ------------------------------------------------------------------ state
     def restart(self) -> dict[str, Any]:
         """Full reset: new bare game AND a new conversation thread. Also
@@ -125,40 +120,18 @@ class InteractiveSelfEvalSession(InteractiveSession):
         return super().restart()
 
     def reset_game(self, record: bool = True) -> dict[str, Any]:
-        """Swap in a brand-new random bare board, SAME conversation.
+        """Swap in a brand-new random board, SAME conversation.
 
-        With ``record=True`` (default) the reset is written to the
-        conversation as a message, so the agent's memory carries an explicit
-        marker that everything before it happened on a DIFFERENT board.
+        Refuses mid-round (a move may be pending). Delegates the board
+        swap and the recorded ``game_reset`` message to the parent.
         """
         if self.phase != "player":
             raise ValueError(
                 "Cannot reset the game mid-round: the analyst has not run "
                 "and a move may be pending. Finish the round first."
             )
-        self.game = self._new_game()
-        if record:
-            self._run(
-                self.client.short_term.add_message(
-                    session_id=self.session_id, role="user",
-                    content=(
-                        "(The game was reset: a brand-new random board was "
-                        "generated. Previous scenes, moves, and analyses "
-                        "refer to a DIFFERENT board and no longer describe "
-                        "what you see.)"
-                    ),
-                    metadata={"kind": "game_reset"},
-                )
-            )
-        self.round_no = 0
         self._last_outcome = None
-        self._run(mem.clear_session_notes(self.client, self.session_id))
-        logger.info("Game reset (session %s kept).", self.session_id)
-        return {
-            "session_id": self.session_id,
-            "frame_path": self.current_frame_path(),
-            "gold_remaining": game_io.gold_remaining(self.game),
-        }
+        return super().reset_game(record=record)
 
     def _parse_player_action(self, raw: str, kind: str) -> str | None:
         """Reply -> pending action name. ``[END_GAME]`` is recognized even
@@ -196,8 +169,9 @@ class InteractiveSelfEvalSession(InteractiveSession):
         ``human_reply`` (notebook takeover only): skip ``model.generate``
         and the ``[SEARCH]`` loop; the string is the final reply after
         :func:`game_io.truncate_at_first_move_token`. Snapshot, context,
-        persist, and parse are unchanged. Datagen / ``play.ipynb`` never
-        pass this.
+        persist, and parse are unchanged. Datagen never passes this;
+        ``play.ipynb`` uses :meth:`InteractiveSession.ask` with the same
+        argument.
         """
         if self.phase != "player":
             raise ValueError(

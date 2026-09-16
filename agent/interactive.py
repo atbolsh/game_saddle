@@ -15,7 +15,10 @@ None for it -- no board change, session continues.
 
 :meth:`restart` re-initializes the env (a brand new bare game) and starts a
 new conversation thread (a fresh ``session_id``), reusing the already-loaded
-model and the already-connected memory client.
+model and the already-connected memory client. :meth:`reset_game` swaps the
+board on the same conversation (recorded as a ``game_reset`` message).
+User scene / scratchpad edits (:meth:`apply_user_settings`,
+:meth:`replace_scratchpad`) write no conversation message.
 
 **Async bridge.** NAMS is async and the Neo4j async driver is bound to the
 event loop it was created on, but ipywidgets button callbacks are synchronous.
@@ -28,6 +31,7 @@ calls, safe to wire straight to a button's ``on_click``.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 from collections import Counter
@@ -49,8 +53,8 @@ class InteractiveSession:
     """A persistent, single-game interactive mode-1 session.
 
     Construct it once per notebook (it connects NAMS and loads Gemma), then
-    call :meth:`ask` / :meth:`restart` from your UI callbacks and
-    :meth:`close` when done.
+    call :meth:`ask` / :meth:`restart` / :meth:`reset_game` from your UI
+    callbacks and :meth:`close` when done.
     """
 
     def __init__(
@@ -117,6 +121,84 @@ class InteractiveSession:
             "gold_remaining": game_io.gold_remaining(self.game),
         }
 
+    def reset_game(self, record: bool = True) -> dict[str, Any]:
+        """Swap in a brand-new board, SAME conversation.
+
+        With ``record=True`` (default) the reset is written to the
+        conversation as a message, so the agent's memory carries an explicit
+        marker that everything before it happened on a DIFFERENT board.
+        Scene-dict / scratchpad edits do NOT use this path.
+        """
+        self.game = self._new_game()
+        if record:
+            self._run(
+                self.client.short_term.add_message(
+                    session_id=self.session_id, role="user",
+                    content=(
+                        "(The game was reset: a brand-new random board was "
+                        "generated. Previous scenes, moves, and analyses "
+                        "refer to a DIFFERENT board and no longer describe "
+                        "what you see.)"
+                    ),
+                    metadata={"kind": "game_reset"},
+                )
+            )
+        self.round_no = 0
+        self._run(mem.clear_session_notes(self.client, self.session_id))
+        logger.info("Game reset (session %s kept).", self.session_id)
+        return {
+            "session_id": self.session_id,
+            "frame_path": self.current_frame_path(),
+            "gold_remaining": game_io.gold_remaining(self.game),
+        }
+
+    def current_notepad(self) -> str:
+        """The notepad block as the player would see it right now."""
+        notes = self._run(mem.get_session_notes(self.client, self.session_id))
+        return mem.format_notepad(notes)
+
+    def current_notepad_edit_json(self) -> str:
+        """JSON object ``{key: value}`` for the scratchpad editor."""
+        notes = self._run(mem.get_session_notes(self.client, self.session_id))
+        return json.dumps({n["key"]: n["value"] for n in notes}, indent=2)
+
+    def current_settings_dict(self) -> dict[str, Any]:
+        return game_io.game_to_settings_dict(self.game)
+
+    def _refuse_user_edits_if_round_open(self) -> None:
+        if getattr(self, "_pending", None) is not None:
+            raise ValueError(
+                "Cannot edit the scene or scratchpad while a self-eval "
+                "round is open. Finish the round (Back to player) or press "
+                "New room first."
+            )
+
+    def apply_user_settings(self, d: dict[str, Any]) -> dict[str, Any]:
+        """Apply a hand-edited settings dict (openings pipeline in
+        :func:`game_io.apply_edited_settings_dict`). No conversation
+        message, no snapshot -- the next ask snapshots the live board.
+        """
+        self._refuse_user_edits_if_round_open()
+        self.game = game_io.apply_edited_settings_dict(d)
+        return {
+            "frame_path": self.current_frame_path(),
+            "settings": self.current_settings_dict(),
+        }
+
+    def replace_scratchpad(self, notes: dict[str, str]) -> str:
+        """Replace the session notepad. No conversation message."""
+        self._refuse_user_edits_if_round_open()
+        self._run(
+            mem.replace_session_notes(
+                self.client, self.session_id, notes, self.round_no,
+            )
+        )
+        return self.current_notepad()
+
+    def _on_player_end_game(self) -> None:
+        """Hook: multi-gold rooms freeze ``session_state``."""
+        return
+
     def switch_model(
         self,
         key: str,
@@ -147,6 +229,7 @@ class InteractiveSession:
         question: str,
         on_step: Callable[[dict[str, Any]], None] | None = None,
         max_steps: int | None = None,
+        human_reply: str | None = None,
     ) -> dict[str, Any]:
         """Take one generation against the persistent game.
 
@@ -154,8 +237,13 @@ class InteractiveSession:
         one ``ask`` is always one generation (plus any ``[SEARCH]`` loops).
         ``on_step`` (if given) is called with the generation's result dict.
 
+        ``human_reply`` (notebook takeover): skip ``model.generate`` and
+        the ``[SEARCH]`` loop; the string is the final reply after
+        :func:`game_io.truncate_at_first_move_token`.
+
         ``[END_GAME]`` is a stop string so generation halts at the token;
-        ``parse_action`` returns None for it, so nothing is applied.
+        no board action is applied. Multi-gold rooms freeze
+        ``session_state`` via :meth:`_on_player_end_game`.
         """
         del max_steps  # one generation per ask; kept so callers need not change
         # 1. Snapshot the current ('before') frame -> disk + GameSnapshot node.
@@ -184,42 +272,54 @@ class InteractiveSession:
         )
         notepad = mem.format_notepad(notes)
 
-        # 3. Single generation under the unified scene-play prompt.
-        #    [END_GAME] stops generation; parse_action yields None for it.
+        # 3. Single generation under the unified scene-play prompt, or a
+        #    human takeover reply. [END_GAME] stops generation; no board
+        #    action is applied for it.
         search_notes: list[str] = []
         searches: list[dict[str, str]] = []
-        while True:
+        if human_reply is not None:
             messages = modes._build_game_messages(
                 self._system_prompts["scene_play"], before_path, ctx, question,
-                search_results="\n\n".join(search_notes) or None,
                 notepad=notepad,
             )
-            over_budget = len(searches) >= self.cfg.memory_search_max_calls
-            raw = self.model.generate(
-                messages,
-                max_new_tokens=self.cfg.max_new_tokens,
-                stop_strings=None,
-                stop_regex=(
-                    game_io.PLAYER_STOP_PATTERN if over_budget
-                    else game_io.PLAYER_STOP_PATTERN + "|"
-                    + modes.SEARCH_TOOL_PATTERN
-                ),
-            )
+            raw = game_io.truncate_at_first_move_token(human_reply)
             kind, payload, text = modes.classify_move_or_search(raw)
-            if kind != "search" or over_budget:
-                break
-            results = self._run(
-                mem.search_memory(
-                    self.client, payload, tiers=("semantic", "reasoning"),
-                    top_k=self.cfg.memory_search_top_k, scrub=True,
-                    exclude_analyst=True,
+        else:
+            while True:
+                messages = modes._build_game_messages(
+                    self._system_prompts["scene_play"], before_path, ctx,
+                    question,
+                    search_results="\n\n".join(search_notes) or None,
+                    notepad=notepad,
                 )
-            )
-            search_notes.append(modes.format_search_note(payload, results))
-            searches.append({"query": payload, "results": results, "thought": text})
-            if len(searches) >= self.cfg.memory_search_max_calls:
-                search_notes.append(modes.SEARCH_BUDGET_NOTE)
-            logger.info("[SEARCH %s]", payload)
+                over_budget = len(searches) >= self.cfg.memory_search_max_calls
+                raw = self.model.generate(
+                    messages,
+                    max_new_tokens=self.cfg.max_new_tokens,
+                    stop_strings=None,
+                    stop_regex=(
+                        game_io.PLAYER_STOP_PATTERN if over_budget
+                        else game_io.PLAYER_STOP_PATTERN + "|"
+                        + modes.SEARCH_TOOL_PATTERN
+                    ),
+                )
+                kind, payload, text = modes.classify_move_or_search(raw)
+                if kind != "search" or over_budget:
+                    break
+                results = self._run(
+                    mem.search_memory(
+                        self.client, payload, tiers=("semantic", "reasoning"),
+                        top_k=self.cfg.memory_search_top_k, scrub=True,
+                        exclude_analyst=True,
+                    )
+                )
+                search_notes.append(modes.format_search_note(payload, results))
+                searches.append(
+                    {"query": payload, "results": results, "thought": text}
+                )
+                if len(searches) >= self.cfg.memory_search_max_calls:
+                    search_notes.append(modes.SEARCH_BUDGET_NOTE)
+                logger.info("[SEARCH %s]", payload)
 
         new_notes = game_io.parse_remember_notes(raw)
         for k, v in new_notes:
@@ -229,17 +329,25 @@ class InteractiveSession:
                 )
             )
         self.round_no += 1
-        parsed = game_io.parse_move(raw) if kind == "move" else None
-        action = parsed[0] if parsed else None
-        count = parsed[1] if parsed else 1
-        gold_collected = (
-            game_io.apply_action(self.game, action, count=count) if action else 0
-        )
+        if modes._TOK_END_GAME in raw:
+            action = "END_GAME"
+            count = 1
+            gold_collected = 0
+            self._on_player_end_game()
+        else:
+            parsed = game_io.parse_move(raw) if kind == "move" else None
+            action = parsed[0] if parsed else None
+            count = parsed[1] if parsed else 1
+            gold_collected = (
+                game_io.apply_action(self.game, action, count=count)
+                if action else 0
+            )
 
         turn = self._run(
             modes._record_step(
                 self.client, self.session_id, self.cfg, self.game, question, raw,
-                action, gold_collected, snapshot_before_id, before_path,
+                None if action == "END_GAME" else action,
+                gold_collected, snapshot_before_id, before_path,
                 include_user_message=True,
             )
         )
@@ -294,16 +402,21 @@ class InteractiveSession:
                 )
             )
 
-        return {
+        out = {
             "session_id": self.session_id,
             "question": question,
             "steps": [step_result],
             "num_steps": 1,
             "gold_remaining": game_io.gold_remaining(self.game),
+            # Meaningless for multi-gold (a 0-gold room starts "solved").
+            # Notebooks key off session_state + gold count instead.
             "solved": game_io.gold_remaining(self.game) == 0,
             "trace_id": str(trace.id) if trace else None,
             "success": success,
         }
+        if hasattr(self, "session_state"):
+            out["session_state"] = self.session_state
+        return out
 
     def dump_db(self, name: str | None = None, include_embeddings: bool = False) -> dict[str, Any]:
         """Dump the current DB status (all nodes + relationships) to a ``.dump``
