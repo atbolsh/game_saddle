@@ -585,60 +585,60 @@ _FORM_FONT = '"Helvetica Neue", Helvetica, Arial, sans-serif'
 
 _SETTINGS_FORM_CSS = """
 <style>
-.gs-form, .gs-form * {
-  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif !important;
+.gs-form {
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
 }
-.gs-form input,
-.gs-form select,
-.gs-form textarea,
+.gs-form .widget-text,
+.gs-form .widget-dropdown,
+.gs-form .widget-slider {
+  width: 100% !important;
+  max-width: 100% !important;
+  min-height: 44px !important;
+  margin: 0 0 8px 0 !important;
+}
+.gs-form .widget-inline-hbox {
+  width: 100% !important;
+  max-width: 100% !important;
+  flex-wrap: nowrap !important;
+}
 .gs-form .widget-text input,
-.gs-form .widget-dropdown select,
-.gs-form .widget-inline-text input {
+.gs-form .widget-dropdown select {
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif !important;
   font-size: 16px !important;
-  line-height: 1.3 !important;
-  min-height: 40px !important;
-  height: 40px !important;
+  min-height: 36px !important;
   padding: 6px 10px !important;
   box-sizing: border-box !important;
 }
 .gs-form .widget-label,
 .gs-form label {
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif !important;
   font-size: 15px !important;
   font-weight: 600 !important;
   color: #0d3d3d !important;
-}
-.gs-form .widget-slider .widget-label {
-  font-size: 15px !important;
-}
-.gs-form .gs-row-btn button,
-.gs-form .gs-row-btn .jupyter-button {
-  font-size: 22px !important;
-  font-weight: 700 !important;
-  min-width: 44px !important;
-  min-height: 40px !important;
-  line-height: 1 !important;
-}
-.gs-form .widget-hbox {
-  align-items: center !important;
 }
 .gs-form .gs-section {
   font-size: 16px !important;
   font-weight: 700 !important;
   color: #0d5c5c !important;
-  margin: 12px 0 6px !important;
+  margin: 16px 0 8px !important;
+}
+.gs-form .gs-item {
+  width: 100% !important;
+  box-sizing: border-box !important;
 }
 </style>
 """
 
 
 def _pm_button(label: str, tooltip: str) -> widgets.Button:
-    btn = widgets.Button(
+    return widgets.Button(
         description=label,
         tooltip=tooltip,
-        layout=widgets.Layout(width="44px", height="40px"),
+        layout=widgets.Layout(
+            width="auto", min_width="110px", height="40px",
+            margin="0 10px 0 0",
+        ),
     )
-    btn.add_class("gs-row-btn")
-    return btn
 
 
 def _compact_number(
@@ -646,8 +646,8 @@ def _compact_number(
     value: float | int,
     *,
     kind: str = "float",
-    width: str = "150px",
-    dw: str = "70px",
+    width: str = "100%",
+    dw: str = "80px",
     on_change: Callable[[Any], None] | None = None,
 ) -> Any:
     cls = widgets.IntText if kind == "int" else widgets.FloatText
@@ -655,7 +655,10 @@ def _compact_number(
         value=value,
         description=description,
         step=1 if kind == "int" else 0.01,
-        layout=widgets.Layout(width=width, height="40px"),
+        layout=widgets.Layout(
+            width=width, min_width="240px", min_height="44px",
+            margin="0 0 8px 0",
+        ),
         style={"description_width": dw},
     )
     if on_change is not None:
@@ -720,13 +723,13 @@ def _settings_summary(d: dict[str, Any]) -> str:
 def _settings_view_html(d: dict[str, Any], height_px: int) -> str:
     body = _html.escape(_settings_summary(d))
     return (
-        f"<div style='height:{height_px}px;overflow:auto;background:#1f7a7a;"
-        "color:#f4ffff;border-radius:6px;padding:16px 18px;"
-        "box-sizing:border-box;"
+        f"<div style='height:{height_px}px;overflow:auto;background:#e6f4f4;"
+        "color:#0d3d3d;border:1px solid #5aa8a8;border-radius:6px;"
+        "padding:16px 18px;box-sizing:border-box;"
         f"font-family:{_FORM_FONT};font-size:16px;line-height:1.5'>"
-        "<div style='font-weight:700;font-size:18px;margin-bottom:6px'>"
-        "Game settings</div>"
-        "<div style='font-size:15px;opacity:0.92;margin-bottom:14px'>"
+        "<div style='font-weight:700;font-size:18px;color:#0d5c5c;"
+        "margin-bottom:6px'>Game settings</div>"
+        "<div style='font-size:15px;color:#555;margin-bottom:14px'>"
         "Press Edit to change the scene.</div>"
         f"<pre style='margin:0;font-family:inherit;font-size:16px;"
         f"white-space:pre-wrap'>{body}</pre></div>"
@@ -762,7 +765,7 @@ def _settings_card(
         continuous_update=True,
         readout=True,
         readout_format=".3f",
-        layout=widgets.Layout(width="98%", height="40px"),
+        layout=widgets.Layout(width="100%", min_height="44px"),
         style={"description_width": "90px"},
     )
     dir_readout = widgets.HTML()
@@ -796,63 +799,62 @@ def _settings_card(
         if on_form_change is not None:
             on_form_change()
 
-    def _row_shell(fields: list[Any], plus: widgets.Button, minus: widgets.Button) -> widgets.VBox:
-        return widgets.VBox(
+    def _row_shell(
+        fields: list[Any],
+        plus: widgets.Button,
+        minus: widgets.Button,
+        *,
+        min_height_px: int,
+    ) -> widgets.VBox:
+        box = widgets.VBox(
             [
-                widgets.HBox(fields, layout=widgets.Layout(
-                    align_items="center", flex_flow="row wrap",
-                )),
+                *fields,
                 widgets.HBox(
                     [plus, minus],
-                    layout=widgets.Layout(align_items="center", margin="6px 0 0 0"),
+                    layout=widgets.Layout(
+                        align_items="center",
+                        margin="8px 0 0 0",
+                        min_height="48px",
+                        width="100%",
+                    ),
                 ),
             ],
             layout=widgets.Layout(
                 border="1px solid #7bbbbb",
-                padding="10px 12px",
-                margin="0 0 10px 0",
+                padding="12px 14px",
+                margin="0 0 14px 0",
                 width="100%",
+                min_height=f"{min_height_px}px",
                 background="#f3fbfb",
             ),
         )
+        box.add_class("gs-item")
+        return box
 
-    def _empty_add_row(label: str, btn: widgets.Button) -> widgets.HBox:
-        return widgets.HBox(
-            [
-                widgets.HTML(
-                    "<div style='font-family:" + _FORM_FONT + ";"
-                    "font-size:16px;padding:8px 8px 8px 0'>"
-                    f"{_html.escape(label)}</div>"
-                ),
-                btn,
-            ],
-            layout=widgets.Layout(
-                align_items="center",
-                border="1px dashed #7bbbbb",
-                padding="8px 12px",
-                margin="0 0 10px 0",
-            ),
-        )
+    def _empty_add_row(btn: widgets.Button) -> widgets.Button:
+        btn.layout.width = "100%"
+        btn.layout.min_width = "240px"
+        btn.layout.height = "44px"
+        btn.layout.margin = "0 0 12px 0"
+        return btn
 
     def _sync_gold_box() -> None:
         if gold_rows:
             gold_box.children = tuple(r.box for r in gold_rows)
         else:
-            gold_box.children = (_empty_add_row("Add a gold", add_gold_btn),)
+            gold_box.children = (_empty_add_row(add_gold_btn),)
 
     def _sync_opening_box() -> None:
         if opening_rows:
             opening_box.children = tuple(r.box for r in opening_rows)
         else:
-            opening_box.children = (
-                _empty_add_row("Add an opening", add_opening_btn),
-            )
+            opening_box.children = (_empty_add_row(add_opening_btn),)
 
     def _sync_wall_box() -> None:
         if wall_rows:
             wall_box.children = tuple(r.box for r in wall_rows)
         else:
-            wall_box.children = (_empty_add_row("Add a wall", add_wall_btn),)
+            wall_box.children = (_empty_add_row(add_wall_btn),)
 
     def _next_opening_side() -> str:
         used = {str(r.side.value) for r in opening_rows}
@@ -879,10 +881,10 @@ def _settings_card(
         _notify()
 
     def _make_gold_row(x: float, y: float) -> SimpleNamespace:
-        xw = _compact_number("x", x, width="150px", dw="24px", on_change=_notify)
-        yw = _compact_number("y", y, width="150px", dw="24px", on_change=_notify)
-        plus = _pm_button("+", "Add a gold after this row")
-        minus = _pm_button("−", "Delete this gold")
+        xw = _compact_number("x", x, on_change=_notify)
+        yw = _compact_number("y", y, on_change=_notify)
+        plus = _pm_button("+ add", "Add a gold after this row")
+        minus = _pm_button("− delete", "Delete this gold")
         ns = SimpleNamespace(x=xw, y=yw, plus=plus, minus=minus, box=None)
 
         def _add(_):
@@ -896,7 +898,7 @@ def _settings_card(
 
         plus.on_click(_add)
         minus.on_click(_remove)
-        ns.box = _row_shell([xw, yw], plus, minus)
+        ns.box = _row_shell([xw, yw], plus, minus, min_height_px=160)
         return ns
 
     def _make_opening_row(side: str, center: float, width: float) -> SimpleNamespace:
@@ -904,17 +906,16 @@ def _settings_card(
             options=list(_OPENING_SIDES),
             value=side if side in _OPENING_SIDES else "left",
             description="side",
-            layout=widgets.Layout(width="200px", height="40px"),
-            style={"description_width": "48px"},
+            layout=widgets.Layout(
+                width="100%", min_width="240px", min_height="44px",
+                margin="0 0 8px 0",
+            ),
+            style={"description_width": "80px"},
         )
-        cw = _compact_number(
-            "center", center, width="180px", dw="70px", on_change=_notify,
-        )
-        ww = _compact_number(
-            "width", width, width="170px", dw="60px", on_change=_notify,
-        )
-        plus = _pm_button("+", "Add an opening after this row")
-        minus = _pm_button("−", "Delete this opening")
+        cw = _compact_number("center", center, on_change=_notify)
+        ww = _compact_number("width", width, on_change=_notify)
+        plus = _pm_button("+ add", "Add an opening after this row")
+        minus = _pm_button("− delete", "Delete this opening")
         side_dd.observe(_notify, names="value")
         ns = SimpleNamespace(
             side=side_dd, center=cw, width=ww, plus=plus, minus=minus, box=None,
@@ -931,21 +932,19 @@ def _settings_card(
 
         plus.on_click(_add)
         minus.on_click(_remove)
-        ns.box = _row_shell([side_dd, cw, ww], plus, minus)
+        ns.box = _row_shell([side_dd, cw, ww], plus, minus, min_height_px=200)
         return ns
 
     def _make_wall_row(
         x: float, y: float, w: float, h: float, angle: float,
     ) -> SimpleNamespace:
-        xw = _compact_number("x", x, width="130px", dw="20px", on_change=_notify)
-        yw = _compact_number("y", y, width="130px", dw="20px", on_change=_notify)
-        ww = _compact_number("w", w, width="130px", dw="20px", on_change=_notify)
-        hw = _compact_number("h", h, width="130px", dw="20px", on_change=_notify)
-        aw = _compact_number(
-            "angle", angle, width="160px", dw="52px", on_change=_notify,
-        )
-        plus = _pm_button("+", "Add a wall after this row")
-        minus = _pm_button("−", "Delete this wall")
+        xw = _compact_number("x", x, on_change=_notify)
+        yw = _compact_number("y", y, on_change=_notify)
+        ww = _compact_number("w", w, on_change=_notify)
+        hw = _compact_number("h", h, on_change=_notify)
+        aw = _compact_number("angle", angle, on_change=_notify)
+        plus = _pm_button("+ add", "Add a wall after this row")
+        minus = _pm_button("− delete", "Delete this wall")
         ns = SimpleNamespace(
             x=xw, y=yw, w=ww, h=hw, angle=aw, plus=plus, minus=minus, box=None,
         )
@@ -961,7 +960,9 @@ def _settings_card(
 
         plus.on_click(_add)
         minus.on_click(_remove)
-        ns.box = _row_shell([xw, yw, ww, hw, aw], plus, minus)
+        ns.box = _row_shell(
+            [xw, yw, ww, hw, aw], plus, minus, min_height_px=300,
+        )
         return ns
 
     def load_form(d: dict[str, Any]) -> None:
@@ -1096,40 +1097,45 @@ def _settings_card(
             r.minus.disabled = on
 
     game_size = _compact_number(
-        "gameSize", 64, kind="int", width="170px", dw="84px", on_change=_notify,
+        "gameSize", 64, kind="int", on_change=_notify,
     )
-    agent_x = _compact_number(
-        "agent_x", 0.5, width="170px", dw="72px", on_change=_notify,
-    )
-    agent_y = _compact_number(
-        "agent_y", 0.5, width="170px", dw="72px", on_change=_notify,
-    )
-    agent_r = _compact_number(
-        "agent_r", 0.05, width="170px", dw="72px", on_change=_notify,
-    )
-    gold_r = _compact_number(
-        "gold_r", 0.03, width="170px", dw="72px", on_change=_notify,
-    )
+    agent_x = _compact_number("agent_x", 0.5, on_change=_notify)
+    agent_y = _compact_number("agent_y", 0.5, on_change=_notify)
+    agent_r = _compact_number("agent_r", 0.05, on_change=_notify)
+    gold_r = _compact_number("gold_r", 0.03, on_change=_notify)
     dir_slider.observe(_notify, names="value")
     dir_readout.value = _dir_label(0.0)
 
-    add_gold_btn = _pm_button("+", "Add a gold")
-    add_opening_btn = _pm_button("+", "Add an opening")
-    add_wall_btn = _pm_button("+", "Add a wall")
+    add_gold_btn = widgets.Button(
+        description="+ add gold",
+        layout=widgets.Layout(width="100%", min_width="240px", height="44px"),
+    )
+    add_opening_btn = widgets.Button(
+        description="+ add opening",
+        layout=widgets.Layout(width="100%", min_width="240px", height="44px"),
+    )
+    add_wall_btn = widgets.Button(
+        description="+ add wall",
+        layout=widgets.Layout(width="100%", min_width="240px", height="44px"),
+    )
     add_gold_btn.on_click(lambda _: _insert_gold(len(gold_rows)))
     add_opening_btn.on_click(lambda _: _insert_opening(len(opening_rows)))
     add_wall_btn.on_click(lambda _: _insert_wall(len(wall_rows)))
-    gold_box = widgets.VBox()
-    opening_box = widgets.VBox()
-    wall_box = widgets.VBox()
+    _list_layout = widgets.Layout(width="100%")
+    gold_box = widgets.VBox(layout=_list_layout)
+    opening_box = widgets.VBox(layout=_list_layout)
+    wall_box = widgets.VBox(layout=_list_layout)
     _sync_gold_box()
     _sync_opening_box()
     _sync_wall_box()
 
     form = widgets.VBox(
         [
-            widgets.HBox([game_size, agent_x, agent_y]),
-            widgets.HBox([agent_r, gold_r]),
+            game_size,
+            agent_x,
+            agent_y,
+            agent_r,
+            gold_r,
             dir_slider,
             dir_readout,
             _section_label("openings  (side, center, width)"),
@@ -1140,9 +1146,12 @@ def _settings_card(
             wall_box,
         ],
         layout=widgets.Layout(
-            height=f"{max(height_px, 380)}px",
-            overflow="auto",
-            padding="10px 12px",
+            width="100%",
+            min_height="480px",
+            max_height="640px",
+            overflow_y="auto",
+            overflow_x="hidden",
+            padding="12px 14px",
             border="1px solid #5aa8a8",
             background="#e6f4f4",
         ),
@@ -1300,7 +1309,7 @@ def live_board_row(
     side = widgets.VBox(
         [settings.box, scratch.box],
         layout=widgets.Layout(
-            flex="1 1 560px",
+            flex="1 0 520px",
             min_width="520px",
             width="auto",
         ),
