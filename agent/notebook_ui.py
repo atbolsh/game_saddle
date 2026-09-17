@@ -587,6 +587,20 @@ _SETTINGS_FORM_CSS = """
 <style>
 .gs-form {
   font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  overflow-y: auto !important;
+  max-height: 720px !important;
+}
+.gs-form .jupyter-widgets,
+.gs-form .widget-vbox,
+.gs-form .widget-hbox,
+.gs-form .widget-html,
+.gs-form .widget-button,
+.gs-form .widget-text,
+.gs-form .widget-dropdown,
+.gs-form .widget-slider,
+.gs-form .lm-Widget,
+.gs-form .p-Widget {
+  flex-shrink: 0 !important;
 }
 .gs-form .widget-text,
 .gs-form .widget-dropdown,
@@ -616,15 +630,10 @@ _SETTINGS_FORM_CSS = """
   font-weight: 600 !important;
   color: #0d3d3d !important;
 }
-.gs-form .gs-section {
-  font-size: 16px !important;
-  font-weight: 700 !important;
-  color: #0d5c5c !important;
-  margin: 16px 0 8px !important;
-}
 .gs-form .gs-item {
   width: 100% !important;
   box-sizing: border-box !important;
+  flex-shrink: 0 !important;
 }
 </style>
 """
@@ -636,7 +645,7 @@ def _pm_button(label: str, tooltip: str) -> widgets.Button:
         tooltip=tooltip,
         layout=widgets.Layout(
             width="auto", min_width="110px", height="40px",
-            margin="0 10px 0 0",
+            margin="0 10px 0 0", flex="0 0 auto",
         ),
     )
 
@@ -657,7 +666,7 @@ def _compact_number(
         step=1 if kind == "int" else 0.01,
         layout=widgets.Layout(
             width=width, min_width="240px", min_height="44px",
-            margin="0 0 8px 0",
+            margin="0 0 8px 0", flex="0 0 auto",
         ),
         style={"description_width": dw},
     )
@@ -668,7 +677,10 @@ def _compact_number(
 
 def _section_label(text: str) -> widgets.HTML:
     return widgets.HTML(
-        f"<div class='gs-section'>{_html.escape(text)}</div>"
+        "<div style='font-family:Helvetica Neue,Helvetica,Arial,sans-serif;"
+        "font-size:16px;font-weight:700;color:#0d5c5c;"
+        f"padding:12px 0 6px'>{_html.escape(text)}</div>",
+        layout=widgets.Layout(width="100%", min_height="36px", flex="0 0 auto"),
     )
 
 
@@ -765,10 +777,14 @@ def _settings_card(
         continuous_update=True,
         readout=True,
         readout_format=".3f",
-        layout=widgets.Layout(width="100%", min_height="44px"),
+        layout=widgets.Layout(
+            width="100%", min_height="44px", flex="0 0 auto",
+        ),
         style={"description_width": "90px"},
     )
-    dir_readout = widgets.HTML()
+    dir_readout = widgets.HTML(
+        layout=widgets.Layout(width="100%", min_height="28px", flex="0 0 auto"),
+    )
 
     gold_rows: list[SimpleNamespace] = []
     opening_rows: list[SimpleNamespace] = []
@@ -816,6 +832,7 @@ def _settings_card(
                         margin="8px 0 0 0",
                         min_height="48px",
                         width="100%",
+                        flex="0 0 auto",
                     ),
                 ),
             ],
@@ -826,6 +843,7 @@ def _settings_card(
                 width="100%",
                 min_height=f"{min_height_px}px",
                 background="#f3fbfb",
+                flex="0 0 auto",
             ),
         )
         box.add_class("gs-item")
@@ -834,8 +852,10 @@ def _settings_card(
     def _empty_add_row(btn: widgets.Button) -> widgets.Button:
         btn.layout.width = "100%"
         btn.layout.min_width = "240px"
-        btn.layout.height = "44px"
+        btn.layout.height = "48px"
+        btn.layout.min_height = "48px"
         btn.layout.margin = "0 0 12px 0"
+        btn.layout.flex = "0 0 auto"
         return btn
 
     def _sync_gold_box() -> None:
@@ -908,7 +928,7 @@ def _settings_card(
             description="side",
             layout=widgets.Layout(
                 width="100%", min_width="240px", min_height="44px",
-                margin="0 0 8px 0",
+                margin="0 0 8px 0", flex="0 0 auto",
             ),
             style={"description_width": "80px"},
         )
@@ -1108,20 +1128,29 @@ def _settings_card(
 
     add_gold_btn = widgets.Button(
         description="+ add gold",
-        layout=widgets.Layout(width="100%", min_width="240px", height="44px"),
+        layout=widgets.Layout(
+            width="100%", min_width="240px", height="48px",
+            min_height="48px", flex="0 0 auto",
+        ),
     )
     add_opening_btn = widgets.Button(
         description="+ add opening",
-        layout=widgets.Layout(width="100%", min_width="240px", height="44px"),
+        layout=widgets.Layout(
+            width="100%", min_width="240px", height="48px",
+            min_height="48px", flex="0 0 auto",
+        ),
     )
     add_wall_btn = widgets.Button(
         description="+ add wall",
-        layout=widgets.Layout(width="100%", min_width="240px", height="44px"),
+        layout=widgets.Layout(
+            width="100%", min_width="240px", height="48px",
+            min_height="48px", flex="0 0 auto",
+        ),
     )
     add_gold_btn.on_click(lambda _: _insert_gold(len(gold_rows)))
     add_opening_btn.on_click(lambda _: _insert_opening(len(opening_rows)))
     add_wall_btn.on_click(lambda _: _insert_wall(len(wall_rows)))
-    _list_layout = widgets.Layout(width="100%")
+    _list_layout = widgets.Layout(width="100%", flex="0 0 auto")
     gold_box = widgets.VBox(layout=_list_layout)
     opening_box = widgets.VBox(layout=_list_layout)
     wall_box = widgets.VBox(layout=_list_layout)
@@ -1129,7 +1158,7 @@ def _settings_card(
     _sync_opening_box()
     _sync_wall_box()
 
-    form = widgets.VBox(
+    form_inner = widgets.VBox(
         [
             game_size,
             agent_x,
@@ -1145,15 +1174,19 @@ def _settings_card(
             _section_label("walls  (x, y, w, h, angle)"),
             wall_box,
         ],
+        layout=widgets.Layout(width="100%", flex="0 0 auto"),
+    )
+    form = widgets.Box(
+        [form_inner],
         layout=widgets.Layout(
             width="100%",
-            min_height="480px",
-            max_height="640px",
+            max_height="720px",
             overflow_y="auto",
             overflow_x="hidden",
             padding="12px 14px",
             border="1px solid #5aa8a8",
             background="#e6f4f4",
+            flex="0 0 auto",
         ),
     )
     form.add_class("gs-form")
