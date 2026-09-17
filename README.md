@@ -340,8 +340,8 @@ E4B); the wider 2026-07 candidate field, and why it lost, is recorded in
   **New room**. Eating gold is not a win.   A live row shows teal settings (left), the current frame, and a maroon
   scratchpad (right) — user-only; settings never enter the player prompt.
   Settings are the full scene (pose, gold, walls, radii, gameSize), a
-  direction slider (0…2π), and one opening per side (checkbox + center +
-  width); Render computes `from`/`to` and reconciles
+  direction slider (0…2π), and add/remove rows for gold, openings (side +
+  center + width), and walls; Render computes `from`/`to` and reconciles
   openings into `walls` in `game_io.reconcile_walls_to_openings`, then
   passes the dict to the existing renderer without an `openings` key.
   Scratchpad is still JSON (bad format stays in edit mode). Generation
