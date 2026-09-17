@@ -482,17 +482,33 @@ def _editor_card(
     border: str,
     height_px: int,
     hint: str,
+    edit_label: str,
+    render_label: str,
 ) -> SimpleNamespace:
-    """View HTML + Edit/Render textarea. Edit does not clobber in-progress text."""
+    """View HTML + labeled Edit/Render buttons on top (always visible).
+
+    Edit does not clobber in-progress text. Render stays enabled whenever
+    generation is not running -- it applies the textarea if the user has
+    entered edit mode, otherwise the current live JSON.
+    """
+    edit_btn = widgets.Button(
+        description=edit_label,
+        tooltip=edit_label,
+        layout=widgets.Layout(width="auto", min_width="160px"),
+    )
+    render_btn = widgets.Button(
+        description=render_label,
+        button_style="success",
+        tooltip=render_label,
+        layout=widgets.Layout(width="auto", min_width="180px"),
+    )
     view = widgets.HTML()
     textarea = widgets.Textarea(
         value="",
-        layout=widgets.Layout(width="100%", height=f"{max(height_px - 36, 120)}px"),
+        layout=widgets.Layout(width="100%", height=f"{max(height_px, 160)}px"),
     )
     textarea.layout.display = "none"
     textarea.add_class(_TAMED_CLASS)
-    edit_btn = widgets.Button(description="Edit")
-    render_btn = widgets.Button(description="Render", button_style="success")
     status = widgets.HTML()
     editing = False
 
@@ -511,14 +527,14 @@ def _editor_card(
             textarea.value = edit_text
         editing = True
         view.layout.display = "none"
-        textarea.layout.display = None
+        textarea.layout.display = ""
         status.value = ""
 
     def show_view(view_text: str) -> None:
         nonlocal editing
         editing = False
         textarea.layout.display = "none"
-        view.layout.display = None
+        view.layout.display = ""
         _set_view(view_text)
         status.value = ""
 
@@ -530,18 +546,21 @@ def _editor_card(
 
     def set_disabled(on: bool) -> None:
         edit_btn.disabled = on
-        render_btn.disabled = on or not editing
+        render_btn.disabled = on
+
+    def current_edit_text() -> str:
+        return textarea.value
 
     box = widgets.VBox([
-        view,
-        textarea,
         widgets.HBox([edit_btn, render_btn]),
         status,
+        view,
+        textarea,
     ], layout=widgets.Layout(
-        flex="1 1 360px",
-        min_width="320px",
-        border=f"1px solid {border}",
-        padding="6px",
+        flex="1 1 380px",
+        min_width="340px",
+        border=f"2px solid {border}",
+        padding="8px",
     ))
     return SimpleNamespace(
         view=view,
@@ -555,6 +574,7 @@ def _editor_card(
         show_view=show_view,
         set_error=set_error,
         set_disabled=set_disabled,
+        current_edit_text=current_edit_text,
         title=title,
     )
 
@@ -575,26 +595,31 @@ def live_board_row(
     frame = widgets.Image(format="png", width=width)
     frame.layout = widgets.Layout(width=f"{width}px", flex=f"0 0 {width}px")
     caption = widgets.HTML()
+    body_h = min(width, 280)
 
     scratch = _editor_card(
         title="Player's scratchpad",
         title_color="#7a2e2e",
         bg="#f7e6e6",
         border="#c69c9c",
-        height_px=width,
+        height_px=body_h,
         hint="Edit as JSON {key: value}. Bad format stays in edit mode.",
+        edit_label="Edit scratchpad",
+        render_label="Render scratchpad",
     )
     settings = _editor_card(
         title="Game settings",
         title_color="#0d5c5c",
         bg="#e6f4f4",
         border="#5aa8a8",
-        height_px=width,
+        height_px=body_h,
         hint=(
             "To change the boundary, edit openings. Boundary-band walls "
             "lose if they conflict. Interior walls, gold, and pose are "
             "taken as written. Render strips openings and rebuilds walls."
         ),
+        edit_label="Edit game settings",
+        render_label="Render game settings",
     )
 
     def is_editing() -> bool:
@@ -641,10 +666,14 @@ def live_board_row(
             on_changed()
 
     def _on_scratch_render(_) -> None:
-        if busy.generating or not scratch.is_editing():
+        if busy.generating:
             return
+        raw = scratch.current_edit_text().strip()
+        if not raw:
+            raw = session.current_notepad_edit_json()
+            scratch.enter_edit(raw)
         try:
-            notes = parse_notepad_edit(scratch.textarea.value)
+            notes = parse_notepad_edit(raw)
             session.replace_scratchpad(notes)
         except ValueError as exc:
             scratch.set_error(f"Error, bad format, fix input before saving.\n{exc}")
@@ -655,10 +684,14 @@ def live_board_row(
             on_changed()
 
     def _on_settings_render(_) -> None:
-        if busy.generating or not settings.is_editing():
+        if busy.generating:
             return
+        raw = settings.current_edit_text().strip()
+        if not raw:
+            raw = json.dumps(session.current_settings_dict(), indent=2)
+            settings.enter_edit(raw)
         try:
-            d = parse_settings_edit_json(settings.textarea.value)
+            d = parse_settings_edit_json(raw)
             session.apply_user_settings(d)
         except ValueError as exc:
             settings.set_error(
@@ -683,10 +716,8 @@ def live_board_row(
             widgets.VBox([caption, frame], layout=widgets.Layout(
                 flex=f"0 0 {width}px",
             )),
-            widgets.VBox(
-                [scratch.box, settings.box],
-                layout=widgets.Layout(flex="1 1 520px", min_width="320px"),
-            ),
+            scratch.box,
+            settings.box,
         ],
         layout=widgets.Layout(width="100%", align_items="flex-start"),
     )
