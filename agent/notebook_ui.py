@@ -404,7 +404,7 @@ class UiBusy:
     """Generating lock shared by play and multi-gold notebooks.
 
     ``generating`` disables Edit / Ask / Analyze / New room / model switch.
-    Scratchpad edit mode or a dirty settings form disables Ask / Analyze.
+    Scratchpad or settings edit mode disables Ask / Analyze.
     Notebooks call :meth:`set_on_change` with their ``_sync_phase``.
     """
 
@@ -557,10 +557,10 @@ def _editor_card(
         view,
         textarea,
     ], layout=widgets.Layout(
-        flex="1 1 380px",
-        min_width="340px",
+        width="100%",
         border=f"2px solid {border}",
         padding="8px",
+        margin="0 0 12px 0",
     ))
     return SimpleNamespace(
         view=view,
@@ -581,14 +581,64 @@ def _editor_card(
 
 _OPENING_SIDES = ("left", "right", "top", "bottom")
 _TWO_PI = 2.0 * math.pi
+_FORM_FONT = '"Helvetica Neue", Helvetica, Arial, sans-serif'
+
+_SETTINGS_FORM_CSS = """
+<style>
+.gs-form, .gs-form * {
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif !important;
+}
+.gs-form input,
+.gs-form select,
+.gs-form textarea,
+.gs-form .widget-text input,
+.gs-form .widget-dropdown select,
+.gs-form .widget-inline-text input {
+  font-size: 16px !important;
+  line-height: 1.3 !important;
+  min-height: 40px !important;
+  height: 40px !important;
+  padding: 6px 10px !important;
+  box-sizing: border-box !important;
+}
+.gs-form .widget-label,
+.gs-form label {
+  font-size: 15px !important;
+  font-weight: 600 !important;
+  color: #0d3d3d !important;
+}
+.gs-form .widget-slider .widget-label {
+  font-size: 15px !important;
+}
+.gs-form .gs-row-btn button,
+.gs-form .gs-row-btn .jupyter-button {
+  font-size: 22px !important;
+  font-weight: 700 !important;
+  min-width: 44px !important;
+  min-height: 40px !important;
+  line-height: 1 !important;
+}
+.gs-form .widget-hbox {
+  align-items: center !important;
+}
+.gs-form .gs-section {
+  font-size: 16px !important;
+  font-weight: 700 !important;
+  color: #0d5c5c !important;
+  margin: 12px 0 6px !important;
+}
+</style>
+"""
 
 
 def _pm_button(label: str, tooltip: str) -> widgets.Button:
-    return widgets.Button(
+    btn = widgets.Button(
         description=label,
         tooltip=tooltip,
-        layout=widgets.Layout(width="32px"),
+        layout=widgets.Layout(width="44px", height="40px"),
     )
+    btn.add_class("gs-row-btn")
+    return btn
 
 
 def _compact_number(
@@ -596,8 +646,8 @@ def _compact_number(
     value: float | int,
     *,
     kind: str = "float",
-    width: str = "128px",
-    dw: str = "58px",
+    width: str = "150px",
+    dw: str = "70px",
     on_change: Callable[[Any], None] | None = None,
 ) -> Any:
     cls = widgets.IntText if kind == "int" else widgets.FloatText
@@ -605,7 +655,7 @@ def _compact_number(
         value=value,
         description=description,
         step=1 if kind == "int" else 0.01,
-        layout=widgets.Layout(width=width),
+        layout=widgets.Layout(width=width, height="40px"),
         style={"description_width": dw},
     )
     if on_change is not None:
@@ -613,32 +663,96 @@ def _compact_number(
     return w
 
 
-def _settings_card(*, height_px: int, on_form_change: Callable[[], None] | None = None) -> SimpleNamespace:
-    """Always-visible teal form for the full settings dict."""
+def _section_label(text: str) -> widgets.HTML:
+    return widgets.HTML(
+        f"<div class='gs-section'>{_html.escape(text)}</div>"
+    )
+
+
+def _settings_summary(d: dict[str, Any]) -> str:
+    direction = float(d.get("direction", 0.0))
+    lines = [
+        f"gameSize   {int(d.get('gameSize', 64))}",
+        f"direction  {direction:.3f} rad   ({direction * 180.0 / math.pi:.1f}°)",
+        (
+            f"agent      ({float(d.get('agent_x', 0.0)):.3f}, "
+            f"{float(d.get('agent_y', 0.0)):.3f})   "
+            f"r={float(d.get('agent_r', 0.0)):.3f}"
+        ),
+        f"gold_r     {float(d.get('gold_r', 0.0)):.3f}",
+        "",
+        "openings",
+    ]
+    ops = d.get("openings") or []
+    if not ops:
+        lines.append("  (none)")
+    else:
+        for i, op in enumerate(ops):
+            side = op.get("side", "?")
+            center = opening_axis_center(op)
+            width = float(op["width"])
+            lines.append(
+                f"  {i}   {side}   center={center:.3f}   width={width:.3f}"
+            )
+    lines.append("")
+    lines.append("gold")
+    golds = d.get("gold") or []
+    if not golds:
+        lines.append("  (none)")
+    else:
+        for i, g in enumerate(golds):
+            lines.append(f"  {i}   ({float(g[0]):.3f}, {float(g[1]):.3f})")
+    lines.append("")
+    lines.append("walls   [x, y, w, h, angle]")
+    walls = d.get("walls") or []
+    if not walls:
+        lines.append("  (none)")
+    else:
+        for i, wall in enumerate(walls):
+            lines.append(
+                f"  {i}   [{float(wall[0]):.3f}, {float(wall[1]):.3f}, "
+                f"{float(wall[2]):.3f}, {float(wall[3]):.3f}, "
+                f"{float(wall[4]):.3f}]"
+            )
+    return "\n".join(lines)
+
+
+def _settings_view_html(d: dict[str, Any], height_px: int) -> str:
+    body = _html.escape(_settings_summary(d))
+    return (
+        f"<div style='height:{height_px}px;overflow:auto;background:#1f7a7a;"
+        "color:#f4ffff;border-radius:6px;padding:16px 18px;"
+        "box-sizing:border-box;"
+        f"font-family:{_FORM_FONT};font-size:16px;line-height:1.5'>"
+        "<div style='font-weight:700;font-size:18px;margin-bottom:6px'>"
+        "Game settings</div>"
+        "<div style='font-size:15px;opacity:0.92;margin-bottom:14px'>"
+        "Press Edit to change the scene.</div>"
+        f"<pre style='margin:0;font-family:inherit;font-size:16px;"
+        f"white-space:pre-wrap'>{body}</pre></div>"
+    )
+
+
+def _settings_card(
+    *,
+    height_px: int,
+    on_form_change: Callable[[], None] | None = None,
+) -> SimpleNamespace:
+    """Teal settings: solid view until Edit; widget form until Render."""
     edit_btn = widgets.Button(
-        description="Reload from board",
-        tooltip="Discard unrendered form edits and reload from the live board",
-        layout=widgets.Layout(width="auto", min_width="160px"),
+        description="Edit game settings",
+        tooltip="Unlock the settings form",
+        layout=widgets.Layout(width="auto", min_width="170px"),
     )
     render_btn = widgets.Button(
         description="Render game settings",
         button_style="success",
-        tooltip="Apply the full settings form to the live board",
+        tooltip="Apply the form to the live board",
         layout=widgets.Layout(width="auto", min_width="180px"),
     )
-    hint = widgets.HTML(
-        value=(
-            "<div style='font-size:11px;color:#0d5c5c;margin:4px 0 8px'>"
-            "<b>Game settings</b> — same fields as the old JSON, as widgets. "
-            "Direction is 0…2π. Gold, openings, and walls are lists: "
-            "<b>+</b> adds a blank row, <b>−</b> deletes that row. An opening "
-            "is side + center (one number along that edge) + width; from/to "
-            "are computed on Render. Boundary-band walls lose to openings; "
-            "interior walls, gold, pose, and radii are taken as written."
-            "</div>"
-        )
-    )
+    css = widgets.HTML(value=_SETTINGS_FORM_CSS)
     status = widgets.HTML()
+    view = widgets.HTML()
     dir_slider = widgets.FloatSlider(
         value=0.0,
         min=0.0,
@@ -648,8 +762,8 @@ def _settings_card(*, height_px: int, on_form_change: Callable[[], None] | None 
         continuous_update=True,
         readout=True,
         readout_format=".3f",
-        layout=widgets.Layout(width="98%"),
-        style={"description_width": "80px"},
+        layout=widgets.Layout(width="98%", height="40px"),
+        style={"description_width": "90px"},
     )
     dir_readout = widgets.HTML()
 
@@ -657,41 +771,23 @@ def _settings_card(*, height_px: int, on_form_change: Callable[[], None] | None 
     opening_rows: list[SimpleNamespace] = []
     wall_rows: list[SimpleNamespace] = []
     loading = False
-    applied: tuple[Any, ...] | None = None
+    editing = False
+    generating_blocked = False
 
     def _dir_label(rad: float) -> str:
         return (
-            "<div style='font-size:11px;color:#555;margin:-4px 0 8px 84px'>"
-            f"{rad:.3f} rad  ({rad * 180.0 / math.pi:.1f}°)  ·  0 … 2π"
-            "</div>"
-        )
-
-    def _form_snapshot() -> tuple[Any, ...]:
-        return (
-            int(game_size.value),
-            float(dir_slider.value),
-            float(agent_x.value),
-            float(agent_y.value),
-            float(agent_r.value),
-            float(gold_r.value),
-            tuple(
-                (float(r.x.value), float(r.y.value)) for r in gold_rows
-            ),
-            tuple(
-                (str(r.side.value), float(r.center.value), float(r.width.value))
-                for r in opening_rows
-            ),
-            tuple(
-                (float(r.x.value), float(r.y.value), float(r.w.value),
-                 float(r.h.value), float(r.angle.value))
-                for r in wall_rows
-            ),
+            "<div style='font-family:" + _FORM_FONT + ";"
+            "font-size:15px;color:#0d3d3d;margin:0 0 10px 94px'>"
+            f"{rad:.3f} rad &nbsp; ({rad * 180.0 / math.pi:.1f}°) "
+            "&nbsp; · &nbsp; 0 … 2π</div>"
         )
 
     def is_editing() -> bool:
-        if applied is None:
-            return False
-        return _form_snapshot() != applied
+        return editing
+
+    def _sync_edit_render() -> None:
+        edit_btn.disabled = generating_blocked
+        render_btn.disabled = generating_blocked or not editing
 
     def _notify(_change: Any = None) -> None:
         if loading:
@@ -700,34 +796,63 @@ def _settings_card(*, height_px: int, on_form_change: Callable[[], None] | None 
         if on_form_change is not None:
             on_form_change()
 
+    def _row_shell(fields: list[Any], plus: widgets.Button, minus: widgets.Button) -> widgets.VBox:
+        return widgets.VBox(
+            [
+                widgets.HBox(fields, layout=widgets.Layout(
+                    align_items="center", flex_flow="row wrap",
+                )),
+                widgets.HBox(
+                    [plus, minus],
+                    layout=widgets.Layout(align_items="center", margin="6px 0 0 0"),
+                ),
+            ],
+            layout=widgets.Layout(
+                border="1px solid #7bbbbb",
+                padding="10px 12px",
+                margin="0 0 10px 0",
+                width="100%",
+                background="#f3fbfb",
+            ),
+        )
+
+    def _empty_add_row(label: str, btn: widgets.Button) -> widgets.HBox:
+        return widgets.HBox(
+            [
+                widgets.HTML(
+                    "<div style='font-family:" + _FORM_FONT + ";"
+                    "font-size:16px;padding:8px 8px 8px 0'>"
+                    f"{_html.escape(label)}</div>"
+                ),
+                btn,
+            ],
+            layout=widgets.Layout(
+                align_items="center",
+                border="1px dashed #7bbbbb",
+                padding="8px 12px",
+                margin="0 0 10px 0",
+            ),
+        )
+
     def _sync_gold_box() -> None:
-        gold_box.children = tuple([r.box for r in gold_rows] + [add_gold_btn])
+        if gold_rows:
+            gold_box.children = tuple(r.box for r in gold_rows)
+        else:
+            gold_box.children = (_empty_add_row("Add a gold", add_gold_btn),)
 
     def _sync_opening_box() -> None:
-        opening_box.children = tuple(
-            [r.box for r in opening_rows] + [add_opening_btn]
-        )
+        if opening_rows:
+            opening_box.children = tuple(r.box for r in opening_rows)
+        else:
+            opening_box.children = (
+                _empty_add_row("Add an opening", add_opening_btn),
+            )
 
     def _sync_wall_box() -> None:
-        wall_box.children = tuple([r.box for r in wall_rows] + [add_wall_btn])
-
-    def _make_gold_row(x: float, y: float) -> SimpleNamespace:
-        xw = _compact_number("x", x, width="100px", dw="16px", on_change=_notify)
-        yw = _compact_number("y", y, width="100px", dw="16px", on_change=_notify)
-        rm = _pm_button("−", "Remove this gold")
-        ns = SimpleNamespace(
-            x=xw, y=yw, rm=rm,
-            box=widgets.HBox([xw, yw, rm], layout=widgets.Layout(align_items="center")),
-        )
-
-        def _remove(_):
-            if ns in gold_rows:
-                gold_rows.remove(ns)
-                _sync_gold_box()
-                _notify()
-
-        rm.on_click(_remove)
-        return ns
+        if wall_rows:
+            wall_box.children = tuple(r.box for r in wall_rows)
+        else:
+            wall_box.children = (_empty_add_row("Add a wall", add_wall_btn),)
 
     def _next_opening_side() -> str:
         used = {str(r.side.value) for r in opening_rows}
@@ -736,29 +861,67 @@ def _settings_card(*, height_px: int, on_form_change: Callable[[], None] | None 
                 return side
         return "left"
 
+    def _insert_gold(idx: int) -> None:
+        gold_rows.insert(idx, _make_gold_row(0.5, 0.5))
+        _sync_gold_box()
+        _notify()
+
+    def _insert_opening(idx: int) -> None:
+        opening_rows.insert(
+            idx, _make_opening_row(_next_opening_side(), 0.5, 0.2),
+        )
+        _sync_opening_box()
+        _notify()
+
+    def _insert_wall(idx: int) -> None:
+        wall_rows.insert(idx, _make_wall_row(0.4, 0.4, 0.2, 0.2, 0.0))
+        _sync_wall_box()
+        _notify()
+
+    def _make_gold_row(x: float, y: float) -> SimpleNamespace:
+        xw = _compact_number("x", x, width="150px", dw="24px", on_change=_notify)
+        yw = _compact_number("y", y, width="150px", dw="24px", on_change=_notify)
+        plus = _pm_button("+", "Add a gold after this row")
+        minus = _pm_button("−", "Delete this gold")
+        ns = SimpleNamespace(x=xw, y=yw, plus=plus, minus=minus, box=None)
+
+        def _add(_):
+            _insert_gold(gold_rows.index(ns) + 1)
+
+        def _remove(_):
+            if ns in gold_rows:
+                gold_rows.remove(ns)
+                _sync_gold_box()
+                _notify()
+
+        plus.on_click(_add)
+        minus.on_click(_remove)
+        ns.box = _row_shell([xw, yw], plus, minus)
+        return ns
+
     def _make_opening_row(side: str, center: float, width: float) -> SimpleNamespace:
         side_dd = widgets.Dropdown(
             options=list(_OPENING_SIDES),
             value=side if side in _OPENING_SIDES else "left",
             description="side",
-            layout=widgets.Layout(width="150px"),
-            style={"description_width": "36px"},
+            layout=widgets.Layout(width="200px", height="40px"),
+            style={"description_width": "48px"},
         )
         cw = _compact_number(
-            "center", center, width="140px", dw="52px", on_change=_notify,
+            "center", center, width="180px", dw="70px", on_change=_notify,
         )
         ww = _compact_number(
-            "width", width, width="130px", dw="46px", on_change=_notify,
+            "width", width, width="170px", dw="60px", on_change=_notify,
         )
-        rm = _pm_button("−", "Remove this opening")
+        plus = _pm_button("+", "Add an opening after this row")
+        minus = _pm_button("−", "Delete this opening")
         side_dd.observe(_notify, names="value")
         ns = SimpleNamespace(
-            side=side_dd, center=cw, width=ww, rm=rm,
-            box=widgets.HBox(
-                [side_dd, cw, ww, rm],
-                layout=widgets.Layout(align_items="center"),
-            ),
+            side=side_dd, center=cw, width=ww, plus=plus, minus=minus, box=None,
         )
+
+        def _add(_):
+            _insert_opening(opening_rows.index(ns) + 1)
 
         def _remove(_):
             if ns in opening_rows:
@@ -766,25 +929,29 @@ def _settings_card(*, height_px: int, on_form_change: Callable[[], None] | None 
                 _sync_opening_box()
                 _notify()
 
-        rm.on_click(_remove)
+        plus.on_click(_add)
+        minus.on_click(_remove)
+        ns.box = _row_shell([side_dd, cw, ww], plus, minus)
         return ns
 
     def _make_wall_row(
         x: float, y: float, w: float, h: float, angle: float,
     ) -> SimpleNamespace:
-        xw = _compact_number("x", x, width="88px", dw="14px", on_change=_notify)
-        yw = _compact_number("y", y, width="88px", dw="14px", on_change=_notify)
-        ww = _compact_number("w", w, width="88px", dw="14px", on_change=_notify)
-        hw = _compact_number("h", h, width="88px", dw="14px", on_change=_notify)
-        aw = _compact_number("θ", angle, width="88px", dw="14px", on_change=_notify)
-        rm = _pm_button("−", "Remove this wall")
-        ns = SimpleNamespace(
-            x=xw, y=yw, w=ww, h=hw, angle=aw, rm=rm,
-            box=widgets.HBox(
-                [xw, yw, ww, hw, aw, rm],
-                layout=widgets.Layout(align_items="center"),
-            ),
+        xw = _compact_number("x", x, width="130px", dw="20px", on_change=_notify)
+        yw = _compact_number("y", y, width="130px", dw="20px", on_change=_notify)
+        ww = _compact_number("w", w, width="130px", dw="20px", on_change=_notify)
+        hw = _compact_number("h", h, width="130px", dw="20px", on_change=_notify)
+        aw = _compact_number(
+            "angle", angle, width="160px", dw="52px", on_change=_notify,
         )
+        plus = _pm_button("+", "Add a wall after this row")
+        minus = _pm_button("−", "Delete this wall")
+        ns = SimpleNamespace(
+            x=xw, y=yw, w=ww, h=hw, angle=aw, plus=plus, minus=minus, box=None,
+        )
+
+        def _add(_):
+            _insert_wall(wall_rows.index(ns) + 1)
 
         def _remove(_):
             if ns in wall_rows:
@@ -792,11 +959,13 @@ def _settings_card(*, height_px: int, on_form_change: Callable[[], None] | None 
                 _sync_wall_box()
                 _notify()
 
-        rm.on_click(_remove)
+        plus.on_click(_add)
+        minus.on_click(_remove)
+        ns.box = _row_shell([xw, yw, ww, hw, aw], plus, minus)
         return ns
 
     def load_form(d: dict[str, Any]) -> None:
-        nonlocal loading, applied
+        nonlocal loading
         loading = True
         try:
             game_size.value = int(d.get("gameSize", 64))
@@ -837,19 +1006,11 @@ def _settings_card(*, height_px: int, on_form_change: Callable[[], None] | None 
                     float(wall[3]), float(wall[4]),
                 ))
             _sync_wall_box()
-            applied = _form_snapshot()
         finally:
             loading = False
         status.value = ""
 
     def collect(_base: dict[str, Any] | None = None) -> dict[str, Any]:
-        openings: list[dict[str, Any]] = []
-        for r in opening_rows:
-            openings.append({
-                "side": str(r.side.value),
-                "center": float(r.center.value),
-                "width": float(r.width.value),
-            })
         return {
             "gameSize": int(game_size.value),
             "direction": float(dir_slider.value),
@@ -865,18 +1026,50 @@ def _settings_card(*, height_px: int, on_form_change: Callable[[], None] | None 
                  float(r.h.value), float(r.angle.value)]
                 for r in wall_rows
             ],
-            "openings": openings,
+            "openings": [
+                {
+                    "side": str(r.side.value),
+                    "center": float(r.center.value),
+                    "width": float(r.width.value),
+                }
+                for r in opening_rows
+            ],
         }
+
+    def enter_edit(d: dict[str, Any]) -> None:
+        nonlocal editing
+        if not editing:
+            load_form(d)
+        editing = True
+        view.layout.display = "none"
+        form.layout.display = ""
+        status.value = ""
+        _sync_edit_render()
+        if on_form_change is not None:
+            on_form_change()
+
+    def show_view(d: dict[str, Any]) -> None:
+        nonlocal editing
+        editing = False
+        form.layout.display = "none"
+        view.layout.display = ""
+        view.value = _settings_view_html(d, height_px)
+        status.value = ""
+        _sync_edit_render()
+        if on_form_change is not None:
+            on_form_change()
 
     def set_error(msg: str) -> None:
         status.value = (
-            "<div style='color:#a00;font-family:monospace;white-space:pre-wrap'>"
+            "<div style='color:#a00;font-family:" + _FORM_FONT + ";"
+            "font-size:15px;white-space:pre-wrap'>"
             f"{_html.escape(msg)}</div>"
         )
 
     def set_disabled(on: bool) -> None:
-        edit_btn.disabled = on
-        render_btn.disabled = on
+        nonlocal generating_blocked
+        generating_blocked = on
+        _sync_edit_render()
         add_gold_btn.disabled = on
         add_opening_btn.disabled = on
         add_wall_btn.disabled = on
@@ -885,56 +1078,53 @@ def _settings_card(*, height_px: int, on_form_change: Callable[[], None] | None 
         for r in gold_rows:
             r.x.disabled = on
             r.y.disabled = on
-            r.rm.disabled = on
+            r.plus.disabled = on
+            r.minus.disabled = on
         for r in opening_rows:
             r.side.disabled = on
             r.center.disabled = on
             r.width.disabled = on
-            r.rm.disabled = on
+            r.plus.disabled = on
+            r.minus.disabled = on
         for r in wall_rows:
             r.x.disabled = on
             r.y.disabled = on
             r.w.disabled = on
             r.h.disabled = on
             r.angle.disabled = on
-            r.rm.disabled = on
+            r.plus.disabled = on
+            r.minus.disabled = on
 
     game_size = _compact_number(
-        "gameSize", 64, kind="int", width="140px", dw="68px", on_change=_notify,
+        "gameSize", 64, kind="int", width="170px", dw="84px", on_change=_notify,
     )
-    agent_x = _compact_number("agent_x", 0.5, on_change=_notify)
-    agent_y = _compact_number("agent_y", 0.5, on_change=_notify)
-    agent_r = _compact_number("agent_r", 0.05, on_change=_notify)
-    gold_r = _compact_number("gold_r", 0.03, on_change=_notify)
-
+    agent_x = _compact_number(
+        "agent_x", 0.5, width="170px", dw="72px", on_change=_notify,
+    )
+    agent_y = _compact_number(
+        "agent_y", 0.5, width="170px", dw="72px", on_change=_notify,
+    )
+    agent_r = _compact_number(
+        "agent_r", 0.05, width="170px", dw="72px", on_change=_notify,
+    )
+    gold_r = _compact_number(
+        "gold_r", 0.03, width="170px", dw="72px", on_change=_notify,
+    )
     dir_slider.observe(_notify, names="value")
     dir_readout.value = _dir_label(0.0)
 
     add_gold_btn = _pm_button("+", "Add a gold")
     add_opening_btn = _pm_button("+", "Add an opening")
     add_wall_btn = _pm_button("+", "Add a wall")
-
-    def _on_add_gold(_):
-        gold_rows.append(_make_gold_row(0.5, 0.5))
-        _sync_gold_box()
-        _notify()
-
-    def _on_add_opening(_):
-        opening_rows.append(_make_opening_row(_next_opening_side(), 0.5, 0.2))
-        _sync_opening_box()
-        _notify()
-
-    def _on_add_wall(_):
-        wall_rows.append(_make_wall_row(0.4, 0.4, 0.2, 0.2, 0.0))
-        _sync_wall_box()
-        _notify()
-
-    add_gold_btn.on_click(_on_add_gold)
-    add_opening_btn.on_click(_on_add_opening)
-    add_wall_btn.on_click(_on_add_wall)
-    gold_box = widgets.VBox([add_gold_btn])
-    opening_box = widgets.VBox([add_opening_btn])
-    wall_box = widgets.VBox([add_wall_btn])
+    add_gold_btn.on_click(lambda _: _insert_gold(len(gold_rows)))
+    add_opening_btn.on_click(lambda _: _insert_opening(len(opening_rows)))
+    add_wall_btn.on_click(lambda _: _insert_wall(len(wall_rows)))
+    gold_box = widgets.VBox()
+    opening_box = widgets.VBox()
+    wall_box = widgets.VBox()
+    _sync_gold_box()
+    _sync_opening_box()
+    _sync_wall_box()
 
     form = widgets.VBox(
         [
@@ -942,40 +1132,36 @@ def _settings_card(*, height_px: int, on_form_change: Callable[[], None] | None 
             widgets.HBox([agent_r, gold_r]),
             dir_slider,
             dir_readout,
-            widgets.HTML(
-                "<div style='font-size:11px;font-weight:bold;margin:6px 0 2px'>"
-                "openings [side, center, width]</div>"
-            ),
+            _section_label("openings  (side, center, width)"),
             opening_box,
-            widgets.HTML(
-                "<div style='font-size:11px;font-weight:bold;margin:8px 0 2px'>"
-                "gold [x, y]</div>"
-            ),
+            _section_label("gold  (x, y)"),
             gold_box,
-            widgets.HTML(
-                "<div style='font-size:11px;font-weight:bold;margin:8px 0 2px'>"
-                "walls [x, y, w, h, angle]</div>"
-            ),
+            _section_label("walls  (x, y, w, h, angle)"),
             wall_box,
         ],
         layout=widgets.Layout(
-            height=f"{max(height_px, 320)}px",
+            height=f"{max(height_px, 380)}px",
             overflow="auto",
-            padding="4px 6px",
+            padding="10px 12px",
             border="1px solid #5aa8a8",
             background="#e6f4f4",
         ),
     )
+    form.add_class("gs-form")
+    form.layout.display = "none"
+    _sync_edit_render()
+
     box = widgets.VBox([
         widgets.HBox([edit_btn, render_btn]),
-        hint,
+        css,
         status,
+        view,
         form,
     ], layout=widgets.Layout(
-        flex="1 1 420px",
-        min_width="400px",
+        width="100%",
         border="2px solid #5aa8a8",
         padding="8px",
+        margin="0 0 12px 0",
     ))
     return SimpleNamespace(
         box=box,
@@ -983,7 +1169,8 @@ def _settings_card(*, height_px: int, on_form_change: Callable[[], None] | None 
         render_btn=render_btn,
         status=status,
         is_editing=is_editing,
-        load_form=load_form,
+        enter_edit=enter_edit,
+        show_view=show_view,
         collect=collect,
         set_error=set_error,
         set_disabled=set_disabled,
@@ -998,23 +1185,23 @@ def live_board_row(
     width: int = 420,
     on_changed: Callable[[], None] | None = None,
 ) -> SimpleNamespace:
-    """Sticky teal settings | frame | maroon scratchpad.
+    """Board on the left; teal settings stacked over maroon scratchpad.
 
-    Hidden from the agent until the next generation. Generation cannot
-    start while the scratchpad is in edit mode or the settings form is
-    dirty; Edit/Reload is disabled while ``busy.generating``.
+    Settings stay a solid teal summary until Edit. Generation cannot
+    start while either card is in edit mode. Hidden from the agent
+    until the next generation.
     """
     frame = widgets.Image(format="png", width=width)
     frame.layout = widgets.Layout(width=f"{width}px", flex=f"0 0 {width}px")
     caption = widgets.HTML()
-    body_h = min(width, 280)
+    body_h = 360
 
     scratch = _editor_card(
         title="Player's scratchpad",
         title_color="#7a2e2e",
         bg="#f7e6e6",
         border="#c69c9c",
-        height_px=body_h,
+        height_px=280,
         hint="Edit as JSON {key: value}. Bad format stays in edit mode.",
         edit_label="Edit scratchpad",
         render_label="Render scratchpad",
@@ -1036,14 +1223,15 @@ def live_board_row(
         path = session.current_frame_path()
         frame.value = Path(path).read_bytes()
         caption.value = (
-            "<div style='font-family:monospace;font-size:12px;color:#444'>"
+            "<div style='font-family:\"Helvetica Neue\",Helvetica,Arial,"
+            "sans-serif;font-size:14px;color:#444'>"
             "current board — live scene; Ask snapshots this, not the "
             "history prints below</div>"
         )
         if force_views or not scratch.is_editing():
             scratch.show_view(session.current_notepad())
         if force_views or not settings.is_editing():
-            settings.load_form(session.current_settings_dict())
+            settings.show_view(session.current_settings_dict())
         _sync_buttons()
         if on_changed is not None:
             on_changed()
@@ -1061,10 +1249,10 @@ def live_board_row(
         if on_changed is not None:
             on_changed()
 
-    def _on_settings_reload(_) -> None:
+    def _on_settings_edit(_) -> None:
         if busy.generating:
             return
-        settings.load_form(session.current_settings_dict())
+        settings.enter_edit(session.current_settings_dict())
         _sync_buttons()
         if on_changed is not None:
             on_changed()
@@ -1088,10 +1276,10 @@ def live_board_row(
             on_changed()
 
     def _on_settings_render(_) -> None:
-        if busy.generating:
+        if busy.generating or not settings.is_editing():
             return
         try:
-            d = settings.collect(session.current_settings_dict())
+            d = settings.collect()
             session.apply_user_settings(d)
         except ValueError as exc:
             settings.set_error(
@@ -1099,23 +1287,30 @@ def live_board_row(
             )
             return
         frame.value = Path(session.current_frame_path()).read_bytes()
-        settings.load_form(session.current_settings_dict())
+        settings.show_view(session.current_settings_dict())
         _sync_buttons()
         if on_changed is not None:
             on_changed()
 
     scratch.edit_btn.on_click(_on_scratch_edit)
     scratch.render_btn.on_click(_on_scratch_render)
-    settings.edit_btn.on_click(_on_settings_reload)
+    settings.edit_btn.on_click(_on_settings_edit)
     settings.render_btn.on_click(_on_settings_render)
 
+    side = widgets.VBox(
+        [settings.box, scratch.box],
+        layout=widgets.Layout(
+            flex="1 1 560px",
+            min_width="520px",
+            width="auto",
+        ),
+    )
     box = widgets.HBox(
         [
-            settings.box,
             widgets.VBox([caption, frame], layout=widgets.Layout(
                 flex=f"0 0 {width}px",
             )),
-            scratch.box,
+            side,
         ],
         layout=widgets.Layout(width="100%", align_items="flex-start"),
     )

@@ -337,8 +337,9 @@ E4B); the wider 2026-07 candidate field, and why it lost, is recorded in
   one move token (`[CLOCK n]`, `[ANTICLOCK n]`, `[FORWARD]`,
   `[END_GAME]`). Generation stops at the token and the move is applied.
   `[END_GAME]` applies no board action and freezes the session until
-  **New room**. Eating gold is not a win.   A live row shows teal settings (left), the current frame, and a maroon
-  scratchpad (right) — user-only; settings never enter the player prompt.
+  **New room**. Eating gold is not a win.   A live row shows the current frame on the left and teal settings stacked
+  over the maroon scratchpad on the right — user-only; settings never
+  enter the player prompt. Settings stay a solid teal summary until Edit.
   Settings are the full scene (pose, gold, walls, radii, gameSize), a
   direction slider (0…2π), and add/remove rows for gold, openings (side +
   center + width), and walls; Render computes `from`/`to` and reconciles
