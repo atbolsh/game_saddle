@@ -9,9 +9,12 @@ call.
 One :meth:`ask` is **one generation**: the agent sees the current live frame
 plus its (settings-stripped) memory context, may run ``[SEARCH]`` loops, and
 emits at most one move token. Generation stops at the token; CLOCK /
-ANTICLOCK / FORWARD are applied immediately. ``[END_GAME]`` is a stop
-string so generation halts there, but ``game_io.parse_action`` returns
-None for it -- no board change, session continues.
+ANTICLOCK / FORWARD are applied immediately. The next ask prefixes the
+player question with the engine-truth board update (ate / did not eat)
+and stores that prefixed text as the user message -- same as the
+self-eval player path, minus analyst traces. ``[END_GAME]`` is a stop
+string so generation halts there; no board change. Multi-gold rooms
+freeze ``session_state`` via :meth:`_on_player_end_game`.
 
 :meth:`restart` re-initializes the env (a brand new bare game) and starts a
 new conversation thread (a fresh ``session_id``), reusing the already-loaded
@@ -114,6 +117,7 @@ class InteractiveSession:
         self.game = self._new_game()
         self.session_id = mem.new_session_id()
         self.round_no = 0
+        self._last_outcome: dict[str, Any] | None = None
         logger.info("Interactive session restarted: session_id=%s", self.session_id)
         return {
             "session_id": self.session_id,
@@ -144,6 +148,7 @@ class InteractiveSession:
                 )
             )
         self.round_no = 0
+        self._last_outcome = None
         self._run(mem.clear_session_notes(self.client, self.session_id))
         logger.info("Game reset (session %s kept).", self.session_id)
         return {
@@ -241,11 +246,20 @@ class InteractiveSession:
         the ``[SEARCH]`` loop; the string is the final reply after
         :func:`game_io.truncate_at_first_move_token`.
 
+        After a CLOCK / ANTICLOCK / FORWARD, the next call prefixes the
+        question with :func:`game_io.board_update_line` (ate / did not
+        eat) and stores that prefixed text as the user message -- same
+        as :meth:`InteractiveSelfEvalSession.ask_player`.
+
         ``[END_GAME]`` is a stop string so generation halts at the token;
         no board action is applied. Multi-gold rooms freeze
         ``session_state`` via :meth:`_on_player_end_game`.
         """
         del max_steps  # one generation per ask; kept so callers need not change
+        question = game_io.compose_player_question(
+            question, getattr(self, "_last_outcome", None),
+            end_game_note=getattr(self, "END_GAME_UNAVAILABLE_NOTE", None),
+        )
         # 1. Snapshot the current ('before') frame -> disk + GameSnapshot node.
         snapshot_before_id = image_store.snapshot_id()
         settings_before = game_io.game_to_settings_dict(self.game)
@@ -263,7 +277,7 @@ class InteractiveSession:
         ctx = self._run(
             mem.get_game_context(
                 self.client, self.session_id, query=query,
-                recent_window=self.cfg.recent_messages_window,
+                recent_window=self.cfg.player_recent_messages_window,
                 exclude_analyst=True,
             )
         )
@@ -342,6 +356,14 @@ class InteractiveSession:
                 game_io.apply_action(self.game, action, count=count)
                 if action else 0
             )
+
+        if action and action != "END_GAME":
+            self._last_outcome = {
+                "action": action,
+                "gold_collected": gold_collected,
+                "gold_remaining": game_io.gold_remaining(self.game),
+                "count": count,
+            }
 
         turn = self._run(
             modes._record_step(

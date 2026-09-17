@@ -178,11 +178,10 @@ class InteractiveSelfEvalSession(InteractiveSession):
                 "A player reply is already awaiting analysis; run "
                 "ask_analyst() first."
             )
-        if self._last_outcome is not None:
-            prefix = game_io.board_update_line(**self._last_outcome)
-            if self._last_outcome.get("action") == "END_GAME":
-                prefix = prefix + "\n" + self.END_GAME_UNAVAILABLE_NOTE
-            question = prefix + "\n\n" + question
+        question = game_io.compose_player_question(
+            question, self._last_outcome,
+            end_game_note=self.END_GAME_UNAVAILABLE_NOTE,
+        )
 
         # 1. Snapshot the current ('before') frame -> disk + GameSnapshot node.
         snapshot_before_id = image_store.snapshot_id()

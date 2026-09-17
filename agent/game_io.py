@@ -850,6 +850,28 @@ def board_update_line(action: str, gold_collected: int, gold_remaining: int,
     )
 
 
+def compose_player_question(
+    question: str,
+    last_outcome: dict[str, Any] | None,
+    *,
+    end_game_note: str | None = None,
+) -> str:
+    """Prefix a player question with the last applied move's board update.
+
+    The returned string is both the prompt ``Question / instruction`` and
+    the stored user ``Message``, so the eat / no-eat sentence stays in
+    the recency window as long as that message does. ``end_game_note``
+    is the legacy self-eval suffix when ``[END_GAME]`` is not a real
+    stop (play and multi-gold never pass it).
+    """
+    if not last_outcome:
+        return question
+    prefix = board_update_line(**last_outcome)
+    if last_outcome.get("action") == "END_GAME" and end_game_note:
+        prefix = prefix + "\n" + end_game_note
+    return prefix + "\n\n" + question
+
+
 def find_bare_move(text: str) -> str | None:
     """Return the LAST bare (unbracketed) move word in ``text`` -- e.g.
     'ANTICLOCK' without brackets -- or ``None``.

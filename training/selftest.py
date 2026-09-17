@@ -1803,6 +1803,7 @@ def t1_pure() -> str:
         _SIDE_WALL_WIDTH,
         PLAYER_STOP_PATTERN,
         board_update_line,
+        compose_player_question,
         boundary_openings,
         find_bare_move,
         find_invalid_move_token,
@@ -1891,6 +1892,23 @@ def t1_pure() -> str:
     uneaten = board_update_line("CLOCK", 0, 3)
     assert "[CLOCK]" in uneaten and "3 gold(s)" in uneaten
     assert "ATE" not in uneaten
+    checks += 1
+    assert compose_player_question("go", None) == "go"
+    eat_q = compose_player_question(
+        "did you eat a gold recently",
+        {"action": "FORWARD", "gold_collected": 1,
+         "gold_remaining": 2, "count": 1},
+    )
+    assert eat_q.startswith("Board update:")
+    assert "ATE a gold" in eat_q and eat_q.endswith("did you eat a gold recently")
+    note = "You are playing in a mode where the [END_GAME] move is not available."
+    end_q = compose_player_question(
+        "next",
+        {"action": "END_GAME", "gold_collected": 0,
+         "gold_remaining": 1, "count": 1},
+        end_game_note=note,
+    )
+    assert note in end_q and end_q.endswith("next")
     checks += 1
     empty_pad = format_notepad([])
     assert "Your notepad is empty" in empty_pad
