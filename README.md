@@ -337,13 +337,16 @@ E4B); the wider 2026-07 candidate field, and why it lost, is recorded in
   one move token (`[CLOCK n]`, `[ANTICLOCK n]`, `[FORWARD]`,
   `[END_GAME]`). Generation stops at the token and the move is applied.
   `[END_GAME]` applies no board action and freezes the session until
-  **New room**. Eating gold is not a win. A live row shows the current
-  frame plus a maroon scratchpad and a teal settings editor (user-only;
-  settings never enter the player prompt). **Edit** / **Render** on those
-  cards: hand-edited `openings` are reconciled into `walls` in
-  `game_io.reconcile_walls_to_openings`, then the dict is passed to the
-  existing renderer without an `openings` key. Bad JSON stays in edit
-  mode. Generation cannot start while either card is being edited. To
+  **New room**. Eating gold is not a win.   A live row shows teal settings (left), the current frame, and a maroon
+  scratchpad (right) — user-only; settings never enter the player prompt.
+  Settings are the full scene (pose, gold, walls, radii, gameSize), a
+  direction slider (0…2π), and one opening per side (checkbox + center +
+  width); Render computes `from`/`to` and reconciles
+  openings into `walls` in `game_io.reconcile_walls_to_openings`, then
+  passes the dict to the existing renderer without an `openings` key.
+  Scratchpad is still JSON (bad format stays in edit mode). Generation
+  cannot start while the scratchpad is being edited or the settings form
+  is dirty. To
   discard an unwanted conversation, run the gated reset cell
   (`session.reset_memory_to_seed()`) or `bash scripts/reset_semantics.sh`.
   The session class is

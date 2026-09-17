@@ -16,14 +16,14 @@
   pictographic move buttons).
 - :func:`room_scenario_bar`, :func:`live_board_row`, and
   :class:`UiBusy` are the shared gold/opening bar, floating
-  frame+scratchpad+settings editors, and generating/editing lock.
+  frame+settings+scratchpad editors, and generating/editing lock.
 """
 
 from __future__ import annotations
 
 import base64
 import html as _html
-import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -31,7 +31,7 @@ from typing import Any, Callable
 import ipywidgets as widgets
 from IPython.display import HTML, display
 
-from agent.game_io import ACTIONS, parse_notepad_edit, parse_settings_edit_json
+from agent.game_io import ACTIONS, opening_axis_center, parse_notepad_edit
 
 #: CSS class marking a Textarea widget as Shift-Enter-tamed.
 _TAMED_CLASS = "tame-shift-enter"
@@ -404,8 +404,8 @@ class UiBusy:
     """Generating lock shared by play and multi-gold notebooks.
 
     ``generating`` disables Edit / Ask / Analyze / New room / model switch.
-    Either editor in edit mode disables Ask / Analyze. Notebooks call
-    :meth:`set_on_change` with their ``_sync_phase``.
+    Scratchpad edit mode or a dirty settings form disables Ask / Analyze.
+    Notebooks call :meth:`set_on_change` with their ``_sync_phase``.
     """
 
     def __init__(self) -> None:
@@ -579,6 +579,431 @@ def _editor_card(
     )
 
 
+_OPENING_SIDES = ("left", "right", "top", "bottom")
+_TWO_PI = 2.0 * math.pi
+
+
+def _compact_number(
+    description: str,
+    value: float | int,
+    *,
+    kind: str = "float",
+    width: str = "128px",
+    dw: str = "58px",
+    on_change: Callable[[Any], None] | None = None,
+) -> Any:
+    cls = widgets.IntText if kind == "int" else widgets.FloatText
+    w = cls(
+        value=value,
+        description=description,
+        step=1 if kind == "int" else 0.01,
+        layout=widgets.Layout(width=width),
+        style={"description_width": dw},
+    )
+    if on_change is not None:
+        w.observe(on_change, names="value")
+    return w
+
+
+def _settings_card(*, height_px: int, on_form_change: Callable[[], None] | None = None) -> SimpleNamespace:
+    """Always-visible teal form for the full settings dict."""
+    edit_btn = widgets.Button(
+        description="Reload from board",
+        tooltip="Discard unrendered form edits and reload from the live board",
+        layout=widgets.Layout(width="auto", min_width="160px"),
+    )
+    render_btn = widgets.Button(
+        description="Render game settings",
+        button_style="success",
+        tooltip="Apply the full settings form to the live board",
+        layout=widgets.Layout(width="auto", min_width="180px"),
+    )
+    hint = widgets.HTML(
+        value=(
+            "<div style='font-size:11px;color:#0d5c5c;margin:4px 0 8px'>"
+            "<b>Game settings</b> — same fields as the old JSON, as widgets. "
+            "Direction is 0…2π. Check a side to cut an opening; "
+            "<b>center</b> is one number along that edge (y on left/right, "
+            "x on top/bottom); <b>width</b> is the gap. from/to are computed "
+            "on Render. Boundary-band walls lose to openings; interior walls, "
+            "gold, pose, and radii are taken as written."
+            "</div>"
+        )
+    )
+    status = widgets.HTML()
+    dir_slider = widgets.FloatSlider(
+        value=0.0,
+        min=0.0,
+        max=_TWO_PI,
+        step=0.01,
+        description="direction",
+        continuous_update=True,
+        readout=True,
+        readout_format=".3f",
+        layout=widgets.Layout(width="98%"),
+        style={"description_width": "80px"},
+    )
+    dir_readout = widgets.HTML()
+
+    sides: dict[str, SimpleNamespace] = {}
+    gold_rows: list[SimpleNamespace] = []
+    wall_rows: list[SimpleNamespace] = []
+    loading = False
+    applied: tuple[Any, ...] | None = None
+
+    def _dir_label(rad: float) -> str:
+        return (
+            "<div style='font-size:11px;color:#555;margin:-4px 0 8px 84px'>"
+            f"{rad:.3f} rad  ({rad * 180.0 / math.pi:.1f}°)  ·  0 … 2π"
+            "</div>"
+        )
+
+    def _sync_side_enabled(side: str) -> None:
+        on = bool(sides[side].enabled.value)
+        sides[side].center.disabled = not on
+        sides[side].width.disabled = not on
+
+    def _form_snapshot() -> tuple[Any, ...]:
+        return (
+            int(game_size.value),
+            float(dir_slider.value),
+            float(agent_x.value),
+            float(agent_y.value),
+            float(agent_r.value),
+            float(gold_r.value),
+            tuple(
+                (float(r.x.value), float(r.y.value)) for r in gold_rows
+            ),
+            tuple(
+                (float(r.x.value), float(r.y.value), float(r.w.value),
+                 float(r.h.value), float(r.angle.value))
+                for r in wall_rows
+            ),
+            tuple(
+                (
+                    bool(sides[s].enabled.value),
+                    float(sides[s].center.value),
+                    float(sides[s].width.value),
+                )
+                for s in _OPENING_SIDES
+            ),
+        )
+
+    def is_editing() -> bool:
+        if applied is None:
+            return False
+        return _form_snapshot() != applied
+
+    def _notify(_change: Any = None) -> None:
+        if loading:
+            return
+        dir_readout.value = _dir_label(float(dir_slider.value))
+        if on_form_change is not None:
+            on_form_change()
+
+    def _sync_gold_box() -> None:
+        gold_box.children = tuple([r.box for r in gold_rows] + [add_gold_btn])
+
+    def _sync_wall_box() -> None:
+        wall_box.children = tuple([r.box for r in wall_rows] + [add_wall_btn])
+
+    def _make_gold_row(x: float, y: float) -> SimpleNamespace:
+        xw = _compact_number("x", x, width="100px", dw="16px", on_change=_notify)
+        yw = _compact_number("y", y, width="100px", dw="16px", on_change=_notify)
+        rm = widgets.Button(
+            description="×", tooltip="Remove this gold",
+            layout=widgets.Layout(width="32px"),
+        )
+        ns = SimpleNamespace(
+            x=xw, y=yw, rm=rm,
+            box=widgets.HBox([xw, yw, rm], layout=widgets.Layout(align_items="center")),
+        )
+
+        def _remove(_):
+            if ns in gold_rows:
+                gold_rows.remove(ns)
+                _sync_gold_box()
+                _notify()
+
+        rm.on_click(_remove)
+        return ns
+
+    def _make_wall_row(
+        x: float, y: float, w: float, h: float, angle: float,
+    ) -> SimpleNamespace:
+        xw = _compact_number("x", x, width="88px", dw="14px", on_change=_notify)
+        yw = _compact_number("y", y, width="88px", dw="14px", on_change=_notify)
+        ww = _compact_number("w", w, width="88px", dw="14px", on_change=_notify)
+        hw = _compact_number("h", h, width="88px", dw="14px", on_change=_notify)
+        aw = _compact_number("θ", angle, width="88px", dw="14px", on_change=_notify)
+        rm = widgets.Button(
+            description="×", tooltip="Remove this wall",
+            layout=widgets.Layout(width="32px"),
+        )
+        ns = SimpleNamespace(
+            x=xw, y=yw, w=ww, h=hw, angle=aw, rm=rm,
+            box=widgets.HBox(
+                [xw, yw, ww, hw, aw, rm],
+                layout=widgets.Layout(align_items="center"),
+            ),
+        )
+
+        def _remove(_):
+            if ns in wall_rows:
+                wall_rows.remove(ns)
+                _sync_wall_box()
+                _notify()
+
+        rm.on_click(_remove)
+        return ns
+
+    def load_form(d: dict[str, Any]) -> None:
+        nonlocal loading, applied
+        loading = True
+        extras: list[str] = []
+        try:
+            game_size.value = int(d.get("gameSize", 64))
+            val = float(d.get("direction", 0.0))
+            if val < 0.0 or val > _TWO_PI:
+                val = val % _TWO_PI
+            dir_slider.value = val
+            dir_readout.value = _dir_label(val)
+            agent_x.value = float(d.get("agent_x", 0.5))
+            agent_y.value = float(d.get("agent_y", 0.5))
+            agent_r.value = float(d.get("agent_r", 0.05))
+            gold_r.value = float(d.get("gold_r", 0.03))
+            gold_rows[:] = []
+            for g in d.get("gold") or []:
+                if not isinstance(g, (list, tuple)) or len(g) < 2:
+                    raise ValueError(f"gold entry {g!r} is not [x, y]")
+                gold_rows.append(_make_gold_row(float(g[0]), float(g[1])))
+            _sync_gold_box()
+            wall_rows[:] = []
+            for wall in d.get("walls") or []:
+                if not isinstance(wall, (list, tuple)) or len(wall) < 5:
+                    raise ValueError(
+                        f"wall {wall!r} is not [x, y, w, h, angle]"
+                    )
+                wall_rows.append(_make_wall_row(
+                    float(wall[0]), float(wall[1]), float(wall[2]),
+                    float(wall[3]), float(wall[4]),
+                ))
+            _sync_wall_box()
+            used: set[str] = set()
+            for op in d.get("openings") or []:
+                side = op.get("side")
+                if side not in sides:
+                    continue
+                if side in used:
+                    extras.append(side)
+                    continue
+                used.add(side)
+                sides[side].enabled.value = True
+                sides[side].center.value = opening_axis_center(op)
+                sides[side].width.value = float(op["width"])
+            for side in _OPENING_SIDES:
+                if side not in used:
+                    sides[side].enabled.value = False
+                    sides[side].center.value = 0.5
+                    sides[side].width.value = 0.2
+                _sync_side_enabled(side)
+            applied = _form_snapshot()
+        finally:
+            loading = False
+        if extras:
+            status.value = (
+                "<div style='color:#864;font-family:monospace'>"
+                "This board has more than one opening on "
+                f"{', '.join(extras)}; the form keeps the first. "
+                "Render will replace that side with the form row."
+                "</div>"
+            )
+        else:
+            status.value = ""
+
+    def collect(_base: dict[str, Any] | None = None) -> dict[str, Any]:
+        openings: list[dict[str, Any]] = []
+        for side in _OPENING_SIDES:
+            if not sides[side].enabled.value:
+                continue
+            openings.append({
+                "side": side,
+                "center": float(sides[side].center.value),
+                "width": float(sides[side].width.value),
+            })
+        return {
+            "gameSize": int(game_size.value),
+            "direction": float(dir_slider.value),
+            "agent_x": float(agent_x.value),
+            "agent_y": float(agent_y.value),
+            "agent_r": float(agent_r.value),
+            "gold_r": float(gold_r.value),
+            "gold": [
+                [float(r.x.value), float(r.y.value)] for r in gold_rows
+            ],
+            "walls": [
+                [float(r.x.value), float(r.y.value), float(r.w.value),
+                 float(r.h.value), float(r.angle.value)]
+                for r in wall_rows
+            ],
+            "openings": openings,
+        }
+
+    def set_error(msg: str) -> None:
+        status.value = (
+            "<div style='color:#a00;font-family:monospace;white-space:pre-wrap'>"
+            f"{_html.escape(msg)}</div>"
+        )
+
+    def set_disabled(on: bool) -> None:
+        edit_btn.disabled = on
+        render_btn.disabled = on
+        add_gold_btn.disabled = on
+        add_wall_btn.disabled = on
+        for w in (game_size, dir_slider, agent_x, agent_y, agent_r, gold_r):
+            w.disabled = on
+        for r in gold_rows:
+            r.x.disabled = on
+            r.y.disabled = on
+            r.rm.disabled = on
+        for r in wall_rows:
+            r.x.disabled = on
+            r.y.disabled = on
+            r.w.disabled = on
+            r.h.disabled = on
+            r.angle.disabled = on
+            r.rm.disabled = on
+        for side in _OPENING_SIDES:
+            sides[side].enabled.disabled = on
+            if on:
+                sides[side].center.disabled = True
+                sides[side].width.disabled = True
+            else:
+                _sync_side_enabled(side)
+
+    game_size = _compact_number(
+        "gameSize", 64, kind="int", width="140px", dw="68px", on_change=_notify,
+    )
+    agent_x = _compact_number("agent_x", 0.5, on_change=_notify)
+    agent_y = _compact_number("agent_y", 0.5, on_change=_notify)
+    agent_r = _compact_number("agent_r", 0.05, on_change=_notify)
+    gold_r = _compact_number("gold_r", 0.03, on_change=_notify)
+
+    for side in _OPENING_SIDES:
+        enabled = widgets.Checkbox(
+            value=False,
+            description=side,
+            indent=False,
+            layout=widgets.Layout(width="90px"),
+        )
+        center = widgets.FloatText(
+            value=0.5,
+            description="center",
+            step=0.01,
+            layout=widgets.Layout(width="150px"),
+            style={"description_width": "52px"},
+        )
+        width = widgets.FloatText(
+            value=0.2,
+            description="width",
+            step=0.01,
+            layout=widgets.Layout(width="140px"),
+            style={"description_width": "46px"},
+        )
+        enabled.observe(lambda change, s=side: _sync_side_enabled(s), names="value")
+        enabled.observe(_notify, names="value")
+        center.observe(_notify, names="value")
+        width.observe(_notify, names="value")
+        sides[side] = SimpleNamespace(
+            enabled=enabled, center=center, width=width,
+            row=widgets.HBox(
+                [enabled, center, width],
+                layout=widgets.Layout(align_items="center"),
+            ),
+        )
+        _sync_side_enabled(side)
+    dir_slider.observe(_notify, names="value")
+    dir_readout.value = _dir_label(0.0)
+
+    add_gold_btn = widgets.Button(
+        description="Add gold",
+        layout=widgets.Layout(width="auto", min_width="90px"),
+    )
+    add_wall_btn = widgets.Button(
+        description="Add wall",
+        layout=widgets.Layout(width="auto", min_width="90px"),
+    )
+
+    def _on_add_gold(_):
+        gold_rows.append(_make_gold_row(0.5, 0.5))
+        _sync_gold_box()
+        _notify()
+
+    def _on_add_wall(_):
+        wall_rows.append(_make_wall_row(0.4, 0.4, 0.2, 0.2, 0.0))
+        _sync_wall_box()
+        _notify()
+
+    add_gold_btn.on_click(_on_add_gold)
+    add_wall_btn.on_click(_on_add_wall)
+    gold_box = widgets.VBox([add_gold_btn])
+    wall_box = widgets.VBox([add_wall_btn])
+
+    form = widgets.VBox(
+        [
+            widgets.HBox([game_size, agent_x, agent_y]),
+            widgets.HBox([agent_r, gold_r]),
+            dir_slider,
+            dir_readout,
+            widgets.HTML(
+                "<div style='font-size:11px;font-weight:bold;margin:6px 0 2px'>"
+                "openings</div>"
+            ),
+            *[sides[s].row for s in _OPENING_SIDES],
+            widgets.HTML(
+                "<div style='font-size:11px;font-weight:bold;margin:8px 0 2px'>"
+                "gold [x, y]</div>"
+            ),
+            gold_box,
+            widgets.HTML(
+                "<div style='font-size:11px;font-weight:bold;margin:8px 0 2px'>"
+                "walls [x, y, w, h, angle]</div>"
+            ),
+            wall_box,
+        ],
+        layout=widgets.Layout(
+            height=f"{max(height_px, 320)}px",
+            overflow="auto",
+            padding="4px 6px",
+            border="1px solid #5aa8a8",
+            background="#e6f4f4",
+        ),
+    )
+    box = widgets.VBox([
+        widgets.HBox([edit_btn, render_btn]),
+        hint,
+        status,
+        form,
+    ], layout=widgets.Layout(
+        flex="1 1 420px",
+        min_width="400px",
+        border="2px solid #5aa8a8",
+        padding="8px",
+    ))
+    return SimpleNamespace(
+        box=box,
+        edit_btn=edit_btn,
+        render_btn=render_btn,
+        status=status,
+        is_editing=is_editing,
+        load_form=load_form,
+        collect=collect,
+        set_error=set_error,
+        set_disabled=set_disabled,
+        textarea=None,
+    )
+
+
 def live_board_row(
     session: Any,
     busy: UiBusy,
@@ -586,11 +1011,11 @@ def live_board_row(
     width: int = 420,
     on_changed: Callable[[], None] | None = None,
 ) -> SimpleNamespace:
-    """Sticky frame + maroon scratchpad + teal settings (Edit/Render).
+    """Sticky teal settings | frame | maroon scratchpad.
 
     Hidden from the agent until the next generation. Generation cannot
-    start while either card is in edit mode; Edit is disabled while
-    ``busy.generating``.
+    start while the scratchpad is in edit mode or the settings form is
+    dirty; Edit/Reload is disabled while ``busy.generating``.
     """
     frame = widgets.Image(format="png", width=width)
     frame.layout = widgets.Layout(width=f"{width}px", flex=f"0 0 {width}px")
@@ -607,19 +1032,14 @@ def live_board_row(
         edit_label="Edit scratchpad",
         render_label="Render scratchpad",
     )
-    settings = _editor_card(
-        title="Game settings",
-        title_color="#0d5c5c",
-        bg="#e6f4f4",
-        border="#5aa8a8",
-        height_px=body_h,
-        hint=(
-            "To change the boundary, edit openings. Boundary-band walls "
-            "lose if they conflict. Interior walls, gold, and pose are "
-            "taken as written. Render strips openings and rebuilds walls."
-        ),
-        edit_label="Edit game settings",
-        render_label="Render game settings",
+
+    def _on_settings_form_change() -> None:
+        _sync_buttons()
+        if on_changed is not None:
+            on_changed()
+
+    settings = _settings_card(
+        height_px=body_h, on_form_change=_on_settings_form_change,
     )
 
     def is_editing() -> bool:
@@ -630,14 +1050,13 @@ def live_board_row(
         frame.value = Path(path).read_bytes()
         caption.value = (
             "<div style='font-family:monospace;font-size:12px;color:#444'>"
-            "current board</div>"
+            "current board — live scene; Ask snapshots this, not the "
+            "history prints below</div>"
         )
         if force_views or not scratch.is_editing():
             scratch.show_view(session.current_notepad())
         if force_views or not settings.is_editing():
-            settings.show_view(
-                json.dumps(session.current_settings_dict(), indent=2)
-            )
+            settings.load_form(session.current_settings_dict())
         _sync_buttons()
         if on_changed is not None:
             on_changed()
@@ -655,12 +1074,10 @@ def live_board_row(
         if on_changed is not None:
             on_changed()
 
-    def _on_settings_edit(_) -> None:
+    def _on_settings_reload(_) -> None:
         if busy.generating:
             return
-        settings.enter_edit(
-            json.dumps(session.current_settings_dict(), indent=2)
-        )
+        settings.load_form(session.current_settings_dict())
         _sync_buttons()
         if on_changed is not None:
             on_changed()
@@ -686,38 +1103,32 @@ def live_board_row(
     def _on_settings_render(_) -> None:
         if busy.generating:
             return
-        raw = settings.current_edit_text().strip()
-        if not raw:
-            raw = json.dumps(session.current_settings_dict(), indent=2)
-            settings.enter_edit(raw)
         try:
-            d = parse_settings_edit_json(raw)
+            d = settings.collect(session.current_settings_dict())
             session.apply_user_settings(d)
         except ValueError as exc:
             settings.set_error(
-                f"Error, bad format, fix input before saving.\n{exc}"
+                f"Error, fix settings before rendering.\n{exc}"
             )
             return
         frame.value = Path(session.current_frame_path()).read_bytes()
-        settings.show_view(
-            json.dumps(session.current_settings_dict(), indent=2)
-        )
+        settings.load_form(session.current_settings_dict())
         _sync_buttons()
         if on_changed is not None:
             on_changed()
 
     scratch.edit_btn.on_click(_on_scratch_edit)
     scratch.render_btn.on_click(_on_scratch_render)
-    settings.edit_btn.on_click(_on_settings_edit)
+    settings.edit_btn.on_click(_on_settings_reload)
     settings.render_btn.on_click(_on_settings_render)
 
     box = widgets.HBox(
         [
+            settings.box,
             widgets.VBox([caption, frame], layout=widgets.Layout(
                 flex=f"0 0 {width}px",
             )),
             scratch.box,
-            settings.box,
         ],
         layout=widgets.Layout(width="100%", align_items="flex-start"),
     )

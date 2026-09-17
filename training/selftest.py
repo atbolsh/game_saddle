@@ -2197,6 +2197,16 @@ def t1_pure() -> str:
     split = reconcile_walls_to_openings(full, hand_gap)
     recovered = boundary_openings({"walls": split})
     assert _ops_eq(recovered, boundary_openings({"walls": gapped})), recovered
+    scalar_gap = [{"side": "right", "center": 0.5, "width": 0.2}]
+    assert _ops_eq(
+        boundary_openings({"walls": reconcile_walls_to_openings(full, scalar_gap)}),
+        boundary_openings({"walls": gapped}),
+    )
+    xy_gap = [{"side": "right", "center": [1.0, 0.5], "width": 0.2}]
+    assert _ops_eq(
+        boundary_openings({"walls": reconcile_walls_to_openings(full, xy_gap)}),
+        boundary_openings({"walls": gapped}),
+    )
     # Interior wall (center block) survives; openings still just the gap.
     with_interior = gapped + [[0.4, 0.4, 0.2, 0.2, 0.0]]
     kept = reconcile_walls_to_openings(with_interior, gapped_ops)

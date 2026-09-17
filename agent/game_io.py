@@ -322,19 +322,39 @@ def _side_wall_rect(side: str, lo: float, hi: float) -> list[float]:
     raise ValueError(f"unknown side {side!r}")
 
 
-def _opening_axis_interval(op: Any) -> tuple[str, float, float]:
-    """``(side, lo, hi)`` on the edge axis from a hand-edited opening object."""
+def opening_axis_center(op: dict[str, Any]) -> float:
+    """Scalar center along the edge axis (y on left/right, x on top/bottom).
+
+    Accepts a float ``center``, a 2d ``[x, y]`` (projects onto the axis),
+    or the midpoint of ``from``/``to``.
+    """
     if not isinstance(op, dict):
         raise ValueError(f"opening is not an object: {op!r}")
     side = op.get("side")
     if side not in _SIDE_SPECS:
         raise ValueError(f"unknown opening side {side!r}")
+    spec = _SIDE_SPECS[side]
+    center = op.get("center")
+    if isinstance(center, (int, float)):
+        return float(center)
+    if isinstance(center, (list, tuple)) and len(center) == 2:
+        try:
+            cx, cy = float(center[0]), float(center[1])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"opening on {side} center must be numeric: {exc}"
+            ) from exc
+        return cy if spec["axis"] == "y" else cx
+    if center is not None:
+        raise ValueError(
+            f"opening on {side} center must be a float or [x, y]; "
+            f"got {center!r}"
+        )
     fr, to = op.get("from"), op.get("to")
     if not (isinstance(fr, (list, tuple)) and isinstance(to, (list, tuple))
             and len(fr) == 2 and len(to) == 2):
         raise ValueError(
-            f"opening on {side} needs from/to as [x, y] pairs; got "
-            f"from={fr!r} to={to!r}"
+            f"opening on {side} needs center or from/to; got {op!r}"
         )
     try:
         fx, fy = float(fr[0]), float(fr[1])
@@ -343,22 +363,12 @@ def _opening_axis_interval(op: Any) -> tuple[str, float, float]:
         raise ValueError(
             f"opening on {side} from/to must be numeric: {exc}"
         ) from exc
-    spec = _SIDE_SPECS[side]
-    edge = spec["edge"]
     if spec["axis"] == "y":
-        lo, hi = (fy, ty) if fy <= ty else (ty, fy)
-        if abs(fx - edge) > 1e-6 or abs(tx - edge) > 1e-6:
-            raise ValueError(
-                f"opening on {side} from/to x must be {edge}, "
-                f"got from={list(fr)!r} to={list(to)!r}"
-            )
-    else:
-        lo, hi = (fx, tx) if fx <= tx else (tx, fx)
-        if abs(fy - edge) > 1e-6 or abs(ty - edge) > 1e-6:
-            raise ValueError(
-                f"opening on {side} from/to y must be {edge}, "
-                f"got from={list(fr)!r} to={list(to)!r}"
-            )
+        return (fy + ty) / 2.0
+    return (fx + tx) / 2.0
+
+
+def _validate_axis_interval(side: str, lo: float, hi: float) -> tuple[str, float, float]:
     if lo < -1e-9 or hi > 1.0 + 1e-9:
         raise ValueError(
             f"opening on {side} [{lo}, {hi}] is outside [0, 1]"
@@ -368,6 +378,63 @@ def _opening_axis_interval(op: Any) -> tuple[str, float, float]:
             f"opening on {side} width {hi - lo} is below {_OPENING_MIN_WIDTH}"
         )
     return side, lo, hi
+
+
+def _opening_axis_interval(op: Any) -> tuple[str, float, float]:
+    """``(side, lo, hi)`` on the edge axis from an opening object.
+
+    Authoring form is ``side`` + scalar ``center`` + ``width``; ``from`` /
+    ``to`` 2d endpoints are accepted when present (derived snapshots) and
+    otherwise computed from center/width. A 2d ``center`` is projected
+    onto the edge axis.
+    """
+    if not isinstance(op, dict):
+        raise ValueError(f"opening is not an object: {op!r}")
+    side = op.get("side")
+    if side not in _SIDE_SPECS:
+        raise ValueError(f"unknown opening side {side!r}")
+    spec = _SIDE_SPECS[side]
+    fr, to = op.get("from"), op.get("to")
+    has_ft = (isinstance(fr, (list, tuple)) and isinstance(to, (list, tuple))
+              and len(fr) == 2 and len(to) == 2)
+    if has_ft:
+        try:
+            fx, fy = float(fr[0]), float(fr[1])
+            tx, ty = float(to[0]), float(to[1])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"opening on {side} from/to must be numeric: {exc}"
+            ) from exc
+        edge = spec["edge"]
+        if spec["axis"] == "y":
+            lo, hi = (fy, ty) if fy <= ty else (ty, fy)
+            if abs(fx - edge) > 1e-6 or abs(tx - edge) > 1e-6:
+                raise ValueError(
+                    f"opening on {side} from/to x must be {edge}, "
+                    f"got from={list(fr)!r} to={list(to)!r}"
+                )
+        else:
+            lo, hi = (fx, tx) if fx <= tx else (tx, fx)
+            if abs(fy - edge) > 1e-6 or abs(ty - edge) > 1e-6:
+                raise ValueError(
+                    f"opening on {side} from/to y must be {edge}, "
+                    f"got from={list(fr)!r} to={list(to)!r}"
+                )
+        return _validate_axis_interval(side, lo, hi)
+    if "center" not in op or "width" not in op:
+        raise ValueError(
+            f"opening on {side} needs from/to as [x, y] pairs, or "
+            f"center (axis float or [x, y]) and width; got {op!r}"
+        )
+    try:
+        width = float(op["width"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"opening on {side} width must be numeric: {exc}"
+        ) from exc
+    axis_c = opening_axis_center(op)
+    lo, hi = axis_c - width / 2.0, axis_c + width / 2.0
+    return _validate_axis_interval(side, lo, hi)
 
 
 def validate_openings(openings: Any) -> list[tuple[str, float, float]]:
@@ -440,7 +507,7 @@ def reconcile_walls_to_openings(
 
 
 def parse_settings_edit_json(text: str) -> dict[str, Any]:
-    """Parse the teal-box textarea. Bad JSON -> ``ValueError`` (user-fixable)."""
+    """Parse a settings-dict JSON string. Bad JSON -> ``ValueError``."""
     try:
         obj = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -453,7 +520,8 @@ def parse_settings_edit_json(text: str) -> dict[str, Any]:
 def apply_edited_settings_dict(d: dict[str, Any]) -> discreteGame:
     """Teal-box Render pipeline, in order:
 
-    1. look at ``openings`` (required);
+    1. look at ``openings`` (required; authoring form is side +
+       scalar center + width; 2d ``from``/``to`` are computed here);
     2. ``reconcile_walls_to_openings``;
     3. strip ``openings`` and pass the rest to
        :func:`settings_from_dict` / :func:`game_from_settings_dict`.
