@@ -11,6 +11,7 @@ import io
 import random
 import re
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +32,7 @@ SAMPLES_DIR = HERE / "samples"
 SNAKE_INSTRUCTION = """Your role is to guide a snake within a Snake game featuring multiple apples.
 This game is played on a board of size 10 by 10. The board uses a standard Cartesian coordinate system, where (0,0) represents the bottom-left position and (9,9) is the top-rightmost coordinate.
 The current board is the image. Read the snakes, apples, and positions from that image only.
-You are the green snake (brighter head). The enemy is blue (brighter head). Apples are red.
+You are the olive-green snake (player 1). The enemy is teal (player 2). Apples are red circles.
 Rules:
 1) If you move onto an apple, you grow and gain 1 point.
 2) If your head moves to a position where its coordinates (x, y) are outside the board boundaries (meaning x < 0, x > 9, y < 0, or y > 9), or into a space occupied by another snake's body, or into a space occupied by your own body, you die. That's the worst move.
@@ -92,14 +93,33 @@ def load_repo_env() -> Path:
 
 
 GRID = 10
-_YOU_BODY = (46, 160, 67)
-_YOU_HEAD = (120, 230, 90)
-_ENEMY_BODY = (52, 110, 200)
-_ENEMY_HEAD = (110, 180, 255)
-_APPLE = (220, 50, 50)
-_BG = (28, 28, 32)
-_LINE = (50, 50, 56)
-_HEAD_DOT = (250, 250, 250)
+# ViGaL project-page canvas (docs/static/js/snake-game.js drawBoard/drawRound).
+_BG = (249, 250, 251)       # #f9fafb
+_LINE = (229, 231, 235)     # #e5e7eb
+_APPLE = (239, 68, 68)      # #ef4444
+_YOU = (79, 112, 34)        # #4F7022 player 1
+_ENEMY = (3, 108, 142)      # #036C8E player 2
+_ACTIONS: dict[str, tuple[int, int]] = {
+    "UP": (0, 1),
+    "DOWN": (0, -1),
+    "LEFT": (-1, 0),
+    "RIGHT": (1, 0),
+}
+
+
+@dataclass
+class SnakeScene:
+    """One 10x10 dual-snake position. Coords are game space, not pixels.
+
+    (0, 0) is bottom-left; +x right; +y up (top of the image). Head is
+    ``you[0]`` / ``enemy[0]``. The image is the only thing sent to the model.
+    """
+
+    image: Image.Image
+    you: list[tuple[int, int]]
+    enemy: list[tuple[int, int]]
+    apples: list[tuple[int, int]]
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 def _random_walk(n: int, occupied: set[tuple[int, int]], rng: random.Random) -> list[tuple[int, int]]:
@@ -127,18 +147,131 @@ def _random_walk(n: int, occupied: set[tuple[int, int]], rng: random.Random) -> 
     return body
 
 
-def random_snake_board(
+def _blend(rgb: tuple[int, int, int], alpha: float) -> tuple[int, int, int]:
+    return tuple(int(c * alpha + b * (1.0 - alpha)) for c, b in zip(rgb, _BG))
+
+
+def render_snake_image(
+    you: list[tuple[int, int]],
+    enemy: list[tuple[int, int]],
+    apples: list[tuple[int, int]],
+) -> Image.Image:
+    """Match ViGaL's canvas: light grid, inset squares, fading tail, red dots.
+
+    Pixel y is flipped: game y=0 is the bottom row
+    (``(H - 1 - y) * s`` in snake-game.js).
+    """
+    img = Image.new("RGB", (BOARD_SIZE, BOARD_SIZE), _BG)
+    draw = ImageDraw.Draw(img)
+    s = BOARD_SIZE / GRID
+
+    def cell_origin(x: int, y: int) -> tuple[float, float]:
+        return x * s, (GRID - 1 - y) * s
+
+    for i in range(GRID + 1):
+        px = min(BOARD_SIZE - 1, int(round(i * s)))
+        draw.line([(px, 0), (px, BOARD_SIZE - 1)], fill=_LINE)
+        draw.line([(0, px), (BOARD_SIZE - 1, px)], fill=_LINE)
+
+    for ax, ay in apples:
+        ox, oy = cell_origin(ax, ay)
+        r = s / 3
+        cx, cy = ox + s / 2, oy + s / 2
+        draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=_APPLE)
+
+    def paint(cells: list[tuple[int, int]], color: tuple[int, int, int]) -> None:
+        for i, (x, y) in enumerate(cells):
+            alpha = 1.0 if i == 0 else max(0.3, 0.8 - i * 0.1)
+            ox, oy = cell_origin(x, y)
+            draw.rectangle(
+                (ox + 2, oy + 2, ox + s - 2, oy + s - 2),
+                fill=_blend(color, alpha),
+            )
+
+    paint(enemy, _ENEMY)
+    paint(you, _YOU)
+    return img
+
+
+def _manhattan(a: tuple[int, int], b: tuple[int, int]) -> int:
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
+def _is_death(
+    pos: tuple[int, int],
+    you: list[tuple[int, int]],
+    enemy: list[tuple[int, int]],
+) -> bool:
+    x, y = pos
+    if x < 0 or x >= GRID or y < 0 or y >= GRID:
+        return True
+    if pos in you or pos in enemy:
+        return True
+    return False
+
+
+def snake_oracle(scene: SnakeScene) -> dict[str, Any]:
+    """Engine-truth best/worst from the official Snake rules (Appendix A.2).
+
+    Worst = every move that dies (wall / other snake / own body).
+    Best = a safe move that strictly reduces Manhattan distance to the
+    nearest apple; if none do, the safe move(s) with the smallest new
+    distance. Coords are game space ((0,0) bottom-left, +y up).
+    """
+    head = scene.you[0]
+    nearest = min(scene.apples, key=lambda a: _manhattan(head, a)) if scene.apples else None
+    base = _manhattan(head, nearest) if nearest else None
+    worst: list[str] = []
+    closer: list[str] = []
+    safe: list[tuple[str, int]] = []
+    for name, (dx, dy) in _ACTIONS.items():
+        nxt = (head[0] + dx, head[1] + dy)
+        if _is_death(nxt, scene.you, scene.enemy):
+            worst.append(name)
+            continue
+        dist = _manhattan(nxt, nearest) if nearest else 0
+        safe.append((name, dist))
+        if nearest is not None and dist < base:
+            closer.append(name)
+    bests = closer or [n for n, d in safe if d == min((dd for _, dd in safe), default=0)]
+    if not bests and safe:
+        bests = [safe[0][0]]
+    return {
+        "you_head": head,
+        "you": list(scene.you),
+        "enemy_head": scene.enemy[0],
+        "enemy": list(scene.enemy),
+        "apples": list(scene.apples),
+        "nearest_apple": nearest,
+        "manhattan": base,
+        "best": bests[0] if bests else None,
+        "bests": bests,
+        "worst": worst,
+        "worst_label": ",".join(worst) if worst else "None",
+        "axes": "(0,0)=bottom-left; +x right; +y up (toward the top of the image)",
+    }
+
+
+def format_oracle(oracle: dict[str, Any]) -> str:
+    na = oracle["nearest_apple"]
+    return (
+        f"ORACLE  {oracle['axes']}\n"
+        f"  you head={oracle['you_head']}  body={oracle['you']}\n"
+        f"  enemy head={oracle['enemy_head']}  body={oracle['enemy']}\n"
+        f"  apples={oracle['apples']}\n"
+        f"  nearest apple={na}  manhattan={oracle['manhattan']}\n"
+        f"  best (safe, closer to nearest): {oracle['bests'] or '(none)'}\n"
+        f"  worst (die): {oracle['worst_label']}"
+    )
+
+
+def new_snake_scene(
     *,
     n_apples: int | None = None,
     you_len: int | None = None,
     enemy_len: int | None = None,
     seed: int | None = None,
-) -> Image.Image:
-    """A random 10x10 dual-snake scene as a 512x512 RGB image (pixels only).
-
-    (0,0) is bottom-left, +x right, +y up — same convention as the official
-    Snake instruction. Nothing about this state is returned as text.
-    """
+) -> SnakeScene:
     rng = random.Random(seed)
     occupied: set[tuple[int, int]] = set()
     you = _random_walk(you_len or rng.randint(2, 5), occupied, rng)
@@ -150,43 +283,24 @@ def random_snake_board(
     for cell in free[:n_apples]:
         apples.append(cell)
         occupied.add(cell)
+    return SnakeScene(
+        image=render_snake_image(you, enemy, apples),
+        you=you,
+        enemy=enemy,
+        apples=apples,
+    )
 
-    img = Image.new("RGB", (BOARD_SIZE, BOARD_SIZE), _BG)
-    draw = ImageDraw.Draw(img)
-    cell = BOARD_SIZE / GRID
 
-    def box(x: int, y: int) -> tuple[int, int, int, int]:
-        # y-up: image row 0 is y = GRID-1
-        col = x
-        row = (GRID - 1) - y
-        left = int(round(col * cell))
-        top = int(round(row * cell))
-        right = int(round((col + 1) * cell)) - 1
-        bottom = int(round((row + 1) * cell)) - 1
-        return left, top, right, bottom
-
-    for x in range(GRID + 1):
-        px = min(BOARD_SIZE - 1, int(round(x * cell)))
-        draw.line([(px, 0), (px, BOARD_SIZE - 1)], fill=_LINE)
-    for y in range(GRID + 1):
-        py = min(BOARD_SIZE - 1, int(round(y * cell)))
-        draw.line([(0, py), (BOARD_SIZE - 1, py)], fill=_LINE)
-
-    def paint(cells: list[tuple[int, int]], body: tuple[int, int], head: tuple[int, int]) -> None:
-        for i, (x, y) in enumerate(cells):
-            draw.rectangle(box(x, y), fill=head if i == 0 else body)
-        hx, hy = cells[0]
-        l, t, r, b = box(hx, hy)
-        cx, cy = (l + r) // 2, (t + b) // 2
-        draw.ellipse((cx - 3, cy - 3, cx + 3, cy + 3), fill=_HEAD_DOT)
-
-    for ax, ay in apples:
-        l, t, r, b = box(ax, ay)
-        pad = max(2, int(cell * 0.18))
-        draw.ellipse((l + pad, t + pad, r - pad, b - pad), fill=_APPLE)
-    paint(enemy, _ENEMY_BODY, _ENEMY_HEAD)
-    paint(you, _YOU_BODY, _YOU_HEAD)
-    return img
+def random_snake_board(
+    *,
+    n_apples: int | None = None,
+    you_len: int | None = None,
+    enemy_len: int | None = None,
+    seed: int | None = None,
+) -> Image.Image:
+    return new_snake_scene(
+        n_apples=n_apples, you_len=you_len, enemy_len=enemy_len, seed=seed,
+    ).image
 
 
 def load_board_image(src: str | Path | Image.Image | bytes) -> Image.Image:
@@ -284,45 +398,45 @@ def load_vigal_model(model_id: str = MODEL_ID) -> tuple[Any, Any]:
 def generate_vigal(
     model: Any,
     processor: Any,
-    images: list[Image.Image | str | Path],
+    images: list[Image.Image | str | Path] | None,
     question: str,
     *,
     max_new_tokens: int = 2048,
 ) -> str:
-    """One generation: 512x512 RGB image(s) + question text. No board-as-text."""
-    from qwen_vl_utils import process_vision_info
-
-    if not images:
-        raise ValueError("generate_vigal needs at least one board image")
+    """One generation. ``images`` empty/None = text only (no vision tokens)."""
     if not (question or "").strip():
         raise ValueError("generate_vigal needs a question")
-    boards = [load_board_image(im) for im in images]
+    images = list(images or [])
     with tempfile.TemporaryDirectory(prefix="vigal_") as td:
-        paths = []
-        for i, board in enumerate(boards):
-            dest = Path(td) / f"board_{i}.png"
-            board.save(dest, format="PNG")
-            paths.append(str(dest))
-        messages = [{
-            "role": "user",
-            "content": (
-                [{"type": "image", "image": p} for p in paths]
-                + [{"type": "text", "text": question.strip()}]
-            ),
-        }]
-        text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-        )
-        image_inputs, video_inputs = process_vision_info(messages)
-        kwargs: dict[str, Any] = {
-            "text": [text],
-            "images": image_inputs,
-            "padding": True,
-            "return_tensors": "pt",
-        }
-        if video_inputs:
-            kwargs["videos"] = video_inputs
-        inputs = processor(**kwargs)
+        content: list[dict[str, Any]] = []
+        if images:
+            from qwen_vl_utils import process_vision_info
+
+            for i, im in enumerate(images):
+                dest = Path(td) / f"board_{i}.png"
+                load_board_image(im).save(dest, format="PNG")
+                content.append({"type": "image", "image": str(dest)})
+            content.append({"type": "text", "text": question.strip()})
+            messages = [{"role": "user", "content": content}]
+            text = processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
+            image_inputs, video_inputs = process_vision_info(messages)
+            kwargs: dict[str, Any] = {
+                "text": [text],
+                "images": image_inputs,
+                "padding": True,
+                "return_tensors": "pt",
+            }
+            if video_inputs:
+                kwargs["videos"] = video_inputs
+            inputs = processor(**kwargs)
+        else:
+            messages = [{"role": "user", "content": question.strip()}]
+            text = processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
+            inputs = processor(text=[text], padding=True, return_tensors="pt")
         device = next(model.parameters()).device
         inputs = inputs.to(device)
         generated = model.generate(**inputs, max_new_tokens=max_new_tokens)
