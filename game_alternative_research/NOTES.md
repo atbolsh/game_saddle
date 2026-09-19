@@ -1,18 +1,57 @@
 # Alternative game environments for a Gemma4-12B-class VLM
 
-Scratchpad for the 2026-09-16 survey. Question: which games has anyone
-gotten an out-of-the-box OR finetuned ~7–12B VLM to play WELL, with
-visual input, simple discrete-ish actions, the whole 2D scene in play
-(no gridworld navigation), real-time preferred?
+Scratchpad for the 2026-09-16 survey and the later ViGaL notebook
+excursion. Question: which games has anyone gotten an out-of-the-box
+OR finetuned ~7–12B VLM to play WELL, with visual input, simple
+discrete-ish actions, the whole 2D scene in play (no gridworld
+navigation), real-time preferred?
 
-NOT committed. Nothing outside this folder touched. No code downloaded.
+Folder is isolated: `vigal.ipynb` / `vigal_io.py` / `vigal_setup.sh`
+are not wired through `agent/` / NAMS / Gemma.
+
+## DECISIONS (2026-09-19, after the ViGaL notebook)
+
+**Do not use ViGaL-7B directly.** We may switch to its *base*
+(Qwen2.5-VL-7B-Instruct) for a next step, not the Snake/Rotation RLOO
+checkpoint.
+
+Reasons:
+
+1. It was trained on **settings + image**, not image alone. The
+   public default (paper Appendix A.2 + `train_snake.sh`) dumps live
+   coordinates / last action / snake bodies into the text. Tab 7(e)
+   was the opposite ablation (text-only, no image). Vision-only — what
+   `vigal.ipynb` ran — is unpublished. The image probably mostly
+   helped when a crash was imminent but not obvious from the text.
+2. It is *ok* at interpreting the visual scene and recording *close*
+   to where everything is. It is not *good* at it. Even the faulty
+   pretrained game_saddle system is better at this, for our game.
+3. Additional finetuning of ViGaL-7B is possible. Prefer finetuning
+   something designed for *our* game (an S1 / S2 system). Reasoning
+   gains can come from merely using Gemma4.
+
+Good excursion. Nobody seems to have the small system we want and can
+picture. That is a good sign. These guys started from a very similar
+setup, then stopped short and published.
+
+What we actually ran: static Q&A in `vigal.ipynb` (New board 10×10
+Snake, 512² pixels only, official A.2 *instructions* minus the state
+dump, oracle printed for the human only). Renderer matched their
+canvas (`snake-game.js`: light grid, olive/teal, y-up) except apples
+as full-cell red squares (their JS uses circles; paper/screenshots
+are squares). General Ask box: no board. Atan2 probe (our bearing
+recipe, x-diff first) — even with a worked example it fell back to
+textbook `atan2(y, x)` and the clock hour was right only by a
+cancelled arithmetic error. Consistent with (2).
 
 ## DECISIONS (2026-09-16, end of survey)
 
-Verdicts on the candidates, in priority order:
+Verdicts on the candidates, in priority order. **Superseded for
+ViGaL-7B on 2026-09-19** (see above): do not use that checkpoint.
 
-1. **ViGaL is the #1 option**, with a later expansion for full 2D
-   motion instead of a gridworld.
+1. **ViGaL was the #1 option** (survey-time), with a later expansion
+   for full 2D motion instead of a gridworld. 2026-09-19: checkpoint
+   rejected; base model still a possible next step.
    - Needs to be tested on its native games first (Snake via
      SnakeBench + the Rotation task; weights
      https://huggingface.co/yunfeixie/ViGaL-7B, training scripts at
