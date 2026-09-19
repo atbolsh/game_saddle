@@ -32,7 +32,7 @@ SAMPLES_DIR = HERE / "samples"
 SNAKE_INSTRUCTION = """Your role is to guide a snake within a Snake game featuring multiple apples.
 This game is played on a board of size 10 by 10. The board uses a standard Cartesian coordinate system, where (0,0) represents the bottom-left position and (9,9) is the top-rightmost coordinate.
 The current board is the image. Read the snakes, apples, and positions from that image only.
-You are the olive-green snake (player 1). The enemy is teal (player 2). Apples are red circles.
+You are the olive-green snake (player 1). The enemy is teal (player 2). Apples are red squares that fill their board cell.
 Rules:
 1) If you move onto an apple, you grow and gain 1 point.
 2) If your head moves to a position where its coordinates (x, y) are outside the board boundaries (meaning x < 0, x > 9, y < 0, or y > 9), or into a space occupied by another snake's body, or into a space occupied by your own body, you die. That's the worst move.
@@ -156,7 +156,7 @@ def render_snake_image(
     enemy: list[tuple[int, int]],
     apples: list[tuple[int, int]],
 ) -> Image.Image:
-    """Match ViGaL's canvas: light grid, inset squares, fading tail, red dots.
+    """Match ViGaL's canvas: light grid, inset snakes, fading tail, full-cell apples.
 
     Pixel y is flipped: game y=0 is the bottom row
     (``(H - 1 - y) * s`` in snake-game.js).
@@ -168,16 +168,14 @@ def render_snake_image(
     def cell_origin(x: int, y: int) -> tuple[float, float]:
         return x * s, (GRID - 1 - y) * s
 
+    for ax, ay in apples:
+        ox, oy = cell_origin(ax, ay)
+        draw.rectangle((ox, oy, ox + s, oy + s), fill=_APPLE)
+
     for i in range(GRID + 1):
         px = min(BOARD_SIZE - 1, int(round(i * s)))
         draw.line([(px, 0), (px, BOARD_SIZE - 1)], fill=_LINE)
         draw.line([(0, px), (BOARD_SIZE - 1, px)], fill=_LINE)
-
-    for ax, ay in apples:
-        ox, oy = cell_origin(ax, ay)
-        r = s / 3
-        cx, cy = ox + s / 2, oy + s / 2
-        draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=_APPLE)
 
     def paint(cells: list[tuple[int, int]], color: tuple[int, int, int]) -> None:
         for i, (x, y) in enumerate(cells):
