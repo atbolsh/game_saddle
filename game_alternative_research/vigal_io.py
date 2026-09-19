@@ -8,13 +8,14 @@ Appendix A.2, live coordinate dump stripped) or arbitrary custom text.
 from __future__ import annotations
 
 import io
+import random
 import re
 import tempfile
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from PIL import Image
+from PIL import Image, ImageDraw
 
 BOARD_SIZE = 512
 MODEL_ID = "yunfeixie/ViGaL-7B"
@@ -30,6 +31,7 @@ SAMPLES_DIR = HERE / "samples"
 SNAKE_INSTRUCTION = """Your role is to guide a snake within a Snake game featuring multiple apples.
 This game is played on a board of size 10 by 10. The board uses a standard Cartesian coordinate system, where (0,0) represents the bottom-left position and (9,9) is the top-rightmost coordinate.
 The current board is the image. Read the snakes, apples, and positions from that image only.
+You are the green snake (brighter head). The enemy is blue (brighter head). Apples are red.
 Rules:
 1) If you move onto an apple, you grow and gain 1 point.
 2) If your head moves to a position where its coordinates (x, y) are outside the board boundaries (meaning x < 0, x > 9, y < 0, or y > 9), or into a space occupied by another snake's body, or into a space occupied by your own body, you die. That's the worst move.
@@ -87,6 +89,104 @@ def load_repo_env() -> Path:
     env_path = REPO_ROOT / ".env"
     load_dotenv(env_path)
     return env_path
+
+
+GRID = 10
+_YOU_BODY = (46, 160, 67)
+_YOU_HEAD = (120, 230, 90)
+_ENEMY_BODY = (52, 110, 200)
+_ENEMY_HEAD = (110, 180, 255)
+_APPLE = (220, 50, 50)
+_BG = (28, 28, 32)
+_LINE = (50, 50, 56)
+_HEAD_DOT = (250, 250, 250)
+
+
+def _random_walk(n: int, occupied: set[tuple[int, int]], rng: random.Random) -> list[tuple[int, int]]:
+    """Head-first polyline of length ``n`` on the 10x10 grid."""
+    free = [(x, y) for x in range(GRID) for y in range(GRID) if (x, y) not in occupied]
+    if not free:
+        raise RuntimeError("no free cell for a snake")
+    head = rng.choice(free)
+    body = [head]
+    occupied.add(head)
+    dirs = ((1, 0), (-1, 0), (0, 1), (0, -1))
+    for _ in range(n - 1):
+        x, y = body[-1]
+        opts = [
+            (x + dx, y + dy)
+            for dx, dy in dirs
+            if 0 <= x + dx < GRID and 0 <= y + dy < GRID
+            and (x + dx, y + dy) not in occupied
+        ]
+        if not opts:
+            break
+        nxt = rng.choice(opts)
+        body.append(nxt)
+        occupied.add(nxt)
+    return body
+
+
+def random_snake_board(
+    *,
+    n_apples: int | None = None,
+    you_len: int | None = None,
+    enemy_len: int | None = None,
+    seed: int | None = None,
+) -> Image.Image:
+    """A random 10x10 dual-snake scene as a 512x512 RGB image (pixels only).
+
+    (0,0) is bottom-left, +x right, +y up — same convention as the official
+    Snake instruction. Nothing about this state is returned as text.
+    """
+    rng = random.Random(seed)
+    occupied: set[tuple[int, int]] = set()
+    you = _random_walk(you_len or rng.randint(2, 5), occupied, rng)
+    enemy = _random_walk(enemy_len or rng.randint(2, 5), occupied, rng)
+    n_apples = n_apples if n_apples is not None else rng.randint(3, 5)
+    apples: list[tuple[int, int]] = []
+    free = [(x, y) for x in range(GRID) for y in range(GRID) if (x, y) not in occupied]
+    rng.shuffle(free)
+    for cell in free[:n_apples]:
+        apples.append(cell)
+        occupied.add(cell)
+
+    img = Image.new("RGB", (BOARD_SIZE, BOARD_SIZE), _BG)
+    draw = ImageDraw.Draw(img)
+    cell = BOARD_SIZE / GRID
+
+    def box(x: int, y: int) -> tuple[int, int, int, int]:
+        # y-up: image row 0 is y = GRID-1
+        col = x
+        row = (GRID - 1) - y
+        left = int(round(col * cell))
+        top = int(round(row * cell))
+        right = int(round((col + 1) * cell)) - 1
+        bottom = int(round((row + 1) * cell)) - 1
+        return left, top, right, bottom
+
+    for x in range(GRID + 1):
+        px = min(BOARD_SIZE - 1, int(round(x * cell)))
+        draw.line([(px, 0), (px, BOARD_SIZE - 1)], fill=_LINE)
+    for y in range(GRID + 1):
+        py = min(BOARD_SIZE - 1, int(round(y * cell)))
+        draw.line([(0, py), (BOARD_SIZE - 1, py)], fill=_LINE)
+
+    def paint(cells: list[tuple[int, int]], body: tuple[int, int], head: tuple[int, int]) -> None:
+        for i, (x, y) in enumerate(cells):
+            draw.rectangle(box(x, y), fill=head if i == 0 else body)
+        hx, hy = cells[0]
+        l, t, r, b = box(hx, hy)
+        cx, cy = (l + r) // 2, (t + b) // 2
+        draw.ellipse((cx - 3, cy - 3, cx + 3, cy + 3), fill=_HEAD_DOT)
+
+    for ax, ay in apples:
+        l, t, r, b = box(ax, ay)
+        pad = max(2, int(cell * 0.18))
+        draw.ellipse((l + pad, t + pad, r - pad, b - pad), fill=_APPLE)
+    paint(enemy, _ENEMY_BODY, _ENEMY_HEAD)
+    paint(you, _YOU_BODY, _YOU_HEAD)
+    return img
 
 
 def load_board_image(src: str | Path | Image.Image | bytes) -> Image.Image:
