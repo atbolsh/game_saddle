@@ -5,7 +5,7 @@ milestone (the Gemma 4 E4B + NAMS game agent) but is a real objective for
 later. Items are not commitments; they are reminders. The README's
 "Notes / limitations" section points here.
 
-Status legend: **Not started** / **Exploring** / **In progress**.
+Status legend: **Not started** / **Exploring** / **In progress** / **On ice**.
 
 ## 1. Automatic finetuning dataset generation — *Not started*
 
@@ -478,3 +478,52 @@ to match the current protocol (or delete `controls` if `_BLOCK_MOVE_TOKENS`
 already covers it). Healing `core_*` from `modes.py` does not touch this
 list. Do not treat "prompts updated" as "every Preference in the graph is
 current."
+
+## 14. Synthetic-situation training for analyst and player — *On ice*
+
+**On ice (2026-09-16).** Not the current project. The recipe is written
+down so it is not lost; do not pick it up while memory / play-and-reflect
+is the live work.
+
+Both halves share one idea: stop waiting for full games to produce the
+failures you want to train on. Build the situations, then train.
+
+### Analyst: constructed player text → multi-sample traces → CE or GRPO
+
+Each item is a **new** situation (do not freeze a handful of planted
+templates and replay them). The "Player" reply is not sampled from the
+live policy first — it is **constructed**, with regex filters, into
+known buckets: correct, partially correct, or false. That constructed
+reply is the analyst's input. Run **multiple** analyst traces on that
+same item. Then train on the resulting batches with either:
+
+* **CE** on the traces that pass a programmatic check (verified
+  `WRONG:` spans, sign-correct rating, format), or
+* **GRPO** across the group, with a verifiable composite reward — not
+  "rating equals `oracle_verdict`," which collapses the analyst into a
+  slower oracle that never reads the reasoning.
+
+`training/planted_errors.py` is the existing corruption half of this
+(clock-word shift, direction swap, move-token scramble). The new work
+is the situation factory, the balanced correct / partial / false
+buckets, the multi-trace batch, and the CE/GRPO trainer. Starting
+analyst backprop means the current KD-to-base pin
+(`AnalystTraceSource`) has to become a parent-checkpoint trust region;
+otherwise the leash fights the update. Shared-trunk: player smoke still
+has to pass after an analyst-training run.
+
+Related: goal 4 (denser analyst marks), goal 7 (GRPO machinery),
+`training/TRAINING_TRACE_EXTRAS.md` (planted-error probe),
+`training/TRAINING_GAME_TRACES.md` (engine-verified analyst STaR).
+
+### Player: artificial trouble-area scenes instead of full games
+
+Same factory, other role. Feed the **player** constructed scenes
+instead of 50-round games, concentrated on known leaks (the
+ray-hit → no-FORWARD transition in goal 5 is the standing example),
+and train on the feedback of those. Full-game datagen drowns the rare
+decisive turns in correct continuations; a scene factory can oversample
+the failures.
+
+The two halves can share a situation factory. They do not have to ship
+in the same week.

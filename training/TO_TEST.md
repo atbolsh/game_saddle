@@ -583,3 +583,21 @@ weekend smoke / t5 / t8 / t9 stay sealed one-gold eat-to-win.
   --seed 7`. `generation_stats.json` should have `"room": "multi-gold"`.
   Walk-out wins fire as `win_kind: "exit"` in traces. Delete
   `data_game/selftest_multi_gold` afterwards.
+
+Rich user-session instrumentation (2026-09-16): deleted
+`interactive_self_eval.ipynb` (sealed one-gold is a multi-gold dropdown
+choice). `play.ipynb` is multi-gold minus the analyst, with `[END_GAME]`
+freeze. Teal settings + maroon scratchpad Edit/Render; openings
+reconcile in `game_io.reconcile_walls_to_openings` then the dict is
+passed to the existing renderer without an `openings` key.
+
+* **Rerun t1** (seconds — `reconcile_walls_to_openings` roundtrip on
+  sealed / gapped fixtures; full side-wall + hand-drawn right gap is
+  split; interior wall kept; overlapping openings / bad JSON / missing
+  `openings` / bad scratchpad keys raise; `apply_edited_settings_dict`
+  strips openings before `settings_from_dict`).
+* **Remote notebook smoke** (play + multi_gold_eval): Edit/Render bad
+  JSON stays in edit mode; openings gap appears on the board; scratchpad
+  JSON save shows in the view pane; play `[END_GAME]` greys Ask until
+  New room. Generation stays disabled while either card is in edit
+  mode. Self-eval Render mid-round must refuse. Debrief untouched.

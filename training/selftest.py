@@ -45,7 +45,10 @@ Stage map (rationale in the Intermission plan):
                 backfill; leak scrubber covers openings; END_GAME oracle
                 correct/wrong + action-balance 1.0; unified prompt composition;
                 core-tip numbered categories + labeled dump shape;
-                batch-cap-aware step estimate; cosine floor clamp
+                batch-cap-aware step estimate; cosine floor clamp;
+                NAMS similarity retrieval off (prompt + scratchpad only);
+                openings reconcile (hand-edited gaps -> walls, strip
+                openings before settings_from_dict)
   * t2-data     manifest loads, per-source counts vs meta.json, probes exist
   * t3-model    4-bit QLoRA load, terminator, CE/KD forward+backward
                 (image example included), teacher-path sanity, kd_anchor
@@ -1800,6 +1803,7 @@ def t1_pure() -> str:
         _SIDE_WALL_WIDTH,
         PLAYER_STOP_PATTERN,
         board_update_line,
+        compose_player_question,
         boundary_openings,
         find_bare_move,
         find_invalid_move_token,
@@ -1808,7 +1812,11 @@ def t1_pure() -> str:
         parse_remember_notes,
         truncate_at_first_move_token,
     )
-    from agent.memory import format_notepad
+    from agent.memory import (
+        format_notepad,
+        retrieve_context,
+        retrieval_enabled,
+    )
     # Notebook human-takeover: first bracketed move token ends the reply.
     assert (
         truncate_at_first_move_token("aim then [FORWARD]\njunk after")
@@ -1885,6 +1893,23 @@ def t1_pure() -> str:
     assert "[CLOCK]" in uneaten and "3 gold(s)" in uneaten
     assert "ATE" not in uneaten
     checks += 1
+    assert compose_player_question("go", None) == "go"
+    eat_q = compose_player_question(
+        "did you eat a gold recently",
+        {"action": "FORWARD", "gold_collected": 1,
+         "gold_remaining": 2, "count": 1},
+    )
+    assert eat_q.startswith("Board update:")
+    assert "ATE a gold" in eat_q and eat_q.endswith("did you eat a gold recently")
+    note = "You are playing in a mode where the [END_GAME] move is not available."
+    end_q = compose_player_question(
+        "next",
+        {"action": "END_GAME", "gold_collected": 0,
+         "gold_remaining": 1, "count": 1},
+        end_game_note=note,
+    )
+    assert note in end_q and end_q.endswith("next")
+    checks += 1
     empty_pad = format_notepad([])
     assert "Your notepad is empty" in empty_pad
     assert "[REMEMBER key: short note]" in empty_pad
@@ -1895,6 +1920,15 @@ def t1_pure() -> str:
     ])
     assert "target: the left gold, near the top wall" in filled_pad
     assert "(updated round 4)" in filled_pad
+    checks += 1
+    # Phase-2 default: get_context dump off; last-K recency + [SEARCH]
+    # stay. retrieve_context short-circuits without touching the client.
+    import asyncio
+    from agent.config import CONFIG
+    assert retrieval_enabled() is False
+    assert CONFIG.recent_messages_window == 7
+    assert CONFIG.player_recent_messages_window == 7
+    assert asyncio.run(retrieve_context(None, "q", "sid")) == ""
     checks += 1
     w = _SIDE_WALL_WIDTH
     full = [
@@ -2121,8 +2155,13 @@ def t1_pure() -> str:
     checks += 1
 
     from agent.game_io import (
+        apply_edited_settings_dict,
+        parse_notepad_edit,
+        parse_settings_edit_json,
+        reconcile_walls_to_openings,
         settings_from_dict, settings_json_with_openings,
         settings_to_dict,
+        validate_openings,
     )
     from agent import memory as memmod
     # g0 is opening="forbid" (asserted sealed above). new_bare_game is
@@ -2155,13 +2194,96 @@ def t1_pure() -> str:
     assert settings_json_with_openings(None) is None
     checks += 1
 
+    # Hand-edited openings -> walls. Roundtrip on sealed / gapped fixtures;
+    # a full side-wall overlapping a right-side gap is split.
+    def _ops_key(o):
+        return (o["side"], round(o["from"][0], 9), round(o["from"][1], 9),
+                round(o["to"][0], 9), round(o["to"][1], 9))
+
+    def _ops_eq(a, b):
+        return sorted(a, key=_ops_key) == sorted(b, key=_ops_key)
+
+    sealed_ops = []
+    walls_sealed = reconcile_walls_to_openings(full, sealed_ops)
+    assert _ops_eq(boundary_openings({"walls": walls_sealed}), sealed_ops)
+    gapped_ops = boundary_openings({"walls": gapped})
+    walls_gapped = reconcile_walls_to_openings(gapped, gapped_ops)
+    assert _ops_eq(boundary_openings({"walls": walls_gapped}), gapped_ops)
+    hand_gap = [{
+        "side": "right", "from": [1.0, 0.4], "to": [1.0, 0.6],
+    }]
+    split = reconcile_walls_to_openings(full, hand_gap)
+    recovered = boundary_openings({"walls": split})
+    assert _ops_eq(recovered, boundary_openings({"walls": gapped})), recovered
+    scalar_gap = [{"side": "right", "center": 0.5, "width": 0.2}]
+    assert _ops_eq(
+        boundary_openings({"walls": reconcile_walls_to_openings(full, scalar_gap)}),
+        boundary_openings({"walls": gapped}),
+    )
+    xy_gap = [{"side": "right", "center": [1.0, 0.5], "width": 0.2}]
+    assert _ops_eq(
+        boundary_openings({"walls": reconcile_walls_to_openings(full, xy_gap)}),
+        boundary_openings({"walls": gapped}),
+    )
+    # Interior wall (center block) survives; openings still just the gap.
+    with_interior = gapped + [[0.4, 0.4, 0.2, 0.2, 0.0]]
+    kept = reconcile_walls_to_openings(with_interior, gapped_ops)
+    assert any(
+        abs(float(w[0]) - 0.4) < 1e-9 and abs(float(w[2]) - 0.2) < 1e-9
+        for w in kept
+    ), kept
+    try:
+        validate_openings([{"side": "left", "from": [0.0, 0.0], "to": [0.0, 0.5]},
+                           {"side": "left", "from": [0.0, 0.4], "to": [0.0, 0.8]}])
+        raise AssertionError("overlapping openings did not raise")
+    except ValueError as exc:
+        assert "overlapping" in str(exc), exc
+    try:
+        parse_settings_edit_json("{")
+        raise AssertionError("bad settings JSON did not raise")
+    except ValueError as exc:
+        assert "not valid" in str(exc), exc
+    edited = {
+        "gameSize": 64, "direction": 0.0, "agent_x": 0.5, "agent_y": 0.5,
+        "agent_r": 0.05, "gold_r": 0.03, "gold": [], "walls": full,
+        "openings": hand_gap,
+    }
+    rebuilt_game = apply_edited_settings_dict(edited)
+    assert getattr(rebuilt_game.settings, "openings", None) is None
+    assert _ops_eq(
+        settings_to_dict(rebuilt_game.settings)["openings"],
+        boundary_openings({"walls": gapped}),
+    )
+    try:
+        apply_edited_settings_dict({k: v for k, v in edited.items()
+                                    if k != "openings"})
+        raise AssertionError("missing openings did not raise")
+    except ValueError as exc:
+        assert "openings must be present" in str(exc), exc
+    assert parse_notepad_edit("{}") == {}
+    assert parse_notepad_edit('{"Target": "left gold"}') == {
+        "target": "left gold"
+    }
+    try:
+        parse_notepad_edit('{"bad key": "x"}')
+        raise AssertionError("bad notepad key did not raise")
+    except ValueError as exc:
+        assert "bad scratchpad key" in str(exc), exc
+    try:
+        parse_notepad_edit("[1, 2]")
+        raise AssertionError("notepad array did not raise")
+    except ValueError as exc:
+        assert "object" in str(exc), exc
+    checks += 1
+
     return (
         f"{checks} unit groups passed (ratings, rewards, noise, tripwire, "
         "source, batching, scrambler, questions, stack-eq, vram-split, "
         "persist-stamp, resume-unfinished, weekend-ckpt, "
         "multi-gold datagen flag, openings, end-game parse, prompt "
         "composition, openings backfill, leak scrubber, core-tip seed, "
-        "step estimate, cosine floor)"
+        "step estimate, cosine floor, nams retrieval off, "
+        "openings reconcile)"
     )
 
 

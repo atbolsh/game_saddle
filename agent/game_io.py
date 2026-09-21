@@ -271,6 +271,307 @@ def boundary_openings(settings: dict[str, Any]) -> list[dict[str, Any]]:
     return openings
 
 
+# Side specs shared with boundary_openings (axis + which edge is the wall).
+_SIDE_SPECS: dict[str, dict[str, Any]] = {
+    "left":   {"axis": "y", "edge": 0.0, "is_low": True},
+    "right":  {"axis": "y", "edge": 1.0, "is_low": False},
+    "bottom": {"axis": "x", "edge": 0.0, "is_low": True},
+    "top":    {"axis": "x", "edge": 1.0, "is_low": False},
+}
+
+# Scratchpad editor keys: same charset as [REMEMBER key: ...].
+NOTEPAD_KEY_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def _wall_xywha(wall: Any) -> tuple[float, float, float, float, float]:
+    if not isinstance(wall, (list, tuple)) or len(wall) < 5:
+        raise ValueError(f"wall {wall!r} is not [x, y, w, h, angle]")
+    x, y, w, h, angle = (float(wall[0]), float(wall[1]),
+                         float(wall[2]), float(wall[3]),
+                         float(wall[4]))
+    x0, x1 = min(x, x + w), max(x, x + w)
+    y0, y1 = min(y, y + h), max(y, y + h)
+    return x0, x1, y0, y1, angle
+
+
+def _wall_in_side_band(
+    x0: float, x1: float, y0: float, y1: float, spec: dict[str, Any],
+) -> bool:
+    band = _OPENING_BAND
+    if spec["axis"] == "y":
+        if spec["is_low"]:
+            return x0 <= band and x1 >= 0.0
+        return x1 >= 1.0 - band and x0 <= 1.0
+    if spec["is_low"]:
+        return y0 <= band and y1 >= 0.0
+    return y1 >= 1.0 - band and y0 <= 1.0
+
+
+def _side_wall_rect(side: str, lo: float, hi: float) -> list[float]:
+    """Axis-aligned ``_SIDE_WALL_WIDTH`` rect covering ``[lo, hi]`` on ``side``."""
+    thick = _SIDE_WALL_WIDTH
+    span = hi - lo
+    if side == "left":
+        return [0.0, lo, thick, span, 0.0]
+    if side == "right":
+        return [1.0 - thick, lo, thick, span, 0.0]
+    if side == "bottom":
+        return [lo, 0.0, span, thick, 0.0]
+    if side == "top":
+        return [lo, 1.0 - thick, span, thick, 0.0]
+    raise ValueError(f"unknown side {side!r}")
+
+
+def opening_axis_center(op: dict[str, Any]) -> float:
+    """Scalar center along the edge axis (y on left/right, x on top/bottom).
+
+    Accepts a float ``center``, a 2d ``[x, y]`` (projects onto the axis),
+    or the midpoint of ``from``/``to``.
+    """
+    if not isinstance(op, dict):
+        raise ValueError(f"opening is not an object: {op!r}")
+    side = op.get("side")
+    if side not in _SIDE_SPECS:
+        raise ValueError(f"unknown opening side {side!r}")
+    spec = _SIDE_SPECS[side]
+    center = op.get("center")
+    if isinstance(center, (int, float)):
+        return float(center)
+    if isinstance(center, (list, tuple)) and len(center) == 2:
+        try:
+            cx, cy = float(center[0]), float(center[1])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"opening on {side} center must be numeric: {exc}"
+            ) from exc
+        return cy if spec["axis"] == "y" else cx
+    if center is not None:
+        raise ValueError(
+            f"opening on {side} center must be a float or [x, y]; "
+            f"got {center!r}"
+        )
+    fr, to = op.get("from"), op.get("to")
+    if not (isinstance(fr, (list, tuple)) and isinstance(to, (list, tuple))
+            and len(fr) == 2 and len(to) == 2):
+        raise ValueError(
+            f"opening on {side} needs center or from/to; got {op!r}"
+        )
+    try:
+        fx, fy = float(fr[0]), float(fr[1])
+        tx, ty = float(to[0]), float(to[1])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"opening on {side} from/to must be numeric: {exc}"
+        ) from exc
+    if spec["axis"] == "y":
+        return (fy + ty) / 2.0
+    return (fx + tx) / 2.0
+
+
+def _validate_axis_interval(side: str, lo: float, hi: float) -> tuple[str, float, float]:
+    if lo < -1e-9 or hi > 1.0 + 1e-9:
+        raise ValueError(
+            f"opening on {side} [{lo}, {hi}] is outside [0, 1]"
+        )
+    if hi - lo < _OPENING_MIN_WIDTH:
+        raise ValueError(
+            f"opening on {side} width {hi - lo} is below {_OPENING_MIN_WIDTH}"
+        )
+    return side, lo, hi
+
+
+def _opening_axis_interval(op: Any) -> tuple[str, float, float]:
+    """``(side, lo, hi)`` on the edge axis from an opening object.
+
+    Authoring form is ``side`` + scalar ``center`` + ``width``; ``from`` /
+    ``to`` 2d endpoints are accepted when present (derived snapshots) and
+    otherwise computed from center/width. A 2d ``center`` is projected
+    onto the edge axis.
+    """
+    if not isinstance(op, dict):
+        raise ValueError(f"opening is not an object: {op!r}")
+    side = op.get("side")
+    if side not in _SIDE_SPECS:
+        raise ValueError(f"unknown opening side {side!r}")
+    spec = _SIDE_SPECS[side]
+    fr, to = op.get("from"), op.get("to")
+    has_ft = (isinstance(fr, (list, tuple)) and isinstance(to, (list, tuple))
+              and len(fr) == 2 and len(to) == 2)
+    if has_ft:
+        try:
+            fx, fy = float(fr[0]), float(fr[1])
+            tx, ty = float(to[0]), float(to[1])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"opening on {side} from/to must be numeric: {exc}"
+            ) from exc
+        edge = spec["edge"]
+        if spec["axis"] == "y":
+            lo, hi = (fy, ty) if fy <= ty else (ty, fy)
+            if abs(fx - edge) > 1e-6 or abs(tx - edge) > 1e-6:
+                raise ValueError(
+                    f"opening on {side} from/to x must be {edge}, "
+                    f"got from={list(fr)!r} to={list(to)!r}"
+                )
+        else:
+            lo, hi = (fx, tx) if fx <= tx else (tx, fx)
+            if abs(fy - edge) > 1e-6 or abs(ty - edge) > 1e-6:
+                raise ValueError(
+                    f"opening on {side} from/to y must be {edge}, "
+                    f"got from={list(fr)!r} to={list(to)!r}"
+                )
+        return _validate_axis_interval(side, lo, hi)
+    if "center" not in op or "width" not in op:
+        raise ValueError(
+            f"opening on {side} needs from/to as [x, y] pairs, or "
+            f"center (axis float or [x, y]) and width; got {op!r}"
+        )
+    try:
+        width = float(op["width"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"opening on {side} width must be numeric: {exc}"
+        ) from exc
+    axis_c = opening_axis_center(op)
+    lo, hi = axis_c - width / 2.0, axis_c + width / 2.0
+    return _validate_axis_interval(side, lo, hi)
+
+
+def validate_openings(openings: Any) -> list[tuple[str, float, float]]:
+    """Parse a hand-edited ``openings`` list. Raises ``ValueError`` on
+    bad types, unknown sides, out-of-range or overlapping intervals.
+    No silent coercion."""
+    if not isinstance(openings, list):
+        raise ValueError(
+            f"openings must be a list, got {type(openings).__name__}"
+        )
+    parsed = [_opening_axis_interval(op) for op in openings]
+    by_side: dict[str, list[tuple[float, float]]] = {s: [] for s in _SIDE_SPECS}
+    for side, lo, hi in parsed:
+        by_side[side].append((lo, hi))
+    for side, ivs in by_side.items():
+        ordered = sorted(ivs)
+        for i in range(1, len(ordered)):
+            if ordered[i][0] < ordered[i - 1][1] - 1e-12:
+                raise ValueError(f"overlapping openings on the {side} side")
+    return parsed
+
+
+def reconcile_walls_to_openings(
+    walls: Any, openings: Any,
+) -> list[list[float]]:
+    """Single helper above ``discreteGame``: look at hand-edited openings,
+    edit ``walls`` so they do not conflict, return the new wall list.
+
+    ``openings`` is the required gap set on the unit-square boundary.
+    Boundary-band walls that cover a gap are split/trimmed; stretches
+    not listed as openings are sealed with ``_SIDE_WALL_WIDTH`` rects
+    (deleting an opening reseals that stretch). Interior walls pass
+    through. Rotated boundary-band walls raise, same as
+    :func:`boundary_openings`.
+
+    Implemented as: drop old boundary-band walls, emit the complement of
+    the openings list on each side, keep interior. That *is* the conflict
+    resolver -- not a second path.
+    """
+    if not isinstance(walls, list):
+        raise ValueError(f"walls must be a list, got {type(walls).__name__}")
+    parsed = validate_openings(openings)
+    interior: list[list[float]] = []
+    for wall in walls:
+        x0, x1, y0, y1, angle = _wall_xywha(wall)
+        on_boundary = False
+        for side, spec in _SIDE_SPECS.items():
+            if not _wall_in_side_band(x0, x1, y0, y1, spec):
+                continue
+            if abs(angle) > 1e-9:
+                raise ValueError(
+                    f"boundary-band wall on the {side} side has nonzero "
+                    f"angle {angle} (wall={wall!r}); openings are only "
+                    f"defined for axis-aligned boundary walls"
+                )
+            on_boundary = True
+        if not on_boundary:
+            interior.append([float(wall[0]), float(wall[1]), float(wall[2]),
+                             float(wall[3]), float(wall[4])])
+    by_side: dict[str, list[tuple[float, float]]] = {s: [] for s in _SIDE_SPECS}
+    for side, lo, hi in parsed:
+        by_side[side].append((lo, hi))
+    rebuilt = list(interior)
+    for side, ivs in by_side.items():
+        for a, b in _complement(ivs):
+            if b - a < 1e-12:
+                continue
+            rebuilt.append(_side_wall_rect(side, a, b))
+    return rebuilt
+
+
+def parse_settings_edit_json(text: str) -> dict[str, Any]:
+    """Parse a settings-dict JSON string. Bad JSON -> ``ValueError``."""
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"settings JSON is not valid: {exc}") from exc
+    if not isinstance(obj, dict):
+        raise ValueError("settings JSON must be an object")
+    return obj
+
+
+def apply_edited_settings_dict(d: dict[str, Any]) -> discreteGame:
+    """Teal-box Render pipeline, in order:
+
+    1. look at ``openings`` (required; authoring form is side +
+       scalar center + width; 2d ``from``/``to`` are computed here);
+    2. ``reconcile_walls_to_openings``;
+    3. strip ``openings`` and pass the rest to
+       :func:`settings_from_dict` / :func:`game_from_settings_dict`.
+
+    ``discreteGame`` never sees openings. Visual noise is not applied here.
+    """
+    if not isinstance(d, dict):
+        raise ValueError(
+            f"settings must be a JSON object, got {type(d).__name__}"
+        )
+    if "openings" not in d:
+        raise ValueError(
+            "openings must be present; the teal view always includes it"
+        )
+    gold = d.get("gold", [])
+    if not isinstance(gold, list):
+        raise ValueError(f"gold must be a list, got {type(gold).__name__}")
+    walls = d.get("walls")
+    if not isinstance(walls, list):
+        raise ValueError(f"walls must be a list, got {type(walls).__name__}")
+    new_walls = reconcile_walls_to_openings(walls, d["openings"])
+    stripped = {k: v for k, v in d.items() if k != "openings"}
+    stripped["walls"] = new_walls
+    return game_from_settings_dict(stripped)
+
+
+def parse_notepad_edit(text: str) -> dict[str, str]:
+    """Parse the scratchpad editor JSON object ``{key: value, ...}``.
+
+    Keys must match :data:`NOTEPAD_KEY_RE` (same as ``[REMEMBER]``).
+    Keys are lowercased. Empty object is a valid empty pad.
+    """
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"scratchpad is not valid JSON: {exc}") from exc
+    if not isinstance(obj, dict):
+        raise ValueError("scratchpad JSON must be an object {key: value}")
+    out: dict[str, str] = {}
+    for k, v in obj.items():
+        if not isinstance(k, str) or not NOTEPAD_KEY_RE.fullmatch(k):
+            raise ValueError(
+                f"bad scratchpad key {k!r}; use letters, digits, underscore"
+            )
+        if not isinstance(v, str):
+            raise ValueError(f"scratchpad value for {k!r} must be a string")
+        out[k.lower()] = v
+    return out
+
+
 def new_multi_gold_game(
     gameSize: int = 768,
     n_gold: int | None = None,
@@ -547,6 +848,28 @@ def board_update_line(action: str, gold_collected: int, gold_remaining: int,
         f"Board update: your last move ({token}) did not eat a gold. "
         f"{gold_remaining} gold(s) remain on the board."
     )
+
+
+def compose_player_question(
+    question: str,
+    last_outcome: dict[str, Any] | None,
+    *,
+    end_game_note: str | None = None,
+) -> str:
+    """Prefix a player question with the last applied move's board update.
+
+    The returned string is both the prompt ``Question / instruction`` and
+    the stored user ``Message``, so the eat / no-eat sentence stays in
+    the recency window as long as that message does. ``end_game_note``
+    is the legacy self-eval suffix when ``[END_GAME]`` is not a real
+    stop (play and multi-gold never pass it).
+    """
+    if not last_outcome:
+        return question
+    prefix = board_update_line(**last_outcome)
+    if last_outcome.get("action") == "END_GAME" and end_game_note:
+        prefix = prefix + "\n" + end_game_note
+    return prefix + "\n\n" + question
 
 
 def find_bare_move(text: str) -> str | None:

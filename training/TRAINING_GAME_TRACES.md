@@ -407,7 +407,10 @@ analyst *improve* rather than merely not degrade.
 
 **Committed instead:** no analyst backprop at all for now, and no engine
 verification (springboard principle). Recorded as the pre-approved mechanism
-for a later "train the analyst" stage if one happens.
+for a later "train the analyst" stage if one happens. **2026-09-16:** that
+later recipe is [FUTURE_GOALS.md](../FUTURE_GOALS.md) goal 14 (constructed
+player text in new situations, multi-trace CE or GRPO, plus artificial
+player scenes on known leaks). Still on ice.
 
 ### Disagree and commit: engine-derived baselines for player data — **ACTIVATED 2026-08-05**
 

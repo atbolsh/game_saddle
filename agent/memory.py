@@ -30,6 +30,29 @@ from . import run_logging
 
 logger = logging.getLogger(__name__)
 
+_RETRIEVAL_OFF_LOGGED = False
+
+
+def retrieval_enabled(cfg: AgentConfig | None = None) -> bool:
+    """Whether the ``get_context`` semantic dump may enter the prompt.
+
+    Does not gate the last-K recency window, `[SEARCH]`, core-tip prompt
+    load (`load_scene_prompts`), or the session scratchpad
+    (`get_session_notes` / `[REMEMBER]`).
+    """
+    return (cfg or CONFIG).nams_retrieval
+
+
+def _log_retrieval_off() -> None:
+    global _RETRIEVAL_OFF_LOGGED
+    if not _RETRIEVAL_OFF_LOGGED:
+        _RETRIEVAL_OFF_LOGGED = True
+        logger.info(
+            "NAMS get_context dump is OFF (prompt + scratchpad + last-K "
+            "recency + [SEARCH] stay); set NAMS_RETRIEVAL=1 to restore "
+            "the semantic dump"
+        )
+
 
 def make_memory_settings(cfg: AgentConfig | None = None):
     """Build a NAMS ``MemorySettings`` for the bolt backend."""
@@ -380,6 +403,15 @@ async def retrieve_context(client: Any, query: str, session_id: str) -> Any:
     """Thin wrapper over NAMS ``client.get_context`` (the semantic search across
     all memory tiers) that logs the retrieval. Returns the raw context object /
     string exactly as NAMS provides it -- callers do their own scrubbing."""
+    if not retrieval_enabled():
+        _log_retrieval_off()
+        run_logging.log_db_retrieval(
+            function="client.get_context",
+            arguments={"query": query, "session_id": session_id,
+                       "skipped": "nams_retrieval=off"},
+            result="",
+        )
+        return ""
     ctx = await client.get_context(query=query, session_id=session_id)
     if isinstance(ctx, str):
         result = ctx
@@ -437,27 +469,33 @@ async def get_game_context(
     the semantic block drops any line carrying :data:`ANALYST_TAG` or a
     leftover prefix -- a masking-only line filter, where over-masking is
     safe and leaking is not.
+
+    The recency window is always on (last-K verbatim). The semantic dump
+    is gated by :func:`retrieval_enabled`.
     """
-    ctx = await retrieve_context(client, query=query, session_id=session_id)
-    if isinstance(ctx, str):
-        semantic = _strip_settings_from_text(ctx)
-    else:
-        cleaned = _strip_settings(ctx)
-        # NAMS may return a structured object; stringify for the prompt.
-        import json as _json
-
-        try:
-            semantic = _json.dumps(cleaned, default=str, indent=2)
-        except Exception:
-            semantic = str(cleaned)
-    # Recent moves belong to the recency window below, not the semantic block.
-    semantic = strip_nams_recent_conversation(semantic)
-    if exclude_analyst:
-        semantic = strip_analyst_lines(semantic)
-
     recent = await get_recent_messages(
         client, session_id, recent_window, exclude_analyst=exclude_analyst
     )
+    semantic = ""
+    if retrieval_enabled():
+        ctx = await retrieve_context(client, query=query, session_id=session_id)
+        if isinstance(ctx, str):
+            semantic = _strip_settings_from_text(ctx)
+        else:
+            cleaned = _strip_settings(ctx)
+            # NAMS may return a structured object; stringify for the prompt.
+            import json as _json
+
+            try:
+                semantic = _json.dumps(cleaned, default=str, indent=2)
+            except Exception:
+                semantic = str(cleaned)
+        # Recent moves belong to the recency window, not the semantic block.
+        semantic = strip_nams_recent_conversation(semantic)
+        if exclude_analyst:
+            semantic = strip_analyst_lines(semantic)
+    else:
+        _log_retrieval_off()
 
     parts: list[str] = []
     if recent:
@@ -1066,6 +1104,33 @@ async def clear_session_notes(client: Any, session_id: str) -> None:
         raise
 
 
+async def replace_session_notes(
+    client: Any,
+    session_id: str,
+    notes: dict[str, str],
+    round_no: int,
+) -> None:
+    """Replace this session's scratchpad with ``notes`` (key -> value).
+
+    Unchanged keys keep their previous ``updated_round``; new or edited
+    keys get ``round_no``. Empty ``notes`` leaves an empty pad. Hidden
+    from the agent until the next generation fetches the notes.
+    """
+    existing = {
+        n["key"]: n
+        for n in await get_session_notes(client, session_id)
+    }
+    await clear_session_notes(client, session_id)
+    for key, value in notes.items():
+        old = existing.get(key)
+        rnd = (
+            int(old["updated_round"])
+            if old is not None and old.get("value") == value
+            else round_no
+        )
+        await set_session_note(client, session_id, key, value, rnd)
+
+
 def format_notepad(notes: list[dict]) -> str:
     """Render the complete notepad block injected into the player prompt.
 
@@ -1095,6 +1160,9 @@ async def get_semantic_model(client: Any) -> str:
     only returns a *subset* of long-term memory. The privileged modes (2/3) that
     should reason/judge against the complete rubric want the whole thing, so we
     read it directly. Best-effort: returns "" on error."""
+    if not retrieval_enabled():
+        _log_retrieval_off()
+        return ""
     ent_rows: list[Any] = []
     pref_rows: list[Any] = []
     try:
