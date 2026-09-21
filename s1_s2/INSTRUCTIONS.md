@@ -72,4 +72,7 @@ argue that part.
    it a bad S2 choice? Any other networks to recommend over it? The old
    concerns about LLM quality and reasoning quality still apply.
 
-5. Any other suggestions, comments, concerns?
+5. Should I keep this work in this repo? Or is it cleaner to start a new repo
+   Is the technical debt cost or the "restart" cost higher for code development, do you think?
+
+6. Any other suggestions, comments, concerns?
