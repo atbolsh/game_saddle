@@ -39,6 +39,12 @@ bulk. This is the Helix idea of a fast net with its own eyes (Figure,
 "Helix", 20 Feb 2025: 80M S1, own conv backbone, 200 Hz, conditioned
 by a stale S2 latent) cut down to four logits.
 
+`neural_net/s1.py` keeps every ResNet-18 stage (stride 4, 8, 16, and
+32 on a 768 frame) and pools each map with the target query. The four
+pooled vectors are concatenated into the 4-way decision. ImageNet
+weights are an initialization option only; after that the whole
+module is a `state_dict`. `s` is not an input.
+
 ### Later option: one backbone, both nets
 
 Not part of the first S1. When it is worth doing, run the
@@ -205,7 +211,7 @@ not change families to make the six floats easier.
 
 ## 6. Same repo
 
-Stay in this repo. Put the new loop in `s1_s2/` and call the engine,
+Stay in this repo. Put the new loop in `neural_net/` and call the engine,
 the renderer, and the oracle from there. A new repo would mean
 re-paying for the geometry, the Gemma loader, and the pad workaround.
 The debt that hurts is writing this inside `interactive.py` and
@@ -214,10 +220,11 @@ round. Do not do that.
 
 ## 7. Two constraints on the handoff
 
-Latch the point S1 chases. Emitting six floats on every token is
-right for training. Driving the actor from every token is not, until
-`v` is trained. Use the last token of an S2 turn, or an explicit
-commit. Otherwise S1 spends the whole reply chasing head noise.
+The loop in `neural_net/` updates S1's target on every new token: S1
+steps on the live game until the next token's forward returns (or
+until an optional step cap). An untrained `v` will send it after head
+noise; that is what the head's training is for. Do not hand an
+untrained head's numbers to a run you mean to keep.
 
 `s` in the text and `s` in the head will diverge on purpose at first.
 The word loss never touches the new head. The September analyst
