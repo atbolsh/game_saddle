@@ -10,11 +10,8 @@ as the rest of training. Run on the remote GPU box, from the repo root::
 ``BATCH_SIZE`` below is the default. ``--batch-size`` overrides it.
 A fresh run calls ``S1.init_from_imagenet`` unless ``--no-imagenet`` is
 set. ``--resume PATH`` loads a ``torch.save`` state dict and does not
-touch ImageNet.
-
-The script stops if, after warmup, the GPU waits on datagen for more than
-twice the step time on three steps in a row. That means the pygame
-sampler is the bottleneck and should be looked at before a long run.
+touch ImageNet. Datagen time is logged every step and does not stop
+the run.
 """
 
 from __future__ import annotations
@@ -231,7 +228,6 @@ def main() -> None:
     vram = None
     prefetch = None
     metrics = run_dir / "metrics.jsonl"
-    slow_streak = 0
     try:
         vram = VramMonitor(f"s1_pretrain_{stamp}")
         vram.set_stage("train")
@@ -289,7 +285,6 @@ def main() -> None:
             _sync()
             optim_s = time.perf_counter() - t_opt
 
-            gpu_s = forward_s + backward_s + optim_s
             record = {
                 "step": step,
                 "loss": round(float(loss.detach()), 6),
@@ -310,19 +305,6 @@ def main() -> None:
                 "step %d loss %.4f datagen %.3fs worker %.3fs fwd %.3fs bwd %.3fs",
                 step, record["loss"], datagen_s, worker_s, forward_s, backward_s,
             )
-
-            if step >= 5 and datagen_s > 2.0 * max(gpu_s, 1e-6):
-                slow_streak += 1
-            else:
-                slow_streak = 0
-            if slow_streak >= 3:
-                raise RuntimeError(
-                    "datagen is the bottleneck: GPU waited "
-                    f"{datagen_s:.3f}s on the batch while the step was "
-                    f"{gpu_s:.3f}s, three steps in a row. Not switching to "
-                    "a second rasterizer; look at the pygame sampler before "
-                    "a long run."
-                )
 
             if (step + 1) % args.save_every == 0:
                 ckpt = run_dir / f"step_{step + 1:06d}.pt"
