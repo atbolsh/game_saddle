@@ -4,8 +4,12 @@ Each example is one random 0–3 gold board, one target coordinate, and the
 oracle's next primitive. Frames go through the same label-safe image noise
 as the rest of training. Run on the remote GPU box, from the repo root::
 
-    python -m neural_net.train_s1
-    python -m neural_net.train_s1 --batch-size 64 --steps 20000
+    python -m neural_net.train_s1 --batch-size 384 --workers 48
+
+That command trains until the wall clock hits ``HOURS`` (18). Stop it
+whenever you want: Ctrl-C writes ``last.pt`` and a numbered checkpoint,
+then exits. ``--steps N`` also stops at N optimizer steps, whichever
+limit comes first. ``--hours 0 --steps N`` is a step-only run.
 
 ``BATCH_SIZE`` below is the default. ``--batch-size`` overrides it.
 A fresh run calls ``S1.init_from_imagenet`` unless ``--no-imagenet`` is
@@ -26,6 +30,7 @@ import argparse
 import json
 import logging
 import multiprocessing as mp
+import signal
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor
@@ -34,11 +39,13 @@ from pathlib import Path
 import numpy as np
 import torch
 
-# Tunables. Command-line flags override BATCH_SIZE, the step count, and
-# the datagen worker count. The 96 GB card can go above the default once
-# a step's memory headroom is visible in the log.
+# Tunables. Command-line flags override BATCH_SIZE, the worker count, and
+# the stopping rule. The 96 GB card can go above the default once a
+# step's memory headroom is visible in the log. The run stops at HOURS
+# of wall clock or at --steps, whichever comes first. --steps 0 means
+# there is no step cap.
 BATCH_SIZE = 32
-STEPS = 20000
+HOURS = 18.0
 WORKERS = 8
 SAVE_EVERY = 200
 LR_BACKBONE = 1e-4
@@ -181,15 +188,27 @@ def _collate(samples: list[dict], device: torch.device):
 def main() -> None:
     parser = argparse.ArgumentParser(description="S1 oracle SFT")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
-    parser.add_argument("--steps", type=int, default=STEPS)
+    parser.add_argument(
+        "--steps", type=int, default=0,
+        help="stop after this many optimizer steps (0 = no step cap)",
+    )
+    parser.add_argument(
+        "--hours", type=float, default=HOURS,
+        help="stop after this many hours of wall clock (0 = no clock). "
+             "Ctrl-C saves last.pt and exits.",
+    )
     parser.add_argument("--workers", type=int, default=WORKERS)
     parser.add_argument("--save-every", type=int, default=SAVE_EVERY)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--no-imagenet", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
-    if args.batch_size < 1 or args.steps < 1 or args.workers < 1 or args.save_every < 1:
-        raise SystemExit("batch-size, steps, workers, and save-every must be >= 1")
+    if args.batch_size < 1 or args.workers < 1 or args.save_every < 1:
+        raise SystemExit("batch-size, workers, and save-every must be >= 1")
+    if args.steps < 0 or args.hours < 0:
+        raise SystemExit("--steps and --hours must be >= 0")
+    if args.steps == 0 and args.hours == 0:
+        raise SystemExit("set --steps or --hours; both 0 would not stop")
     if not torch.cuda.is_available():
         raise SystemExit("train_s1 requires CUDA; run it on the remote GPU box")
 
@@ -228,11 +247,57 @@ def main() -> None:
     vram = None
     prefetch = None
     metrics = run_dir / "metrics.jsonl"
+    step = 0
+    t0 = time.perf_counter()
+
+    def _save_stop(reason: str) -> None:
+        model.save(run_dir / "last.pt")
+        numbered = None
+        if step > 0:
+            numbered = run_dir / f"step_{step:06d}.pt"
+            model.save(numbered)
+        elapsed_h = (time.perf_counter() - t0) / 3600.0
+        _append_jsonl(metrics, {
+            "kind": "stop",
+            "reason": reason,
+            "step": step,
+            "elapsed_h": round(elapsed_h, 4),
+            "t": time.time(),
+        })
+        logger.info(
+            "stopped (%s) at step %d after %.2f h; last.pt in %s",
+            reason, step, elapsed_h, run_dir,
+        )
+        if numbered is not None:
+            logger.info("saved %s", numbered)
+
+    interrupted_by: dict[str, int | None] = {"signum": None}
+
+    def _on_signal(signum, _frame):
+        # SIGINT (Ctrl-C) and SIGTERM both land here. Raising aborts the
+        # current step; the handler below writes the checkpoint.
+        interrupted_by["signum"] = signum
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+    logger.info(
+        "budget: hours=%s steps=%s batch=%d workers=%d save_every=%d",
+        args.hours or "none", args.steps or "none",
+        args.batch_size, args.workers, args.save_every,
+    )
+
     try:
         vram = VramMonitor(f"s1_pretrain_{stamp}")
         vram.set_stage("train")
         prefetch = _Prefetch(args.batch_size, args.workers, args.seed)
-        for step in range(args.steps):
+        while True:
+            if args.steps and step >= args.steps:
+                _save_stop("steps")
+                break
+            if args.hours and (time.perf_counter() - t0) >= args.hours * 3600.0:
+                _save_stop("hours")
+                break
             scale = 1.0 if step >= WARMUP_STEPS else (step + 1) / WARMUP_STEPS
             for group, base in zip(opt.param_groups, base_lrs):
                 group["lr"] = base * scale
@@ -311,8 +376,14 @@ def main() -> None:
                 model.save(ckpt)
                 model.save(run_dir / "last.pt")
                 logger.info("saved %s", ckpt)
-        model.save(run_dir / "last.pt")
-        logger.info("finished %d steps, last.pt in %s", args.steps, run_dir)
+            step += 1
+    except KeyboardInterrupt:
+        signum = interrupted_by["signum"] or signal.SIGINT
+        try:
+            _save_stop(signal.Signals(signum).name)
+        except Exception:
+            logger.exception("could not save last.pt after the interrupt")
+        raise SystemExit(128 + signum)
     except Exception as exc:
         _write_crash(run_dir, exc)
         try:
