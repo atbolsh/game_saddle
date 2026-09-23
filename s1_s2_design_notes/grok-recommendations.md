@@ -33,6 +33,36 @@ commands. This S1 emits one of four classes per tick.
   primitive. Facing is only in the picture, so the frame is in every
   batch. `s` may be passed later as another vector into the same
   query. Do not build a float-only MLP and bolt vision on afterwards.
+  The label is the zone of allowance below (`neural_net/oracle.py`).
+
+### Zone of allowance
+
+`noop` when the target is within 70% of `agent_r`. That disc is also
+the whole of the "inside the agent" training draw, so every one of
+those targets is a noop. The outer 30% of the sprite is still a move
+when a target from another draw lands there.
+
+Otherwise `FORWARD` inside the zone and the shorter turn outside it
+(`CLOCK` when the target is clockwise of facing). One `FORWARD` step
+is 1/16 of the board. Out to 1.2 of those steps the zone is the
+straight beam: in front of the center, and within `agent_r` of the
+facing ray, which is the strip repeated `FORWARD` presses sweep. Past
+that line the beam's two edges open, and the angle between the edges
+is 12°. At forward distance `along` the half-width is `agent_r` up to
+1.2/16, then `agent_r + (along - 1.2/16) * tan(6°)`.
+
+![Zone of allowance, to scale](zone_of_allowance.svg)
+
+The head stays four logits and a softmax. A two-output head is a
+possible later change, and only if stun-lock is still there after
+these labels. At a large distance the right move is hard to see, so a
+scalar can still jump from one frame to the next; that is why it is
+not the fix now. If it is tried: a halt sigmoid in (0, 1), noop below
+0.5, otherwise an action value in (−1, 1) — below −0.5 ANTICLOCK,
+above 0.5 CLOCK, and FORWARD in between. Being near CLOCK is then far
+from ANTICLOCK inside one frame. Decode in one function, train the
+action value only when the label is not noop, and keep scoring the
+decoded move against the four labels.
 
 The pool is a few hundred thousand parameters. The backbone is the
 bulk. This is the Helix idea of a fast net with its own eyes (Figure,
