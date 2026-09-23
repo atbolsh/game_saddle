@@ -13,9 +13,15 @@ limit comes first. ``--hours 0 --steps N`` is a step-only run.
 
 ``BATCH_SIZE`` below is the default. ``--batch-size`` overrides it.
 A fresh run calls ``S1.init_from_imagenet`` unless ``--no-imagenet`` is
-set. ``--resume PATH`` loads a ``torch.save`` state dict and does not
-touch ImageNet. Datagen time is logged every step and does not stop
-the run.
+set. ``--checkpoint PATH`` (``--resume`` is the same flag) loads a
+``torch.save`` state dict as the starting weights and does not touch
+ImageNet; the run still gets a new directory under ``weights/s1/``.
+Datagen time is logged every step and does not stop the run.
+
+Losses for a run are the ``loss`` field in that directory's
+``metrics.jsonl`` (one JSON object per step) and ``last_step.json``
+(the latest step). The same numbers are printed on stdout and copied
+to ``train.log``.
 """
 
 from __future__ import annotations
@@ -153,6 +159,16 @@ def _write_crash(run_dir: Path, exc: BaseException) -> None:
     })
 
 
+def _resolve_checkpoint(path: Path, weights: Path) -> Path:
+    """``path`` itself, or the same relative path under ``weights/``."""
+    if path.is_file():
+        return path
+    under = weights / path
+    if under.is_file():
+        return under
+    raise SystemExit(f"checkpoint not found: {path}")
+
+
 def _backbone_params(model: torch.nn.Module):
     trunks = []
     heads = []
@@ -199,10 +215,21 @@ def main() -> None:
     )
     parser.add_argument("--workers", type=int, default=WORKERS)
     parser.add_argument("--save-every", type=int, default=SAVE_EVERY)
-    parser.add_argument("--resume", type=Path, default=None)
+    parser.add_argument(
+        "--checkpoint", type=Path, default=None,
+        help="optional .pt to start from. Skips ImageNet init. "
+             "A new run directory is still created.",
+    )
+    parser.add_argument(
+        "--resume", type=Path, default=None,
+        help="same as --checkpoint",
+    )
     parser.add_argument("--no-imagenet", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+    if args.checkpoint is not None and args.resume is not None:
+        raise SystemExit("pass only one of --checkpoint and --resume")
+    start_ckpt = args.checkpoint if args.checkpoint is not None else args.resume
     if args.batch_size < 1 or args.workers < 1 or args.save_every < 1:
         raise SystemExit("batch-size, workers, and save-every must be >= 1")
     if args.steps < 0 or args.hours < 0:
@@ -220,12 +247,14 @@ def main() -> None:
     run_dir = weights_root() / "s1" / stamp
     run_dir.mkdir(parents=True, exist_ok=True)
     _configure_logging(run_dir)
+    logger.info("run dir %s", run_dir)
 
     device = torch.device("cuda")
     model = S1().to(device)
-    if args.resume is not None:
-        model.load_weights(args.resume)
-        logger.info("loaded S1 weights from %s", args.resume)
+    if start_ckpt is not None:
+        start_ckpt = _resolve_checkpoint(start_ckpt, weights_root())
+        model.load_weights(start_ckpt)
+        logger.info("starting weights %s", start_ckpt)
     elif not args.no_imagenet:
         copied = model.init_from_imagenet()
         logger.info("init_from_imagenet copied %d tensors", copied)
