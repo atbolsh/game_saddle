@@ -13,6 +13,9 @@ appended to a jsonl log.
 
 Equal prompt lengths share a prefill. Mixed lengths are separate cohorts
 and are never left-padded (transformers#47651).
+
+Learn-to-look pretraining does not use this loop. That run stops a reply
+on eos and does not emit [HOLD] or [RELOAD].
 """
 
 from __future__ import annotations
