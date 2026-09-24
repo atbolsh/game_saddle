@@ -2,19 +2,14 @@
 
 The bearing matches ``training/generate_game_traces.py`` ``_oracle_meta``:
 ``atan2(dx, dy)``, theta a compass bearing, positive relative bearing means
-the target is clockwise of the facing. ``noop`` when the point is within
-70% of ``agent_r`` (a buffer inside the sprite). Otherwise ``FORWARD``
-inside the zone of allowance, and the shorter turn outside it.
+the target is clockwise of the facing.
 
-The zone is the beam the sprite sweeps by pressing ``FORWARD``, then a
-cone. One ``FORWARD`` step is 1/16 of the board, the ``stepForward``
-default. Out to 1.2 of those steps the beam is straight: the point is in
-front of the center and the facing ray comes within ``agent_r`` of it.
-Past that line the beam's two edges open, and the angle between the
-edges is 12° (6° each side of the beam, one turn step). A point in front
-at forward distance ``along`` is inside when its perpendicular distance
-is at most ``agent_r`` for ``along`` ≤ 1.2/16, and at most
-``agent_r + (along - 1.2/16) * tan(6°)`` further out. The picture is
+``noop`` when the point is within 70% of ``agent_r``. Otherwise
+``FORWARD`` when the point lies in the 12° sweep of a beam of
+half-width ``0.6 * agent_r``. The beam is the strip within that
+distance of a facing ray; the zone is every such strip whose facing
+is within 6° of the agent (one turn step either side). Outside it,
+the shorter turn. The picture is
 ``s1_s2_design_notes/zone_of_allowance.svg``.
 
 The old mixture (inside / opening / gold / free space) is scaled by 0.8.
@@ -40,15 +35,11 @@ ACTION_INDEX = {name: i for i, name in enumerate(ACTIONS)}
 #: Inside-agent training draws use this same radius.
 NOOP_RADIUS_FRAC = 0.70
 
-#: One ``FORWARD`` primitive. ``discreteGame.stepForward`` default.
-FORWARD_STEP = 1.0 / 16
-#: The straight beam runs this many ``FORWARD`` steps. The cone opens
-#: after that.
-ALLOWANCE_STRAIGHT_STEPS = 1.2
-#: Half of the 12° opening. 6° is one ``CLOCK`` step (``pi/30``).
+#: Half-width of the beam that sweeps the zone, as a fraction of
+#: ``agent_r``. The previous zone used a full radius here.
+BEAM_HALF_WIDTH_FRAC = 0.60
+#: Half of the 12° sweep. 6° is one ``CLOCK`` step (``pi/30``).
 _CONE_HALF_RAD = math.pi / 30
-_CONE_TAN = math.tan(_CONE_HALF_RAD)
-_STRAIGHT_REACH = ALLOWANCE_STRAIGHT_STEPS * FORWARD_STEP
 
 #: ``discreteEngine.draw_agent`` draws the eye at ``0.4 * agent_r``.
 EYE_RADIUS_FRAC = 0.4
@@ -66,40 +57,39 @@ _OPENING_P = 0.20 * _LEGACY_SCALE
 _GOLD_P = 0.20 * _LEGACY_SCALE
 
 
-def _allowance_half_width(along: float, agent_r: float) -> float:
-    """Half-width of the zone at forward distance ``along``.
+def _in_swept_beam(dist: float, rel: float, agent_r: float) -> bool:
+    """True when some heading within 6° of facing covers ``rel``.
 
-    ``along`` is the projection onto the facing vector. Up to
-    ``_STRAIGHT_REACH`` the beam is as wide as the sprite. Past it the
-    edges leave the beam at 6° each, so a slice perpendicular to facing
-    widens by ``tan(6°)`` per unit of extra distance.
+    Each heading owns a beam of half-width ``BEAM_HALF_WIDTH_FRAC *
+    agent_r``: in front of that heading, and at most that far from its
+    ray. The zone is the sweep of that beam across 12°.
     """
-    extra = along - _STRAIGHT_REACH
-    if extra <= 0.0:
-        return agent_r
-    return agent_r + extra * _CONE_TAN
+    half_width = BEAM_HALF_WIDTH_FRAC * agent_r
+    phi = abs(rel)
+    if phi <= _CONE_HALF_RAD:
+        return True
+    delta = phi - _CONE_HALF_RAD
+    return math.cos(delta) > 0.0 and dist * math.sin(delta) <= half_width
 
 
 def point_oracle(settings: Any, x: float, y: float) -> str:
     """Next primitive that brings the agent disc onto ``(x, y)``.
 
     ``noop`` inside ``NOOP_RADIUS_FRAC * agent_r``. ``FORWARD`` inside
-    the zone of allowance. Outside it, ``CLOCK`` when the relative
-    bearing is positive (clockwise) and ``ANTICLOCK`` otherwise.
+    the swept beam. Outside it, ``CLOCK`` when the relative bearing is
+    positive (clockwise) and ``ANTICLOCK`` otherwise.
     """
     ax = float(settings.agent_x)
     ay = float(settings.agent_y)
     ar = float(settings.agent_r)
     dx = float(x) - ax
     dy = float(y) - ay
-    if math.hypot(dx, dy) <= NOOP_RADIUS_FRAC * ar:
+    dist = math.hypot(dx, dy)
+    if dist <= NOOP_RADIUS_FRAC * ar:
         return "noop"
     theta = float(settings.direction)
     rel = (math.atan2(dx, dy) - theta + math.pi) % (2 * math.pi) - math.pi
-    fx, fy = math.sin(theta), math.cos(theta)
-    along = dx * fx + dy * fy
-    perp = dx * fy - dy * fx
-    if along > 0.0 and abs(perp) <= _allowance_half_width(along, ar):
+    if _in_swept_beam(dist, rel, ar):
         return "FORWARD"
     return "CLOCK" if rel > 0 else "ANTICLOCK"
 

@@ -42,14 +42,12 @@ the whole of the "inside the agent" training draw, so every one of
 those targets is a noop. The outer 30% of the sprite is still a move
 when a target from another draw lands there.
 
-Otherwise `FORWARD` inside the zone and the shorter turn outside it
-(`CLOCK` when the target is clockwise of facing). One `FORWARD` step
-is 1/16 of the board. Out to 1.2 of those steps the zone is the
-straight beam: in front of the center, and within `agent_r` of the
-facing ray, which is the strip repeated `FORWARD` presses sweep. Past
-that line the beam's two edges open, and the angle between the edges
-is 12°. At forward distance `along` the half-width is `agent_r` up to
-1.2/16, then `agent_r + (along - 1.2/16) * tan(6°)`.
+Otherwise `FORWARD` when the target lies in the 12° sweep of a beam
+of half-width `0.6 * agent_r`, and the shorter turn outside it
+(`CLOCK` when the target is clockwise of facing). The beam is the
+strip within `0.6 * agent_r` of a facing ray. The zone is every such
+strip whose facing is within 6° of the agent. The previous zone was
+this same sweep of a beam one full radius wide.
 
 ![Zone of allowance, to scale](zone_of_allowance.svg)
 
