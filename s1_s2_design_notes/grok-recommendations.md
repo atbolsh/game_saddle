@@ -192,6 +192,28 @@ labels pin to the frame S2 saw (section 4). Leave `v` and `v_bar` at
 loss weight 0 until there are labels. An untrained head will still
 produce numbers. Do not hand those to S1.
 
+If a later run has to teach the look by reward instead of a labeled
+point, keep it off the vocabulary. The game consumes the 6-vector at
+each reply token, and S1 walks `(v + v_bar) / 2` during that token's
+interval, so the scalar attaches to those actions. He does not want a
+density over the coordinates. Re-forward the stored reply under the
+current weights, regress the head toward a stored look only when that
+interval's advantage was good, and drop the rest. A hidden state saved
+before later batches stepped the model is not a graph to backward
+through.
+
+The better option, while the simulator is available: search for a
+look, then distill it with the same L2. From a stored state and the
+target the reply named, roll S1 (or the oracle) forward on a handful
+of candidate points and keep the one that makes progress. Sample those
+candidates near where the previous model already placed its look, plus
+a few farther out, so the search spends its rollouts where the head is
+already close. The winner is an ordinary regression label on the
+re-forwarded reply. No density, no sampled policy, no ratio. The label
+depends on the board and the named target, so a replay stays valid
+after the weights move. Keep the search near the named target so the
+look does not contradict the words.
+
 ## 4. S2 vision: stale frame at the end of the prompt
 
 Initial approach: one frame per S2 turn, stale for the whole reply,
