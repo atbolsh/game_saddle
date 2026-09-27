@@ -153,6 +153,42 @@ def _ask(kind: str, phrase: str) -> str:
     raise ValueError(f"bad kind {kind!r}")
 
 
+def corner_phrase(name: str) -> str:
+    """The synthetic phase's name for one ``_CORNERS`` entry."""
+    return f"the {name} corner"
+
+
+def gold_region_phrases() -> list[str]:
+    """Every phrase ``_gold_phrase`` emits, upper row then lower row."""
+    found: list[str] = []
+    for y in (1.0, 0.0):
+        for x in (0.0, 0.5, 1.0):
+            phrase = _gold_phrase(x, y)
+            if phrase not in found:
+                found.append(phrase)
+    return found
+
+
+def standard_user_questions() -> list[str]:
+    """User lines this trainer asks, in a stable order.
+
+    The beginning line, then every look, then every move. Phrases are
+    the corner names and the gold-region names.
+    """
+    phrases = [corner_phrase(name) for name, _x, _y in _CORNERS]
+    phrases.extend(gold_region_phrases())
+    questions = [S2_BEGINNING_USER]
+    for kind in ("look", "move"):
+        for phrase in phrases:
+            questions.append(_ask(kind, phrase))
+    return questions
+
+
+def start_of_game_user_text(notepad: str, question: str) -> str:
+    """Notepad block, a blank line, then the question. Beginnings use this."""
+    return notepad + "\n\n" + question
+
+
 def _coords(kind: str, agent: tuple[float, float],
             target: tuple[float, float]) -> list[float]:
     """s, v, v_bar. Look leaves the body; move sends S1 to the target."""
@@ -910,7 +946,9 @@ class Run:
             _system_message(SYSTEM_PROMPT_S2),
             {"role": "user", "content": [
                 {"type": "image", "url": str(seen)},
-                {"type": "text", "text": notepad + "\n\n" + S2_BEGINNING_USER},
+                {"type": "text", "text": start_of_game_user_text(
+                    notepad, S2_BEGINNING_USER,
+                )},
             ]},
         ]
         reply = _generate_text(
@@ -1102,7 +1140,7 @@ class Run:
             point = (float(golds[index][0]), float(golds[index][1]))
         else:
             name, x, y = self.rng.choice(_CORNERS)
-            phrase = f"the {name} corner"
+            phrase = corner_phrase(name)
             point = (float(x), float(y))
         lines = _S2_LOOK_LINES if kind == "look" else _S2_MOVE_LINES
         reply = self.rng.choice(lines)
@@ -1111,7 +1149,7 @@ class Run:
         for _turn in range(n_hist):
             hist_kind = "look" if self.rng.random() < 0.5 else "move"
             hist_name, _hx, _hy = self.rng.choice(_CORNERS)
-            hist_phrase = f"the {hist_name} corner"
+            hist_phrase = corner_phrase(hist_name)
             hist_lines = (
                 _S2_LOOK_LINES if hist_kind == "look" else _S2_MOVE_LINES
             )

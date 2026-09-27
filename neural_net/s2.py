@@ -290,3 +290,49 @@ class GemmaS2:
         path = Path(path)
         self.load_gemma(path / "gemma")
         self.load_head(path / "coord_head.pt")
+
+    def load_snapshot(self, path: str | Path) -> GemmaS2:
+        """Load one snapshot directory and leave the model in eval.
+
+        Learn-to-look writes the PEFT adapter and ``coord_head.pt`` side
+        by side under ``weights/s2/``. ``save_all`` writes ``gemma/`` plus
+        ``coord_head.pt``. A base Gemma that is already loaded is kept
+        when swapping a learn-to-look adapter. ``save_all`` reloads Gemma
+        from that directory.
+        """
+        path = Path(path)
+        head = path / "coord_head.pt"
+        if (path / "gemma" / "gemma_meta.json").is_file():
+            if not head.is_file():
+                raise FileNotFoundError(f"load_snapshot: missing {head}")
+            self.load_all(path)
+            return self
+        adapter = path / "adapter_config.json"
+        if not adapter.is_file() or not head.is_file():
+            raise FileNotFoundError(
+                f"load_snapshot: {path} needs coord_head.pt and either "
+                "adapter_config.json or gemma/gemma_meta.json"
+            )
+        if self.vl.model is None:
+            self.load()
+        self._unwrap_adapter()
+        from peft import PeftModel
+
+        self.vl.model = PeftModel.from_pretrained(
+            self.vl.model, str(path), is_trainable=False
+        )
+        self.vl.model.eval()
+        self._install_hook()
+        self.load_head(head)
+        return self
+
+    def _unwrap_adapter(self) -> None:
+        """Drop a previously applied PEFT wrapper. Base weights stay as loaded."""
+        from peft import PeftModel
+
+        model = self.vl.model
+        if not isinstance(model, PeftModel):
+            return
+        self.vl.model = model.get_base_model()
+        self.vl.model.eval()
+        self._install_hook()
