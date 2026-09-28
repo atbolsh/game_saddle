@@ -214,6 +214,22 @@ def _strip_settings_from_text(text: str) -> str:
     return _SETTINGS_TEXT_RE.sub('"<redacted>"', text)
 
 
+RECENT_CONVERSATION_HEADER = (
+    "Recent conversation (most recent last -- your latest questions and "
+    "moves this session, in order). These messages describe EARLIER "
+    "positions of the board: the attached image is the only CURRENT "
+    "view, and your notepad is the current state of your saved notes. "
+    "Where old messages disagree with the image or the notepad, trust "
+    "the image and the notepad:"
+)
+
+
+def format_recent_block(lines: list[tuple[str, str]]) -> str:
+    """Recent-conversation block, same header ``get_game_context`` uses."""
+    body = "\n".join(f"[{role}] {text}" for role, text in lines)
+    return RECENT_CONVERSATION_HEADER + "\n" + body
+
+
 def _message_timestamp(m: Any) -> Any:
     """Best-effort timestamp accessor -- NAMS' Message dataclass uses
     ``timestamp``; some code paths expose ``created_at``."""
@@ -499,14 +515,7 @@ async def get_game_context(
 
     parts: list[str] = []
     if recent:
-        parts.append(
-            "Recent conversation (most recent last -- your latest questions and "
-            "moves this session, in order). These messages describe EARLIER "
-            "positions of the board: the attached image is the only CURRENT "
-            "view, and your notepad is the current state of your saved notes. "
-            "Where old messages disagree with the image or the notepad, trust "
-            "the image and the notepad:\n" + recent
-        )
+        parts.append(RECENT_CONVERSATION_HEADER + "\n" + recent)
     if semantic and semantic.strip() not in ("", "{}", "[]"):
         parts.append(
             "Relevant memories (semantic search across messages, entities, "

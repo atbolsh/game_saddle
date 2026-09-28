@@ -6,6 +6,11 @@ A reply ends when generation stops on eos. This trainer does not treat
 [HOLD] or [RELOAD] as controls; a beginning that emits [HOLD] is saved
 and skipped.
 
+Synthetic boards have 0-3 golds. Each user turn is the live game shape:
+an optional recent-conversation block, a notepad (often a fake target
+note), the picture, and a question naming a gold, an exit, a corner,
+or "your target".
+
 Traces are appended and flushed under data_game/<label>/. Logs go to
 logs/train_<label>_<stamp>/. A full checkpoint (the Gemma adapter and
 coord_head.pt) goes to weights/s2/. Gemma-only adapters stay under
@@ -20,6 +25,7 @@ import copy
 import io
 import json
 import logging
+import math
 import multiprocessing
 import os
 import random
@@ -28,6 +34,7 @@ import signal
 import tempfile
 import time
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +50,7 @@ from agent.modes import (
     SYSTEM_PROMPT_S2_ANALYST,
     _S2_LOOK_LINES,
     _S2_MOVE_LINES,
+    _build_game_messages,
     parse_target,
 )
 from agent.model import ADAPTERS, VLModel, spec_for
@@ -78,9 +86,10 @@ logger = logging.getLogger("s2_look")
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DATA_GAME = REPO_ROOT / "data_game"
 N_BEGINNINGS = 64
-#: Weekend optimizer steps landed near 25 s. The cosine length uses that
-#: figure when --max-steps is omitted; the clock is still --hours.
-MEASURED_STEP_S = 25.0
+#: sep24_s2_learn_to_look: 5806 synthetic steps in 17.85 h. The cosine
+#: length uses that figure when --max-steps is omitted; the clock is
+#: still --hours.
+MEASURED_STEP_S = 11.0
 HEAD_LR = 1e-4
 HEAD_WEIGHT_DECAY = 0.01
 BEGINNING_MAX_NEW_TOKENS = 256
@@ -153,6 +162,11 @@ def _ask(kind: str, phrase: str) -> str:
     raise ValueError(f"bad kind {kind!r}")
 
 
+S2_YOUR_TARGET_LINES = ("Look at your target.", "Move to your target.")
+
+_KIND_WEIGHT = {"gold": 0.5, "exit": 0.2, "corner": 0.3}
+
+
 def corner_phrase(name: str) -> str:
     """The synthetic phase's name for one ``_CORNERS`` entry."""
     return f"the {name} corner"
@@ -172,21 +186,19 @@ def gold_region_phrases() -> list[str]:
 def standard_user_questions() -> list[str]:
     """User lines this trainer asks, in a stable order.
 
-    The beginning line, then every look, then every move. Phrases are
-    the corner names and the gold-region names.
+    The beginning line, then every look, then every move, then the two
+    "your target" lines. Phrases are the corner names, the gold-region
+    names, "the gold", and "the exit".
     """
     phrases = [corner_phrase(name) for name, _x, _y in _CORNERS]
     phrases.extend(gold_region_phrases())
+    phrases.extend(["the gold", "the exit"])
     questions = [S2_BEGINNING_USER]
     for kind in ("look", "move"):
         for phrase in phrases:
             questions.append(_ask(kind, phrase))
+    questions.extend(S2_YOUR_TARGET_LINES)
     return questions
-
-
-def start_of_game_user_text(notepad: str, question: str) -> str:
-    """Notepad block, a blank line, then the question. Beginnings use this."""
-    return notepad + "\n\n" + question
 
 
 def _coords(kind: str, agent: tuple[float, float],
@@ -203,12 +215,208 @@ def _coords(kind: str, agent: tuple[float, float],
     return [sx, sy, vx, vy, bx, by]
 
 
+def _targets_on_board(
+    settings: dict,
+) -> list[tuple[str, str, tuple[float, float]]]:
+    """Named places on this board: golds, exits, then the eight corners.
+
+    One gold is "the gold". Several golds use region names, and a gold
+    whose region name is shared with another gold is left out. One exit
+    is "the exit"; several are named by wall.
+    """
+    found: list[tuple[str, str, tuple[float, float]]] = []
+    golds = settings.get("gold") or []
+    if len(golds) == 1:
+        x, y = float(golds[0][0]), float(golds[0][1])
+        found.append(("gold", "the gold", (x, y)))
+    elif golds:
+        rows = [
+            (_gold_phrase(float(g[0]), float(g[1])),
+             (float(g[0]), float(g[1])))
+            for g in golds
+        ]
+        counts: dict[str, int] = {}
+        for phrase, _point in rows:
+            counts[phrase] = counts.get(phrase, 0) + 1
+        for phrase, point in rows:
+            if counts[phrase] == 1:
+                found.append(("gold", phrase, point))
+    openings = settings.get("openings") or []
+    if len(openings) == 1:
+        center = openings[0]["center"]
+        found.append((
+            "exit", "the exit", (float(center[0]), float(center[1])),
+        ))
+    else:
+        for opening in openings:
+            center = opening["center"]
+            found.append((
+                "exit",
+                f"the exit on the {opening['side']} wall",
+                (float(center[0]), float(center[1])),
+            ))
+    for name, x, y in _CORNERS:
+        found.append(("corner", corner_phrase(name), (float(x), float(y))))
+    return found
+
+
+def _draw_target(
+    candidates: list[tuple[str, str, tuple[float, float]]],
+    rng: random.Random,
+) -> tuple[str, str, tuple[float, float]]:
+    """Gold 0.5, exit 0.2, corner 0.3, renormalised over kinds present."""
+    grouped: dict[str, list[tuple[str, str, tuple[float, float]]]] = {}
+    for item in candidates:
+        grouped.setdefault(item[0], []).append(item)
+    kinds = [kind for kind in ("gold", "exit", "corner") if grouped.get(kind)]
+    if not kinds:
+        raise RuntimeError("board has no look or move target")
+    total = sum(_KIND_WEIGHT[kind] for kind in kinds)
+    pick = rng.random() * total
+    acc = 0.0
+    chosen = kinds[-1]
+    for kind in kinds:
+        acc += _KIND_WEIGHT[kind]
+        if pick < acc:
+            chosen = kind
+            break
+    return rng.choice(grouped[chosen])
+
+
+@dataclass
+class SyntheticPrompt:
+    messages: list[dict]
+    question: str
+    kind: str
+    phrase: str
+    point: tuple[float, float]
+    coords: list[float] | None
+    target_note: str | None
+    question_kind: str
+    candidate_kind: str
+    context: str
+    notepad: str
+
+
+def beginning_messages(image_path: str, notepad: str) -> list[dict]:
+    """The beginnings user turn: empty context, the notepad, the picture."""
+    return _build_game_messages(
+        SYSTEM_PROMPT_S2, image_path, "", S2_BEGINNING_USER, notepad=notepad,
+    )
+
+
+def _fake_rounds(
+    candidates: list[tuple[str, str, tuple[float, float]]],
+    rng: random.Random,
+    target_note: str | None,
+) -> list[tuple[str, str]]:
+    n_rounds = 0 if rng.random() < 0.4 else rng.choice((1, 2, 3))
+    lines: list[tuple[str, str]] = []
+    if n_rounds < 1:
+        return lines
+    start = 0
+    if target_note:
+        lines.append(("user", S2_BEGINNING_USER))
+        lines.append((
+            "assistant",
+            f"[REMEMBER target: {target_note}]\n{rng.choice(_S2_LOOK_LINES)}",
+        ))
+        start = 1
+    pool = candidates
+    if target_note:
+        others = [item for item in candidates if item[1] != target_note]
+        if others:
+            pool = others
+    for _round in range(start, n_rounds):
+        hist_kind = "look" if rng.random() < 0.5 else "move"
+        _cand_kind, hist_phrase, _point = rng.choice(pool)
+        hist_lines = (
+            _S2_LOOK_LINES if hist_kind == "look" else _S2_MOVE_LINES
+        )
+        lines.append(("user", _ask(hist_kind, hist_phrase)))
+        lines.append(("assistant", rng.choice(hist_lines)))
+    return lines
+
+
+def synthetic_prompt(
+    settings: dict,
+    rng: random.Random,
+    image_path: str,
+    *,
+    question: str | None = None,
+) -> SyntheticPrompt:
+    """One synthetic user turn, including the fake notepad and history.
+
+    ``question`` overrides the drawn question (the testing notebook's
+    text box). The coordinate label is then omitted.
+    """
+    candidates = _targets_on_board(settings)
+    cand_kind, phrase, point = _draw_target(candidates, rng)
+    move_kind = "look" if rng.random() < 0.5 else "move"
+    note_pool = [item for item in candidates if item[0] in ("gold", "exit")]
+    target_note: str | None = None
+    note_kind = cand_kind
+    note_point = point
+    if note_pool and rng.random() < 0.75:
+        note_kind, target_note, note_point = rng.choice(note_pool)
+        notepad = mem.format_notepad([{
+            "key": "target",
+            "value": target_note,
+            "updated_round": rng.randrange(1, 4),
+        }])
+    else:
+        notepad = mem.format_notepad([])
+    rounds = _fake_rounds(candidates, rng, target_note)
+    context = mem.format_recent_block(rounds) if rounds else ""
+    if question is not None:
+        asked = question
+        question_kind = "given"
+        out_kind, out_phrase, out_point, out_cand = (
+            move_kind, phrase, point, cand_kind,
+        )
+        coords = None
+    elif target_note is not None and rng.random() < 0.5:
+        asked = S2_YOUR_TARGET_LINES[0 if move_kind == "look" else 1]
+        question_kind = "your_target"
+        out_kind, out_phrase, out_point, out_cand = (
+            move_kind, target_note, note_point, note_kind,
+        )
+        coords = _coords(
+            out_kind,
+            (float(settings["agent_x"]), float(settings["agent_y"])),
+            out_point,
+        )
+    else:
+        asked = _ask(move_kind, phrase)
+        question_kind = "explicit"
+        out_kind, out_phrase, out_point, out_cand = (
+            move_kind, phrase, point, cand_kind,
+        )
+        coords = _coords(
+            out_kind,
+            (float(settings["agent_x"]), float(settings["agent_y"])),
+            out_point,
+        )
+    messages = _build_game_messages(
+        SYSTEM_PROMPT_S2, image_path, context, asked, notepad=notepad,
+    )
+    return SyntheticPrompt(
+        messages=messages,
+        question=asked,
+        kind=out_kind,
+        phrase=out_phrase,
+        point=out_point,
+        coords=coords,
+        target_note=target_note,
+        question_kind=question_kind,
+        candidate_kind=out_cand,
+        context=context,
+        notepad=notepad,
+    )
+
+
 def _system_message(text: str) -> dict:
     return {"role": "system", "content": [{"type": "text", "text": text}]}
-
-
-def _text_message(role: str, text: str) -> dict:
-    return {"role": role, "content": [{"type": "text", "text": text}]}
 
 
 def _append_jsonl(path: Path, obj: dict) -> None:
@@ -354,14 +562,69 @@ def _align_hidden(hidden: torch.Tensor, weights: torch.Tensor,
 
 def _coord_l2(head: nn.Linear, hidden: torch.Tensor, weights: torch.Tensor,
               targets: torch.Tensor) -> torch.Tensor:
+    """MSE of s, v, and v_bar, as a length-3 tensor.
+
+    Each pair is the mean of its two squared errors, then the masked mean
+    over reply positions, then the mean over the batch. ``parts.mean()``
+    is the scalar trained today.
+    """
     pred = head(hidden.float())
-    err = (pred - targets[:, None, :].to(pred.dtype)).pow(2).mean(dim=-1)
+    diff = (pred - targets[:, None, :].to(pred.dtype)).pow(2)
     mask = weights != 0
     counts = mask.sum(dim=1)
     if bool((counts == 0).any()):
         raise RuntimeError("coordinate loss row has no reply tokens")
-    per = (err * mask).sum(dim=1) / counts.to(err.dtype)
-    return per.mean()
+    denom = counts.to(diff.dtype)
+    parts = []
+    for start in (0, 2, 4):
+        err = diff[..., start:start + 2].mean(dim=-1)
+        per = (err * mask).sum(dim=1) / denom
+        parts.append(per.mean())
+    return torch.stack(parts)
+
+
+def _rms(mse: float) -> float:
+    return math.sqrt(max(0.0, mse))
+
+
+def _merge_step_parts(
+    look_parts: list[dict[str, float]],
+    replay_parts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for key in ("look_ce", "l2_s", "l2_v", "l2_vbar"):
+        vals = [row[key] for row in look_parts if key in row]
+        if vals:
+            merged[key] = sum(vals) / len(vals)
+    if replay_parts:
+        merged["replay_loss"] = (
+            sum(float(row["replay_loss"]) for row in replay_parts)
+            / len(replay_parts)
+        )
+        merged["replay_kind"] = [row["replay_kind"] for row in replay_parts]
+    return merged
+
+
+def _format_step(step: int, kind: str, loss_value: float,
+                 parts: dict[str, Any], grad_norm: float,
+                 lrs: list[float]) -> str:
+    tail = f"grad {grad_norm:.1f} | lr {lrs[0]:.3g} / {lrs[-1]:.3g}"
+    if kind == "beginning":
+        return (
+            f"step {step} beginning "
+            f"rms s {_rms(parts['l2_s']):.2f} "
+            f"v {_rms(parts['l2_v']):.2f} "
+            f"vbar {_rms(parts['l2_vbar']):.2f} | {tail}"
+        )
+    kinds = ", ".join(str(item) for item in parts.get("replay_kind") or [])
+    return (
+        f"step {step} synthetic loss {loss_value:.3f} | "
+        f"look ce {parts.get('look_ce', 0.0):.3f} "
+        f"rms s {_rms(parts['l2_s']):.3f} "
+        f"v {_rms(parts['l2_v']):.3f} "
+        f"vbar {_rms(parts['l2_vbar']):.3f} | "
+        f"replay {parts.get('replay_loss', 0.0):.2f} [{kinds}] | {tail}"
+    )
 
 
 def _generate_text(vl: VLModel, model: Any, messages: list[dict],
@@ -409,6 +672,8 @@ class Run:
         self.skip_streak = 0
         self.session_ids: list[str] = []
         self.scratchpads_cleared = False
+        self.cosine_steps = 0
+        self._cosine_floor_warned = False
         self.deadline = 0.0
         self.model = None
         self.processor = None
@@ -518,11 +783,28 @@ class Run:
         )
         warmup = int(total_steps * cfg.warmup_ratio)
         if cfg.scheduler == "cosine":
-            self.scheduler = get_scheduler(
-                "cosine_with_min_lr", self.optimizer,
-                num_warmup_steps=warmup,
-                num_training_steps=total_steps,
-                scheduler_specific_kwargs={"min_lr_rate": cfg.lr_floor},
+            self.cosine_steps = total_steps
+            floor = cfg.lr_floor
+
+            def _factor(step: int, _warmup: int = warmup,
+                        _total: int = total_steps, _floor: float = floor,
+                        ) -> float:
+                # At and after the scheduled length the multiplier is the
+                # floor. An unclamped cosine walks back up toward the peak.
+                if step >= _total:
+                    return _floor
+                if _warmup > 0 and step < _warmup:
+                    return step / max(1, _warmup)
+                span = max(1, _total - _warmup)
+                progress = (step - _warmup) / span
+                return (
+                    _floor
+                    + (1.0 - _floor) * 0.5
+                    * (1.0 + math.cos(math.pi * progress))
+                )
+
+            self.scheduler = torch.optim.lr_scheduler.LambdaLR(
+                self.optimizer, _factor,
             )
         else:
             self.scheduler = get_scheduler(
@@ -709,7 +991,8 @@ class Run:
             "gpu": _gpu_mem_snapshot(),
         })
 
-    def _optimizer_step(self, loss_value: float, kind: str) -> None:
+    def _optimizer_step(self, loss_value: float, kind: str,
+                        parts: dict[str, Any]) -> None:
         assert self.optimizer is not None and self.scheduler is not None
         assert self.head is not None and self.model is not None
         assert self.tlog is not None
@@ -734,6 +1017,15 @@ class Run:
                 % self.cfg.prefix_kv_refresh_steps == 0):
             self.prefix_state.cache = None
             self.prefix_state.key = None
+        if (not self._cosine_floor_warned
+                and self.cosine_steps
+                and self.step > self.cosine_steps):
+            self._cosine_floor_warned = True
+            logger.warning(
+                "cosine finished at step %d; lr holds at the floor",
+                self.step,
+            )
+            self.tlog.event("cosine_floor", step=self.step)
         lrs = self.scheduler.get_last_lr()
         record = {
             "step": self.step,
@@ -745,13 +1037,16 @@ class Run:
             "lr_head": lrs[-1],
             "gpu": _gpu_mem_snapshot(),
         }
+        record.update(parts)
         self.tlog.last_step(record)
         self._log_metrics(record)
         if self.step % self.cfg.log_steps == 0:
             logger.info(
-                "step %d %s loss %.4f grad %.3f lr %.3g / %.3g",
-                self.step, kind, loss_value, float(grad_norm),
-                lrs[0], lrs[-1],
+                "%s",
+                _format_step(
+                    self.step, kind, loss_value, parts,
+                    float(grad_norm), lrs,
+                ),
             )
         if self.cfg.save_steps and self.step % self.cfg.save_steps == 0:
             self.save("save_steps")
@@ -764,7 +1059,8 @@ class Run:
         return float(loss.detach())
 
     def _look_loss(self, exs: list[TrainingExample], *,
-                   cross_entropy: bool) -> torch.Tensor:
+                   cross_entropy: bool,
+                   ) -> tuple[torch.Tensor, dict[str, float]]:
         assert self.collator is not None and self.model is not None
         assert self.head is not None
         built = self.collator.build_batch(exs)
@@ -783,10 +1079,15 @@ class Run:
                     f"beginning hidden length {int(hidden.shape[1])} "
                     f"!= input length {input_len}"
                 )
-            loss = _coord_l2(self.head, hidden, weights, targets)
+            parts_t = _coord_l2(self.head, hidden, weights, targets)
+            loss = parts_t.mean()
             if not loss.requires_grad:
                 raise RuntimeError("beginning loss is not connected to the graph")
-            return loss
+            return loss, {
+                "l2_s": float(parts_t[0].detach()),
+                "l2_v": float(parts_t[1].detach()),
+                "l2_vbar": float(parts_t[2].detach()),
+            }
 
         captured: dict[str, torch.Tensor] = {}
 
@@ -815,9 +1116,15 @@ class Run:
             raise RuntimeError(
                 "coordinate loss is not connected to the look-batch graph"
             )
-        return ce + coord
+        return ce + coord.mean(), {
+            "look_ce": float(ce.detach()),
+            "l2_s": float(coord[0].detach()),
+            "l2_v": float(coord[1].detach()),
+            "l2_vbar": float(coord[2].detach()),
+        }
 
-    def _replay_loss(self, exs: list[TrainingExample]) -> torch.Tensor:
+    def _replay_loss(self, exs: list[TrainingExample],
+                     ) -> tuple[torch.Tensor, dict[str, Any]]:
         assert self.collator is not None and self.model is not None
         built = self.collator.build_batch(exs)
         self._heartbeat(exs, "replay", built)
@@ -831,7 +1138,10 @@ class Run:
             prefix_hash=exs[0].prefix_hash,
             kd_chunk=self.cfg.kd_lm_head_chunk,
         )
-        return loss
+        return loss, {
+            "replay_loss": float(loss.detach()),
+            "replay_kind": exs[0].loss,
+        }
 
     def _stopped(self) -> bool:
         if self.hours > 0 and time.perf_counter() >= self.deadline:
@@ -942,15 +1252,7 @@ class Run:
         self.session_ids.append(sid)
         notes = loop.run_until_complete(mem.get_session_notes(client, sid))
         notepad = mem.format_notepad(notes)
-        messages = [
-            _system_message(SYSTEM_PROMPT_S2),
-            {"role": "user", "content": [
-                {"type": "image", "url": str(seen)},
-                {"type": "text", "text": start_of_game_user_text(
-                    notepad, S2_BEGINNING_USER,
-                )},
-            ]},
-        ]
+        messages = beginning_messages(str(seen), notepad)
         reply = _generate_text(
             self.vl, self.model, messages, BEGINNING_MAX_NEW_TOKENS,
         )
@@ -1074,10 +1376,10 @@ class Run:
                 batch = pending[:n]
                 pending = pending[n:]
                 self.optimizer.zero_grad(set_to_none=True)
-                loss = self._look_loss(batch, cross_entropy=False)
+                loss, parts = self._look_loss(batch, cross_entropy=False)
                 value = self._backward(loss, 1)
                 self.phase = "beginnings"
-                self._optimizer_step(value, "beginning")
+                self._optimizer_step(value, "beginning", parts)
                 self.beginnings_trained += len(batch)
                 self._flush_state()
                 logger.info(
@@ -1128,59 +1430,40 @@ class Run:
         return found
 
     def _synthetic_example(self) -> TrainingExample:
-        raw = self._take_board((2, 3))
+        raw = self._take_board((0, 1, 2, 3))
         settings = raw["settings"]
-        golds = settings["gold"]
-        phrases = [_gold_phrase(float(g[0]), float(g[1])) for g in golds]
-        unique = len(phrases) == len(set(phrases)) and bool(phrases)
-        kind = "look" if self.rng.random() < 0.5 else "move"
-        if unique and self.rng.random() < 0.5:
-            index = self.rng.randrange(len(golds))
-            phrase = phrases[index]
-            point = (float(golds[index][0]), float(golds[index][1]))
-        else:
-            name, x, y = self.rng.choice(_CORNERS)
-            phrase = corner_phrase(name)
-            point = (float(x), float(y))
-        lines = _S2_LOOK_LINES if kind == "look" else _S2_MOVE_LINES
-        reply = self.rng.choice(lines)
-        n_hist = 0 if self.rng.random() < 0.5 else self.rng.choice((1, 2))
-        messages = [_system_message(SYSTEM_PROMPT_S2)]
-        for _turn in range(n_hist):
-            hist_kind = "look" if self.rng.random() < 0.5 else "move"
-            hist_name, _hx, _hy = self.rng.choice(_CORNERS)
-            hist_phrase = corner_phrase(hist_name)
-            hist_lines = (
-                _S2_LOOK_LINES if hist_kind == "look" else _S2_MOVE_LINES
-            )
-            messages.append(_text_message("user", _ask(hist_kind, hist_phrase)))
-            messages.append(_text_message(
-                "assistant", self.rng.choice(hist_lines),
-            ))
         path = self.images / f"look_{self.seen_looks:06d}.png"
         noised = noise_image(
             _open_png(raw["png"]), self.rng, TRAINING_STRENGTH,
         )
         _save_png(noised, path)
         self.seen_looks += 1
-        messages.append({"role": "user", "content": [
-            {"type": "image", "url": str(path)},
-            {"type": "text", "text": _ask(kind, phrase)},
-        ]})
-        agent = (float(settings["agent_x"]), float(settings["agent_y"]))
-        coords = _coords(kind, agent, point)
+        built = synthetic_prompt(settings, self.rng, str(path))
+        if built.coords is None:
+            raise RuntimeError("synthetic prompt has no coordinate label")
+        reply_lines = (
+            _S2_LOOK_LINES if built.kind == "look" else _S2_MOVE_LINES
+        )
+        reply = self.rng.choice(reply_lines)
         record = {
-            "messages": messages,
+            "messages": built.messages,
             "target_text": reply,
             "meta": {
-                "kind": kind,
-                "phrase": phrase,
-                "coords": coords,
+                "kind": built.kind,
+                "phrase": built.phrase,
+                "coords": built.coords,
                 "image": str(path),
+                "n_gold": len(settings.get("gold") or []),
+                "n_openings": len(settings.get("openings") or []),
+                "target_note": built.target_note,
+                "question_kind": built.question_kind,
+                "candidate_kind": built.candidate_kind,
             },
         }
         _append_jsonl(self.look_path, record)
-        return self._example(messages, reply, coords, "s2_look", "ce")
+        return self._example(
+            built.messages, reply, built.coords, "s2_look", "ce",
+        )
 
     def synthetic(self) -> None:
         if self.phase != "synthetic":
@@ -1193,18 +1476,25 @@ class Run:
         while not self._stopped():
             self.optimizer.zero_grad(set_to_none=True)
             losses: list[float] = []
+            look_parts: list[dict[str, float]] = []
+            replay_parts: list[dict[str, Any]] = []
             for i in range(self.cfg.grad_accum):
                 if i % 2 == 0:
                     exs = [
                         self._synthetic_example()
                         for _ in range(self.cfg.micro_batch)
                     ]
-                    loss = self._look_loss(exs, cross_entropy=True)
+                    loss, parts = self._look_loss(exs, cross_entropy=True)
+                    look_parts.append(parts)
                 else:
                     exs = self.replay.next_batch()
-                    loss = self._replay_loss(exs)
+                    loss, parts = self._replay_loss(exs)
+                    replay_parts.append(parts)
                 losses.append(self._backward(loss, self.cfg.grad_accum))
-            self._optimizer_step(sum(losses) / len(losses), "synthetic")
+            self._optimizer_step(
+                sum(losses) / len(losses), "synthetic",
+                _merge_step_parts(look_parts, replay_parts),
+            )
 
     def run(self) -> int:
         self.deadline = time.perf_counter() + self.hours * 3600.0
