@@ -1,11 +1,12 @@
-# Grok recommendations (2026-09-21)
+# Cursor recommendations (2026-09-21; renamed 2026-09-29)
 
 Locked answers to the questions in `INSTRUCTIONS.md`, plus the S1
 shape agreed after that note. Sharing S1's convolutional backbone
 with Gemma is a later option, written at the end of section 1.
 Amended the same day: the checkpoint decision in section 2 is his
 call, recorded disagree-and-commit; section 4 (S2 vision placement)
-is new.
+is new. Section 8 (2026-09-29) is shelved: his call is to try
+improvised fixes first, recorded disagree-and-commit.
 
 ## 1. S1
 
@@ -281,3 +282,53 @@ The word loss never touches the new head. The September analyst
 already says "bottom" and then prints `y = 0.814` and marks itself
 correct. The head is how that sentence stops being graded against
 itself.
+
+## 8. Shelved: isolated probe before the next head run (2026-09-29)
+
+Written after the sep24 learn-to-look review. Shelved by his
+decision: three improvised attempts come first; this is the fallback
+if they do not move the coordinate loss below the baselines.
+
+What the sep24 numbers say. Labels from `look_moves.jsonl` give a
+constant-predictor MSE of 0.055 (`s`), 0.113 (`v`), 0.245 (`v_bar`),
+0.138 overall, and a text-only lookup (phrase -> point, `s` = mean)
+of 0.057 overall. Decomposing the logged loss
+(`L2 ~ 2*loss - replay - CE`, replay ~0.15-0.20 with KD against an
+identical anchor) puts the run's L2 at roughly 0.3-0.4 and never
+below ~0.10. The head did not reach even the text-only floor. With
+LoRA at 3e-6 for 5.8k steps the trunk moved ~0.017 per parameter in
+Adam units, about 1/1400 of OpenVLA-OFT's recipe (5e-4, 50k steps),
+so the run was a linear probe of frozen last-layer features fit by
+SGD. Also 73% of `v` labels were corners, which need no vision.
+
+The probe. The 46k images and prompts are on disk. Forward 4-8k of
+them once with `output_hidden_states`. Cache the reply-position
+vector at layers {8, 16, 24, 32, 40, 48} and the 256 image-token
+states at two middle layers (fp16, ~2 MB per example per layer).
+Then, on the cache:
+
+- Closed-form ridge regression per layer for `s` and `v`. Read RMS in
+  board units against the floors above. `s` is one green disc; if no
+  layer recovers it linearly from 8k examples, the frozen-trunk route
+  is closed.
+- A small attention pool over the cached 16x16 token grid, keys with
+  2D coordinate channels, query from the reply-token vector, soft
+  argmax to a point (`S1._pool` on Gemma's tokens). Minutes to fit.
+- Optionally an MLP on the best single layer, to see if depth in the
+  head buys anything once the layer is right.
+
+Literature behind the layer choice: intermediate layers beat the
+final layer on probes (Skean et al., ICML 2025, arXiv:2502.02013);
+last-token probes on MLLMs drop sharply at the topmost layer
+(arXiv:2402.17304); GR00T N1 reads layer 12 of 24 and found it beat
+the final layer (arXiv:2503.14734); SmolVLA attends to the first L/2
+layers (arXiv:2506.01844). The final layer works when the trunk is
+trained for it (OpenVLA-OFT, arXiv:2502.19645, MLP on final states,
+L1 loss, LoRA lr 5e-4).
+
+What the probe decides. Which layer the head reads, and whether it
+reads one vector or the token grid. After that, a training run with
+the trunk unfrozen for real (LoRA lr in the 1e-4 to 5e-4 range, KD
+anchor on), `l2_v` split by candidate kind, and the two floors
+printed at startup so the RMS lines have something to be read
+against. More frames only after the loss moves under the floors.
