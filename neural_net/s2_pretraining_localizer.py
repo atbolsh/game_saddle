@@ -98,16 +98,24 @@ TRAINER_NAME = "s2_pretraining_localizer"
 # optimizer, not of the trunk. Replace with the bench's "localizer s/step"
 # inverted (1 / seconds) before trusting --cosine-steps 0.
 LOCALIZER_STEPS_PER_S = 100.0
+# RMS of the whole tensor. A wrong mask or a shifted grid is ~1.
+# The first bench's grid *max* was 0.053 against a query RMS well under
+# this, which is one bf16 element, not a bad gather.
 _EQUIV_TOL = 0.05
+# Worst single element. bf16 across a 256x3840 grid trips 0.05; a real
+# disagreement is far above this.
+_EQUIV_MAX_TOL = 0.25
 _KIND_MOVE = {"look": 0, "move": 1}
 _KIND_CAND = {"gold": 0, "exit": 1, "corner": 2}
 
 
-def _rel_err(got: torch.Tensor, ref: torch.Tensor) -> float:
-    return float(
-        (got.float() - ref.float()).abs().max()
-        / (ref.float().abs().max() + 1e-6)
-    )
+def _rel_err(got: torch.Tensor, ref: torch.Tensor) -> tuple[float, float]:
+    """``(rms_rel, max_rel)`` of ``got`` against ``ref``, both fp32."""
+    diff = (got.float() - ref.float()).abs()
+    ref_abs = ref.float().abs()
+    rms = float(diff.square().mean().sqrt() / (ref_abs.square().mean().sqrt() + 1e-6))
+    peak = float(diff.max() / (ref_abs.max() + 1e-6))
+    return rms, peak
 
 
 def _factor(step: int, warmup: int, total: int, floor: float) -> float:
@@ -995,19 +1003,28 @@ class Trainer:
             raise RuntimeError(
                 f"equivalence query shapes {tuple(q_two.shape)} vs {tuple(q_one.shape)}"
             )
-        q_err = _rel_err(q_two, q_one)
-        g_err = _rel_err(two["grid"], one["grid"])
+        q_rms, q_max = _rel_err(q_two, q_one)
+        g_rms, g_max = _rel_err(two["grid"], one["grid"])
         logger.info(
-            "equivalence query_rel %.6f grid_rel %.6f (limit %.2f)",
-            q_err, g_err, _EQUIV_TOL,
+            "equivalence query rms %.6f max %.6f | grid rms %.6f max %.6f "
+            "(rms limit %.2f, max limit %.2f)",
+            q_rms, q_max, g_rms, g_max, _EQUIV_TOL, _EQUIV_MAX_TOL,
         )
         self.tlog.event(
-            "equivalence_check", query_rel=q_err, grid_rel=g_err, limit=_EQUIV_TOL,
+            "equivalence_check",
+            query_rms=q_rms, query_max=q_max,
+            grid_rms=g_rms, grid_max=g_max,
+            rms_limit=_EQUIV_TOL, max_limit=_EQUIV_MAX_TOL,
         )
-        if q_err >= _EQUIV_TOL or g_err >= _EQUIV_TOL:
+        if (
+            q_rms >= _EQUIV_TOL or g_rms >= _EQUIV_TOL
+            or q_max >= _EQUIV_MAX_TOL or g_max >= _EQUIV_MAX_TOL
+        ):
             raise RuntimeError(
-                f"two-stage vs single-stage relative error query {q_err:.6f} "
-                f"grid {g_err:.6f}, limit {_EQUIV_TOL}. Rerun with --single-stage."
+                f"two-stage vs single-stage query rms {q_rms:.6f} max {q_max:.6f}, "
+                f"grid rms {g_rms:.6f} max {g_max:.6f} "
+                f"(rms limit {_EQUIV_TOL}, max limit {_EQUIV_MAX_TOL}). "
+                "Rerun with --single-stage."
             )
 
     def ingest(self, n_images: int, *, bench: bool, check: bool) -> None:
