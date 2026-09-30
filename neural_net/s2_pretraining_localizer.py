@@ -987,15 +987,16 @@ class Trainer:
         The single pass does not count the image again.
         """
         assert self.tlog is not None
-        _elapsed, single = self._single_stage([image], record=False)
+        _elapsed, rows = self._single_stage([image], record=False)
+        one = rows[0]
         q_two = two["queries"][0][two["valid_r"][0]]
-        q_one = single["queries"][0][single["valid_r"][0]]
+        q_one = one["queries"][0][one["valid_r"][0]]
         if q_two.shape != q_one.shape:
             raise RuntimeError(
                 f"equivalence query shapes {tuple(q_two.shape)} vs {tuple(q_one.shape)}"
             )
         q_err = _rel_err(q_two, q_one)
-        g_err = _rel_err(two["grid"], single["grid"])
+        g_err = _rel_err(two["grid"], one["grid"])
         logger.info(
             "equivalence query_rel %.6f grid_rel %.6f (limit %.2f)",
             q_err, g_err, _EQUIV_TOL,
