@@ -332,3 +332,73 @@ the trunk unfrozen for real (LoRA lr in the 1e-4 to 5e-4 range, KD
 anchor on), `l2_v` split by candidate kind, and the two floors
 printed at startup so the RMS lines have something to be read
 against. More frames only after the loss moves under the floors.
+
+## 9. Localizer (2026-09-30)
+
+The sep24 linear head read the final hidden state. That state is the
+next-token distribution, and the run never moved the trunk enough to
+make it a vision feature. The Localizer reads one earlier decoder
+layer instead, and it is the only thing that trains.
+
+Readout. Gemma 4 12B has 48 decoder layers. `KEPT_LAYER = 24`. The
+image is the 16x16 of patch tokens at that layer's output (256
+states, not the 257th soft token). A query comes from the same layer
+at the reply positions of the token being scored. Both are projected
+to d = 512. Two pre-norm self-attention layers refine the grid. Three
+heads (`s`, `v`, `v_bar`) attend it. The point is the
+attention-weighted cell centre plus a zero-initialised offset, so step
+0 is the softmax expectation. Cell centres match `S1._pool`: row 0 is
+the top of the board, world `y = 1`.
+
+Not built, recorded here so it is not reinvented: a softmax mix of
+layers `(16, 24, 32)` with a learned per-head temperature, one buffer
+of about 1500 images, and the choice rule "keep the shallowest layer
+that reaches the text-only floor". Tonight is one layer. `--kept-layer`
+changes it.
+
+Base model. `aug27_big_step_iter1_step313`. Its `embed_vision` was
+trained on board frames. The sep24 LoRA is discarded: at 3e-6 for
+5806 steps it moved about 1/1400 of a real VLA fine-tune, so it is not
+a vision adapter worth keeping. The trunk stays frozen. No LoRA
+gradient, no replay, no KD, no token loss.
+
+No image. Every coordinate is 0.5. Not NaN, not zeros. A prompt with
+no picture still has to hand `_split_coords` six ordinary floats.
+
+Loop. Stage A is the shared stem (system, notepad, history, picture,
+through `Question / instruction:`), one forward per image, stopped at
+the kept layer. Stage B is that image's K questions, teacher-forced,
+reading the repeated stage-A cache. K questions per image is exact:
+the question is after the picture, so the cache does not depend on it.
+Several images per prompt would not be exact, and a cached query from
+image A is never paired with a grid from image B. `--single-stage`
+recomputes the picture for every question when the two-stage check
+fails. The check is a relative error under 0.05 on the first image's
+first question, query and grid, two-stage against a full forward.
+
+Floors, from labels only. Constant: RMS of predicting the running
+mean, per pair. Text-only: `s` is the running mean of `s`, `v` is the
+running mean of that phrase, `v_bar` is `2 * mean_s - v` on a look and
+`v` on a move. The log line prints the model's RMS next to both.
+
+CoordEmbedder. Built, installed on the token embedding, gate exactly
+0, `enabled` False, not in the optimizer. Inputs are `v` and `v_bar`
+only (`s` is in the picture). Anything outside `[-1, 2]` raises; there
+is no clamp. The map is `(x + 1) / 3`, which sends that interval onto
+`[0, 1]`. Eight fixed Fourier bands. Band 0 is `cos(pi * x_unit)` on
+`[0, pi]`, strictly monotone, so the lowest band alone is injective.
+The projection is `Linear(32 -> 3840)` with std-0.02, not zero: the
+output is `tanh(gate) * proj(features)`, and a zero projection plus a
+zero gate is a saddle (both gradients are zero). `tanh` rather than
+`sigmoid` (0.5 at init) or `ReLU` (no gradient at 0). RoPE is not an
+additive sine in the residual, so these bands are not a second
+positional code. Shelved ablation: bilinear lookup in
+`embed_vision.pos_embedding` instead of the Fourier path for `v`.
+
+Phase order. This trainer is learn to look: frozen trunk, Localizer
+only. Learn to tell where you are looking comes after a Localizer hits
+the floors. That later phase sets `enabled`, teacher-forces label `v`
+and `v_bar` at reply positions, later mixes in the Localizer's own
+detached predictions, adds a read-back loss (a later position must
+reproduce an earlier injected coordinate), and trains LoRA at 1e-4 to
+5e-4 with the KD anchor on. The gate does not move before that.

@@ -338,25 +338,35 @@ def _fake_rounds(
     return lines
 
 
-def synthetic_prompt(
-    settings: dict,
-    rng: random.Random,
-    image_path: str,
-    *,
-    question: str | None = None,
-) -> SyntheticPrompt:
-    """One synthetic user turn, including the fake notepad and history.
+@dataclass
+class BoardContext:
+    candidates: list[tuple[str, str, tuple[float, float]]]
+    target_note: str | None
+    note_kind: str | None
+    note_point: tuple[float, float] | None
+    notepad: str
+    context: str
+    agent: tuple[float, float]
 
-    ``question`` overrides the drawn question (the testing notebook's
-    text box). The coordinate label is then omitted.
-    """
+
+@dataclass
+class DrawnQuestion:
+    kind: str
+    phrase: str
+    point: tuple[float, float]
+    candidate_kind: str
+    question_kind: str
+    question: str
+    coords: list[float]
+
+
+def board_context(settings: dict, rng: random.Random) -> BoardContext:
+    """Notepad, fake history, and the agent point for one board."""
     candidates = _targets_on_board(settings)
-    cand_kind, phrase, point = _draw_target(candidates, rng)
-    move_kind = "look" if rng.random() < 0.5 else "move"
     note_pool = [item for item in candidates if item[0] in ("gold", "exit")]
     target_note: str | None = None
-    note_kind = cand_kind
-    note_point = point
+    note_kind: str | None = None
+    note_point: tuple[float, float] | None = None
     if note_pool and rng.random() < 0.75:
         note_kind, target_note, note_point = rng.choice(note_pool)
         notepad = mem.format_notepad([{
@@ -368,23 +378,29 @@ def synthetic_prompt(
         notepad = mem.format_notepad([])
     rounds = _fake_rounds(candidates, rng, target_note)
     context = mem.format_recent_block(rounds) if rounds else ""
-    if question is not None:
-        asked = question
-        question_kind = "given"
-        out_kind, out_phrase, out_point, out_cand = (
-            move_kind, phrase, point, cand_kind,
-        )
-        coords = None
-    elif target_note is not None and rng.random() < 0.5:
+    agent = (float(settings["agent_x"]), float(settings["agent_y"]))
+    return BoardContext(
+        candidates=candidates,
+        target_note=target_note,
+        note_kind=note_kind,
+        note_point=note_point,
+        notepad=notepad,
+        context=context,
+        agent=agent,
+    )
+
+
+def draw_question(ctx: BoardContext, rng: random.Random) -> DrawnQuestion:
+    """One look or move question against ``ctx``'s board."""
+    cand_kind, phrase, point = _draw_target(ctx.candidates, rng)
+    move_kind = "look" if rng.random() < 0.5 else "move"
+    if ctx.target_note is not None and rng.random() < 0.5:
+        if ctx.note_point is None or ctx.note_kind is None:
+            raise RuntimeError("target note is set without a point")
         asked = S2_YOUR_TARGET_LINES[0 if move_kind == "look" else 1]
         question_kind = "your_target"
         out_kind, out_phrase, out_point, out_cand = (
-            move_kind, target_note, note_point, note_kind,
-        )
-        coords = _coords(
-            out_kind,
-            (float(settings["agent_x"]), float(settings["agent_y"])),
-            out_point,
+            move_kind, ctx.target_note, ctx.note_point, ctx.note_kind,
         )
     else:
         asked = _ask(move_kind, phrase)
@@ -392,13 +408,75 @@ def synthetic_prompt(
         out_kind, out_phrase, out_point, out_cand = (
             move_kind, phrase, point, cand_kind,
         )
-        coords = _coords(
-            out_kind,
-            (float(settings["agent_x"]), float(settings["agent_y"])),
-            out_point,
+    return DrawnQuestion(
+        kind=out_kind,
+        phrase=out_phrase,
+        point=out_point,
+        candidate_kind=out_cand,
+        question_kind=question_kind,
+        question=asked,
+        coords=_coords(out_kind, ctx.agent, out_point),
+    )
+
+
+def draw_questions(
+    ctx: BoardContext, rng: random.Random, k: int,
+) -> list[DrawnQuestion]:
+    """Up to ``k`` questions with no repeated ``(kind, phrase)``.
+
+    Stops after ``8 * k`` draws. Fewer than ``k`` is allowed; the
+    caller repeats the last draw and marks the copies.
+    """
+    drawn: list[DrawnQuestion] = []
+    seen: set[tuple[str, str]] = set()
+    for _attempt in range(8 * k):
+        if len(drawn) >= k:
+            break
+        item = draw_question(ctx, rng)
+        key = (item.kind, item.phrase)
+        if key in seen:
+            continue
+        seen.add(key)
+        drawn.append(item)
+    return drawn
+
+
+def synthetic_prompt(
+    settings: dict,
+    rng: random.Random,
+    image_path: str,
+    *,
+    question: str | None = None,
+) -> SyntheticPrompt:
+    """One synthetic user turn, including the fake notepad and history.
+
+    ``question`` overrides the drawn question (the testing notebook's
+    text box). The coordinate label is then omitted.
+
+    Records are equivalent to the v2 trainer, not bit-identical: the
+    notepad is drawn before the question, so the same seed does not
+    replay the old random stream.
+    """
+    ctx = board_context(settings, rng)
+    if question is not None:
+        cand_kind, phrase, point = _draw_target(ctx.candidates, rng)
+        move_kind = "look" if rng.random() < 0.5 else "move"
+        asked = question
+        question_kind = "given"
+        out_kind, out_phrase, out_point, out_cand = (
+            move_kind, phrase, point, cand_kind,
         )
+        coords = None
+    else:
+        drawn = draw_question(ctx, rng)
+        asked = drawn.question
+        question_kind = drawn.question_kind
+        out_kind, out_phrase, out_point, out_cand = (
+            drawn.kind, drawn.phrase, drawn.point, drawn.candidate_kind,
+        )
+        coords = drawn.coords
     messages = _build_game_messages(
-        SYSTEM_PROMPT_S2, image_path, context, asked, notepad=notepad,
+        SYSTEM_PROMPT_S2, image_path, ctx.context, asked, notepad=ctx.notepad,
     )
     return SyntheticPrompt(
         messages=messages,
@@ -407,11 +485,11 @@ def synthetic_prompt(
         phrase=out_phrase,
         point=out_point,
         coords=coords,
-        target_note=target_note,
+        target_note=ctx.target_note,
         question_kind=question_kind,
         candidate_kind=out_cand,
-        context=context,
-        notepad=notepad,
+        context=ctx.context,
+        notepad=ctx.notepad,
     )
 
 

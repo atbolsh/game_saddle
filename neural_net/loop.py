@@ -141,7 +141,7 @@ class S1S2:
             log_file.close()
 
     def _ensure_loaded(self) -> None:
-        if self.s2.vl.model is None or self.s2.coord_head is None:
+        if self.s2.vl.model is None or self.s2.localizer is None:
             self.s2.load()
         device = next(self.s2.vl.model.parameters()).device
         self.s1.to(device)
@@ -261,7 +261,9 @@ class S1S2:
             decode_exc: BaseException | None = None
             try:
                 with _use_stream(s2_stream):
-                    logits, coords, past = self.s2.decode(token_ids, past, seq_len)
+                    logits, coords, past = self.s2.decode(
+                        token_ids, past, seq_len, prev_coords=coords,
+                    )
             except BaseException as exc:
                 decode_exc = exc
             finally:

@@ -1,18 +1,24 @@
-"""Gemma 4 with a 6-float coordinate head on the lm_head input.
+"""Gemma 4 with a Localizer readout on one decoder layer.
 
-The head reads the same last-token hidden state that feeds lm_head and
-emits (s_x, s_y, v_x, v_y, v_bar_x, v_bar_y) with no sigmoid. Head math
-is fp32. The trunk stays on whatever dtype it was loaded with.
+The Localizer reads the image-token states at ``KEPT_LAYER`` and the
+hidden state of the token being generated, and emits
+``(s_x, s_y, v_x, v_y, v_bar_x, v_bar_y)``. A prompt with no image
+yields ``NO_IMAGE_COORD`` (0.5) for every coordinate.
+
+``CoordEmbedder`` is installed on the token embedding and stays
+disabled. It does nothing until a later phase sets ``enabled``.
 
 Save / load slices:
 
-* save_all / load_all — Gemma slice plus the head
+* save_all / load_all — Gemma slice plus localizer.pt and coord_embed.pt
 * save_gemma / load_gemma — Gemma only
-* save_head / load_head — the linear layer only
+* save_snapshot / load_snapshot — the Localizer bundle
 
 A PEFT adapter (the aug27 checkpoints) is saved with save_pretrained.
 A bare HuggingFace Gemma is saved as a full state_dict; that file is
 the whole 12B and is large on purpose.
+
+A sep24 snapshot that only has ``coord_head.pt`` is rejected by name.
 """
 
 from __future__ import annotations
@@ -25,6 +31,15 @@ import torch
 from torch import nn
 
 from agent.model import VLModel, spec_for
+from neural_net.coord_embed import CoordEmbedder
+from neural_net.localizer import (
+    KEPT_LAYER,
+    LayerTap,
+    Localizer,
+    gather_grid,
+    grid_positions,
+    no_image_coords,
+)
 
 
 def _wants_cache_position(model: nn.Module) -> bool:
@@ -78,12 +93,15 @@ class GemmaS2:
         self,
         model_key: str = "gemma-4-12b",
         checkpoint: str | None = None,
+        kept_layer: int = KEPT_LAYER,
     ) -> None:
         self.model_key = model_key
         self.vl = VLModel(spec_for(model_key), checkpoint=checkpoint)
-        self.coord_head: nn.Linear | None = None
-        self._hook: Any = None
-        self._last_hidden: torch.Tensor | None = None
+        self.kept_layer = int(kept_layer)
+        self.localizer: Localizer | None = None
+        self.coord_embed: CoordEmbedder | None = None
+        self._tap: LayerTap | None = None
+        self._grid: torch.Tensor | None = None
 
     @property
     def hidden_size(self) -> int:
@@ -93,41 +111,33 @@ class GemmaS2:
 
     def load(self) -> GemmaS2:
         """Load the HuggingFace base plus this instance's checkpoint, and
-        a freshly initialized coordinate head."""
+        a freshly initialized Localizer."""
         self.vl.load()
-        self._build_head()
+        self._build_readout()
         return self
 
-    def _build_head(self) -> None:
+    def _build_readout(self) -> None:
         if self.vl.model is None:
-            raise RuntimeError("_build_head called before the model was loaded")
+            raise RuntimeError("_build_readout called before the model was loaded")
         device = next(self.vl.model.parameters()).device
         size = self.hidden_size
-        previous = self.coord_head
-        self.coord_head = nn.Linear(size, 6).to(device=device, dtype=torch.float32)
-        if previous is not None and previous.in_features == size:
-            self.coord_head.load_state_dict(previous.state_dict())
-        self._install_hook()
-
-    def _install_hook(self) -> None:
-        if self._hook is not None:
-            self._hook.remove()
-            self._hook = None
-        if self.vl.model is None:
-            return
-        head = _find_lm_head(self.vl.model)
-
-        def _capture(_module: nn.Module, args: tuple, _output: Any) -> None:
-            hidden = args[0]
-            if hidden.dim() == 3:
-                hidden = hidden[:, -1]
-            elif hidden.dim() != 2:
-                raise RuntimeError(
-                    f"lm_head input rank {hidden.dim()}, expected 2 or 3"
-                )
-            self._last_hidden = hidden.detach()
-
-        self._hook = head.register_forward_hook(_capture)
+        previous_loc = self.localizer
+        previous_emb = self.coord_embed
+        if self._tap is not None:
+            self._tap.remove()
+            self._tap = None
+        if previous_emb is not None:
+            previous_emb.uninstall()
+        self.localizer = Localizer(size).to(device=device, dtype=torch.float32)
+        self.coord_embed = CoordEmbedder(size).to(device=device, dtype=torch.float32)
+        if previous_loc is not None and previous_loc.hidden_size == size:
+            self.localizer.load_state_dict(previous_loc.state_dict())
+        if previous_emb is not None and previous_emb.hidden_size == size:
+            self.coord_embed.load_state_dict(previous_emb.state_dict())
+            self.coord_embed.enabled = previous_emb.enabled
+        self._tap = LayerTap(self.vl.model, self.kept_layer)
+        self.coord_embed.install(self.vl.model)
+        self._grid = None
 
     def prefill(self, encoded: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor, Any]:
         """Cached prefill. Returns (logits [B, V], coords [B, 6], past)."""
@@ -135,19 +145,36 @@ class GemmaS2:
         inputs = self.vl._move_inputs_to_model(encoded)
         mask = inputs["attention_mask"]
         inputs["position_ids"] = (mask.long().cumsum(-1) - 1).clamp(min=0)
-        return self._forward(inputs)
+        logits, past = self._forward(inputs)
+        hidden = self._tap.take()
+        batch = int(hidden.shape[0])
+        device = hidden.device
+        has_mask = (
+            "mm_token_type_ids" in inputs or "token_type_ids" in inputs
+        )
+        mask_tensor = inputs.get("mm_token_type_ids", inputs.get("token_type_ids"))
+        if not has_mask or mask_tensor is None or not bool((mask_tensor != 0).any()):
+            self._grid = None
+            coords = no_image_coords(batch, 1, device)[:, 0, :]
+        else:
+            positions = grid_positions(inputs)
+            self._grid = gather_grid(hidden, positions).to(torch.bfloat16)
+            coords = self.localizer(self._grid, hidden[:, -1:, :])[0][:, 0, :]
+        return logits, coords, past
 
     def decode(
         self,
         token_ids: torch.Tensor,
         past: Any,
         seq_len: int,
+        prev_coords: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, Any]:
         """One cached decode step.
 
         token_ids is [B], the tokens just produced. seq_len is how many
         real tokens are already in the cache; the new token sits at that
-        index.
+        index. ``prev_coords`` is the previous step's ``[B, 6]``; while
+        the embedder is disabled, passing it changes nothing.
         """
         self._require_loaded()
         if token_ids.dim() != 1:
@@ -166,34 +193,46 @@ class GemmaS2:
             ),
             "past_key_values": past,
         }
-        return self._forward(inputs)
+        if prev_coords is not None:
+            self.coord_embed.set_pending(
+                prev_coords[:, 2:6].unsqueeze(1).to(device),
+                positions=torch.zeros(batch, 1, dtype=torch.long, device=device),
+            )
+        try:
+            logits, past_out = self._forward(inputs)
+            hidden = self._tap.take()
+            if self._grid is None:
+                coords = no_image_coords(batch, 1, device)[:, 0, :]
+            else:
+                coords = self.localizer(self._grid, hidden)[0][:, 0, :]
+        finally:
+            self.coord_embed.clear_pending()
+        return logits, coords, past_out
 
-    def _forward(self, inputs: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor, Any]:
-        assert self.coord_head is not None
-        self._last_hidden = None
+    def _forward(self, inputs: dict[str, Any]) -> tuple[torch.Tensor, Any]:
         pos = inputs.get("position_ids")
         if pos is not None and _wants_cache_position(self.vl.model):
             inputs = dict(inputs)
             inputs["cache_position"] = pos[0]
         with torch.inference_mode():
             out = self.vl.model(**inputs, use_cache=True, logits_to_keep=1)
-        if self._last_hidden is None:
-            raise RuntimeError(
-                "lm_head hook did not fire; the coordinate head has no input"
-            )
         logits = out.logits
         if logits.dim() == 3:
             logits = logits[:, -1, :]
         elif logits.dim() != 2:
             raise RuntimeError(f"logits rank {logits.dim()}, expected 2 or 3")
-        coords = self.coord_head(self._last_hidden.float())
         past = getattr(out, "past_key_values", None)
         if past is None:
             raise RuntimeError("Gemma forward returned no past_key_values")
-        return logits, coords, past
+        return logits, past
 
     def _require_loaded(self) -> None:
-        if self.vl.model is None or self.coord_head is None or self._hook is None:
+        if (
+            self.vl.model is None
+            or self.localizer is None
+            or self.coord_embed is None
+            or self._tap is None
+        ):
             raise RuntimeError(
                 "GemmaS2 is not loaded; call load(), load_gemma(), or load_all()"
             )
@@ -201,23 +240,6 @@ class GemmaS2:
     def _require_model(self) -> None:
         if self.vl.model is None:
             raise RuntimeError("Gemma is not loaded")
-
-    def save_head(self, path: str | Path) -> None:
-        if self.coord_head is None:
-            raise RuntimeError("save_head called before the coordinate head exists")
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(self.coord_head.state_dict(), path)
-
-    def load_head(self, path: str | Path) -> None:
-        self._require_model()
-        if self.coord_head is None:
-            self._build_head()
-        assert self.coord_head is not None
-        state = torch.load(Path(path), map_location="cpu", weights_only=True)
-        self.coord_head.load_state_dict(state)
-        device = next(self.vl.model.parameters()).device
-        self.coord_head.to(device=device, dtype=torch.float32)
 
     def save_gemma(self, path: str | Path) -> None:
         """Write the Gemma slice and gemma_meta.json.
@@ -245,8 +267,7 @@ class GemmaS2:
     def load_gemma(self, path: str | Path) -> None:
         """Replace Gemma weights from a directory written by save_gemma.
 
-        A coordinate head that already matches the hidden size is kept.
-        Otherwise a new random head is allocated; follow with load_head.
+        A readout that already matches the hidden size is kept.
         """
         path = Path(path)
         meta_path = path / "gemma_meta.json"
@@ -260,7 +281,8 @@ class GemmaS2:
                 "load_gemma: gemma_meta.json must have model_key and "
                 f"format peft|state_dict, got {meta!r}"
             )
-        previous = self.coord_head
+        previous_loc = self.localizer
+        previous_emb = self.coord_embed
         self.model_key = key
         self.vl = VLModel(spec_for(key), checkpoint=None)
         self.vl.load()
@@ -277,53 +299,145 @@ class GemmaS2:
             state = torch.load(weights, map_location="cpu", weights_only=True)
             self.vl.model.load_state_dict(state)
         self.vl.model.eval()
-        self.coord_head = previous
-        self._build_head()
+        self.localizer = previous_loc
+        self.coord_embed = previous_emb
+        self._build_readout()
+
+    def _save_readout(self, path: Path) -> None:
+        if self.localizer is None or self.coord_embed is None:
+            raise RuntimeError("save called before the readout exists")
+        torch.save(
+            {
+                "state_dict": self.localizer.state_dict(),
+                "kept_layer": self.kept_layer,
+                "dim": self.localizer.dim,
+                "refine_layers": self.localizer.refine_layers,
+                "heads": self.localizer.heads,
+                "mlp_dim": self.localizer.mlp_dim,
+                "hidden_size": self.localizer.hidden_size,
+            },
+            path / "localizer.pt",
+        )
+        self.coord_embed.save(path / "coord_embed.pt")
+
+    def _load_readout_files(self, path: Path) -> None:
+        blob = torch.load(path / "localizer.pt", map_location="cpu", weights_only=True)
+        self.kept_layer = int(blob["kept_layer"])
+        self._build_readout()
+        assert self.localizer is not None
+        if int(blob["hidden_size"]) != self.localizer.hidden_size:
+            raise RuntimeError(
+                f"localizer hidden_size {blob['hidden_size']} != "
+                f"model {self.localizer.hidden_size}"
+            )
+        for key in ("dim", "refine_layers", "heads", "mlp_dim"):
+            if int(blob[key]) != getattr(self.localizer, key):
+                raise RuntimeError(
+                    f"localizer {key} is {blob[key]}, "
+                    f"this build has {getattr(self.localizer, key)}"
+                )
+        self.localizer.load_state_dict(blob["state_dict"])
+        self.coord_embed.load(path / "coord_embed.pt")
+        device = next(self.vl.model.parameters()).device
+        self.localizer.to(device=device, dtype=torch.float32)
+        self.coord_embed.to(device=device, dtype=torch.float32)
 
     def save_all(self, path: str | Path) -> None:
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
         self.save_gemma(path / "gemma")
-        self.save_head(path / "coord_head.pt")
+        self._save_readout(path)
+        _write_json(path / "train_meta.json", {
+            "trainer": "save_all",
+            "gemma_base": None,
+            "kept_layer": self.kept_layer,
+            "model_key": self.model_key,
+        })
 
     def load_all(self, path: str | Path) -> None:
         path = Path(path)
         self.load_gemma(path / "gemma")
-        self.load_head(path / "coord_head.pt")
+        self._load_readout_files(path)
+
+    def save_snapshot(
+        self,
+        path: str | Path,
+        *,
+        gemma_base: str | None,
+        trainer: str,
+        extra: dict | None = None,
+    ) -> None:
+        """Write the Localizer bundle. Gemma weights only when unnamed."""
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        self._save_readout(path)
+        meta = {
+            "trainer": trainer,
+            "gemma_base": gemma_base,
+            "kept_layer": self.kept_layer,
+            "model_key": self.model_key,
+        }
+        if extra:
+            meta.update(extra)
+        _write_json(path / "train_meta.json", meta)
+        if gemma_base is None:
+            self.save_gemma(path / "gemma")
 
     def load_snapshot(self, path: str | Path) -> GemmaS2:
-        """Load one snapshot directory and leave the model in eval.
+        """Load one Localizer snapshot and leave the model in eval.
 
-        Learn-to-look writes the PEFT adapter and ``coord_head.pt`` side
-        by side under ``weights/s2/``. ``save_all`` writes ``gemma/`` plus
-        ``coord_head.pt``. A base Gemma that is already loaded is kept
-        when swapping a learn-to-look adapter. ``save_all`` reloads Gemma
-        from that directory.
+        Precedence for the trunk, with no fallback between branches:
+        ``gemma/gemma_meta.json``, else ``adapter_config.json`` in the
+        snapshot, else ``train_meta.json``'s ``gemma_base`` under
+        ``weights/<model_key>/``. A directory that only has
+        ``coord_head.pt`` is the sep24 linear head and is rejected.
         """
         path = Path(path)
-        head = path / "coord_head.pt"
-        if (path / "gemma" / "gemma_meta.json").is_file():
-            if not head.is_file():
-                raise FileNotFoundError(f"load_snapshot: missing {head}")
-            self.load_all(path)
-            return self
-        adapter = path / "adapter_config.json"
-        if not adapter.is_file() or not head.is_file():
-            raise FileNotFoundError(
-                f"load_snapshot: {path} needs coord_head.pt and either "
-                "adapter_config.json or gemma/gemma_meta.json"
+        if (path / "coord_head.pt").is_file() and not (path / "localizer.pt").is_file():
+            raise RuntimeError(
+                f"{path} is a sep24 linear-head snapshot (coord_head.pt); "
+                "the Localizer format needs localizer.pt"
             )
-        if self.vl.model is None:
-            self.load()
-        self._unwrap_adapter()
-        from peft import PeftModel
+        for name in ("localizer.pt", "coord_embed.pt", "train_meta.json"):
+            if not (path / name).is_file():
+                raise FileNotFoundError(f"load_snapshot: missing {path / name}")
+        meta = json.loads((path / "train_meta.json").read_text(encoding="utf-8"))
+        if (path / "gemma" / "gemma_meta.json").is_file():
+            self.load_gemma(path / "gemma")
+        elif (path / "adapter_config.json").is_file():
+            if self.vl.model is None:
+                self.load()
+            self._unwrap_adapter()
+            from peft import PeftModel
 
-        self.vl.model = PeftModel.from_pretrained(
-            self.vl.model, str(path), is_trainable=False
-        )
-        self.vl.model.eval()
-        self._install_hook()
-        self.load_head(head)
+            self.vl.model = PeftModel.from_pretrained(
+                self.vl.model, str(path), is_trainable=False
+            )
+            self.vl.model.eval()
+        elif meta.get("gemma_base"):
+            from training.train import weights_root
+
+            base = weights_root() / self.model_key / str(meta["gemma_base"])
+            if not (base / "adapter_config.json").is_file():
+                raise FileNotFoundError(
+                    f"load_snapshot: gemma_base {meta['gemma_base']!r} "
+                    f"has no adapter_config.json under {base}"
+                )
+            if self.vl.model is None:
+                self.load()
+            self._unwrap_adapter()
+            from peft import PeftModel
+
+            self.vl.model = PeftModel.from_pretrained(
+                self.vl.model, str(base), is_trainable=False
+            )
+            self.vl.model.eval()
+        else:
+            raise RuntimeError(
+                f"load_snapshot: {path} has no gemma/, no adapter_config.json, "
+                "and train_meta.json has no gemma_base"
+            )
+        self._load_readout_files(path)
         return self
 
     def _unwrap_adapter(self) -> None:
@@ -333,6 +447,10 @@ class GemmaS2:
         model = self.vl.model
         if not isinstance(model, PeftModel):
             return
+        if self.coord_embed is not None:
+            self.coord_embed.uninstall()
+        if self._tap is not None:
+            self._tap.remove()
+            self._tap = None
         self.vl.model = model.get_base_model()
         self.vl.model.eval()
-        self._install_hook()
