@@ -118,6 +118,7 @@ _KIND_CAND = {"gold": 0, "exit": 1, "corner": 2}
 MODE_FULL = 0
 MODE_MID = 1
 BEGIN_LOOK_LINE = "Confirmed. Looking at that spot."
+BEGIN_MOVE_LINE = "Confirmed. Moving to that spot."
 
 
 def _rel_err(got: torch.Tensor, ref: torch.Tensor) -> tuple[float, float]:
@@ -165,9 +166,59 @@ def _image_horizon(step: int, images_seen: int, args: argparse.Namespace) -> int
     return max(step + 1, int(round(horizon)))
 
 
-def _begin_reply(phrase: str) -> str:
-    """The one start-of-game reply. The collator appends the terminator."""
-    return f"[REMEMBER target: {phrase}]\n{BEGIN_LOOK_LINE}"
+def _separate_gold_phrases(
+    golds: list[tuple[float, float]],
+) -> list[tuple[str, tuple[float, float]]]:
+    """Region phrase for each gold. A shared region names the axis of separation.
+
+    One gold is ``the gold``. A gold alone in its region keeps
+    ``_gold_phrase``. Two golds in one region take the axis with the
+    larger span: ``further left`` / ``further right`` when x separates
+    them more, ``further down`` / ``further up`` when y does. World y
+    is up. A tie uses left/right. A third gold in that region keeps the
+    bare region phrase, which is then unique.
+    """
+    if len(golds) == 1:
+        return [("the gold", golds[0])]
+    groups: dict[str, list[tuple[float, float]]] = {}
+    for x, y in golds:
+        groups.setdefault(_gold_phrase(x, y), []).append((x, y))
+    named: list[tuple[str, tuple[float, float]]] = []
+    for phrase, points in groups.items():
+        if len(points) == 1:
+            named.append((phrase, points[0]))
+            continue
+        if len(points) > 3:
+            raise RuntimeError(
+                f"{len(points)} golds share {phrase!r}; no unique further-phrase"
+            )
+        span_x = max(p[0] for p in points) - min(p[0] for p in points)
+        span_y = max(p[1] for p in points) - min(p[1] for p in points)
+        if span_x == 0.0 and span_y == 0.0:
+            raise RuntimeError(f"golds that share {phrase!r} are the same point")
+        if span_x >= span_y:
+            order = sorted(points, key=lambda p: (p[0], p[1]))
+            ends = {0: "further left", len(order) - 1: "further right"}
+        else:
+            order = sorted(points, key=lambda p: (p[1], p[0]))
+            ends = {0: "further down", len(order) - 1: "further up"}
+        for i, point in enumerate(order):
+            if i in ends:
+                named.append((f"{phrase}, {ends[i]}", point))
+            else:
+                named.append((phrase, point))
+    return named
+
+
+def _begin_reply(phrase: str, kind: str) -> str:
+    """One start-of-game reply. The collator appends the terminator."""
+    if kind == "look":
+        line = BEGIN_LOOK_LINE
+    elif kind == "move":
+        line = BEGIN_MOVE_LINE
+    else:
+        raise ValueError(f"bad begin kind {kind!r}")
+    return f"[REMEMBER target: {phrase}]\n{line}"
 
 
 def _close_content_index(tokenizer: Any, text: str) -> int:
@@ -176,7 +227,8 @@ def _close_content_index(tokenizer: Any, text: str) -> int:
     ``]`` is not assumed to be its own token. The collator's offset map
     is the span of each target token; the decode check is the same test
     when a tokenizer returns no offsets. That token is the last midpoint
-    position. Later reply tokens, including the terminator, are a look.
+    position. Later reply tokens, including the terminator, are a look
+    or a move.
     """
     enc = tokenizer(
         text, add_special_tokens=False, return_offsets_mapping=True,
@@ -197,7 +249,10 @@ def _reply_cap(tokenizer: Any, reply_positions: int) -> int:
     lines = list(_S2_LOOK_LINES) + list(_S2_MOVE_LINES)
     phrases = ["the gold", "the exit", "the exit on the bottom wall"]
     phrases.extend(gold_region_phrases())
-    lines.extend(_begin_reply(phrase) for phrase in phrases)
+    phrases.append("the upper-middle gold, further right")
+    for phrase in phrases:
+        lines.append(_begin_reply(phrase, "look"))
+        lines.append(_begin_reply(phrase, "move"))
     longest = 0
     for line in lines:
         n = len(tokenizer(line, add_special_tokens=False)["input_ids"])
@@ -599,32 +654,27 @@ class Trainer:
             self.phrase_ids[phrase] = found
         return found
 
-    def _pick_begin_target(
+    def _begin_targets(
         self, settings: dict,
-    ) -> tuple[str, str, tuple[float, float]]:
-        """One gold, or one exit when the board has no gold.
+    ) -> list[tuple[str, str, tuple[float, float]]]:
+        """Every gold, or every exit when the board has no gold.
 
-        Several golds: one at random, named the way the notepad names
-        them (``the gold`` when there is one, otherwise the region
-        phrase). Two golds that share a region are still a gold; the
-        phrase is that region.
+        The point stored with each phrase is that gold's coordinate.
+        Corners are not targets. A shared region is split by
+        ``_separate_gold_phrases``.
         """
         raw = settings.get("gold") or []
-        named = [
-            item for item in _targets_on_board(settings) if item[0] == "gold"
-        ]
-        if named:
-            return self.rng.choice(named)
         if raw:
-            spot = self.rng.choice(raw)
-            x, y = float(spot[0]), float(spot[1])
-            return ("gold", _gold_phrase(x, y), (x, y))
-        exits = [
-            item for item in _targets_on_board(settings) if item[0] == "exit"
-        ]
+            return [
+                ("gold", phrase, point)
+                for phrase, point in _separate_gold_phrases([
+                    (float(spot[0]), float(spot[1])) for spot in raw
+                ])
+            ]
+        exits = [item for item in _targets_on_board(settings) if item[0] == "exit"]
         if not exits:
             raise RuntimeError("begin session has no gold and no exit")
-        return self.rng.choice(exits)
+        return exits
 
     def _write_board(self, raw: dict, bench: bool) -> tuple[Path, str | None, int]:
         assert self.tmp is not None
@@ -644,36 +694,50 @@ class Trainer:
     def _encode_begin(
         self, raw: dict, path: Path, kept: str | None, index: int, bench: bool,
     ) -> dict[str, Any]:
-        """One teacher-forced REMEMBER reply. The other K slots are duplicates."""
+        """One stem, one look and one move reply per gold.
+
+        The picture is the shared stem, so stage A records it once.
+        Spare slots are duplicates of the last reply and are not sampled.
+        """
         assert self.collator is not None and self.tokenizer is not None
         settings = raw["settings"]
-        cand_kind, phrase, point = self._pick_begin_target(settings)
         agent = (float(settings["agent_x"]), float(settings["agent_y"]))
-        reply = _begin_reply(phrase)
-        close = _close_content_index(self.tokenizer, reply)
         notepad = format_notepad([])
-        example = TrainingExample(
-            messages=beginning_messages(str(path), notepad),
-            target_text=reply,
-            loss="ce",
-            source="s2_localizer",
-            meta={"coords": _coords("look", agent, point)},
-        )
-        coords = _coords("look", agent, point)
-        real = {
-            "kind": "look",
-            "phrase": phrase,
-            "point": list(point),
-            "candidate_kind": cand_kind,
-            "question_kind": "beginning",
-            "question": S2_BEGINNING_USER,
-            "coords": coords,
-            "dup": False,
-        }
-        questions = [real]
-        while len(questions) < self.args.questions_per_image:
-            questions.append({**real, "dup": True})
-        built = self.collator.build(example)
+        messages = beginning_messages(str(path), notepad)
+        k = self.args.questions_per_image
+        questions: list[dict[str, Any]] = []
+        builds = []
+        for cand_kind, phrase, point in self._begin_targets(settings):
+            if len(questions) + 2 > k:
+                break
+            for kind in ("look", "move"):
+                reply = _begin_reply(phrase, kind)
+                coords = _coords(kind, agent, point)
+                builds.append(self.collator.build(TrainingExample(
+                    messages=messages,
+                    target_text=reply,
+                    loss="ce",
+                    source="s2_localizer",
+                    meta={"coords": coords},
+                )))
+                questions.append({
+                    "kind": kind,
+                    "phrase": phrase,
+                    "point": list(point),
+                    "candidate_kind": cand_kind,
+                    "question_kind": "beginning",
+                    "question": S2_BEGINNING_USER,
+                    "coords": coords,
+                    "dup": False,
+                    "close_reply": _close_content_index(self.tokenizer, reply),
+                })
+        if len(questions) < 2:
+            raise RuntimeError(
+                f"a beginning needs a look and a move, got {len(questions)}"
+            )
+        while len(questions) < k:
+            questions.append({**questions[-1], "dup": True})
+            builds.append(builds[-1])
         path.unlink(missing_ok=True)
         if not bench:
             _append_jsonl(self.labels_path, {
@@ -686,11 +750,10 @@ class Trainer:
                 "saved_image": kept,
             })
         return {
-            "builds": [built],
+            "builds": builds,
             "questions": questions,
             "index": index,
             "begin": True,
-            "close_reply": close,
         }
 
     def _encode_image(self, bench: bool) -> dict[str, Any]:
@@ -796,12 +859,13 @@ class Trainer:
                     f"stage-A split {split} does not cover the "
                     f"{self.prefix_n}-token system prefix"
                 )
-            weights = builds[0]["weights"]
-            reply = (weights[0] != 0).nonzero(as_tuple=False).flatten()
-            if reply.numel() == 0 or int(reply[0]) < split:
-                raise RuntimeError(
-                    "reply tokens are inside the shared stem; use --single-stage"
-                )
+            for build in builds:
+                reply = (build["weights"][0] != 0).nonzero(as_tuple=False).flatten()
+                if reply.numel() == 0 or int(reply[-1]) < split:
+                    raise RuntimeError(
+                        "reply does not extend past the shared stem; "
+                        "use --single-stage"
+                    )
             splits.append(split)
             stems.append(ids[0][0, :split])
             masks_src.append(builds[0]["model_inputs"])
@@ -950,8 +1014,15 @@ class Trainer:
         image: dict[str, Any],
         split: int,
         hidden_rows: torch.Tensor,
+        stem_hidden: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """``hidden_rows [K, T, H]`` -> queries ``[K, R, H]``, valid ``[K, R]``."""
+        """Reply states for one image.
+
+        ``hidden_rows`` is stage B, ``[K, T, H]``. Tokens of the reply
+        that sit in the shared stem are taken from ``stem_hidden``, the
+        stage-A row. A look and a move that share ``[REMEMBER ...]``
+        read that bracket from the one stage-A pass.
+        """
         k = self.args.questions_per_image
         queries = torch.zeros(
             k, self.r_max, self.hidden, dtype=torch.bfloat16, device=self.device,
@@ -963,19 +1034,34 @@ class Trainer:
             reply = (weights != 0).nonzero(as_tuple=False).flatten()
             if limit > 0:
                 reply = reply[:limit]
-            local = reply - split
-            if local.numel() == 0:
+            if reply.numel() == 0:
                 raise RuntimeError("question has no reply tokens")
-            if int(local[0]) < 0 or int(local[-1]) >= hidden_rows.shape[1]:
+            pre = reply[reply < split]
+            post = reply[reply >= split]
+            chunks = []
+            if int(pre.numel()):
+                local = pre - self.prefix_n
+                if int(local[0]) < 0 or int(local[-1]) >= int(stem_hidden.shape[0]):
+                    raise RuntimeError(
+                        f"shared reply positions {local[:4].tolist()} outside "
+                        f"stage A length {int(stem_hidden.shape[0])}"
+                    )
+                chunks.append(stem_hidden[local.to(stem_hidden.device)])
+            if int(post.numel()):
+                local = post - split
+                if int(local[0]) < 0 or int(local[-1]) >= int(hidden_rows.shape[1]):
+                    raise RuntimeError(
+                        f"reply positions {local[:4].tolist()} outside stage B "
+                        f"length {int(hidden_rows.shape[1])}"
+                    )
+                chunks.append(hidden_rows[q, local.to(hidden_rows.device)])
+            if not chunks:
+                raise RuntimeError("question has no reply tokens")
+            taken = torch.cat(chunks, dim=0)
+            if int(taken.shape[0]) > self.r_max:
                 raise RuntimeError(
-                    f"reply positions {local[:4].tolist()} outside stage B "
-                    f"length {hidden_rows.shape[1]}"
+                    f"reply length {int(taken.shape[0])} exceeds r_max {self.r_max}"
                 )
-            if int(local.numel()) > self.r_max:
-                raise RuntimeError(
-                    f"reply length {int(local.numel())} exceeds r_max {self.r_max}"
-                )
-            taken = hidden_rows[q, local.to(hidden_rows.device)]
             n = int(taken.shape[0])
             queries[q, :n] = taken.to(torch.bfloat16)
             valid[q, :n] = True
@@ -1014,10 +1100,12 @@ class Trainer:
             dtype=torch.bool, device=self.device,
         )
         mode = torch.zeros(k, self.r_max, dtype=torch.int8, device=self.device)
-        close = image.get("close_reply")
-        if close is not None:
-            n_valid = int(valid[0].sum())
-            mode[0, : min(int(close) + 1, n_valid)] = MODE_MID
+        for q, question in enumerate(image["questions"]):
+            close = question.get("close_reply")
+            if close is None or question.get("dup"):
+                continue
+            n_valid = int(valid[q].sum())
+            mode[q, : min(int(close) + 1, n_valid)] = MODE_MID
         if record:
             fresh = [q for q in image["questions"] if not q["dup"]]
             self.floors.update(
@@ -1049,12 +1137,11 @@ class Trainer:
         already includes the system prefix). Stage B's mask is
         ``[B*K, width + B_max]``, not ``prefix + width``.
 
-        A beginning has one reply, so its longest common prefix is the
-        whole sequence and stage B would be empty. Those images go
-        through ``_single_stage``.
+        A beginning's look and move replies share the picture and the
+        REMEMBER line up to the first token that differs. Those shared
+        reply tokens are read from stage A. The picture is forwarded
+        once.
         """
-        if any(image.get("begin") for image in images):
-            raise RuntimeError("two-stage was given a beginning image")
         inputs, splits, positions = self._stage_a_inputs(images)
         self._assert_same_prefix(inputs["input_ids"])
         width = int(inputs["input_ids"].shape[1])
@@ -1099,7 +1186,9 @@ class Trainer:
         packed = []
         for i, image in enumerate(images):
             rows = hidden_b[i * k:(i + 1) * k]
-            queries, valid = self._queries_from_hidden(image, splits[i], rows)
+            queries, valid = self._queries_from_hidden(
+                image, splits[i], rows, hidden_a[i],
+            )
             packed.append(self._pack_row(
                 image, grid[i], queries, valid, record=record,
             ))
@@ -1287,24 +1376,11 @@ class Trainer:
     def _forward_images(
         self, images: list[dict[str, Any]], *, record: bool,
     ) -> list[dict[str, Any]]:
-        """Two-stage the look/move rows. Beginnings are one reply, so single-stage."""
+        """One stage-A pass per image, including a beginning's several replies."""
         if self.args.single_stage:
             _elapsed, packed = self._single_stage(images, record=record)
             return packed
-        normal = [image for image in images if not image.get("begin")]
-        begins = [image for image in images if image.get("begin")]
-        packed: list[dict[str, Any]] = []
-        by_id: dict[int, dict[str, Any]] = {}
-        if normal:
-            _stage_a, _stage_b, rows = self._two_stage(normal, record=record)
-            for image, row in zip(normal, rows):
-                by_id[id(image)] = row
-        if begins:
-            _elapsed, rows = self._single_stage(begins, record=record)
-            for image, row in zip(begins, rows):
-                by_id[id(image)] = row
-        for image in images:
-            packed.append(by_id[id(image)])
+        _stage_a, _stage_b, packed = self._two_stage(images, record=record)
         return packed
 
     def bench_round(self, images: list[dict[str, Any]], check: bool) -> dict[str, float]:
@@ -1313,21 +1389,7 @@ class Trainer:
             stage_a, packed = self._single_stage(images, record=True)
             stage_b = 0.0
         else:
-            normal = [image for image in images if not image.get("begin")]
-            begins = [image for image in images if image.get("begin")]
-            stage_a = 0.0
-            stage_b = 0.0
-            by_id: dict[int, dict[str, Any]] = {}
-            if normal:
-                stage_a, stage_b, rows = self._two_stage(normal, record=True)
-                for image, row in zip(normal, rows):
-                    by_id[id(image)] = row
-            if begins:
-                extra, rows = self._single_stage(begins, record=True)
-                stage_a += extra
-                for image, row in zip(begins, rows):
-                    by_id[id(image)] = row
-            packed = [by_id[id(image)] for image in images]
+            stage_a, stage_b, packed = self._two_stage(images, record=True)
         if check:
             normal_pairs = [
                 (image, row) for image, row in zip(images, packed)
