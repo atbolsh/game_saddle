@@ -103,10 +103,9 @@ from training.train import (
 logger = logging.getLogger("s2_localizer")
 
 TRAINER_NAME = "s2_pretraining_localizer"
-# Placeholder until the first --bench. Steps per second of the Localizer
-# optimizer, not of the trunk. Replace with the bench's "localizer s/step"
-# inverted (1 / seconds) before trusting --cosine-steps 0.
-LOCALIZER_STEPS_PER_S = 100.0
+# An explicit --cosine-steps may differ from the image horizon by this
+# fraction. Wider than that is a different run, and it is rejected.
+_COSINE_SLACK = 0.05
 # RMS of the whole tensor. A wrong mask or a shifted grid is ~1.
 # The first bench's grid *max* was 0.053 against a query RMS well under
 # this, which is one bf16 element, not a bad gather.
@@ -143,6 +142,27 @@ def _factor(step: int, warmup: int, total: int, floor: float) -> float:
     span = max(1, total - warmup)
     progress = (step - warmup) / span
     return floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def _steps_per_image(args: argparse.Namespace) -> float:
+    """Steady-state optimizer steps per image, once the ring is full.
+
+    A pass takes ``filled * K // localizer_batch`` steps and a refill is
+    ``buffer * refill_fraction`` images. Beginnings do not change that
+    count; they only change which slots are sampled.
+    """
+    refill = max(1, math.ceil(args.buffer_images * args.refill_fraction))
+    per_epoch = max(
+        1, args.buffer_images * args.questions_per_image // args.localizer_batch,
+    )
+    return per_epoch * args.localizer_epochs_per_refill / refill
+
+
+def _image_horizon(step: int, images_seen: int, args: argparse.Namespace) -> int:
+    """Optimizer step at which ``images_seen`` reaches ``--images``."""
+    remaining = max(0, args.images - images_seen)
+    horizon = step + remaining * _steps_per_image(args)
+    return max(step + 1, int(round(horizon)))
 
 
 def _begin_reply(phrase: str) -> str:
@@ -428,13 +448,7 @@ class Trainer:
             self.r_max, self.hidden, self.device,
         )
         n_params = sum(p.numel() for p in self.localizer.parameters())
-        self.cosine_steps = self.args.cosine_steps
-        if self.cosine_steps <= 0:
-            if self.args.hours <= 0:
-                raise RuntimeError("--cosine-steps is required when --hours is 0")
-            self.cosine_steps = max(
-                1, int(self.args.hours * 3600.0 * LOCALIZER_STEPS_PER_S),
-            )
+        self.cosine_steps = self._resolve_cosine()
         warmup = int(self.cosine_steps * self.args.warmup_ratio)
         self.optimizer = torch.optim.AdamW(
             self.localizer.parameters(), lr=self.args.lr, weight_decay=0.01,
@@ -449,6 +463,13 @@ class Trainer:
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, factor)
         for _ in range(self.step):
             self.scheduler.step()
+        logger.info(
+            "cosine horizon %d warmup %d floor %.2f of lr %.3g | "
+            "step %d multiplier %.4f lr %.3g | %.3f optimizer steps/image",
+            self.cosine_steps, warmup, floor, self.args.lr,
+            self.step, factor(self.step), self._lr(),
+            _steps_per_image(self.args),
+        )
         self.tlog.write_config({
             **vars(self.args),
             "kept_layer": self.args.kept_layer,
@@ -484,6 +505,46 @@ class Trainer:
         if self.tmp is not None:
             shutil.rmtree(self.tmp, ignore_errors=True)
             self.tmp = None
+
+    def _resolve_cosine(self) -> int:
+        """Horizon in optimizer steps. An ``--images`` run derives it.
+
+        A steps-per-second constant is not a horizon. ``--cosine-steps``
+        may only name a value within ``_COSINE_SLACK`` of the derived one.
+        ``--bench`` does not train to the cap.
+        """
+        if self.args.bench:
+            return max(1, self.args.cosine_steps)
+        derived = 0
+        if self.args.images > 0:
+            derived = _image_horizon(self.step, self.images_seen, self.args)
+        chosen = self.args.cosine_steps
+        if chosen <= 0:
+            if derived:
+                if self.args.hours > 0:
+                    logger.info(
+                        "cosine follows the --images horizon %d; "
+                        "--hours %.2f may stop the run before the floor",
+                        derived, self.args.hours,
+                    )
+                return derived
+            raise RuntimeError(
+                "--cosine-steps is required. This run has no --images cap, "
+                "so the horizon cannot be derived from the refill arithmetic. "
+                "Do not substitute a steps-per-second guess."
+            )
+        if derived:
+            slack = abs(chosen - derived) / derived
+            if slack > _COSINE_SLACK:
+                rate = _steps_per_image(self.args)
+                raise RuntimeError(
+                    f"--cosine-steps {chosen} is not this run's length. "
+                    f"{self.args.images} images, {self.images_seen} already seen, "
+                    f"step {self.step}, {rate:.3f} optimizer steps/image "
+                    f"→ horizon {derived}. Omit --cosine-steps, or pass {derived}. "
+                    "A short horizon parks the LR at the floor for the rest of the run."
+                )
+        return chosen
 
     def _resume_path(self, name: str) -> Path:
         """``weights/localizer/<name>`` first, then the old ``weights/s2/<name>``."""
@@ -1770,7 +1831,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--lr-floor", type=float, default=0.1)
     p.add_argument("--warmup-ratio", type=float, default=0.03)
-    p.add_argument("--cosine-steps", type=int, default=0)
+    p.add_argument(
+        "--cosine-steps", type=int, default=0,
+        help="Optimizer steps from step 0 until the LR floor. "
+             "0 derives this from --images. A value that misses that "
+             "horizon is rejected. Past the horizon the LR stays at the floor.",
+    )
     p.add_argument("--cell-ce-weight", type=float, default=0.5)
     p.add_argument("--single-stage", action="store_true")
     p.add_argument("--save-steps", type=int, default=2000)
