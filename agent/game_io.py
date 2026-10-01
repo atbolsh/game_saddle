@@ -578,6 +578,7 @@ def new_multi_gold_game(
     opening: str = "require",
     min_gold_separation: float = 0.15,
     min_gold_distance: float = MIN_GOLD_DISTANCE,
+    require_target: bool = False,
 ) -> discreteGame:
     """A room that may hold 0–3 golds and may or may not have a boundary
     opening. ``new_bare_game`` is untouched; this factory is the multi-gold
@@ -589,6 +590,10 @@ def new_multi_gold_game(
     sit at least ``min_gold_distance`` from the agent and
     ``min_gold_separation`` from each other. Does NOT route through
     ``random_bare_settings`` (that function indexes ``gold[0]``).
+
+    ``require_target`` rejects a board that has neither a gold nor an
+    opening, before the game object (and its picture) is built. Default
+    off, so existing callers still receive sealed empty rooms.
     """
     if opening not in ("require", "forbid", "any"):
         raise ValueError(
@@ -632,6 +637,8 @@ def new_multi_gold_game(
             golds.append(found)
         if not placed:
             continue
+        if require_target and not golds and not openings:
+            continue
         settings = Settings(
             gameSize=gameSize,
             agent_r=engine.typical_agent_r,
@@ -646,7 +653,8 @@ def new_multi_gold_game(
 
     raise ValueError(
         f"new_multi_gold_game: no board matched n_gold={n_gold!r} "
-        f"opening={opening!r} after {_MULTI_GOLD_TRIES} tries"
+        f"opening={opening!r} require_target={require_target} "
+        f"after {_MULTI_GOLD_TRIES} tries"
     )
 
 

@@ -129,6 +129,7 @@ def render_clean_board(payload: dict) -> dict:
         gameSize=int(payload["game_size"]),
         n_gold=payload["n_gold"],
         opening="any",
+        require_target=bool(payload.get("require_target")),
     )
     frame = canonical_frame(game)
     settings = game_io.settings_to_dict(game.settings)
@@ -546,10 +547,12 @@ class BoardPump:
     """Prefetch clean boards. ``workers`` 0 renders in this process."""
 
     def __init__(self, workers: int, game_size: int,
-                 n_gold_choices: tuple[int, ...], rng: random.Random) -> None:
+                 n_gold_choices: tuple[int, ...], rng: random.Random,
+                 require_target: bool = False) -> None:
         self.game_size = game_size
         self.n_gold_choices = n_gold_choices
         self.rng = rng
+        self.require_target = require_target
         self.pool = None
         self.pending: list[Any] = []
         self.depth = 0
@@ -581,6 +584,8 @@ class BoardPump:
             "game_size": self.game_size,
             "n_gold": self.rng.choice(self.n_gold_choices),
         }
+        if self.require_target:
+            payload["require_target"] = True
         if self.pool is None:
             self.pending.append(render_clean_board(payload))
         else:

@@ -546,6 +546,7 @@ class Trainer:
         )
         self.pump = BoardPump(
             self.args.workers, CONFIG.game_size, (0, 1, 2, 3), self.rng,
+            require_target=True,
         )
         self.tmp = Path(tempfile.mkdtemp(prefix=f"loc_{self.label}_"))
         return time.perf_counter() - t0
