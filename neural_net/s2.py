@@ -415,7 +415,7 @@ class GemmaS2:
             )
             self.vl.model.eval()
         elif meta.get("gemma_base"):
-            from training.train import weights_root
+            from neural_net.paths import weights_root
 
             base = weights_root() / self.model_key / str(meta["gemma_base"])
             if not (base / "adapter_config.json").is_file():
