@@ -27,6 +27,8 @@ import logging
 import math
 import shutil
 import signal
+import subprocess
+import sys
 import tempfile
 import time
 import traceback
@@ -38,11 +40,13 @@ import torch.nn.functional as F
 
 from agent.config import CONFIG
 from agent.modes import (
+    S2_BEGINNING_USER,
     SYSTEM_PROMPT_S2,
     _S2_LOOK_LINES,
     _S2_MOVE_LINES,
     _build_game_messages,
 )
+from agent.memory import format_notepad
 from agent.model import ADAPTERS, repeat_kv_cache, spec_for
 from neural_net.coord_embed import CoordEmbedder
 from neural_net.localizer import (
@@ -66,8 +70,13 @@ from neural_net.s2_pretraining_learn_to_look import (
     _save_png,
     _system_message,
     _write_json_atomic,
+    _coords,
+    _gold_phrase,
+    _targets_on_board,
+    beginning_messages,
     board_context,
     draw_questions,
+    gold_region_phrases,
 )
 from training.image_noise import TRAINING_STRENGTH, noise_image
 from training.run_weekend import VramMonitor
@@ -107,6 +116,9 @@ _EQUIV_TOL = 0.05
 _EQUIV_MAX_TOL = 0.25
 _KIND_MOVE = {"look": 0, "move": 1}
 _KIND_CAND = {"gold": 0, "exit": 1, "corner": 2}
+MODE_FULL = 0
+MODE_MID = 1
+BEGIN_LOOK_LINE = "Confirmed. Looking at that spot."
 
 
 def _rel_err(got: torch.Tensor, ref: torch.Tensor) -> tuple[float, float]:
@@ -133,8 +145,39 @@ def _factor(step: int, warmup: int, total: int, floor: float) -> float:
     return floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
+def _begin_reply(phrase: str) -> str:
+    """The one start-of-game reply. The collator appends the terminator."""
+    return f"[REMEMBER target: {phrase}]\n{BEGIN_LOOK_LINE}"
+
+
+def _close_content_index(tokenizer: Any, text: str) -> int:
+    """Index of the target token whose text contains the closing ``]``.
+
+    ``]`` is not assumed to be its own token. The collator's offset map
+    is the span of each target token; the decode check is the same test
+    when a tokenizer returns no offsets. That token is the last midpoint
+    position. Later reply tokens, including the terminator, are a look.
+    """
+    enc = tokenizer(
+        text, add_special_tokens=False, return_offsets_mapping=True,
+    )
+    offsets = enc.get("offset_mapping") or []
+    for i, span in enumerate(offsets):
+        start, end = int(span[0]), int(span[1])
+        if "]" in text[start:end]:
+            return i
+    for i, tid in enumerate(enc["input_ids"]):
+        piece = tokenizer.decode([tid], skip_special_tokens=False)
+        if "]" in piece:
+            return i
+    raise RuntimeError(f"REMEMBER reply has no closing bracket: {text!r}")
+
+
 def _reply_cap(tokenizer: Any, reply_positions: int) -> int:
     lines = list(_S2_LOOK_LINES) + list(_S2_MOVE_LINES)
+    phrases = ["the gold", "the exit", "the exit on the bottom wall"]
+    phrases.extend(gold_region_phrases())
+    lines.extend(_begin_reply(phrase) for phrase in phrases)
     longest = 0
     for line in lines:
         n = len(tokenizer(line, add_special_tokens=False)["input_ids"])
@@ -260,6 +303,8 @@ class _Buffer:
         self.cand_kind = torch.zeros(n, k, dtype=torch.int8, device=device)
         self.phrase_id = torch.zeros(n, k, dtype=torch.int32, device=device)
         self.dup = torch.zeros(n, k, dtype=torch.bool, device=device)
+        # Per reply token: MODE_FULL or MODE_MID. A mixed minibatch reads this.
+        self.mode = torch.zeros(n, k, r_max, dtype=torch.int8, device=device)
         self.filled = 0
         self.write = 0
 
@@ -273,6 +318,7 @@ class _Buffer:
         self.cand_kind[slot] = row["cand_kind"]
         self.phrase_id[slot] = row["phrase_id"]
         self.dup[slot] = row["dup"]
+        self.mode[slot] = row["mode"]
         self.write += 1
         self.filled = min(self.n, self.filled + 1)
         return slot
@@ -288,12 +334,14 @@ class Trainer:
         self.labels_path = self.data_dir / "labels.jsonl"
         self.state_path = DATA_GAME / f"{self.label}_state.json"
         self.s2_root = weights_root() / "s2"
+        self.loc_root = weights_root() / "localizer"
         self.step = 0
         self.images_seen = 0
         self.labels_seen = 0
         self.phrase_ids: dict[str, int] = {}
         self.floors = _Floors()
         self._stop = False
+        self._signal: int | None = None
         self._floor_warned = False
         self._checked = False
         self.model = None
@@ -382,6 +430,8 @@ class Trainer:
         n_params = sum(p.numel() for p in self.localizer.parameters())
         self.cosine_steps = self.args.cosine_steps
         if self.cosine_steps <= 0:
+            if self.args.hours <= 0:
+                raise RuntimeError("--cosine-steps is required when --hours is 0")
             self.cosine_steps = max(
                 1, int(self.args.hours * 3600.0 * LOCALIZER_STEPS_PER_S),
             )
@@ -435,14 +485,22 @@ class Trainer:
             shutil.rmtree(self.tmp, ignore_errors=True)
             self.tmp = None
 
+    def _resume_path(self, name: str) -> Path:
+        """``weights/localizer/<name>`` first, then the old ``weights/s2/<name>``."""
+        for root in (self.loc_root, self.s2_root):
+            path = root / name
+            if (path / "train_meta.json").is_file():
+                return path
+        raise FileNotFoundError(
+            f"--resume-snapshot {name!r} is not under {self.loc_root} or {self.s2_root}"
+        )
+
     def _resume(self) -> None:
         name = self.args.resume_snapshot
         if not name:
             return
-        path = self.s2_root / name
+        path = self._resume_path(name)
         meta_path = path / "train_meta.json"
-        if not meta_path.is_file():
-            raise FileNotFoundError(f"--resume-snapshot missing {meta_path}")
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         if meta.get("trainer") != TRAINER_NAME:
             raise RuntimeError(
@@ -480,19 +538,35 @@ class Trainer:
             self.phrase_ids[phrase] = found
         return found
 
-    def _encode_image(self, bench: bool) -> dict[str, Any]:
-        assert self.pump is not None and self.collator is not None and self.tmp is not None
-        raw = self.pump.take()
-        settings = raw["settings"]
-        ctx = board_context(settings, self.rng)
-        k = self.args.questions_per_image
-        drawn = draw_questions(ctx, self.rng, k)
-        if not drawn:
-            raise RuntimeError("draw_questions returned nothing")
-        dups = [False] * len(drawn)
-        while len(drawn) < k:
-            drawn.append(drawn[-1])
-            dups.append(True)
+    def _pick_begin_target(
+        self, settings: dict,
+    ) -> tuple[str, str, tuple[float, float]]:
+        """One gold, or one exit when the board has no gold.
+
+        Several golds: one at random, named the way the notepad names
+        them (``the gold`` when there is one, otherwise the region
+        phrase). Two golds that share a region are still a gold; the
+        phrase is that region.
+        """
+        raw = settings.get("gold") or []
+        named = [
+            item for item in _targets_on_board(settings) if item[0] == "gold"
+        ]
+        if named:
+            return self.rng.choice(named)
+        if raw:
+            spot = self.rng.choice(raw)
+            x, y = float(spot[0]), float(spot[1])
+            return ("gold", _gold_phrase(x, y), (x, y))
+        exits = [
+            item for item in _targets_on_board(settings) if item[0] == "exit"
+        ]
+        if not exits:
+            raise RuntimeError("begin session has no gold and no exit")
+        return self.rng.choice(exits)
+
+    def _write_board(self, raw: dict, bench: bool) -> tuple[Path, str | None, int]:
+        assert self.tmp is not None
         index = self.images_seen
         path = self.tmp / f"img_{index:07d}.png"
         noised = noise_image(_open_png(raw["png"]), self.rng, TRAINING_STRENGTH)
@@ -504,6 +578,76 @@ class Trainer:
             dest = self.images_dir / f"img_{index:07d}.png"
             _save_png(noised, dest)
             kept = str(dest)
+        return path, kept, index
+
+    def _encode_begin(
+        self, raw: dict, path: Path, kept: str | None, index: int, bench: bool,
+    ) -> dict[str, Any]:
+        """One teacher-forced REMEMBER reply. The other K slots are duplicates."""
+        assert self.collator is not None and self.tokenizer is not None
+        settings = raw["settings"]
+        cand_kind, phrase, point = self._pick_begin_target(settings)
+        agent = (float(settings["agent_x"]), float(settings["agent_y"]))
+        reply = _begin_reply(phrase)
+        close = _close_content_index(self.tokenizer, reply)
+        notepad = format_notepad([])
+        example = TrainingExample(
+            messages=beginning_messages(str(path), notepad),
+            target_text=reply,
+            loss="ce",
+            source="s2_localizer",
+            meta={"coords": _coords("look", agent, point)},
+        )
+        coords = _coords("look", agent, point)
+        real = {
+            "kind": "look",
+            "phrase": phrase,
+            "point": list(point),
+            "candidate_kind": cand_kind,
+            "question_kind": "beginning",
+            "question": S2_BEGINNING_USER,
+            "coords": coords,
+            "dup": False,
+        }
+        questions = [real]
+        while len(questions) < self.args.questions_per_image:
+            questions.append({**real, "dup": True})
+        built = self.collator.build(example)
+        path.unlink(missing_ok=True)
+        if not bench:
+            _append_jsonl(self.labels_path, {
+                "image_index": index,
+                "settings": settings,
+                "notepad": notepad,
+                "context": "",
+                "beginning": True,
+                "questions": questions,
+                "saved_image": kept,
+            })
+        return {
+            "builds": [built],
+            "questions": questions,
+            "index": index,
+            "begin": True,
+            "close_reply": close,
+        }
+
+    def _encode_image(self, bench: bool) -> dict[str, Any]:
+        assert self.pump is not None and self.collator is not None and self.tmp is not None
+        raw = self.pump.take()
+        settings = raw["settings"]
+        path, kept, index = self._write_board(raw, bench)
+        if self.rng.random() < self.args.begin_fraction:
+            return self._encode_begin(raw, path, kept, index, bench)
+        ctx = board_context(settings, self.rng)
+        k = self.args.questions_per_image
+        drawn = draw_questions(ctx, self.rng, k)
+        if not drawn:
+            raise RuntimeError("draw_questions returned nothing")
+        dups = [False] * len(drawn)
+        while len(drawn) < k:
+            drawn.append(drawn[-1])
+            dups.append(True)
         builds = []
         questions = []
         for item, is_dup in zip(drawn, dups):
@@ -542,7 +686,13 @@ class Trainer:
                 "questions": questions,
                 "saved_image": kept,
             })
-        return {"builds": builds, "questions": questions, "index": index}
+        return {
+            "builds": builds,
+            "questions": questions,
+            "index": index,
+            "begin": False,
+            "close_reply": None,
+        }
 
     def _heartbeat(self, stage: str) -> None:
         assert self.tlog is not None
@@ -802,6 +952,11 @@ class Trainer:
             [bool(q["dup"]) for q in image["questions"]],
             dtype=torch.bool, device=self.device,
         )
+        mode = torch.zeros(k, self.r_max, dtype=torch.int8, device=self.device)
+        close = image.get("close_reply")
+        if close is not None:
+            n_valid = int(valid[0].sum())
+            mode[0, : min(int(close) + 1, n_valid)] = MODE_MID
         if record:
             fresh = [q for q in image["questions"] if not q["dup"]]
             self.floors.update(
@@ -819,6 +974,7 @@ class Trainer:
             "cand_kind": cand,
             "phrase_id": phrases,
             "dup": dup,
+            "mode": mode,
         }
 
     def _two_stage(
@@ -831,7 +987,13 @@ class Trainer:
         different tokens. The cached length is that padded width (it
         already includes the system prefix). Stage B's mask is
         ``[B*K, width + B_max]``, not ``prefix + width``.
+
+        A beginning has one reply, so its longest common prefix is the
+        whole sequence and stage B would be empty. Those images go
+        through ``_single_stage``.
         """
+        if any(image.get("begin") for image in images):
+            raise RuntimeError("two-stage was given a beginning image")
         inputs, splits, positions = self._stage_a_inputs(images)
         self._assert_same_prefix(inputs["input_ids"])
         width = int(inputs["input_ids"].shape[1])
@@ -959,14 +1121,16 @@ class Trainer:
         k = self.args.questions_per_image
         packed = []
         limit = self.args.reply_positions
-        for i, image in enumerate(images):
-            rows = hidden[i * k:(i + 1) * k]
-            wrows = weights[i * k:(i + 1) * k]
+        offset = 0
+        for image in images:
+            n_build = len(image["builds"])
+            rows = hidden[offset:offset + n_build]
+            wrows = weights[offset:offset + n_build]
             queries = torch.zeros(
                 k, self.r_max, self.hidden, dtype=torch.bfloat16, device=self.device,
             )
             valid = torch.zeros(k, self.r_max, dtype=torch.bool, device=self.device)
-            for q in range(k):
+            for q in range(n_build):
                 reply = (wrows[q] != 0).nonzero(as_tuple=False).flatten() - self.prefix_n
                 if limit > 0:
                     reply = reply[:limit]
@@ -985,8 +1149,13 @@ class Trainer:
                 queries[q, :n] = taken.to(torch.bfloat16)
                 valid[q, :n] = True
             packed.append(self._pack_row(
-                image, grids[i * k], queries, valid, record=record,
+                image, grids[offset], queries, valid, record=record,
             ))
+            offset += n_build
+        if offset != int(hidden.shape[0]):
+            raise RuntimeError(
+                f"single-stage consumed {offset} rows of a {int(hidden.shape[0])}-row batch"
+            )
         return elapsed, packed
 
     def _equivalence(self, image: dict[str, Any], two: dict[str, Any]) -> None:
@@ -1041,16 +1210,41 @@ class Trainer:
                 return
             take = min(batch, remaining)
             images = [self._encode_image(bench) for _ in range(take)]
-            if self.args.single_stage:
-                _elapsed, packed = self._single_stage(images, record=True)
-            else:
-                _stage_a, _stage_b, packed = self._two_stage(images, record=True)
+            packed = self._forward_images(images, record=True)
             if check and not self._checked and not self.args.single_stage:
-                self._equivalence(images[0], packed[0])
-                self._checked = True
+                normal = [
+                    (image, row) for image, row in zip(images, packed)
+                    if not image.get("begin")
+                ]
+                if normal:
+                    self._equivalence(normal[0][0], normal[0][1])
+                    self._checked = True
             for row in packed:
                 self.buffer.add(row)
             remaining -= take
+
+    def _forward_images(
+        self, images: list[dict[str, Any]], *, record: bool,
+    ) -> list[dict[str, Any]]:
+        """Two-stage the look/move rows. Beginnings are one reply, so single-stage."""
+        if self.args.single_stage:
+            _elapsed, packed = self._single_stage(images, record=record)
+            return packed
+        normal = [image for image in images if not image.get("begin")]
+        begins = [image for image in images if image.get("begin")]
+        packed: list[dict[str, Any]] = []
+        by_id: dict[int, dict[str, Any]] = {}
+        if normal:
+            _stage_a, _stage_b, rows = self._two_stage(normal, record=record)
+            for image, row in zip(normal, rows):
+                by_id[id(image)] = row
+        if begins:
+            _elapsed, rows = self._single_stage(begins, record=record)
+            for image, row in zip(begins, rows):
+                by_id[id(image)] = row
+        for image in images:
+            packed.append(by_id[id(image)])
+        return packed
 
     def bench_round(self, images: list[dict[str, Any]], check: bool) -> dict[str, float]:
         assert self.buffer is not None
@@ -1058,10 +1252,29 @@ class Trainer:
             stage_a, packed = self._single_stage(images, record=True)
             stage_b = 0.0
         else:
-            stage_a, stage_b, packed = self._two_stage(images, record=True)
+            normal = [image for image in images if not image.get("begin")]
+            begins = [image for image in images if image.get("begin")]
+            stage_a = 0.0
+            stage_b = 0.0
+            by_id: dict[int, dict[str, Any]] = {}
+            if normal:
+                stage_a, stage_b, rows = self._two_stage(normal, record=True)
+                for image, row in zip(normal, rows):
+                    by_id[id(image)] = row
+            if begins:
+                extra, rows = self._single_stage(begins, record=True)
+                stage_a += extra
+                for image, row in zip(begins, rows):
+                    by_id[id(image)] = row
+            packed = [by_id[id(image)] for image in images]
         if check:
-            self._equivalence(images[0], packed[0])
-            self._checked = True
+            normal_pairs = [
+                (image, row) for image, row in zip(images, packed)
+                if not image.get("begin")
+            ]
+            if normal_pairs:
+                self._equivalence(normal_pairs[0][0], normal_pairs[0][1])
+                self._checked = True
         for row in packed:
             self.buffer.add(row)
         n_labels = sum(
@@ -1135,13 +1348,45 @@ class Trainer:
         pred = pred[:, 0, :]
         logits = cell_logits[:, 0]
         err = (pred - labels).pow(2)
+        mode = self.buffer.mode[ii, qq, rr]
+        full = mode == MODE_FULL
+        mid = mode == MODE_MID
+        if int((full | mid).sum()) != n:
+            raise RuntimeError("a reply token is neither a full look nor a midpoint")
         l2_s = err[:, 0:2].mean()
-        l2_v = err[:, 2:4].mean()
-        l2_vbar = err[:, 4:6].mean()
+        parts: list[torch.Tensor] = []
+        weights: list[int] = []
+        if bool(full.any()):
+            l2_v = err[full][:, 2:4].mean()
+            l2_vbar = err[full][:, 4:6].mean()
+            look_l2 = (err[full][:, 0:2].mean() + l2_v + l2_vbar) / 3
+            parts.append(look_l2)
+            weights.append(int(full.sum()))
+        else:
+            l2_v = err.new_zeros(())
+            l2_vbar = err.new_zeros(())
+            look_l2 = err.new_zeros(())
+        if bool(mid.any()):
+            midpoint = (pred[mid, 2:4] + pred[mid, 4:6]) * 0.5
+            mid_l2 = (midpoint - labels[mid, 0:2]).pow(2).mean()
+            mid_term = (err[mid][:, 0:2].mean() + mid_l2) / 2
+            parts.append(mid_term)
+            weights.append(int(mid.sum()))
+        else:
+            mid_l2 = err.new_zeros(())
+        if not parts:
+            raise RuntimeError("optimizer step has no reply tokens")
+        coord = parts[0] * weights[0]
+        for term, count in zip(parts[1:], weights[1:]):
+            coord = coord + term * count
+        coord = coord / float(sum(weights))
         ces = []
         accs = []
         for head, sl in enumerate((slice(0, 2), slice(2, 4), slice(4, 6))):
-            target = cell_index(labels[:, sl])
+            target = cell_index(labels[:, sl]).clone()
+            if head > 0:
+                target = target.clone()
+                target[mid] = -1
             valid = target != -1
             if bool(valid.any()):
                 ces.append(F.cross_entropy(
@@ -1157,7 +1402,7 @@ class Trainer:
         if not ces:
             raise RuntimeError("cell CE has no valid targets")
         cell_ce = torch.stack(ces).mean()
-        loss = (l2_s + l2_v + l2_vbar) / 3 + self.args.cell_ce_weight * cell_ce
+        loss = coord + self.args.cell_ce_weight * cell_ce
         if not torch.isfinite(loss):
             raise RuntimeError(f"non-finite localizer loss {float(loss)}")
         self.optimizer.zero_grad(set_to_none=True)
@@ -1172,10 +1417,14 @@ class Trainer:
             self._floor_warned = True
             self.tlog.event("cosine_floor", step=self.step, lr=self._lr())
             logger.warning("cosine floor reached at step %d; lr stays at the floor", self.step)
+        err_v = err[:, 2:4].mean(dim=-1).detach()
+        err_v = err_v.clone()
+        err_v[mid] = float("nan")
         record = self._metrics(
             loss, l2_s, l2_v, l2_vbar, cell_ce, accs,
-            err[:, 2:4].mean(dim=-1).detach(),
-            labels, ii, qq, float(grad_norm),
+            err_v, labels, ii, qq, float(grad_norm),
+            mid_l2=mid_l2, look_l2=look_l2,
+            report_full=bool(full.any()), report_mid=bool(mid.any()),
         )
         self.tlog.last_step(record)
         _append_jsonl(self.tlog.run_dir / "metrics.jsonl", record)
@@ -1204,6 +1453,11 @@ class Trainer:
         ii: torch.Tensor,
         qq: torch.Tensor,
         grad_norm: float,
+        *,
+        mid_l2: torch.Tensor,
+        look_l2: torch.Tensor,
+        report_full: bool,
+        report_mid: bool,
     ) -> dict[str, Any]:
         assert self.buffer is not None and self.coord_embed is not None
         move = self.buffer.move_kind[ii, qq].tolist()
@@ -1220,7 +1474,11 @@ class Trainer:
             mask = [c == code for c in cand]
             if any(mask):
                 sel = err_v[[i for i, flag in enumerate(mask) if flag]]
-                by_kind[name] = math.sqrt(float(sel.mean()))
+                sel = sel[torch.isfinite(sel)]
+                if int(sel.numel()):
+                    by_kind[name] = math.sqrt(float(sel.mean()))
+                else:
+                    by_kind[name] = None
             else:
                 by_kind[name] = None
         return {
@@ -1229,11 +1487,15 @@ class Trainer:
             "labels_seen": self.labels_seen,
             "loss": float(loss.detach()),
             "l2_s": float(l2_s.detach()),
-            "l2_v": float(l2_v.detach()),
-            "l2_vbar": float(l2_vbar.detach()),
+            "l2_v": float(l2_v.detach()) if report_full else float("nan"),
+            "l2_vbar": float(l2_vbar.detach()) if report_full else float("nan"),
             "rms_s": math.sqrt(max(0.0, float(l2_s.detach()))),
-            "rms_v": math.sqrt(max(0.0, float(l2_v.detach()))),
-            "rms_vbar": math.sqrt(max(0.0, float(l2_vbar.detach()))),
+            "rms_v": math.sqrt(max(0.0, float(l2_v.detach()))) if report_full else float("nan"),
+            "rms_vbar": (
+                math.sqrt(max(0.0, float(l2_vbar.detach()))) if report_full else float("nan")
+            ),
+            "mid_l2": float(mid_l2.detach()) if report_mid else float("nan"),
+            "look_l2": float(look_l2.detach()) if report_full else float("nan"),
             "rms_v_gold": by_kind["gold"],
             "rms_v_exit": by_kind["exit"],
             "rms_v_corner": by_kind["corner"],
@@ -1265,6 +1527,7 @@ class Trainer:
             "labels_seen": self.labels_seen,
             "phrase_ids": self.phrase_ids,
             "reason": reason,
+            "signal": self._signal,
         }
         blob = {
             "state_dict": self.localizer.state_dict(),
@@ -1276,8 +1539,8 @@ class Trainer:
             "hidden_size": self.localizer.hidden_size,
         }
         for directory in (
-            self.s2_root / f"{self.label}_step_{self.step:06d}",
-            self.s2_root / f"{self.label}_last",
+            self.loc_root / f"{self.label}_step_{self.step:06d}",
+            self.loc_root / f"{self.label}_last",
         ):
             directory.mkdir(parents=True, exist_ok=True)
             torch.save(blob, directory / "localizer.pt")
@@ -1298,25 +1561,45 @@ class Trainer:
 
     def _on_signal(self, signum: int, _frame: Any) -> None:
         self._stop = True
+        self._signal = int(signum)
         logger.warning("signal %s; will save at the next step boundary", signum)
+
+    def _running(self, deadline: float | None) -> bool:
+        if self._stop:
+            return False
+        if deadline is not None and time.perf_counter() >= deadline:
+            return False
+        cap = self.args.images
+        if cap > 0 and self.images_seen >= cap:
+            return False
+        return True
 
     def train(self) -> None:
         signal.signal(signal.SIGINT, self._on_signal)
         signal.signal(signal.SIGTERM, self._on_signal)
-        deadline = time.perf_counter() + self.args.hours * 3600.0
+        deadline = None
+        if self.args.hours > 0:
+            deadline = time.perf_counter() + self.args.hours * 3600.0
         refill = max(1, math.ceil(self.args.buffer_images * self.args.refill_fraction))
         epochs = self.args.localizer_epochs_per_refill
         logger.info(
-            "train hours=%.2f refill_images=%d epochs_per_refill=%d cosine_steps=%d",
-            self.args.hours, refill, epochs, self.cosine_steps,
+            "train hours=%.2f images=%d refill_images=%d epochs_per_refill=%d cosine_steps=%d",
+            self.args.hours, self.args.images, refill, epochs, self.cosine_steps,
         )
-        while not self._stop and time.perf_counter() < deadline:
+        while self._running(deadline):
             self.ingest(refill, bench=False, check=not self._checked)
             for _epoch in range(epochs):
-                if self._stop or time.perf_counter() >= deadline:
+                if self._stop:
+                    break
+                if deadline is not None and time.perf_counter() >= deadline:
                     break
                 self.localizer_pass()
-        reason = "signal" if self._stop else "hours"
+        if self._stop:
+            reason = "signal"
+        elif self.args.images > 0 and self.images_seen >= self.args.images:
+            reason = "images"
+        else:
+            reason = "hours"
         self.save(reason)
 
     def bench(self, rounds: int) -> None:
@@ -1442,8 +1725,10 @@ def _format_log(record: dict[str, Any]) -> str:
 
     return (
         f"step {record['step']} loc "
-        f"rms s {record['rms_s']:.3f} v {record['rms_v']:.3f} "
-        f"vbar {record['rms_vbar']:.3f} | "
+        f"rms s {num(record['rms_s'], '.3f')} v {num(record['rms_v'], '.3f')} "
+        f"vbar {num(record['rms_vbar'], '.3f')} | "
+        f"mid {num(record.get('mid_l2'), '.4f')} "
+        f"look {num(record.get('look_l2'), '.4f')} | "
         f"v by kind gold {kind(record['rms_v_gold'])} "
         f"exit {kind(record['rms_v_exit'])} "
         f"corner {kind(record['rms_v_corner'])} | "
@@ -1467,13 +1752,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--gemma-base", required=True)
     p.add_argument("--label", required=True)
-    p.add_argument("--hours", type=float, default=18.0)
+    p.add_argument("--hours", type=float, default=18.0,
+                   help="Wall-clock cap. 0 disables the clock.")
+    p.add_argument("--images", type=int, default=0,
+                   help="Stop when images_seen reaches N. 0 disables the cap.")
+    p.add_argument("--begin-fraction", type=float, default=0.25,
+                   help="Chance an image is a teacher-forced start of game.")
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--kept-layer", type=int, default=KEPT_LAYER)
-    p.add_argument("--images-per-batch", type=int, default=16)
+    p.add_argument("--images-per-batch", type=int, default=8)
     p.add_argument("--questions-per-image", type=int, default=6)
     p.add_argument("--reply-positions", type=int, default=0)
-    p.add_argument("--buffer-images", type=int, default=4096)
+    p.add_argument("--buffer-images", type=int, default=2048)
     p.add_argument("--refill-fraction", type=float, default=0.125)
     p.add_argument("--localizer-batch", type=int, default=256)
     p.add_argument("--localizer-epochs-per-refill", type=int, default=4)
@@ -1490,16 +1780,126 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--resume-snapshot", default=None)
     p.add_argument("--bench", type=int, default=0)
+    p.add_argument(
+        "--no-supervise", action="store_true",
+        help="Run the trainer in this process. The default parent records the child's death.",
+    )
     return p
 
 
+def _argv_value(argv: list[str], name: str) -> str | None:
+    for i, arg in enumerate(argv):
+        if arg == name and i + 1 < len(argv):
+            return argv[i + 1]
+        if arg.startswith(name + "="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def _dmesg_oom_lines(pid: int) -> list[str]:
+    """Host lines that name an OOM kill. Prefer lines that name ``pid``."""
+    try:
+        proc = subprocess.run(
+            ["dmesg", "-T"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [f"dmesg failed: {exc}"]
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        return [f"dmesg exit {proc.returncode}: {err[:500]}"]
+    recent: list[str] = []
+    matched: list[str] = []
+    needle = str(pid)
+    for line in proc.stdout.splitlines():
+        low = line.lower()
+        if "out of memory" not in low and "killed process" not in low:
+            continue
+        recent.append(line)
+        if needle in line:
+            matched.append(line)
+    if matched:
+        return matched[-40:]
+    return recent[-40:]
+
+
+def _signal_name(rc: int) -> str | None:
+    if rc < 0:
+        try:
+            return signal.Signals(-rc).name
+        except ValueError:
+            return f"SIG{-rc}"
+    if rc > 128:
+        try:
+            return signal.Signals(rc - 128).name
+        except ValueError:
+            return None
+    return None
+
+
+def _supervise(argv: list[str]) -> int:
+    """Run the trainer as a child and record how it died.
+
+    A SIGKILL cannot be logged from inside the trainer. This parent
+    outlives it and writes ``logs/train_<label>_supervise.json``.
+    """
+    label = _argv_value(argv, "--label") or "localizer"
+    child_argv = list(argv)
+    if "--no-supervise" not in child_argv:
+        child_argv.append("--no-supervise")
+    cmd = [sys.executable, "-u", "-m", "neural_net.s2_pretraining_localizer", *child_argv]
+    proc = subprocess.Popen(cmd)
+    forwarded: list[int] = []
+
+    def _forward(signum: int, _frame: Any) -> None:
+        forwarded.append(int(signum))
+        if proc.poll() is None:
+            proc.send_signal(signum)
+
+    signal.signal(signal.SIGTERM, _forward)
+    signal.signal(signal.SIGINT, _forward)
+    rc = proc.wait()
+    name = _signal_name(rc)
+    if name is None and forwarded:
+        try:
+            name = signal.Signals(forwarded[-1]).name
+        except ValueError:
+            name = f"SIG{forwarded[-1]}"
+    record = {
+        "label": label,
+        "pid": proc.pid,
+        "exit_code": rc,
+        "signal": name,
+        "dmesg": _dmesg_oom_lines(proc.pid),
+    }
+    out = Path("logs") / f"train_{label}_supervise.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    _write_json_atomic(out, record)
+    print(
+        f"supervise: child {proc.pid} exit {rc} signal {name} -> {out}",
+        flush=True,
+    )
+    return rc if rc >= 0 else 128 + (-rc)
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    if type(exc).__name__ == "OutOfMemoryError":
+        return True
+    text = str(exc).lower()
+    return "out of memory" in text and "cuda" in text
+
+
 def main() -> None:
-    configure_logging()
     args = _build_parser().parse_args()
+    if not args.no_supervise and not args.bench:
+        raise SystemExit(_supervise(sys.argv[1:]))
+    configure_logging()
     if args.images_per_batch < 1 or args.questions_per_image < 1:
         raise SystemExit("batch sizes must be >= 1")
     if args.buffer_images < 1 or args.localizer_batch < 1:
         raise SystemExit("buffer and localizer batch must be >= 1")
+    if not 0.0 <= args.begin_fraction <= 1.0:
+        raise SystemExit("--begin-fraction must be between 0 and 1")
     trainer = Trainer(args)
     try:
         load_s = trainer.load()
@@ -1510,7 +1910,12 @@ def main() -> None:
         trainer.train()
     except BaseException as exc:
         if trainer.tlog is not None and not isinstance(exc, KeyboardInterrupt):
-            trainer.tlog.record_crash(exc, step=trainer.step)
+            oom = _is_cuda_oom(exc)
+            trainer.tlog.record_crash(
+                exc, step=trainer.step, **({"tag": "cuda_oom"} if oom else {}),
+            )
+            if oom:
+                trainer.tlog.event("cuda_oom", step=trainer.step, error=str(exc)[:500])
         if (
             not args.bench
             and trainer.localizer is not None
@@ -1522,6 +1927,7 @@ def main() -> None:
                 logger.error("crash snapshot failed\n%s", traceback.format_exc())
         if isinstance(exc, KeyboardInterrupt):
             if not args.bench and trainer.localizer is not None:
+                trainer._signal = int(signal.SIGINT)
                 trainer.save("signal")
         raise
     finally:

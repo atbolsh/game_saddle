@@ -320,6 +320,21 @@ class GemmaS2:
         )
         self.coord_embed.save(path / "coord_embed.pt")
 
+    def load_localizer(self, path: str | Path) -> GemmaS2:
+        """Read the Localizer bundle onto an already-loaded trunk.
+
+        The directory holds ``localizer.pt``, ``coord_embed.pt``, and
+        ``train_meta.json``. Gemma weights are not in this directory;
+        ``load_snapshot`` chooses the trunk first, then calls this.
+        """
+        self._require_model()
+        path = Path(path)
+        for name in ("localizer.pt", "coord_embed.pt", "train_meta.json"):
+            if not (path / name).is_file():
+                raise FileNotFoundError(f"load_localizer: missing {path / name}")
+        self._load_readout_files(path)
+        return self
+
     def _load_readout_files(self, path: Path) -> None:
         blob = torch.load(path / "localizer.pt", map_location="cpu", weights_only=True)
         self.kept_layer = int(blob["kept_layer"])
@@ -357,7 +372,7 @@ class GemmaS2:
     def load_all(self, path: str | Path) -> None:
         path = Path(path)
         self.load_gemma(path / "gemma")
-        self._load_readout_files(path)
+        self.load_localizer(path)
 
     def save_snapshot(
         self,
@@ -437,7 +452,7 @@ class GemmaS2:
                 f"load_snapshot: {path} has no gemma/, no adapter_config.json, "
                 "and train_meta.json has no gemma_base"
             )
-        self._load_readout_files(path)
+        self.load_localizer(path)
         return self
 
     def _unwrap_adapter(self) -> None:
