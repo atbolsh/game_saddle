@@ -323,9 +323,10 @@ class Probe:
                     )
                 gathered = hidden[0, hidden_index]
                 student = apply_lm_head_chunked(self.model, gathered, KD_CHUNK)
-                teacher = apply_lm_head_chunked(
-                    self.model, row.hidden.to(self.device), KD_CHUNK,
-                )
+                # The cache is bf16. This head is float32, so score in the
+                # live hidden's dtype. Storage stays bf16.
+                teacher_h = row.hidden.to(device=self.device, dtype=gathered.dtype)
+                teacher = apply_lm_head_chunked(self.model, teacher_h, KD_CHUNK)
                 probe_ce = _token_ce(student, labels)
                 kd = _soft_ce(teacher, student)
         finally:
