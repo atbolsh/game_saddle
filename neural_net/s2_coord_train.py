@@ -1,16 +1,19 @@
 """Phase-2 coord embedder: aug27 LoRA reads a frozen Fourier code.
 
-Anchors are the manifest datasets. CE sources train the dataset targets.
-KD sources match the frozen aug27 adapter with the coordinate code
-muted. The student forward has the code on, on reply tokens only.
+Each optimizer step is an anchor with probability 1/2, otherwise one
+board. The board is prefilled once (system prompt and picture together).
+Sixteen short replies are teacher-forced on that cache, then the cache
+is dropped. It is not kept for the next image: the LoRA that wrote those
+keys changes at the optimizer step.
 
-The other half of the examples are online replies about s, v, and
-v_bar. The oracle scores a single required line. A reward of 0 is
-skipped. One quarter of those slots are teacher-forced on the correct
-line so the format has a gradient before the policy emits it.
+Anchors are the manifest datasets, scored by ``weighted_loss``. CE
+sources train the dataset reply. KD sources match the frozen aug27
+adapter with the coordinate code muted. ``--rl`` replaces the board
+with the archived online sampler. The anchor coin stays.
 
-``--no-rl`` drops that half. ``--hours`` requires ``--cosine-steps``.
-Past that horizon the learning-rate multiplier stays at the floor.
+``--hours`` requires ``--cosine-steps``. Past that horizon the
+learning-rate multiplier stays at the floor. ``--bench`` loads the
+model, times four steady steps, and prints the Monday launch line.
 """
 
 from __future__ import annotations
@@ -29,14 +32,15 @@ import sys
 import tempfile
 import time
 import traceback
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import torch
 
 from agent import game_io
 from agent.config import CONFIG
-from agent.memory import format_notepad
 from agent.model import ADAPTERS, spec_for
 from agent.modes import SYSTEM_PROMPT_S2, _build_game_messages
 from neural_net.coord_embed import CoordEmbedder, resolve_magnitude
@@ -44,22 +48,20 @@ from neural_net.paths import weights_root
 from neural_net.render import canonical_frame
 from neural_net.s2 import _hidden_size, _wants_cache_position
 from neural_net.s2_coord_oracle import (
+    AXIS_MARGIN,
     KIND_HOUR,
     KIND_LEFTRIGHT,
-    KIND_LOOKING,
-    KIND_MOVING,
     KIND_UPDOWN,
-    KINDS,
     REPLY_JITTER_SIGMA,
     S_RADIUS,
     S_SIGMA,
     clock_hour,
     correct_line,
     direction_label,
+    gaze_vbar,
     hour_is_unique,
-    parse_reply,
-    reply_reward,
 )
+from neural_net.s2_coord_rl import rl_loss
 from PIL import Image
 from training.external_data import sources_from_manifest
 from training.run_weekend import VramMonitor
@@ -71,8 +73,10 @@ from training.train import (
     TrainLogger,
     TrainingExample,
     _gpu_mem_snapshot,
+    apply_lm_head_chunked,
     build_model,
     configure_logging,
+    expand_train_kv,
     load_adapter_state,
     materialize,
     resolve_terminator_id,
@@ -82,14 +86,30 @@ from training.train import (
 
 logger = logging.getLogger("s2_coord")
 
-BOOTSTRAP = 0.25
 HOLDOUT_FRACTION = 0.05
 HOLDOUT_CAP = 100
-MAX_NEW_TOKENS = 24
 COORD_LOW = -1.0
 COORD_HIGH = 2.0
 V_TRIES = 400
-NOTEPAD = [{"key": "target", "value": "the upper-left gold", "updated_round": 1}]
+BOARD_TRIES = 40
+DIRECTIONS = ("up", "down", "left", "right")
+_MONDAY = ZoneInfo("America/New_York")
+
+QUESTION_DIRECTION = (
+    "Which way are you looking? Reply with exactly one of these lines "
+    "and say nothing else:\n"
+    "Looking: up\n"
+    "Looking: down\n"
+    "Looking: left\n"
+    "Looking: right"
+)
+QUESTION_HOUR = (
+    "What hour are you looking at? Twelve o'clock is straight up, three "
+    "is straight right, six is straight down, and nine is straight left. "
+    "Reply with exactly one line and say nothing else:\n"
+    "Hour: N\n"
+    "N is an integer from 1 to 12, with no leading zero."
+)
 
 
 def _factor(step: int, warmup: int, total: int, floor: float) -> float:
@@ -103,40 +123,164 @@ def _factor(step: int, warmup: int, total: int, floor: float) -> float:
     return floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
-def _question(kind: str) -> str:
-    if kind == KIND_UPDOWN:
-        return (
-            "Are you looking up or down? Reply with exactly one line and "
-            "no other text:\nLooking: up\nor\nLooking: down"
-        )
-    if kind == KIND_LEFTRIGHT:
-        return (
-            "Are you looking left or right? Reply with exactly one line and "
-            "no other text:\nLooking: left\nor\nLooking: right"
-        )
-    if kind == KIND_HOUR:
-        return (
-            "Which clock hour are you looking at? Twelve o'clock is straight "
-            "up, three is straight right, six is straight down, nine is "
-            "straight left. Reply with exactly one line and no other text:\n"
-            "Hour: N\n"
-            "N is an integer from 1 to 12. No half-hours."
-        )
-    if kind == KIND_LOOKING:
-        return (
-            "Are you looking right now? Reply with exactly one line and "
-            "no other text:\nAnswer: yes\nor\nAnswer: no"
-        )
-    if kind == KIND_MOVING:
-        return (
-            "Are you moving right now? Reply with exactly one line and "
-            "no other text:\nAnswer: yes\nor\nAnswer: no"
-        )
-    raise ValueError(f"unknown kind {kind!r}")
-
-
 def _holdout_count(n: int) -> int:
     return min(HOLDOUT_CAP, max(1, int(n * HOLDOUT_FRACTION)))
+
+
+def _direction_kind(direction: str) -> str:
+    if direction in ("up", "down"):
+        return KIND_UPDOWN
+    if direction in ("left", "right"):
+        return KIND_LEFTRIGHT
+    raise ValueError(f"not a direction {direction!r}")
+
+
+def _in_box(x: float, y: float) -> bool:
+    return COORD_LOW <= x <= COORD_HIGH and COORD_LOW <= y <= COORD_HIGH
+
+
+def _separated(direction: str, sx: float, sy: float, vx: float, vy: float) -> bool:
+    if direction == "up":
+        return (vy - sy) >= AXIS_MARGIN
+    if direction == "down":
+        return (sy - vy) >= AXIS_MARGIN
+    if direction == "right":
+        return (vx - sx) >= AXIS_MARGIN
+    if direction == "left":
+        return (sx - vx) >= AXIS_MARGIN
+    raise ValueError(f"not a direction {direction!r}")
+
+
+def _lcp_len(rows: list[torch.Tensor]) -> int:
+    """Shared token prefix. Same cut as the localizer's ``_lcp_len``."""
+    seqs = [row.view(-1) for row in rows]
+    n = min(int(seq.numel()) for seq in seqs)
+    if n <= 0:
+        raise RuntimeError("image batch has an empty token row")
+    first = seqs[0]
+    for i in range(n):
+        token = int(first[i])
+        for seq in seqs[1:]:
+            if int(seq[i]) != token:
+                return i
+    return n
+
+
+def _token_aligned(key: str, val: torch.Tensor, seq_len: int) -> bool:
+    return (
+        key not in ("input_ids", "attention_mask")
+        and val.dim() == 2
+        and val.shape[0] == 1
+        and int(val.shape[1]) == seq_len
+        and not val.dtype.is_floating_point
+    )
+
+
+def _last_image_index(model_inputs: dict[str, Any]) -> int:
+    if "mm_token_type_ids" in model_inputs:
+        mask = model_inputs["mm_token_type_ids"]
+    elif "token_type_ids" in model_inputs:
+        mask = model_inputs["token_type_ids"]
+    else:
+        raise RuntimeError(
+            "image batch has neither mm_token_type_ids nor token_type_ids"
+        )
+    idx = (mask[0] != 0).nonzero(as_tuple=False).flatten()
+    if int(idx.numel()) == 0:
+        raise RuntimeError("image batch has no image tokens")
+    return int(idx[-1])
+
+
+def _cache_len(cache: Any) -> int:
+    if not hasattr(cache, "layers"):
+        raise RuntimeError(f"prefix cache has no layers: {type(cache)!r}")
+    keys = cache.layers[0].keys
+    if keys is None or not torch.is_tensor(keys) or keys.numel() == 0:
+        raise RuntimeError("prefix cache layer 0 has no keys")
+    return int(keys.shape[-2])
+
+
+def _detach_cache(cache: Any) -> None:
+    if cache is None:
+        raise RuntimeError("prefix cache is missing")
+    layers = getattr(cache, "layers", None)
+    if layers is not None:
+        n = 0
+        for layer in layers:
+            for name in ("keys", "values"):
+                tensor = getattr(layer, name, None)
+                if torch.is_tensor(tensor):
+                    setattr(layer, name, tensor.detach())
+                    n += 1
+        if n == 0:
+            raise RuntimeError(
+                f"prefix cache {type(cache).__name__} has no keys/values"
+            )
+        return
+    key_cache = getattr(cache, "key_cache", None)
+    value_cache = getattr(cache, "value_cache", None)
+    if isinstance(key_cache, list) and isinstance(value_cache, list):
+        cache.key_cache = [tensor.detach() for tensor in key_cache]
+        cache.value_cache = [tensor.detach() for tensor in value_cache]
+        return
+    raise RuntimeError(f"cannot detach cache type {type(cache).__name__}")
+
+
+def _lm_head_dtype(model: Any) -> torch.dtype:
+    inner = model.get_base_model() if hasattr(model, "get_base_model") else model
+    head = getattr(inner, "lm_head", None)
+    if head is None:
+        raise RuntimeError(f"{type(inner).__name__} has no lm_head")
+    return next(head.parameters()).dtype
+
+
+def _nvidia_smi_used_total() -> tuple[int, int] | None:
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    used = 0
+    total = 0
+    for line in proc.stdout.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        parts = [part.strip() for part in text.split(",")]
+        if len(parts) != 2:
+            return None
+        used += int(parts[0])
+        total += int(parts[1])
+    if total <= 0:
+        return None
+    return used, total
+
+
+def _hours_until_monday(now: datetime | None = None) -> tuple[datetime, float] | None:
+    """Hours from ``now`` until Monday 08:00 America/New_York.
+
+    Monday after 08:00 returns None. That stop has passed; the next
+    Monday is not invented.
+    """
+    if now is None:
+        now = datetime.now(_MONDAY)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=_MONDAY)
+    else:
+        now = now.astimezone(_MONDAY)
+    days = (0 - now.weekday()) % 7
+    target = (now + timedelta(days=days)).replace(
+        hour=8, minute=0, second=0, microsecond=0,
+    )
+    if target <= now:
+        return None
+    hours = (target - now).total_seconds() / 3600.0
+    return target, hours
 
 
 class Trainer:
@@ -165,6 +309,8 @@ class Trainer:
         self.scheduler: Any = None
 
     def load(self) -> None:
+        if self.args.bench and self.args.cosine_steps <= 0:
+            self.args.cosine_steps = 1
         random.seed(self.args.seed)
         torch.manual_seed(self.args.seed)
         self.tlog = TrainLogger(self.label)
@@ -221,9 +367,11 @@ class Trainer:
             checkpoint=str(ckpt),
         )
         assert self.scheduler is not None
+        task = "rl" if self.args.rl else "teacher-force"
         logger.info(
-            "magnitude tanh=%.4f frozen | anchors %d | cosine %d warmup %d | lr %.3g",
-            self.magnitude, len(self.anchors),
+            "magnitude tanh=%.4f frozen | task %s | anchors %d | "
+            "cosine %d warmup %d | lr %.3g",
+            self.magnitude, task, len(self.anchors),
             self.args.cosine_steps,
             int(self.args.cosine_steps * self.args.warmup_ratio),
             float(self.scheduler.get_last_lr()[0]),
@@ -296,6 +444,19 @@ class Trainer:
             "gpu": _gpu_mem_snapshot(),
         })
 
+    def _use_cache(self, on: bool) -> None:
+        assert self.model is not None
+        if on:
+            self.model.eval()
+            if hasattr(self.model, "gradient_checkpointing_disable"):
+                self.model.gradient_checkpointing_disable()
+            self.model.config.use_cache = True
+            return
+        self.model.config.use_cache = False
+        self.model.train()
+        if hasattr(self.model, "gradient_checkpointing_enable"):
+            self.model.gradient_checkpointing_enable()
+
     def _arm(self, weights: torch.Tensor, rows: list[list[float]]) -> None:
         assert self.embedder is not None
         index = (weights[0] != 0).nonzero(as_tuple=False).flatten()
@@ -320,6 +481,12 @@ class Trainer:
                 return row
         raise RuntimeError("coordinate jitter stayed illegal")
 
+    def _jitter_rows(
+        self, points: tuple[tuple[float, float], ...],
+        agent: tuple[float, float] | None, n: int,
+    ) -> list[list[float]]:
+        return [self._jitter(points, agent) for _ in range(n)]
+
     def _anchor_rows(self, n: int) -> list[list[float]]:
         s = (self.rng.random(), self.rng.random())
         v = (self.rng.random(), self.rng.random())
@@ -327,7 +494,7 @@ class Trainer:
             self.rng.uniform(COORD_LOW, COORD_HIGH),
             self.rng.uniform(COORD_LOW, COORD_HIGH),
         )
-        return [self._jitter((s, v, v_bar), None) for _ in range(n)]
+        return self._jitter_rows((s, v, v_bar), None, n)
 
     def _anchor_loss(self) -> torch.Tensor:
         assert self.collator is not None and self.model is not None and self.vram is not None
@@ -368,214 +535,310 @@ class Trainer:
             f"s jitter never stayed within {S_RADIUS} of the agent at {agent}"
         )
 
-    def _sample_v(self, game: Any) -> tuple[float, float]:
+    def _sample_v_for(
+        self, game: Any, s: tuple[float, float], direction: str,
+    ) -> tuple[float, float] | None:
+        sx, sy = s
+        kind = _direction_kind(direction)
         for _ in range(V_TRIES):
             vx = self.rng.random()
             vy = self.rng.random()
-            if game.full_wall_check(vx, vy, agent_r=1e-3):
-                return vx, vy
-        raise RuntimeError(f"no v outside a wall after {V_TRIES} draws")
-
-    def _scenario(self) -> dict[str, Any] | None:
-        """One labeled question, or None when the draw was ambiguous."""
-        assert self.tmp is not None
-        game, agent = self._sample_board()
-        kind = self.rng.choice(KINDS)
-        mode = "look" if self.rng.random() < 0.5 else "move"
-        sx, sy = self._sample_s(agent)
-        vx, vy = self._sample_v(game)
-        if kind in (KIND_UPDOWN, KIND_LEFTRIGHT):
-            expected: str | int | None = direction_label(kind, sx, sy, vx, vy)
-            if expected is None:
-                return None
-        elif kind == KIND_HOUR:
+            if not game.full_wall_check(vx, vy, agent_r=1e-3):
+                continue
+            if not _separated(direction, sx, sy, vx, vy):
+                continue
             if not hour_is_unique(sx, sy, vx, vy):
-                return None
-            expected = clock_hour(sx, sy, vx, vy)
-        elif kind == KIND_LOOKING:
-            expected = "yes" if mode == "look" else "no"
-        elif kind == KIND_MOVING:
-            expected = "yes" if mode == "move" else "no"
-        else:
-            raise RuntimeError(f"unhandled kind {kind}")
-        if mode == "move":
-            vbx, vby = vx, vy
-        else:
-            vbx, vby = 2.0 * sx - vx, 2.0 * sy - vy
-        if not (COORD_LOW <= vbx <= COORD_HIGH and COORD_LOW <= vby <= COORD_HIGH):
-            raise RuntimeError(
-                f"v_bar {(vbx, vby)} outside [-1, 2] for s {(sx, sy)} v {(vx, vy)}"
-            )
-        frame = canonical_frame(game)
-        path = self.tmp / f"rl_{self.step}_{time.time_ns()}.png"
-        Image.fromarray(frame).save(path)
-        try:
-            notepad = format_notepad(NOTEPAD) if self.rng.random() < 0.5 else None
-            messages = _build_game_messages(
-                SYSTEM_PROMPT_S2, str(path), "", _question(kind), notepad=notepad,
-            )
-            line = correct_line(kind, expected)
-        except Exception:
-            path.unlink(missing_ok=True)
-            raise
-        return {
-            "kind": kind,
-            "expected": expected,
-            "agent": agent,
-            "points": ((sx, sy), (vx, vy), (vbx, vby)),
-            "messages": messages,
-            "path": path,
-            "line": line,
-        }
+                continue
+            look = gaze_vbar(sx, sy, vx, vy, looking=True)
+            move = gaze_vbar(sx, sy, vx, vy, looking=False)
+            if not (_in_box(*look) and _in_box(*move)):
+                continue
+            got = direction_label(kind, sx, sy, vx, vy)
+            if got != direction:
+                raise RuntimeError(
+                    f"placed {direction} but the oracle says {got}"
+                )
+            return vx, vy
+        return None
 
-    def _rows_for(self, scenario: dict[str, Any], n: int) -> list[list[float]]:
-        points = scenario["points"]
-        agent = scenario["agent"]
-        return [self._jitter(points, agent) for _ in range(n)]
+    def _place_image(self) -> dict[str, Any]:
+        assert self.tmp is not None
+        for _ in range(BOARD_TRIES):
+            game, agent = self._sample_board()
+            sx, sy = self._sample_s(agent)
+            if not _in_box(sx, sy):
+                continue
+            placed: dict[str, tuple[float, float]] = {}
+            good = True
+            for direction in DIRECTIONS:
+                found = self._sample_v_for(game, (sx, sy), direction)
+                if found is None:
+                    good = False
+                    break
+                placed[direction] = found
+            if not good:
+                continue
+            specs = []
+            for direction in DIRECTIONS:
+                vx, vy = placed[direction]
+                kind = _direction_kind(direction)
+                hour = clock_hour(sx, sy, vx, vy)
+                for looking in (True, False):
+                    vbx, vby = gaze_vbar(sx, sy, vx, vy, looking=looking)
+                    specs.append({
+                        "points": ((sx, sy), (vx, vy), (vbx, vby)),
+                        "agent": agent,
+                        "dir_line": correct_line(kind, direction),
+                        "hour_line": correct_line(KIND_HOUR, hour),
+                    })
+            frame = canonical_frame(game)
+            path = self.tmp / f"tf_{self.step}_{time.time_ns()}.png"
+            Image.fromarray(frame).save(path)
+            return {"path": path, "specs": specs}
+        raise RuntimeError(
+            f"no board placed four directions in {BOARD_TRIES} draws"
+        )
 
-    def _begin_sample(self) -> None:
+    def _collate_replies(
+        self, prepared: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        assert self.collator is not None
+        path = prepared["path"]
+        builds: list[dict[str, Any]] = []
+        metas: list[dict[str, Any]] = []
+        for spec in prepared["specs"]:
+            for question, line in (
+                (QUESTION_DIRECTION, spec["dir_line"]),
+                (QUESTION_HOUR, spec["hour_line"]),
+            ):
+                messages = _build_game_messages(
+                    SYSTEM_PROMPT_S2, str(path), "", question,
+                )
+                example = TrainingExample(
+                    messages=messages,
+                    target_text=line,
+                    loss="ce",
+                    source="coord_tf",
+                )
+                builds.append(self.collator.build(example))
+                metas.append({
+                    "points": spec["points"],
+                    "agent": spec["agent"],
+                })
+        if len(builds) != 16:
+            raise RuntimeError(f"expected 16 replies, got {len(builds)}")
+        return builds, metas
+
+    def _prefill(self, model_inputs: dict[str, Any], lcp: int) -> Any:
         assert self.model is not None
-        self.model.eval()
+        seq = int(model_inputs["input_ids"].shape[1])
+        pref: dict[str, Any] = {
+            "input_ids": model_inputs["input_ids"][:, :lcp],
+            "attention_mask": torch.ones(
+                1, lcp, dtype=torch.long, device=self.device,
+            ),
+            "position_ids": torch.arange(lcp, device=self.device).unsqueeze(0),
+        }
+        for key, val in model_inputs.items():
+            if key in ("input_ids", "attention_mask") or not torch.is_tensor(val):
+                continue
+            if _token_aligned(key, val, seq):
+                pref[key] = val[:, :lcp]
+            else:
+                pref[key] = val
+        out = self.model(**pref, use_cache=True, logits_to_keep=1)
+        if out.past_key_values is None:
+            raise RuntimeError("prefix forward returned no past_key_values")
+        return out.past_key_values
+
+    def _suffix_pack(
+        self,
+        builds: list[dict[str, Any]],
+        metas: list[dict[str, Any]],
+        lcp: int,
+    ) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor, list[tuple[int, int]], list[int]]:
+        assert self.model is not None
+        tails: list[torch.Tensor] = []
+        extras_per_row: list[dict[str, torch.Tensor]] = []
+        first_keys: list[str] | None = None
+        reply_local: list[list[int]] = []
+        predictors: list[tuple[int, int]] = []
+        labels: list[int] = []
+        for row, build in enumerate(builds):
+            full = build["model_inputs"]
+            seq = int(full["input_ids"].shape[1])
+            tails.append(full["input_ids"][0, lcp:])
+            sliced: dict[str, torch.Tensor] = {}
+            keys: list[str] = []
+            for key, val in full.items():
+                if torch.is_tensor(val) and _token_aligned(key, val, seq):
+                    keys.append(key)
+                    sliced[key] = val[0, lcp:]
+            if first_keys is None:
+                first_keys = keys
+            elif keys != first_keys:
+                raise RuntimeError(f"suffix aux keys {keys} != {first_keys}")
+            extras_per_row.append(sliced)
+            weights = build["weights"][0]
+            ids = full["input_ids"][0]
+            index = (weights != 0).nonzero(as_tuple=False).flatten()
+            if int(index.numel()) == 0:
+                raise RuntimeError("a reply has no weighted tokens")
+            local: list[int] = []
+            real = seq - lcp
+            for p in index.tolist():
+                if p < lcp:
+                    raise RuntimeError(
+                        f"reply token at {p} is inside the cached prefix {lcp}"
+                    )
+                suf = p - lcp
+                if suf >= real:
+                    raise RuntimeError(
+                        f"reply token {suf} is outside the suffix of length {real}"
+                    )
+                pred = suf - 1
+                if pred < 0:
+                    raise RuntimeError(
+                        "a reply token is the first suffix token; "
+                        "its predictor was in the cached prefix"
+                    )
+                local.append(suf)
+                predictors.append((row, pred))
+                labels.append(int(ids[p]))
+            reply_local.append(local)
+        max_real = max(int(tail.numel()) for tail in tails)
+        max_reply = max(len(local) for local in reply_local)
+        width = max_real + max_reply
+        batch = len(builds)
+        input_ids = torch.zeros(
+            batch, width, dtype=tails[0].dtype, device=self.device,
+        )
+        attn_suf = torch.zeros(batch, width, dtype=torch.long, device=self.device)
+        position_ids = torch.empty(batch, width, dtype=torch.long, device=self.device)
+        coord_pos = torch.empty(
+            batch, max_reply, dtype=torch.long, device=self.device,
+        )
+        coord_rows: list[list[list[float]]] = []
+        for i, tail in enumerate(tails):
+            n = int(tail.numel())
+            input_ids[i, :n] = tail.to(self.device)
+            attn_suf[i, :n] = 1
+            position_ids[i] = lcp + torch.arange(width, device=self.device)
+            extra = max_reply - len(reply_local[i])
+            pads = list(range(n, width))
+            if len(pads) < extra:
+                raise RuntimeError(
+                    f"row {i} has {len(pads)} pad slots for {extra} "
+                    "extra coord positions"
+                )
+            chosen = reply_local[i] + pads[:extra]
+            if len(set(chosen)) != len(chosen):
+                raise RuntimeError(f"row {i} coord positions collide: {chosen}")
+            coord_pos[i] = torch.tensor(chosen, dtype=torch.long, device=self.device)
+            coord_rows.append(self._jitter_rows(
+                metas[i]["points"], metas[i]["agent"], max_reply,
+            ))
+        past = torch.ones(batch, lcp, dtype=torch.long, device=self.device)
+        inputs: dict[str, Any] = {
+            "input_ids": input_ids,
+            "attention_mask": torch.cat([past, attn_suf], dim=1),
+            "position_ids": position_ids,
+        }
+        for key in first_keys or []:
+            sample = extras_per_row[0][key]
+            stacked = torch.zeros(
+                batch, width, dtype=sample.dtype, device=self.device,
+            )
+            for i, sliced in enumerate(extras_per_row):
+                src = sliced[key]
+                stacked[i, : int(src.numel())] = src.to(self.device)
+            inputs[key] = stacked
+        if _wants_cache_position(self.model):
+            inputs["cache_position"] = torch.arange(
+                lcp, lcp + width, device=self.device,
+            )
+        coords = torch.tensor(coord_rows, dtype=torch.float32, device=self.device)
+        return inputs, coord_pos, coords, predictors, labels
+
+    def _cached_reply_loss(
+        self, builds: list[dict[str, Any]], metas: list[dict[str, Any]],
+    ) -> torch.Tensor:
+        assert self.model is not None and self.embedder is not None and self.vram is not None
+        ids_rows = [build["model_inputs"]["input_ids"][0] for build in builds]
+        lcp = _lcp_len(ids_rows)
+        if lcp <= 0:
+            raise RuntimeError("image batch has an empty common prefix")
+        for row in ids_rows:
+            if int(row.numel()) <= lcp:
+                raise RuntimeError(
+                    f"common prefix {lcp} consumed a row of length {int(row.numel())}"
+                )
+        image_at = max(_last_image_index(build["model_inputs"]) for build in builds)
+        if image_at >= lcp:
+            raise RuntimeError(
+                f"common prefix of {lcp} tokens does not cover the image "
+                f"(last image token at {image_at})"
+            )
+        self.vram.set_stage("image")
+        with torch.no_grad():
+            cache = self._prefill(builds[0]["model_inputs"], lcp)
+        _detach_cache(cache)
+        if _cache_len(cache) != lcp:
+            raise RuntimeError(
+                f"prefix cache length {_cache_len(cache)} != {lcp}"
+            )
+        self.model.train()
         if hasattr(self.model, "gradient_checkpointing_disable"):
             self.model.gradient_checkpointing_disable()
         self.model.config.use_cache = True
-
-    def _end_sample(self) -> None:
-        assert self.model is not None
-        self.model.config.use_cache = False
-        self.model.train()
-        if hasattr(self.model, "gradient_checkpointing_enable"):
-            self.model.gradient_checkpointing_enable()
-
-    def _generate(
-        self, scenario: dict[str, Any],
-    ) -> tuple[str, list[int], list[list[float]]]:
-        assert self.model is not None and self.processor is not None and self.embedder is not None
-        assert self.collator is not None
-        tokenizer = self.collator.tokenizer
-        norm = self.collator.adapter.prepare_messages(scenario["messages"])
-        prompt = self.processor.apply_chat_template(
-            norm, tokenize=True, add_generation_prompt=True,
-            return_dict=True, return_tensors="pt",
+        packed, positions, coords, predictors, labels = self._suffix_pack(
+            builds, metas, lcp,
         )
-        inputs: dict[str, Any] = {}
-        for key, val in prompt.items():
-            if not isinstance(val, torch.Tensor):
-                continue
-            if val.dtype.is_floating_point:
-                val = val.to(torch.bfloat16)
-            inputs[key] = val.to(self.device)
-        if "attention_mask" not in inputs:
-            inputs["attention_mask"] = torch.ones_like(inputs["input_ids"])
-        produced: list[int] = []
-        rows: list[list[float]] = []
-        prompt_len = int(inputs["input_ids"].shape[1])
-        self._heartbeat("rl-generate", scenario["kind"], 1, prompt_len)
-        self._begin_sample()
-        try:
-            with torch.inference_mode():
-                out = self.model(**inputs, use_cache=True)
-                past = out.past_key_values
-                logits = out.logits[:, -1, :]
-                seq_len = prompt_len
-                for _step in range(MAX_NEW_TOKENS):
-                    probs = torch.softmax(logits.float(), dim=-1)
-                    next_id = int(torch.multinomial(probs.reshape(-1), 1).item())
-                    if next_id == self.terminator:
-                        break
-                    produced.append(next_id)
-                    row = self._rows_for(scenario, 1)[0]
-                    rows.append(row)
-                    seq_len += 1
-                    step_inputs: dict[str, Any] = {
-                        "input_ids": torch.tensor([[next_id]], device=self.device),
-                        "attention_mask": torch.ones(
-                            1, seq_len, dtype=torch.long, device=self.device,
-                        ),
-                        "past_key_values": past,
-                    }
-                    if _wants_cache_position(self.model):
-                        step_inputs["cache_position"] = torch.tensor(
-                            [seq_len - 1], device=self.device,
-                        )
-                    coord = torch.tensor(row, dtype=torch.float32, device=self.device)
-                    positions = torch.zeros(1, 1, dtype=torch.long, device=self.device)
-                    self.embedder.set_pending(coord.view(1, 1, 6), positions)
-                    try:
-                        out = self.model(**step_inputs, use_cache=True)
-                    finally:
-                        self.embedder.clear_pending()
-                    past = out.past_key_values
-                    logits = out.logits[:, -1, :]
-        finally:
-            self._end_sample()
-        if not produced:
-            return "", [], []
-        text = tokenizer.decode(produced, skip_special_tokens=True)
-        again = tokenizer(text, add_special_tokens=False)["input_ids"]
-        if list(again) != produced:
+        packed["past_key_values"] = expand_train_kv(cache, len(builds))
+        width = int(packed["input_ids"].shape[1])
+        self._heartbeat("image", "coord_tf", len(builds), lcp + width)
+        self.embedder.set_pending(coords, positions)
+        out = self.model(
+            **packed, use_cache=True, output_hidden_states=True, logits_to_keep=1,
+        )
+        if out.past_key_values is None:
             raise RuntimeError(
-                "generated tokens do not re-encode; refusing a misaligned reply. "
-                f"ids {produced} text {text!r} re-encoded {list(again)}"
+                "suffix forward returned no past_key_values; "
+                "the prefix cache was dropped"
             )
-        return text, produced, rows
+        hidden_states = getattr(out, "hidden_states", None)
+        if not hidden_states:
+            raise RuntimeError("suffix forward returned no hidden states")
+        hidden = hidden_states[-1]
+        if int(hidden.shape[1]) != width:
+            raise RuntimeError(
+                f"suffix hidden length {int(hidden.shape[1])} != {width}"
+            )
+        grown = _cache_len(out.past_key_values)
+        if grown != lcp + width:
+            raise RuntimeError(
+                f"suffix cache length {grown} != prefix {lcp} + suffix {width}"
+            )
+        if not predictors:
+            raise RuntimeError("image batch has no reply tokens")
+        gathered = torch.stack(
+            [hidden[row, index] for row, index in predictors], dim=0,
+        )
+        gathered = gathered.to(dtype=_lm_head_dtype(self.model))
+        logits = apply_lm_head_chunked(self.model, gathered, 1024)
+        target = torch.tensor(labels, dtype=torch.long, device=gathered.device)
+        return torch.nn.functional.cross_entropy(logits.float(), target)
 
-    def _rl_loss(self) -> tuple[torch.Tensor | None, Path]:
-        assert self.collator is not None and self.model is not None and self.vram is not None
-        scenario = None
-        for _ in range(50):
-            scenario = self._scenario()
-            if scenario is not None:
-                break
-        if scenario is None:
-            raise RuntimeError("50 board draws had no unambiguous label")
-        path: Path = scenario["path"]
+    def _image_loss(self) -> tuple[torch.Tensor, Path]:
+        prepared = self._place_image()
+        path: Path = prepared["path"]
         try:
-            self.vram.set_stage("rl")
-            bootstrap = self.rng.random() < BOOTSTRAP
-            stored: list[list[float]] | None
-            if bootstrap:
-                text = scenario["line"]
-                weight = 1.0
-                stored = None
-            else:
-                text, _ids, stored = self._generate(scenario)
-                reward = reply_reward(scenario["kind"], text, scenario["expected"])
-                parsed = parse_reply(scenario["kind"], text) is not None
-                self._rl_rewards.append(reward)
-                self._rl_parsed.append(parsed)
-                self._rl_rewards = self._rl_rewards[-50:]
-                self._rl_parsed = self._rl_parsed[-50:]
-                weight = reward
-            if weight == 0.0:
-                return None, path
-            example = TrainingExample(
-                messages=scenario["messages"],
-                target_text=text,
-                loss="ce",
-                source="coord_rl",
-                example_weight=weight,
-            )
-            built = self.collator.build(example)
-            ids = built["model_inputs"]["input_ids"]
-            self._heartbeat(
-                "rl", scenario["kind"], int(ids.shape[0]), int(ids.shape[1]),
-            )
-            n = int((built["weights"][0] != 0).sum())
-            if stored is None:
-                rows = self._rows_for(scenario, n)
-            else:
-                if n != len(stored) + 1:
-                    raise RuntimeError(
-                        f"reply tokens {n} != generated {len(stored)} plus the terminator"
-                    )
-                rows = stored + self._rows_for(scenario, 1)
-            self._arm(built["weights"], rows)
-            loss = weighted_loss(
-                self.model, built["model_inputs"], built["weights"],
-                loss_kind="ce", example_weight=built["example_weight"],
-            )
-            return loss, path
+            builds, metas = self._collate_replies(prepared)
+            self._use_cache(True)
+            try:
+                return self._cached_reply_loss(builds, metas), path
+            finally:
+                self._use_cache(False)
         except Exception:
             path.unlink(missing_ok=True)
             raise
@@ -634,6 +897,15 @@ class Trainer:
             self.embedder.save(directory / "coord_embed.pt")
         logger.info("saved step %d (%s)", self.step, reason)
 
+    def _example_loss(self, kind: str) -> tuple[torch.Tensor | None, Path | None]:
+        if kind == "anchor":
+            return self._anchor_loss(), None
+        if kind == "image":
+            return self._image_loss()
+        if kind == "rl":
+            return rl_loss(self)
+        raise ValueError(f"unknown example kind {kind!r}")
+
     def train(self) -> None:
         assert self.optimizer is not None and self.scheduler is not None
         assert self.model is not None and self.tlog is not None
@@ -643,15 +915,18 @@ class Trainer:
         loss_sum = 0.0
         self.model.train()
         while time.perf_counter() < deadline and not self._stop:
-            assert self.embedder is not None
+            if self.rng.random() < 0.5:
+                kind = "anchor"
+            elif self.args.rl:
+                kind = "rl"
+            else:
+                kind = "image"
             loss = None
             cleanup: Path | None = None
             loss_value = 0.0
+            assert self.embedder is not None
             try:
-                if self.args.no_rl or self.rng.random() < 0.5:
-                    loss = self._anchor_loss()
-                else:
-                    loss, cleanup = self._rl_loss()
+                loss, cleanup = self._example_loss(kind)
                 if loss is not None:
                     loss_value = float(loss.detach())
                     self._finite(loss_value, "loss")
@@ -681,6 +956,135 @@ class Trainer:
                 self.save("step")
         reason = "signal" if self._signal else "hours"
         self.save(reason)
+
+    def _bench_step(self, kind: str, samples: list[tuple[int, int]] | None) -> None:
+        assert self.embedder is not None
+        assert self.optimizer is not None and self.scheduler is not None
+        loss: torch.Tensor | None = None
+        cleanup: Path | None = None
+        try:
+            loss, cleanup = self._example_loss(kind)
+            if loss is None:
+                raise RuntimeError(f"bench {kind} produced no loss")
+            self._finite(float(loss.detach()), "loss")
+            if samples is not None:
+                pair = _nvidia_smi_used_total()
+                if pair is not None:
+                    samples.append(pair)
+            loss.backward()
+            if samples is not None:
+                pair = _nvidia_smi_used_total()
+                if pair is not None:
+                    samples.append(pair)
+            grad_norm = float(torch.nn.utils.clip_grad_norm_(
+                self._params, self._clip,
+            ))
+            self._finite(grad_norm, "grad_norm")
+            self.optimizer.step()
+            self.scheduler.step()
+            self.optimizer.zero_grad(set_to_none=True)
+            self.step += 1
+        finally:
+            self.embedder.clear_pending()
+            if cleanup is not None:
+                cleanup.unlink(missing_ok=True)
+
+    def _bench_report(
+        self, elapsed: float, samples: list[tuple[int, int]], torch_peak: float,
+    ) -> None:
+        assert self.tlog is not None
+        examples = 4
+        per_s = examples / elapsed
+        accum = max(1, int(self.args.grad_accum))
+        steps_per_s = per_s / accum
+        lines = [
+            "bench",
+            "  warmup    1 anchor, 1 image",
+            "  timed     anchor, image, anchor, image",
+            f"  steps/s   {steps_per_s:.4f}",
+        ]
+        if self.args.rl:
+            lines.insert(
+                3,
+                "  note      timed the teacher-force image; --rl was not measured",
+            )
+        if accum != 1:
+            lines.append(
+                f"  grad_accum {accum}  (steps/s counts optimizer steps)"
+            )
+        if samples:
+            used = max(item[0] for item in samples)
+            total = samples[-1][1]
+            lines.append(
+                f"  vram      nvidia-smi {used / 1024:.1f} / {total / 1024:.1f} "
+                f"GiB ({100.0 * used / total:.0f}%)"
+            )
+        else:
+            lines.append("  vram      nvidia-smi unavailable")
+        lines.append(f"            torch peak {torch_peak:.1f} GiB")
+        monday = _hours_until_monday()
+        steps = None
+        hours = None
+        if monday is None:
+            lines.append(
+                "  monday    08:00 ET has passed; no --hours or --cosine-steps"
+            )
+        else:
+            target, hours = monday
+            steps = int(round(steps_per_s * hours * 3600.0))
+            lines.append(f"  monday    {target.strftime('%Y-%m-%d %H:%M')} ET")
+            lines.append(f"  hours     {hours:.2f}")
+            lines.append(f"  steps     {steps}")
+            if steps >= 1:
+                command = [
+                    "python -m neural_net.s2_coord_train \\",
+                    f"  --label {self.label} \\",
+                ]
+                if accum != 1:
+                    command.append(f"  --grad-accum {accum} \\")
+                command.append(f"  --hours {hours:.2f} \\")
+                command.append(f"  --cosine-steps {steps}")
+                lines.append("")
+                lines.extend(command)
+            else:
+                lines.append(
+                    "  the measured rate does not finish one optimizer step "
+                    "before Monday"
+                )
+        text = "\n".join(lines)
+        print(text, flush=True)
+        self.tlog.event(
+            "bench",
+            steps_per_s=steps_per_s,
+            hours=hours,
+            cosine_steps=steps,
+            torch_peak_gib=torch_peak,
+            nvidia_smi=samples,
+        )
+
+    def bench(self) -> None:
+        """Six optimizer steps: one warmup of each path, then two timed of each."""
+        assert self.optimizer is not None
+        self.optimizer.zero_grad(set_to_none=True)
+        self._bench_step("anchor", None)
+        self._bench_step("image", None)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+        samples: list[tuple[int, int]] = []
+        started = time.perf_counter()
+        for kind in ("anchor", "image", "anchor", "image"):
+            self._bench_step(kind, samples)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elapsed = time.perf_counter() - started
+        if elapsed <= 0:
+            raise RuntimeError("bench timer did not advance")
+        if torch.cuda.is_available():
+            peak = torch.cuda.max_memory_allocated() / 1024 ** 3
+        else:
+            peak = 0.0
+        self._bench_report(elapsed, samples, peak)
 
     def _on_signal(self, signum: int, _frame: Any) -> None:
         self._stop = True
@@ -795,21 +1199,30 @@ def _is_cuda_oom(exc: BaseException) -> bool:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--label", default="coord_phase2")
+    parser.add_argument("--label", default="coord_tf")
     parser.add_argument("--gemma-base", default="aug27_big_step_iter1_step313")
     parser.add_argument(
-        "--magnitude", default="recommended",
+        "--magnitude", default="half",
         help="barely, half, recommended, or a float in (0, 1). "
-             "tanh of every gate. Frozen for the run.",
+             "tanh of every gate. Frozen for the run. Default half (0.5).",
     )
-    parser.add_argument("--no-rl", action="store_true")
-    parser.add_argument("--hours", type=float, required=True)
-    parser.add_argument("--cosine-steps", type=int, required=True)
-    parser.add_argument("--lr", type=float, default=3e-6)
+    parser.add_argument(
+        "--rl", action="store_true",
+        help="Archived online sampler instead of the sixteen teacher-forced "
+             "replies. The anchor coin stays.",
+    )
+    parser.add_argument(
+        "--bench", action="store_true",
+        help="Load, warm one anchor and one image, time two of each, "
+             "print VRAM and the Monday --hours / --cosine-steps, then exit.",
+    )
+    parser.add_argument("--hours", type=float, default=0.0)
+    parser.add_argument("--cosine-steps", type=int, default=0)
+    parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--lr-floor", type=float, default=0.1)
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
     parser.add_argument("--max-grad-norm", type=float, default=0.1)
-    parser.add_argument("--grad-accum", type=int, default=4)
+    parser.add_argument("--grad-accum", type=int, default=1)
     parser.add_argument("--save-steps", type=int, default=200)
     parser.add_argument("--log-steps", type=int, default=10)
     parser.add_argument("--seed", type=int, default=17)
@@ -823,10 +1236,11 @@ def main() -> None:
     if not args.no_supervise:
         raise SystemExit(_supervise(sys.argv[1:]))
     configure_logging()
-    if args.hours <= 0:
-        raise SystemExit("--hours must be positive")
-    if args.cosine_steps <= 0:
-        raise SystemExit("--cosine-steps must be positive")
+    if not args.bench:
+        if args.hours <= 0:
+            raise SystemExit("--hours must be positive")
+        if args.cosine_steps <= 0:
+            raise SystemExit("--cosine-steps must be positive")
     if args.grad_accum < 1:
         raise SystemExit("--grad-accum must be >= 1")
     resolve_magnitude(args.magnitude)
@@ -835,7 +1249,10 @@ def main() -> None:
     signal.signal(signal.SIGINT, trainer._on_signal)
     try:
         trainer.load()
-        trainer.train()
+        if args.bench:
+            trainer.bench()
+        else:
+            trainer.train()
     except BaseException as exc:
         if trainer.tlog is not None and not isinstance(exc, KeyboardInterrupt):
             oom = _is_cuda_oom(exc)
@@ -846,12 +1263,14 @@ def main() -> None:
                 trainer.tlog.event(
                     "cuda_oom", step=trainer.step, error=str(exc)[:500],
                 )
-        if trainer.model is not None and not isinstance(exc, KeyboardInterrupt):
+        if (trainer.model is not None and not args.bench
+                and not isinstance(exc, KeyboardInterrupt)):
             try:
                 trainer.save("crash")
             except Exception:
                 logger.error("crash snapshot failed\n%s", traceback.format_exc())
-        if isinstance(exc, KeyboardInterrupt) and trainer.model is not None:
+        if (isinstance(exc, KeyboardInterrupt) and trainer.model is not None
+                and not args.bench):
             trainer._signal = int(signal.SIGINT)
             try:
                 trainer.save("signal")
