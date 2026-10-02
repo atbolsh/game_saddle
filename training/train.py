@@ -574,6 +574,17 @@ class TrainLogger:
             parts.append(f"{k}={v:.3g}" if isinstance(v, float) else f"{k}={v}")
         if "source_loss" in record:
             parts.append("per-source " + json.dumps(record["source_loss"]))
+        tasks = record.get("tasks")
+        if tasks:
+            counts = record.get("task_n") or {}
+            bits = []
+            for key, value in tasks.items():
+                n = counts.get(key)
+                if isinstance(value, float) and n is not None:
+                    bits.append(f"{key}={value:.4g} n={n}")
+                else:
+                    bits.append(f"{key}={value}")
+            parts.append("tasks " + " ".join(bits))
         self._append(self.txt, "  ".join(parts) + "\n")
 
     def eval_row(self, step: int, epoch: int, metrics: dict[str, float]) -> None:

@@ -216,6 +216,7 @@ def rl_loss(trainer: Any) -> tuple[torch.Tensor | None, Path]:
     """One sampled reply. Reward 0 returns ``(None, path)`` and is skipped."""
     assert trainer.collator is not None and trainer.model is not None
     assert trainer.vram is not None
+    trainer._rl_task = None
     drawn = None
     for _ in range(50):
         drawn = scenario(trainer)
@@ -269,6 +270,7 @@ def rl_loss(trainer: Any) -> tuple[torch.Tensor | None, Path]:
             trainer.model, built["model_inputs"], built["weights"],
             loss_kind="ce", example_weight=built["example_weight"],
         )
+        trainer._rl_task = f"rl/{drawn['kind']}"
         return loss, path
     except Exception:
         path.unlink(missing_ok=True)

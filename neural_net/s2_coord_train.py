@@ -11,6 +11,11 @@ sources train the dataset reply. KD sources match the frozen aug27
 adapter with the coordinate code muted. ``--rl`` replaces the board
 with the archived online sampler. The anchor coin stays.
 
+The logged loss stays that one backward scalar. Beside it, the same
+tokens are averaged per task: direction and hour, looking and moving,
+each compass direction, and anchor CE versus KD. The sixteen replies
+are in ``task_detail``. Nothing extra is forwarded.
+
 ``--hours`` requires ``--cosine-steps``. Past that horizon the
 learning-rate multiplier stays at the floor. ``--bench`` loads the
 model, times four steady steps, and prints the Monday launch line.
@@ -125,6 +130,133 @@ def _factor(step: int, warmup: int, total: int, floor: float) -> float:
 
 def _holdout_count(n: int) -> int:
     return min(HOLDOUT_CAP, max(1, int(n * HOLDOUT_FRACTION)))
+
+
+# One reply, or one anchor, is one task. Image keys are
+# ``look|move / up|down|left|right / direction|hour``. Anchor keys are
+# ``anchor/ce|kd/<dataset>``. RL keys are ``rl/<oracle kind>``.
+_GAZES = ("look", "move")
+_QUESTIONS = ("direction", "hour")
+_ROLLUP = (
+    ("direction", lambda key: key.endswith("/direction")),
+    ("hour", lambda key: key.endswith("/hour")),
+    ("looking", lambda key: key.startswith("look/")),
+    ("moving", lambda key: key.startswith("move/")),
+    ("up", lambda key: "/up/" in key),
+    ("down", lambda key: "/down/" in key),
+    ("left", lambda key: "/left/" in key),
+    ("right", lambda key: "/right/" in key),
+    ("anchor_ce", lambda key: key.startswith("anchor/ce/")),
+    ("anchor_kd", lambda key: key.startswith("anchor/kd/")),
+    ("rl", lambda key: key.startswith("rl/")),
+)
+
+
+def _check_task_key(key: str) -> None:
+    gaze, _, rest = key.partition("/")
+    if gaze in _GAZES:
+        direction, _, question = rest.partition("/")
+        if direction in DIRECTIONS and question in _QUESTIONS and "/" not in question:
+            return
+    family, _, rest = key.partition("/")
+    if family == "anchor":
+        kind, sep, source = rest.partition("/")
+        if sep and kind in ("ce", "kd") and source and "/" not in source:
+            return
+    if family == "rl" and rest and "/" not in rest:
+        return
+    raise RuntimeError(f"unknown task key {key!r}")
+
+
+def _add_tasks(
+    sums: dict[str, float], counts: dict[str, int],
+    parts: dict[str, tuple[float, int]],
+) -> None:
+    """Add reply means. ``n`` counts replies (anchors: one example), not tokens."""
+    seen: set[str] = set()
+    for key, (total, n) in parts.items():
+        _check_task_key(key)
+        if key in seen:
+            raise RuntimeError(f"duplicate task {key}")
+        seen.add(key)
+        if isinstance(n, bool) or not isinstance(n, int) or n <= 0:
+            raise RuntimeError(f"task {key} has count {n!r}")
+        if not math.isfinite(total):
+            raise RuntimeError(f"non-finite task {key}: {total}")
+        sums[key] = sums.get(key, 0.0) + float(total)
+        counts[key] = counts.get(key, 0) + n
+
+
+def _rollup(
+    sums: dict[str, float], counts: dict[str, int],
+) -> tuple[dict[str, float], dict[str, int]]:
+    means: dict[str, float] = {}
+    ns: dict[str, int] = {}
+    for name, pred in _ROLLUP:
+        total = 0.0
+        n = 0
+        for key, value in sums.items():
+            if pred(key):
+                total += value
+                n += counts[key]
+        if n:
+            means[name] = total / n
+            ns[name] = n
+    return means, ns
+
+
+def _detail(sums: dict[str, float], counts: dict[str, int]) -> dict[str, float]:
+    return {key: round(sums[key] / counts[key], 4) for key in sorted(sums)}
+
+
+def _format_window(means: dict[str, float], counts: dict[str, int]) -> str:
+    bits = []
+    for name, _pred in _ROLLUP:
+        if name not in means:
+            continue
+        bits.append(f"{name} {means[name]:.4f} n={counts[name]}")
+    return "window " + " ".join(bits)
+
+
+def _reply_parts(
+    token_loss: torch.Tensor,
+    predictors: list[tuple[int, int]],
+    metas: list[dict[str, Any]],
+) -> dict[str, tuple[float, int]]:
+    """Mean token CE of each reply. Detached. The backward uses the grand mean."""
+    if token_loss.ndim != 1:
+        raise RuntimeError(f"token loss rank {token_loss.ndim} != 1")
+    if int(token_loss.shape[0]) != len(predictors):
+        raise RuntimeError("token loss does not line up with reply tokens")
+    n_rows = len(metas)
+    if n_rows == 0:
+        raise RuntimeError("image batch has no replies")
+    rows = [row for row, _pred in predictors]
+    if any(row < 0 or row >= n_rows for row in rows):
+        raise RuntimeError("reply token names a row outside the batch")
+    index = torch.tensor(rows, dtype=torch.long, device=token_loss.device)
+    sums = torch.zeros(n_rows, dtype=torch.float32, device=token_loss.device)
+    counts = torch.zeros(n_rows, dtype=torch.float32, device=token_loss.device)
+    values = token_loss.detach().float()
+    sums.scatter_add_(0, index, values)
+    counts.scatter_add_(0, index, torch.ones_like(values))
+    stats = torch.stack([sums, counts], dim=1).cpu().tolist()
+    parts: dict[str, tuple[float, int]] = {}
+    for i, meta in enumerate(metas):
+        key = meta["task"]
+        if not isinstance(key, str):
+            raise RuntimeError(f"reply {i} task is {key!r}")
+        _check_task_key(key)
+        total, n = stats[i]
+        n_tokens = int(n)
+        if n_tokens <= 0 or n_tokens != n:
+            raise RuntimeError(f"task {key} has {n} reply tokens")
+        if key in parts:
+            raise RuntimeError(f"duplicate task {key}")
+        parts[key] = (total / n_tokens, 1)
+    if len(parts) != n_rows:
+        raise RuntimeError(f"logged {len(parts)} tasks from {n_rows} replies")
+    return parts
 
 
 def _direction_kind(direction: str) -> str:
@@ -305,6 +437,9 @@ class Trainer:
         self.tmp: Path | None = None
         self._rl_rewards: list[float] = []
         self._rl_parsed: list[bool] = []
+        self._rl_task: str | None = None
+        self._win_sum: dict[str, float] = {}
+        self._win_n: dict[str, int] = {}
         self.optimizer: Any = None
         self.scheduler: Any = None
 
@@ -496,7 +631,7 @@ class Trainer:
         )
         return self._jitter_rows((s, v, v_bar), None, n)
 
-    def _anchor_loss(self) -> torch.Tensor:
+    def _anchor_loss(self) -> tuple[torch.Tensor, dict[str, tuple[float, int]]]:
         assert self.collator is not None and self.model is not None and self.vram is not None
         chosen = copy.copy(self.rng.choice(self.anchors))
         if chosen.loss == "kd":
@@ -509,10 +644,20 @@ class Trainer:
         self._heartbeat("anchor", chosen.source, int(ids.shape[0]), int(ids.shape[1]))
         n = int((built["weights"][0] != 0).sum())
         self._arm(built["weights"], self._anchor_rows(n))
-        return weighted_loss(
+        loss = weighted_loss(
             self.model, built["model_inputs"], built["weights"],
             loss_kind=chosen.loss, example_weight=built["example_weight"],
         )
+        if chosen.loss == "kd_anchor":
+            family = "kd"
+        elif chosen.loss == "ce":
+            family = "ce"
+        else:
+            raise RuntimeError(f"anchor loss {chosen.loss!r} is not ce or kd")
+        source = chosen.source
+        if not isinstance(source, str) or not source or "/" in source:
+            raise RuntimeError(f"anchor source {source!r} is not a task name")
+        return loss, {f"anchor/{family}/{source}": (float(loss.detach()), 1)}
 
     def _sample_board(self) -> tuple[Any, tuple[float, float]]:
         game = game_io.new_multi_gold_game(
@@ -588,6 +733,8 @@ class Trainer:
                     specs.append({
                         "points": ((sx, sy), (vx, vy), (vbx, vby)),
                         "agent": agent,
+                        "direction": direction,
+                        "gaze": "look" if looking else "move",
                         "dir_line": correct_line(kind, direction),
                         "hour_line": correct_line(KIND_HOUR, hour),
                     })
@@ -607,9 +754,9 @@ class Trainer:
         builds: list[dict[str, Any]] = []
         metas: list[dict[str, Any]] = []
         for spec in prepared["specs"]:
-            for question, line in (
-                (QUESTION_DIRECTION, spec["dir_line"]),
-                (QUESTION_HOUR, spec["hour_line"]),
+            for question_name, question, line in (
+                ("direction", QUESTION_DIRECTION, spec["dir_line"]),
+                ("hour", QUESTION_HOUR, spec["hour_line"]),
             ):
                 messages = _build_game_messages(
                     SYSTEM_PROMPT_S2, str(path), "", question,
@@ -621,9 +768,12 @@ class Trainer:
                     source="coord_tf",
                 )
                 builds.append(self.collator.build(example))
+                task = f"{spec['gaze']}/{spec['direction']}/{question_name}"
+                _check_task_key(task)
                 metas.append({
                     "points": spec["points"],
                     "agent": spec["agent"],
+                    "task": task,
                 })
         if len(builds) != 16:
             raise RuntimeError(f"expected 16 replies, got {len(builds)}")
@@ -762,7 +912,7 @@ class Trainer:
 
     def _cached_reply_loss(
         self, builds: list[dict[str, Any]], metas: list[dict[str, Any]],
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, dict[str, tuple[float, int]]]:
         assert self.model is not None and self.embedder is not None and self.vram is not None
         ids_rows = [build["model_inputs"]["input_ids"][0] for build in builds]
         lcp = _lcp_len(ids_rows)
@@ -827,16 +977,22 @@ class Trainer:
         gathered = gathered.to(dtype=_lm_head_dtype(self.model))
         logits = apply_lm_head_chunked(self.model, gathered, 1024)
         target = torch.tensor(labels, dtype=torch.long, device=gathered.device)
-        return torch.nn.functional.cross_entropy(logits.float(), target)
+        # reduction none then mean is the same backward as the scalar CE.
+        # The per-reply means are a detached log, not a second forward.
+        token_loss = torch.nn.functional.cross_entropy(
+            logits.float(), target, reduction="none",
+        )
+        return token_loss.mean(), _reply_parts(token_loss, predictors, metas)
 
-    def _image_loss(self) -> tuple[torch.Tensor, Path]:
+    def _image_loss(self) -> tuple[torch.Tensor, Path, dict[str, tuple[float, int]]]:
         prepared = self._place_image()
         path: Path = prepared["path"]
         try:
             builds, metas = self._collate_replies(prepared)
             self._use_cache(True)
             try:
-                return self._cached_reply_loss(builds, metas), path
+                loss, parts = self._cached_reply_loss(builds, metas)
+                return loss, path, parts
             finally:
                 self._use_cache(False)
         except Exception:
@@ -850,8 +1006,24 @@ class Trainer:
         self.tlog.event("nonfinite_" + what, step=self.step, value=value)
         raise RuntimeError(f"non-finite {what} at step {self.step}: {value}")
 
-    def _log(self, loss_value: float, grad_norm: float) -> None:
+    def _task_fields(
+        self, sums: dict[str, float], counts: dict[str, int], scope: str,
+    ) -> dict[str, Any]:
+        means, ns = _rollup(sums, counts)
+        return {
+            "tasks": {key: round(value, 4) for key, value in means.items()},
+            "task_n": ns,
+            "task_detail": _detail(sums, counts),
+            "task_scope": scope,
+        }
+
+    def _log(
+        self, loss_value: float, grad_norm: float,
+        step_sum: dict[str, float], step_n: dict[str, int],
+    ) -> None:
         assert self.tlog is not None and self.scheduler is not None
+        if not step_sum:
+            raise RuntimeError("optimizer step has no task breakdown")
         lr = float(self.scheduler.get_last_lr()[0])
         rewards = self._rl_rewards
         parsed = self._rl_parsed
@@ -867,16 +1039,42 @@ class Trainer:
             "reward_mean": reward_mean,
             "parse_rate": parse_rate,
             "magnitude": self.magnitude,
+            "loss_scope": "step",
+            **self._task_fields(step_sum, step_n, "step"),
         }
         self.tlog.last_step(record)
         if self.step % self.args.log_steps == 0:
-            self.tlog.step(record)
+            window = {
+                **record,
+                **self._task_fields(self._win_sum, self._win_n, "window"),
+            }
+            self.tlog.step(window)
+            self._win_sum.clear()
+            self._win_n.clear()
             reward_s = "n/a" if reward_mean is None else f"{reward_mean:.3f}"
             parse_s = "n/a" if parse_rate is None else f"{parse_rate:.3f}"
             logger.info(
-                "step %d loss %.4f lr %.3g grad %.3f reward %s parse %s",
-                self.step, loss_value, lr, grad_norm, reward_s, parse_s,
+                "step %d loss %.4f lr %.3g grad %.3f %s reward %s parse %s",
+                self.step, loss_value, lr, grad_norm,
+                _format_window(window["tasks"], window["task_n"]),
+                reward_s, parse_s,
             )
+
+    def _flush_task_window(self) -> None:
+        """Write the steps since the last log line. Empty after a log line."""
+        if not self._win_sum or self.tlog is None:
+            return
+        means, counts = _rollup(self._win_sum, self._win_n)
+        record: dict[str, Any] = {
+            "step": self.step,
+            **self._task_fields(self._win_sum, self._win_n, "window"),
+        }
+        if self.scheduler is not None:
+            record["lr"] = float(self.scheduler.get_last_lr()[0])
+        self.tlog.step(record)
+        logger.info("step %d %s", self.step, _format_window(means, counts))
+        self._win_sum.clear()
+        self._win_n.clear()
 
     def save(self, reason: str) -> None:
         assert self.model is not None and self.embedder is not None and self.tlog is not None
@@ -897,14 +1095,30 @@ class Trainer:
             self.embedder.save(directory / "coord_embed.pt")
         logger.info("saved step %d (%s)", self.step, reason)
 
-    def _example_loss(self, kind: str) -> tuple[torch.Tensor | None, Path | None]:
+    def _example_loss(
+        self, kind: str,
+    ) -> tuple[torch.Tensor | None, Path | None, dict[str, tuple[float, int]]]:
+        path: Path | None
         if kind == "anchor":
-            return self._anchor_loss(), None
-        if kind == "image":
-            return self._image_loss()
-        if kind == "rl":
-            return rl_loss(self)
-        raise ValueError(f"unknown example kind {kind!r}")
+            loss, parts = self._anchor_loss()
+            path = None
+        elif kind == "image":
+            loss, path, parts = self._image_loss()
+        elif kind == "rl":
+            loss, path = rl_loss(self)
+            if loss is None:
+                return None, path, {}
+            task = self._rl_task
+            self._rl_task = None
+            if not isinstance(task, str):
+                raise RuntimeError("rl loss returned without a task name")
+            parts = {task: (float(loss.detach()), 1)}
+        else:
+            raise ValueError(f"unknown example kind {kind!r}")
+        if not parts:
+            raise RuntimeError(f"{kind} loss has no task breakdown")
+        _add_tasks({}, {}, parts)
+        return loss, path, parts
 
     def train(self) -> None:
         assert self.optimizer is not None and self.scheduler is not None
@@ -913,6 +1127,8 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         accum = 0
         loss_sum = 0.0
+        step_sum: dict[str, float] = {}
+        step_n: dict[str, int] = {}
         self.model.train()
         while time.perf_counter() < deadline and not self._stop:
             if self.rng.random() < 0.5:
@@ -923,10 +1139,11 @@ class Trainer:
                 kind = "image"
             loss = None
             cleanup: Path | None = None
+            parts: dict[str, tuple[float, int]] = {}
             loss_value = 0.0
             assert self.embedder is not None
             try:
-                loss, cleanup = self._example_loss(kind)
+                loss, cleanup, parts = self._example_loss(kind)
                 if loss is not None:
                     loss_value = float(loss.detach())
                     self._finite(loss_value, "loss")
@@ -937,6 +1154,8 @@ class Trainer:
                     cleanup.unlink(missing_ok=True)
             if loss is None:
                 continue
+            _add_tasks(self._win_sum, self._win_n, parts)
+            _add_tasks(step_sum, step_n, parts)
             accum += 1
             loss_sum += loss_value
             if accum < self.args.grad_accum:
@@ -949,9 +1168,11 @@ class Trainer:
             self.scheduler.step()
             self.optimizer.zero_grad(set_to_none=True)
             self.step += 1
-            self._log(loss_sum / accum, grad_norm)
+            self._log(loss_sum / accum, grad_norm, step_sum, step_n)
             accum = 0
             loss_sum = 0.0
+            step_sum = {}
+            step_n = {}
             if self.args.save_steps > 0 and self.step % self.args.save_steps == 0:
                 self.save("step")
         reason = "signal" if self._signal else "hours"
@@ -963,7 +1184,7 @@ class Trainer:
         loss: torch.Tensor | None = None
         cleanup: Path | None = None
         try:
-            loss, cleanup = self._example_loss(kind)
+            loss, cleanup, _parts = self._example_loss(kind)
             if loss is None:
                 raise RuntimeError(f"bench {kind} produced no loss")
             self._finite(float(loss.detach()), "loss")
@@ -1278,6 +1499,10 @@ def main() -> None:
                 logger.error("signal snapshot failed\n%s", traceback.format_exc())
         raise
     finally:
+        try:
+            trainer._flush_task_window()
+        except Exception:
+            logger.error("task-window flush failed\n%s", traceback.format_exc())
         trainer.close()
 
 
