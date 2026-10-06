@@ -361,14 +361,35 @@ class DrawnQuestion:
     coords: list[float]
 
 
-def board_context(settings: dict, rng: random.Random) -> BoardContext:
-    """Notepad, fake history, and the agent point for one board."""
+def board_context(
+    settings: dict, rng: random.Random, *, forced_note: str | None = None,
+) -> BoardContext:
+    """Notepad, fake history, and the agent point for one board.
+
+    ``forced_note`` is a phrase that must already name exactly one place
+    on this board (``"the gold"`` when there is one gold). The notepad
+    is that phrase, with no region description added here. Omit it and
+    the note is the training draw: a gold or an exit 75% of the time.
+    """
     candidates = _targets_on_board(settings)
     note_pool = [item for item in candidates if item[0] in ("gold", "exit")]
     target_note: str | None = None
     note_kind: str | None = None
     note_point: tuple[float, float] | None = None
-    if note_pool and rng.random() < 0.75:
+    if forced_note is not None:
+        matches = [item for item in candidates if item[1] == forced_note]
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"forced note {forced_note!r} matches {len(matches)} "
+                "places on this board"
+            )
+        note_kind, target_note, note_point = matches[0]
+        notepad = mem.format_notepad([{
+            "key": "target",
+            "value": target_note,
+            "updated_round": rng.randrange(1, 4),
+        }])
+    elif note_pool and rng.random() < 0.75:
         note_kind, target_note, note_point = rng.choice(note_pool)
         notepad = mem.format_notepad([{
             "key": "target",
@@ -448,17 +469,19 @@ def synthetic_prompt(
     image_path: str,
     *,
     question: str | None = None,
+    forced_note: str | None = None,
 ) -> SyntheticPrompt:
     """One synthetic user turn, including the fake notepad and history.
 
     ``question`` overrides the drawn question (the testing notebook's
-    text box). The coordinate label is then omitted.
+    text box). The coordinate label is then omitted. ``forced_note``
+    is passed to ``board_context``.
 
     Records are equivalent to the v2 trainer, not bit-identical: the
     notepad is drawn before the question, so the same seed does not
     replay the old random stream.
     """
-    ctx = board_context(settings, rng)
+    ctx = board_context(settings, rng, forced_note=forced_note)
     if question is not None:
         cand_kind, phrase, point = _draw_target(ctx.candidates, rng)
         move_kind = "look" if rng.random() < 0.5 else "move"

@@ -13,6 +13,7 @@ Save / load slices:
 * save_all / load_all — Gemma slice plus localizer.pt and coord_embed.pt
 * save_gemma / load_gemma — Gemma only
 * save_snapshot / load_snapshot — the Localizer bundle
+* load_parts — a Gemma directory and a Localizer directory, separately
 
 A PEFT adapter (the aug27 checkpoints) is saved with save_pretrained.
 A bare HuggingFace Gemma is saved as a full state_dict; that file is
@@ -453,6 +454,43 @@ class GemmaS2:
                 "and train_meta.json has no gemma_base"
             )
         self.load_localizer(path)
+        return self
+
+    def load_parts(
+        self, gemma_path: str | Path, localizer_path: str | Path,
+    ) -> GemmaS2:
+        """Load the trunk and the readout from two directories.
+
+        ``gemma_path`` is a ``save_gemma`` directory (``gemma_meta.json``)
+        or a PEFT adapter (``adapter_config.json``). ``localizer_path``
+        is a readout directory (``localizer.pt``, ``coord_embed.pt``,
+        ``train_meta.json``). A directory that has both Gemma markers
+        is rejected.
+        """
+        gemma_path = Path(gemma_path)
+        has_meta = (gemma_path / "gemma_meta.json").is_file()
+        has_adapter = (gemma_path / "adapter_config.json").is_file()
+        if has_meta and has_adapter:
+            raise RuntimeError(
+                f"{gemma_path} has both gemma_meta.json and adapter_config.json"
+            )
+        if has_meta:
+            self.load_gemma(gemma_path)
+        elif has_adapter:
+            if self.vl.model is None:
+                self.load()
+            self._unwrap_adapter()
+            from peft import PeftModel
+
+            self.vl.model = PeftModel.from_pretrained(
+                self.vl.model, str(gemma_path), is_trainable=False
+            )
+            self.vl.model.eval()
+        else:
+            raise FileNotFoundError(
+                f"{gemma_path} has neither gemma_meta.json nor adapter_config.json"
+            )
+        self.load_localizer(localizer_path)
         return self
 
     def _unwrap_adapter(self) -> None:
