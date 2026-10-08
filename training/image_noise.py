@@ -5,8 +5,6 @@ skills learned on this one renderer -- one palette, one sprite, one board
 style -- may not generalize. Every frame that reaches the model therefore
 gets mild, LABEL-SAFE degradation, sampled per image:
 
-  * slight random crop + rescale back (small enough never to cut off the
-    agent or the gold);
   * brightness / contrast / color jitter;
   * 2-6 BIG discolored rectangles -- semi-transparent color tints, each
     8-25% of the image side. Placed uniformly at random, so they CAN land
@@ -18,9 +16,10 @@ gets mild, LABEL-SAFE degradation, sampled per image:
   * mild gaussian blur OR a JPEG re-encode (compression artifacts), one of
     the two.
 
-Deliberately EXCLUDED (not label-safe): flips and rotations -- they invert
-the clock/bearing semantics that the OBS line and the move token are graded
-on.
+Deliberately EXCLUDED (not label-safe): flips, rotations, and crops. Flips
+and rotations invert the clock/bearing semantics that the OBS line and the
+move token are graded on. A crop-and-rescale moves the agent and the gold
+off the coordinates the labels name.
 
 10% of frames (:data:`_SKIP_PROB`) skip ALL of the above and pass through
 completely clean: the network must also see uncorrupted boards, or it ends
@@ -59,10 +58,6 @@ from typing import Callable
 INFERENCE_STRENGTH = 0.5
 TRAINING_STRENGTH = 1.0
 
-#: Max crop margin per edge at strength 1.0 -- 4% of a side cannot cut off
-#: the agent or the gold (both are drawn well inside the board). This is the
-#: ONLY sprite-protecting guard: the patches below have none, by design.
-_MAX_CROP = 0.04
 #: Patch geometry: each side is 8-25% of the image side at strength 1.0 --
 #: big enough to (sometimes) cover the agent or the gold.
 _PATCH_SIDE = (0.08, 0.25)
@@ -119,15 +114,6 @@ def noise_image(img, rng: random.Random, strength: float = TRAINING_STRENGTH,
     #    the seeded stream stays reproducible either way.
     if rng.random() < _SKIP_PROB:
         return img
-
-    # -- slight crop + rescale back (usually on, never more than _MAX_CROP)
-    if rng.random() < 0.7:
-        margin = _MAX_CROP * strength
-        left = int(w * rng.uniform(0.0, margin))
-        top = int(h * rng.uniform(0.0, margin))
-        right = w - int(w * rng.uniform(0.0, margin))
-        bottom = h - int(h * rng.uniform(0.0, margin))
-        img = img.crop((left, top, right, bottom)).resize((w, h), Image.BILINEAR)
 
     # -- brightness / contrast / color jitter
     for enhancer in (ImageEnhance.Brightness, ImageEnhance.Contrast,

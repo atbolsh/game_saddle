@@ -516,9 +516,10 @@ analyst / training all see the same bytes) and again at training time
   side each; placed uniformly at random, so partially covering the agent or
   the gold is allowed and intended — tints, not dropout);
 - one whole-image color-drift tint (a full-frame translucent rectangle,
-  weaker than the patches);
-- slight random crops / rescales (≤4% per edge — small enough not to cut
-  off the agent or the gold).
+  weaker than the patches).
+
+Crops and rescales are not used. They move the agent and the gold off the
+coordinates the labels name.
 
 **10% of frames skip everything** (`_SKIP_PROB`, 2026-08-04) and pass
 through completely clean, independently at each end: the network must also
