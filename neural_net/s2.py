@@ -14,6 +14,7 @@ Save / load slices:
 * save_gemma / load_gemma — Gemma only
 * save_snapshot / load_snapshot — the Localizer bundle
 * load_parts — a Gemma directory and a Localizer directory, separately
+* load_coord_checkpoint — a PEFT adapter plus coord_embed.pt, no Localizer file
 
 A PEFT adapter (the aug27 checkpoints) is saved with save_pretrained.
 A bare HuggingFace Gemma is saved as a full state_dict; that file is
@@ -491,6 +492,44 @@ class GemmaS2:
                 f"{gemma_path} has neither gemma_meta.json nor adapter_config.json"
             )
         self.load_localizer(localizer_path)
+        return self
+
+    def load_coord_checkpoint(self, path: str | Path) -> GemmaS2:
+        """Load a coord-trainer directory: the LoRA plus ``coord_embed.pt``.
+
+        The directory has ``adapter_config.json``, ``adapter_model.safetensors``,
+        and ``coord_embed.pt``. It has no Localizer file. The Localizer module
+        stays at its fresh initialization; a caller that draws its points
+        should not. The coordinate file must have ``enabled`` set.
+        """
+        path = Path(path)
+        for name in (
+            "adapter_config.json", "adapter_model.safetensors", "coord_embed.pt",
+        ):
+            if not (path / name).is_file():
+                raise FileNotFoundError(
+                    f"load_coord_checkpoint: missing {path / name}"
+                )
+        if self.vl.model is None:
+            self.load()
+        self._unwrap_adapter()
+        from peft import PeftModel
+
+        self.vl.model = PeftModel.from_pretrained(
+            self.vl.model, str(path), is_trainable=False
+        )
+        self.vl.model.eval()
+        # This directory has no Localizer file. Drop any readout loaded
+        # earlier so _build_readout does not copy it forward.
+        self.localizer = None
+        self._build_readout()
+        assert self.coord_embed is not None and self.localizer is not None
+        self.coord_embed.load(path / "coord_embed.pt")
+        if not self.coord_embed.enabled:
+            raise RuntimeError(f"{path / 'coord_embed.pt'} has enabled=False")
+        device = next(self.vl.model.parameters()).device
+        self.coord_embed.to(device=device, dtype=torch.float32)
+        self.localizer.to(device=device, dtype=torch.float32)
         return self
 
     def _unwrap_adapter(self) -> None:
