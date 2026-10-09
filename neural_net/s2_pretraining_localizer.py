@@ -1,6 +1,6 @@
 """Learn to look: a frozen Gemma trunk and a trained Localizer.
 
-The trunk is the aug27 adapter (``--gemma-base``). Nothing in it
+The trunk is the adapter named by ``--gemma-base``. Nothing in it
 receives gradient: no LoRA step, no replay, no KD, no token CE. Each
 image is encoded once (stage A, through the shared question stem) and
 its kept-layer cache is reused for that image's K questions (stage B).
@@ -10,6 +10,11 @@ The Localizer trains on a GPU ring of those grids and reply states.
 ``enabled`` False. It is not in the optimizer. It trains only in the
 later learn-to-tell-where-you-are-looking phase, after a Localizer
 hits the floors.
+
+``--start`` loads a Localizer directory as the initial weights. The
+step counter, the image count, and the cosine stay at the beginning
+of this run. ``--resume-snapshot`` continues a run: those counters
+and the cosine position are restored.
 
 ``--bench N`` times N rounds of the same path and exits without a
 snapshot and without ``labels.jsonl``.
@@ -503,7 +508,12 @@ class Trainer:
         self.prefix_n = count_prefix_tokens(system, self.tokenizer, processor)
         self.prefix_hash = system_prefix_hash(system)
         self.r_max = _reply_cap(self.tokenizer, self.args.reply_positions)
-        self._resume()
+        if self.args.start and self.args.resume_snapshot:
+            raise RuntimeError("pass --start or --resume-snapshot, not both")
+        if self.args.start:
+            self._start()
+        else:
+            self._resume()
         self.buffer = _Buffer(
             self.args.buffer_images, self.args.questions_per_image,
             self.r_max, self.hidden, self.device,
@@ -618,28 +628,28 @@ class Trainer:
             f"--resume-snapshot {name!r} is not under {self.loc_root} or {self.s2_root}"
         )
 
-    def _resume(self) -> None:
-        name = self.args.resume_snapshot
-        if not name:
-            return
-        path = self._resume_path(name)
-        meta_path = path / "train_meta.json"
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        if meta.get("trainer") != TRAINER_NAME:
-            raise RuntimeError(
-                f"{path} trainer is {meta.get('trainer')!r}, "
-                f"expected {TRAINER_NAME!r}"
-            )
-        if int(meta.get("kept_layer", -1)) != self.args.kept_layer:
-            raise RuntimeError(
-                f"snapshot kept_layer {meta.get('kept_layer')} != "
-                f"--kept-layer {self.args.kept_layer}"
-            )
+    def _load_readout_weights(self, path: Path) -> dict:
+        """Load ``localizer.pt`` and ``coord_embed.pt``. The embedder stays off.
+
+        Counters are left alone. The caller decides whether this is a
+        fresh run or a resumed one.
+        """
+        for name in ("localizer.pt", "coord_embed.pt", "train_meta.json"):
+            if not (path / name).is_file():
+                raise FileNotFoundError(f"{path} is missing {name}")
+        meta = json.loads((path / "train_meta.json").read_text(encoding="utf-8"))
         blob = torch.load(path / "localizer.pt", map_location="cpu", weights_only=True)
         if list(blob.get("coord_order") or []) != list(COORD_ORDER):
             raise RuntimeError(
                 f"{path / 'localizer.pt'} is a 3-point localizer.pt; "
                 "run python -m neural_net.convert_to_sv"
+            )
+        kept = blob.get("kept_layer", meta.get("kept_layer"))
+        if kept is None:
+            raise RuntimeError(f"{path} has no kept_layer")
+        if int(kept) != self.args.kept_layer:
+            raise RuntimeError(
+                f"{path} kept_layer {kept} != --kept-layer {self.args.kept_layer}"
             )
         if int(blob["hidden_size"]) != self.hidden:
             raise RuntimeError(
@@ -649,6 +659,27 @@ class Trainer:
         self.localizer.load_state_dict(blob["state_dict"])
         self.coord_embed.load(path / "coord_embed.pt")
         self.coord_embed.enabled = False
+        return meta
+
+    def _start(self) -> None:
+        """Initial weights only. Step, images, and the cosine stay at 0."""
+        from neural_net.assemble_full import resolve_name
+
+        path = resolve_name(weights_root(), self.args.start, "localizer")
+        self._load_readout_weights(path)
+        logger.info("start weights %s; step 0", path)
+
+    def _resume(self) -> None:
+        name = self.args.resume_snapshot
+        if not name:
+            return
+        path = self._resume_path(name)
+        meta = self._load_readout_weights(path)
+        if meta.get("trainer") != TRAINER_NAME:
+            raise RuntimeError(
+                f"{path} trainer is {meta.get('trainer')!r}, "
+                f"expected {TRAINER_NAME!r}"
+            )
         self.step = int(meta.get("step", 0))
         self.images_seen = int(meta.get("images_seen", 0))
         self.labels_seen = int(meta.get("labels_seen", 0))
@@ -1915,6 +1946,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--save-image-every", type=int, default=200)
     p.add_argument("--seed", type=int, default=17)
     p.add_argument("--device", default="cuda:0")
+    p.add_argument(
+        "--start", default=None,
+        help="Localizer directory under weights/. Weights only; "
+             "the step, the image count, and the cosine start at 0.",
+    )
     p.add_argument("--resume-snapshot", default=None)
     p.add_argument("--bench", type=int, default=0)
     p.add_argument(
@@ -2028,6 +2064,8 @@ def _is_cuda_oom(exc: BaseException) -> bool:
 
 def main() -> None:
     args = _build_parser().parse_args()
+    if args.start and args.resume_snapshot:
+        raise SystemExit("pass --start or --resume-snapshot, not both")
     if not args.no_supervise and not args.bench:
         raise SystemExit(_supervise(sys.argv[1:]))
     configure_logging()
