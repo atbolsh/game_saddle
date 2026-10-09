@@ -1188,8 +1188,10 @@ class Trainer:
 
         Stems are right-padded to one width, so the trunk batch is
         ``--images-per-batch`` even when the questions diverge at
-        different tokens. The cached length is that padded width (it
-        already includes the system prefix). Stage B's mask is
+        different tokens. A full-attention layer's cache is that padded
+        width (it already includes the system prefix). A sliding-window
+        layer stores only the last ``window - 1`` keys; the tokens it
+        has seen are still the padded width. Stage B's mask is
         ``[B*K, width + B_max]``, not ``prefix + width``.
 
         A beginning's look and move replies share the picture and the
@@ -1219,11 +1221,7 @@ class Trainer:
                 f"fall outside the stage-A suffix of length {int(hidden_a.shape[1])}"
             )
         grid = gather_grid(hidden_a, local_pos)
-        seq_len = _layer0_len(cache_a)
-        if seq_len != width:
-            raise RuntimeError(
-                f"stage-A cache length {seq_len} != padded stem {width}"
-            )
+        _assert_stage_a_cache(cache_a, width, self.tap.index)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         t1 = time.perf_counter()
@@ -1869,13 +1867,65 @@ def _drop_layers_above(cache: Any, index: int) -> None:
             layer.values = None
 
 
-def _layer0_len(cache: Any) -> int:
+def _expected_key_len(layer: Any, width: int) -> int:
+    """Keys a cache layer keeps after a stem of ``width`` tokens.
+
+    A sliding layer keeps the last ``window - 1`` positions once the
+    stem reaches the window. A full layer keeps the whole stem.
+    """
+    if not getattr(layer, "is_sliding", False):
+        return width
+    window = getattr(layer, "sliding_window", None)
+    if not isinstance(window, int) or window < 2:
+        raise RuntimeError(
+            f"sliding cache layer has no sliding_window ({window!r})"
+        )
+    return min(width, window - 1)
+
+
+def _assert_stage_a_cache(cache: Any, width: int, kept_layer: int) -> None:
+    """The layers that ran saw ``width`` tokens.
+
+    Layer 0 of Gemma 4 is sliding. Its key tensor stops at
+    ``sliding_window - 1`` (1023 for the 12B), so comparing that tensor
+    to the padded stem fails once the stem is longer than the window.
+    The length stage B's mask uses is ``get_seq_length`` (the tokens
+    seen), which is still the padded stem on every layer that ran.
+    """
     if not hasattr(cache, "layers"):
         raise RuntimeError(f"stage-A cache has no layers: {type(cache)!r}")
-    keys = cache.layers[0].keys
-    if keys is None or not torch.is_tensor(keys) or keys.numel() == 0:
-        raise RuntimeError("stage-A cache layer 0 has no keys")
-    return int(keys.shape[-2])
+    if kept_layer < 0 or kept_layer >= len(cache.layers):
+        raise RuntimeError(
+            f"kept layer {kept_layer} outside cache of {len(cache.layers)} layers"
+        )
+    for i, layer in enumerate(cache.layers):
+        keys = getattr(layer, "keys", None)
+        if keys is None or not torch.is_tensor(keys) or keys.numel() == 0:
+            if i <= kept_layer:
+                raise RuntimeError(f"stage-A cache layer {i} has no keys")
+            continue
+        if not hasattr(layer, "get_seq_length"):
+            raise RuntimeError(
+                f"stage-A cache layer {i} ({type(layer).__name__}) "
+                "has no get_seq_length"
+            )
+        seen = int(layer.get_seq_length())
+        key_len = int(keys.shape[-2])
+        expect = _expected_key_len(layer, width)
+        values = getattr(layer, "values", None)
+        value_len = (
+            int(values.shape[-2])
+            if torch.is_tensor(values) and values.numel()
+            else None
+        )
+        if seen != width or key_len != expect or (
+            value_len is not None and value_len != key_len
+        ):
+            kind = "sliding" if getattr(layer, "is_sliding", False) else "full"
+            raise RuntimeError(
+                f"stage-A cache layer {i} ({kind}) seen {seen} keys {key_len} "
+                f"values {value_len} != padded stem {width}, stored keys {expect}"
+            )
 
 
 def _format_log(record: dict[str, Any]) -> str:
