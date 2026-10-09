@@ -13,3 +13,8 @@ def weights_root() -> Path:
 
     path = Path(CONFIG.weights_dir)
     return path if path.is_absolute() else REPO_ROOT / path
+
+
+def full_weights_dir() -> Path:
+    """``weights/full/``, where an assembled S1+S2 checkpoint is saved."""
+    return weights_root() / "full"

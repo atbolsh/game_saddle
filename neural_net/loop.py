@@ -64,7 +64,12 @@ class GenerateResult:
 
 class S1S2:
     """One actor and one decider. No forward method; step s1 and s2
-    yourself if you want a custom loop. Both are public attributes."""
+    yourself if you want a custom loop. Both are public attributes.
+
+    ``save`` writes a ``save_all`` directory plus ``s1.pt``. ``load``
+    reads that directory back. Assembled checkpoints live under
+    ``weights/full/``.
+    """
 
     def __init__(
         self,
@@ -76,6 +81,31 @@ class S1S2:
     ) -> None:
         self.s1 = s1 if s1 is not None else S1()
         self.s2 = s2 if s2 is not None else GemmaS2(model_key, checkpoint)
+
+    def save(self, path: str | Path) -> Path:
+        """Write this pair into ``path``: Gemma, the readout, and ``s1.pt``."""
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        self.s2.save_all(path)
+        self.s1.save(path / "s1.pt")
+        return path
+
+    @classmethod
+    def load(cls, path: str | Path, *, model_key: str = "gemma-4-12b") -> S1S2:
+        """Load a directory written by :meth:`save`.
+
+        The Gemma slice and the readout go through ``GemmaS2.load_all``.
+        ``s1.pt`` is an ``S1`` state dict.
+        """
+        path = Path(path)
+        s1_path = path / "s1.pt"
+        if not s1_path.is_file():
+            raise FileNotFoundError(f"S1S2.load: missing {s1_path}")
+        s2 = GemmaS2(model_key)
+        s2.load_all(path)
+        s1 = S1()
+        s1.load_weights(s1_path)
+        return cls(s1=s1, s2=s2)
 
     def generate(
         self,

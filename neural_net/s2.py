@@ -15,6 +15,7 @@ Save / load slices:
 * save_snapshot / load_snapshot — the Localizer bundle
 * load_parts — a Gemma directory and a Localizer directory, separately
 * load_coord_checkpoint — a PEFT adapter plus coord_embed.pt, no Localizer file
+* S1S2.save / S1S2.load — a save_all directory plus s1.pt (weights/full/)
 
 A PEFT adapter (the aug27 checkpoints) is saved with save_pretrained.
 A bare HuggingFace Gemma is saved as a full state_dict; that file is
