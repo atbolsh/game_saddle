@@ -293,6 +293,14 @@ def _lcp_len(rows: list[torch.Tensor]) -> int:
     return n
 
 
+def _reply_end(build: dict[str, Any]) -> int:
+    """Index of the last supervised reply token. The terminator counts."""
+    reply = (build["weights"][0] != 0).nonzero(as_tuple=False).flatten()
+    if int(reply.numel()) == 0:
+        raise RuntimeError("question has no reply tokens")
+    return int(reply[-1])
+
+
 def _token_aligned(key: str, val: torch.Tensor, seq_len: int) -> bool:
     return (
         key not in ("input_ids", "attention_mask")
@@ -891,7 +899,13 @@ class Trainer:
         for image in images:
             builds = image["builds"]
             ids = [b["model_inputs"]["input_ids"] for b in builds]
-            split = _lcp_len(ids)
+            # The spare slots are copies of the last reply. One target
+            # (one gold, one exit, a sealed room) makes every slot the
+            # same tokens, so the common prefix runs through the reply
+            # and the stage-B suffix is empty. The last reply token is
+            # the start of that suffix. Diverging replies already split
+            # earlier, and this min leaves that split alone.
+            split = min(_lcp_len(ids), min(_reply_end(build) for build in builds))
             probe = {
                 "input_ids": ids[0],
                 "mm_token_type_ids": builds[0]["model_inputs"].get("mm_token_type_ids"),
@@ -912,11 +926,11 @@ class Trainer:
                     f"{self.prefix_n}-token system prefix"
                 )
             for build in builds:
-                reply = (build["weights"][0] != 0).nonzero(as_tuple=False).flatten()
-                if reply.numel() == 0 or int(reply[-1]) < split:
+                n = int(build["model_inputs"]["input_ids"].shape[1])
+                if split >= n or _reply_end(build) < split:
                     raise RuntimeError(
-                        "reply does not extend past the shared stem; "
-                        "use --single-stage"
+                        f"stage-A split {split} leaves reply "
+                        f"{_reply_end(build)} outside a sequence of length {n}"
                     )
             splits.append(split)
             stems.append(ids[0][0, :split])
