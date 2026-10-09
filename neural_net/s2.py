@@ -481,6 +481,12 @@ class GemmaS2:
         is a readout directory (``localizer.pt``, ``coord_embed.pt``,
         ``train_meta.json``). A directory that has both Gemma markers
         is rejected.
+
+        The Localizer weights come from ``localizer_path``. When
+        ``gemma_path`` also has ``coord_embed.pt``, that file is the
+        coordinate code: a localizer run saves an untrained embedder
+        beside ``localizer.pt``, and it must not replace the code the
+        LoRA was trained against.
         """
         gemma_path = Path(gemma_path)
         has_meta = (gemma_path / "gemma_meta.json").is_file()
@@ -506,6 +512,12 @@ class GemmaS2:
                 f"{gemma_path} has neither gemma_meta.json nor adapter_config.json"
             )
         self.load_localizer(localizer_path)
+        gemma_embed = gemma_path / "coord_embed.pt"
+        if gemma_embed.is_file():
+            assert self.coord_embed is not None
+            self.coord_embed.load(gemma_embed)
+            device = next(self.vl.model.parameters()).device
+            self.coord_embed.to(device=device, dtype=torch.float32)
         return self
 
     def load_coord_checkpoint(self, path: str | Path) -> GemmaS2:

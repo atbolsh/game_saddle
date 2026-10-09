@@ -226,6 +226,10 @@ def assemble(argv: list[str] | None = None) -> Path:
         sources["localizer"] = _rel(root, loc_path)
         print(f"gemma {gemma_path}", flush=True)
         print(f"localizer {loc_path}", flush=True)
+        if (gemma_path / "coord_embed.pt").is_file():
+            print(f"coord_embed {gemma_path / 'coord_embed.pt'}", flush=True)
+        else:
+            print(f"coord_embed {loc_path / 'coord_embed.pt'}", flush=True)
     print(f"s1 {s1_path}", flush=True)
     print(f"output {dest}", flush=True)
 

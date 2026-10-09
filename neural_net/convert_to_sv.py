@@ -123,10 +123,37 @@ def convert_embed_blob(blob: dict) -> dict:
         )
     for key in _VBAR_EMBED_KEYS:
         del state[key]
+    s_initialized = _fill_missing_s(state)
     out = dict(blob)
     out["state_dict"] = state
     out["codes"] = list(_COORD_ORDER)
+    if s_initialized:
+        out["s_channel"] = "initialized"
     return out
+
+
+def _fill_missing_s(state: dict) -> bool:
+    """A localizer run saved before the s channel has only v and v_bar.
+
+    That module was never trained. A zero gate adds nothing. The
+    projection is a fresh draw, the same init as ``CoordEmbedder``.
+    """
+    needed = ("gate_s", "proj_s.weight", "proj_s.bias")
+    if all(key in state for key in needed):
+        return False
+    import torch
+    from torch import nn
+
+    ref = state["proj_v.weight"]
+    if "proj_s.weight" not in state:
+        weight = torch.empty(ref.shape, dtype=ref.dtype)
+        nn.init.normal_(weight, std=0.02)
+        state["proj_s.weight"] = weight
+    if "proj_s.bias" not in state:
+        state["proj_s.bias"] = torch.zeros(ref.shape[0], dtype=ref.dtype)
+    if "gate_s" not in state:
+        state["gate_s"] = torch.zeros((), dtype=ref.dtype)
+    return True
 
 
 def _copy_rest(src: Path, dest: Path) -> None:
@@ -189,7 +216,14 @@ def convert(src: Path, dest: Path, src_label: str) -> None:
         embed_path = src / "coord_embed.pt"
         if embed_path.is_file():
             blob = torch.load(embed_path, map_location="cpu", weights_only=True)
-            torch.save(convert_embed_blob(blob), dest / "coord_embed.pt")
+            converted = convert_embed_blob(blob)
+            torch.save(converted, dest / "coord_embed.pt")
+            if converted.get("s_channel") == "initialized":
+                print(
+                    "coord_embed.pt had no s channel; gate_s is 0 and "
+                    "proj_s is a fresh draw. This file was not the trained code.",
+                    flush=True,
+                )
         _patch_meta(dest, src_label)
         _self_check(dest)
     except Exception:
