@@ -76,15 +76,6 @@ def hour_reward(true_hour: int, said_hour: int) -> float:
     return 0.0
 
 
-def gaze_vbar(
-    sx: float, sy: float, vx: float, vy: float, *, looking: bool,
-) -> tuple[float, float]:
-    """Looking reflects the target through the agent. Moving uses the target."""
-    if looking:
-        return (2.0 * sx - vx, 2.0 * sy - vy)
-    return (vx, vy)
-
-
 def direction_label(kind: str, sx: float, sy: float, vx: float, vy: float) -> str | None:
     """``up`` / ``down`` / ``left`` / ``right``, or None when the axis is a tie."""
     if kind == KIND_UPDOWN:

@@ -66,7 +66,7 @@ class CachedExample:
     labels: torch.Tensor
     control_ce: float
     coords: torch.Tensor
-    base: tuple[float, float, float, float, float, float]
+    base: tuple[float, float, float, float]
 
 
 def _holdout(by_source: dict[str, list[TrainingExample]],
@@ -82,15 +82,14 @@ def _holdout(by_source: dict[str, list[TrainingExample]],
     return held
 
 
-def _jitter_triple(
+def _jitter_pair(
     rng: random.Random,
     s: tuple[float, float],
     v: tuple[float, float],
-    v_bar: tuple[float, float],
 ) -> list[float]:
     for _ in range(100):
         row: list[float] = []
-        for x, y in (s, v, v_bar):
+        for x, y in (s, v):
             row.append(x + rng.gauss(0.0, REPLY_JITTER_SIGMA))
             row.append(y + rng.gauss(0.0, REPLY_JITTER_SIGMA))
         if all(COORD_LOW <= value <= COORD_HIGH for value in row):
@@ -98,24 +97,21 @@ def _jitter_triple(
     raise RuntimeError("coordinate noise stayed outside [-1, 2]")
 
 
-def _draw_base(rng: random.Random) -> tuple[float, float, float, float, float, float]:
+def _draw_base(rng: random.Random) -> tuple[float, float, float, float]:
     return (
         rng.random(), rng.random(),
         rng.random(), rng.random(),
-        rng.uniform(COORD_LOW, COORD_HIGH),
-        rng.uniform(COORD_LOW, COORD_HIGH),
     )
 
 
 def _coords_for(
     rng: random.Random,
-    base: tuple[float, float, float, float, float, float],
+    base: tuple[float, float, float, float],
     n: int,
 ) -> torch.Tensor:
     s = (base[0], base[1])
     v = (base[2], base[3])
-    v_bar = (base[4], base[5])
-    rows = [_jitter_triple(rng, s, v, v_bar) for _ in range(n)]
+    rows = [_jitter_pair(rng, s, v) for _ in range(n)]
     return torch.tensor(rows, dtype=torch.float32)
 
 
@@ -311,7 +307,7 @@ class Probe:
             )
         coords = row.coords.to(self.device)
         positions = reply_index.view(1, -1)
-        self.embedder.set_pending(coords.view(1, -1, 6), positions)
+        self.embedder.set_pending(coords.view(1, -1, 4), positions)
         try:
             with torch.inference_mode():
                 hidden = self._forward_hidden(built["model_inputs"])
@@ -431,7 +427,7 @@ class Probe:
                     if use_embed:
                         coord = _coords_for(self.rng, row.base, 1).to(self.device)
                         positions = torch.zeros(1, 1, dtype=torch.long, device=self.device)
-                        self.embedder.set_pending(coord.view(1, 1, 6), positions)
+                        self.embedder.set_pending(coord.view(1, 1, 4), positions)
                     try:
                         out = self.model(**step_inputs, use_cache=True)
                     finally:

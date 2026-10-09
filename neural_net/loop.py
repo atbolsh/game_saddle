@@ -1,31 +1,27 @@
 """S1 and S2 together.
 
-generate / batched_generate freeze one frame for S2, prefill it at the
-end of the prompt, and then race: S2 decodes the next token on one CUDA
-stream while S1 steps the live game on another, until that forward
-returns. s1_steps_per_token caps an interval. The default (None) is
-as many primitives as finish before the next token.
+generate / batched_generate freeze one frame for S2 and decode until
+eos or a reply that ends with ``[MOVE]``. S1 stays dormant. A reply
+that closes ``[MOVE]`` ends immediately; ``v`` is the Localizer output
+at the token that completed ``[MOVE]``, and ``run_s1_window`` steps
+the live game toward that point for ``S1_WINDOW_SECONDS`` or
+``S1_NOOP_STOP`` consecutive noops, and also stops if the agent exits.
 
-After the last token there is no next forward to wait on, so S1 keeps
-the last target until it emits noop, the agent exits, the cap (if set)
-hits, or S1_TAIL_SAFETY steps. Every move and every interval count is
-appended to a jsonl log.
+Every token, every primitive, and the window's stop reason are
+appended to a jsonl log. ``replay_frames`` rebuilds the window from
+the recorded actions. The engine is deterministic, so no frames are
+stored.
 
-Equal prompt lengths share a prefill. Mixed lengths are separate cohorts
-and are never left-padded (transformers#47651).
-
-Learn-to-look pretraining does not use this loop. That run stops a reply
-on eos and does not emit [HOLD] or [RELOAD].
+Equal prompt lengths share a prefill. Mixed lengths are separate
+cohorts and are never left-padded (transformers#47651).
 """
 
 from __future__ import annotations
 
-import contextlib
 import copy
 import json
 import logging
 import os
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,10 +44,22 @@ from neural_net.s2 import GemmaS2
 
 logger = logging.getLogger(__name__)
 
-# Tail interval only. Overlapped intervals stop when the next token's
-# forward returns (or at s1_steps_per_token). The tail has no next token,
-# so this bounds a policy that never emits noop.
-S1_TAIL_SAFETY = 256
+S1_WINDOW_SECONDS = 10.0
+S1_NOOP_STOP = 20
+
+
+@dataclass
+class MoveRecord:
+    """One S1 window. ``start_settings`` is the board before the first step."""
+
+    start_settings: dict[str, Any]
+    v: list[float]
+    actions: list[str]
+    collected: int
+    exited: bool
+    n_steps: int
+    elapsed: float
+    stopped_by: str
 
 
 @dataclass
@@ -60,6 +68,9 @@ class GenerateResult:
     n_tokens: int
     n_s1_steps: int
     log_path: str
+    moved: bool
+    v: list[float] | None
+    move: MoveRecord | None
 
 
 class S1S2:
@@ -113,15 +124,15 @@ class S1S2:
         prompt: str | list[dict],
         *,
         max_new_tokens: int | None = None,
-        s1_steps_per_token: int | None = None,
         log_path: str | Path | None = None,
+        on_token=None,
     ) -> GenerateResult:
         return self.batched_generate(
             [game],
             [prompt],
             max_new_tokens=max_new_tokens,
-            s1_steps_per_token=s1_steps_per_token,
             log_path=log_path,
+            on_token=on_token,
         )[0]
 
     def batched_generate(
@@ -130,8 +141,8 @@ class S1S2:
         prompts: list[str | list[dict]],
         *,
         max_new_tokens: int | None = None,
-        s1_steps_per_token: int | None = None,
         log_path: str | Path | None = None,
+        on_token=None,
     ) -> list[GenerateResult]:
         if len(games) != len(prompts):
             raise ValueError(
@@ -139,11 +150,6 @@ class S1S2:
             )
         if not games:
             return []
-        if s1_steps_per_token is not None and s1_steps_per_token < 1:
-            raise ValueError(
-                "s1_steps_per_token must be >= 1 or None, "
-                f"got {s1_steps_per_token}"
-            )
         self._ensure_loaded()
         log_file = _open_log(log_path)
         try:
@@ -158,9 +164,9 @@ class S1S2:
                     [games[i] for i in cohort],
                     stack_equal_length([encoded[i] for i in cohort]),
                     max_new_tokens=max_new_tokens,
-                    s1_steps_per_token=s1_steps_per_token,
                     log_file=log_file,
                     row_ids=cohort,
+                    on_token=on_token,
                 )
                 for index, result in zip(cohort, sub):
                     results[index] = result
@@ -183,11 +189,12 @@ class S1S2:
         encoded: dict[str, Any],
         *,
         max_new_tokens: int | None,
-        s1_steps_per_token: int | None,
         log_file,
         row_ids: list[int],
+        on_token=None,
     ) -> list[GenerateResult]:
         from agent.config import CONFIG
+        from agent.modes import ends_with_move
 
         limit = CONFIG.max_new_tokens if max_new_tokens is None else max_new_tokens
         if limit < 1:
@@ -196,43 +203,47 @@ class S1S2:
         eos = _eos_ids(self.s2.vl)
         tokenizer = getattr(self.s2.vl.processor, "tokenizer", self.s2.vl.processor)
         device = next(self.s2.vl.model.parameters()).device
-        s1_stream, s2_stream = _streams(device)
 
         batch = len(games)
         prompt_len = int(encoded["input_ids"].shape[1])
         logger.info("S1S2 cohort rows=%s prompt_tokens=%d", row_ids, prompt_len)
 
-        with _use_stream(s2_stream):
-            logits, coords, past = self.s2.prefill(encoded)
-        _sync(s2_stream)
-
+        logits, prev_coords, past = self.s2.prefill(encoded)
         seq_len = prompt_len
         generated: list[list[int]] = [[] for _ in range(batch)]
         finished = [False] * batch
-        step_counts = [0] * batch
-        log_lock = threading.Lock()
+        moved = [False] * batch
+        move_v: list[list[float] | None] = [None] * batch
+        records: list[MoveRecord | None] = [None] * batch
         log_path = log_file.name
 
         def emit(record: dict) -> None:
             line = json.dumps(record, separators=(",", ":")) + "\n"
-            with log_lock:
-                log_file.write(line)
-                log_file.flush()
-                os.fsync(log_file.fileno())
+            log_file.write(line)
+            log_file.flush()
+            os.fsync(log_file.fileno())
 
+        eos_feed = min(eos)
         for token_index in range(limit):
             token_ids = _sample(logits, sampling)
             include = [not flag for flag in finished]
-            eos_feed = min(eos)
             for row in range(batch):
                 if not include[row]:
                     token_ids[row] = eos_feed
                     continue
-                tid = int(token_ids[row])
-                generated[row].append(tid)
-                if tid in eos:
-                    finished[row] = True
-                s_xy, v_xy, vbar_xy, target = _split_coords(coords[row])
+                generated[row].append(int(token_ids[row]))
+            logits, coords, past = self.s2.decode(
+                token_ids, past, seq_len, prev_coords=prev_coords,
+            )
+            seq_len += 1
+            prev_coords = coords
+            for row in range(batch):
+                if not include[row]:
+                    continue
+                tid = generated[row][-1]
+                text = tokenizer.decode(generated[row], skip_special_tokens=True)
+                s_xy, v_xy = _split_coords(coords[row])
+                move_close = ends_with_move(text)
                 emit({
                     "kind": "token",
                     "row": row_ids[row],
@@ -241,79 +252,38 @@ class S1S2:
                     "piece": tokenizer.decode([tid], skip_special_tokens=False),
                     "s": s_xy,
                     "v": v_xy,
-                    "v_bar": vbar_xy,
-                    "target": target,
+                    "move_close": move_close,
                     "eos": tid in eos,
                 })
-
-            snapshot = coords.detach().float().cpu().clone()
-            last = (token_index + 1 == limit) or all(finished)
-            if last:
-                n_steps = self._s1_interval(
-                    games, snapshot, stop=None,
-                    cap=_tail_cap(s1_steps_per_token), until_settled=True,
-                    token_index=token_index, row_ids=row_ids, emit=emit,
-                    device=device, stream=s1_stream, step_counts=step_counts,
-                    include=include,
-                )
-                emit({
-                    "kind": "interval_end",
-                    "token_index": token_index,
-                    "rows": row_ids,
-                    "n_steps": n_steps,
-                    "tail": True,
-                })
+                if on_token is not None:
+                    on_token({
+                        "row": row_ids[row],
+                        "piece": tokenizer.decode([tid], skip_special_tokens=False),
+                        "s": s_xy,
+                        "v": v_xy,
+                        "eos": tid in eos,
+                        "move_close": move_close,
+                    })
+                if move_close:
+                    finished[row] = True
+                    moved[row] = True
+                    move_v[row] = v_xy
+                elif tid in eos:
+                    finished[row] = True
+            if all(finished):
                 break
 
-            stop = threading.Event()
-            error: dict[str, BaseException] = {}
-            holder = {"n": 0}
-
-            def _worker(
-                snap: torch.Tensor = snapshot,
-                stop_event: threading.Event = stop,
-                index: int = token_index,
-                include_rows: list[bool] = include,
-            ) -> None:
-                try:
-                    holder["n"] = self._s1_interval(
-                        games, snap, stop=stop_event, cap=s1_steps_per_token,
-                        until_settled=False, token_index=index, row_ids=row_ids,
-                        emit=emit, device=device, stream=s1_stream,
-                        step_counts=step_counts, include=include_rows,
-                    )
-                except BaseException as exc:  # re-raised on the main thread
-                    error["exc"] = exc
-                    stop_event.set()
-
-            worker = threading.Thread(target=_worker, name="s1-interval")
-            worker.start()
-            decode_exc: BaseException | None = None
-            try:
-                with _use_stream(s2_stream):
-                    logits, coords, past = self.s2.decode(
-                        token_ids, past, seq_len, prev_coords=coords,
-                    )
-            except BaseException as exc:
-                decode_exc = exc
-            finally:
-                _sync(s2_stream)
-                stop.set()
-                worker.join()
-            if decode_exc is not None and "exc" in error:
-                raise decode_exc from error["exc"]
-            if decode_exc is not None:
-                raise decode_exc
-            if "exc" in error:
-                raise error["exc"]
-            seq_len += 1
-            emit({
-                "kind": "interval_end",
-                "token_index": token_index,
-                "rows": row_ids,
-                "n_steps": holder["n"],
-                "tail": False,
-            })
+        for row in range(batch):
+            if not moved[row] or move_v[row] is None:
+                continue
+            records[row] = run_s1_window(
+                self.s1,
+                games[row],
+                move_v[row],
+                device=device,
+                emit=emit,
+                row_id=row_ids[row],
+            )
 
         return [
             GenerateResult(
@@ -321,93 +291,127 @@ class S1S2:
                     generated[row], skip_special_tokens=True
                 ).strip(),
                 n_tokens=len(generated[row]),
-                n_s1_steps=step_counts[row],
+                n_s1_steps=0 if records[row] is None else records[row].n_steps,
                 log_path=log_path,
+                moved=moved[row],
+                v=move_v[row],
+                move=records[row],
             )
             for row in range(batch)
         ]
 
-    def _s1_interval(
-        self,
-        games: list[discreteGame],
-        coords: torch.Tensor,
-        *,
-        stop: threading.Event | None,
-        cap: int | None,
-        until_settled: bool,
-        token_index: int,
-        row_ids: list[int],
-        emit,
-        device: torch.device,
-        stream,
-        step_counts: list[int],
-        include: list[bool],
-    ) -> int:
-        """Step still-active games until stop, cap, or (tail only) every
-        active row has emitted noop or exited.
 
-        coords is [B, 6] for the token that opened this interval. Returns
-        how many S1 forwards ran.
-        """
-        if device.type == "cuda":
-            torch.cuda.set_device(device)
-        active = list(include)
-        caches = [WallCache() for _ in games]
-        target = (coords[:, 2:4] + coords[:, 4:6]) / 2
-        n_forwards = 0
-        while True:
-            if stop is not None and stop.is_set():
-                break
-            if cap is not None and n_forwards >= cap:
-                break
-            rows = [i for i, on in enumerate(active) if on]
-            if not rows:
-                break
-            frames = [caches[i].render(games[i]) for i in rows]
-            xy = target[rows].to(device, non_blocking=device.type == "cuda")
-            images = _frames_tensor(frames, device)
-            with _use_stream(stream):
-                with torch.inference_mode():
-                    logits = self.s1(images, xy)
-            _sync(stream)
-            choice = torch.argmax(logits, dim=-1).tolist()
-            settled = True
-            for local, row in enumerate(rows):
-                action = ACTIONS[int(choice[local])]
-                before = pose(games[row])
-                collected = apply_primitive(games[row], action)
-                after = pose(games[row])
-                exited = bool(games[row].agent_exited())
-                chased = [
-                    round(float(v), 6) for v in target[row].tolist()
-                ]
-                emit({
-                    "kind": "move",
-                    "row": row_ids[row],
-                    "token_index": token_index,
-                    "step": n_forwards,
-                    "action": action,
-                    "target": chased,
-                    "collected": collected,
-                    "exited": exited,
-                    "before": before,
-                    "after": after,
-                })
-                step_counts[row] += 1
-                if exited:
-                    active[row] = False
-                if not until_settled or action != "noop":
-                    settled = False
-            n_forwards += 1
-            if until_settled and settled:
-                break
-        return n_forwards
+def run_s1_window(
+    s1: S1,
+    game: discreteGame,
+    v: list[float] | tuple[float, float],
+    *,
+    device: torch.device,
+    seconds: float = S1_WINDOW_SECONDS,
+    noop_stop: int = S1_NOOP_STOP,
+    emit=None,
+    row_id: int = 0,
+) -> MoveRecord:
+    """Step ``game`` toward ``v`` until time, a noop streak, or exit.
+
+    The clock is wall time. The noop counter resets on any other action.
+    ``stopped_by`` is ``time``, ``noops``, or ``exit``.
+    """
+    from agent.game_io import game_to_settings_dict
+
+    point = [float(v[0]), float(v[1])]
+    if len(point) != 2:
+        raise ValueError(f"v must be two numbers, got {len(v)}")
+    if seconds < 0:
+        raise ValueError(f"seconds must be >= 0, got {seconds}")
+    if noop_stop < 1:
+        raise ValueError(f"noop_stop must be >= 1, got {noop_stop}")
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    s1.to(device)
+    s1.eval()
+    start_settings = game_to_settings_dict(game)
+    cache = WallCache()
+    xy = torch.tensor([point], dtype=torch.float32, device=device)
+    actions: list[str] = []
+    collected_total = 0
+    noop_run = 0
+    exited = False
+    stopped = "time"
+    started = time.perf_counter()
+    while True:
+        if time.perf_counter() - started >= seconds:
+            stopped = "time"
+            break
+        if noop_run >= noop_stop:
+            stopped = "noops"
+            break
+        images = _frames_tensor([cache.render(game)], device)
+        with torch.inference_mode():
+            logits = s1(images, xy)
+        action = ACTIONS[int(torch.argmax(logits, dim=-1).item())]
+        before = pose(game)
+        collected = int(apply_primitive(game, action))
+        after = pose(game)
+        exited = bool(game.agent_exited())
+        actions.append(action)
+        collected_total += collected
+        if action == "noop":
+            noop_run += 1
+        else:
+            noop_run = 0
+        if emit is not None:
+            emit({
+                "kind": "move",
+                "row": row_id,
+                "step": len(actions) - 1,
+                "action": action,
+                "v": [round(item, 6) for item in point],
+                "collected": collected,
+                "exited": exited,
+                "before": before,
+                "after": after,
+            })
+        if exited:
+            stopped = "exit"
+            break
+        if noop_run >= noop_stop:
+            stopped = "noops"
+            break
+    elapsed = time.perf_counter() - started
+    record = MoveRecord(
+        start_settings=start_settings,
+        v=[round(item, 6) for item in point],
+        actions=actions,
+        collected=collected_total,
+        exited=exited,
+        n_steps=len(actions),
+        elapsed=elapsed,
+        stopped_by=stopped,
+    )
+    if emit is not None:
+        emit({
+            "kind": "window_end",
+            "row": row_id,
+            "stopped_by": record.stopped_by,
+            "n_steps": record.n_steps,
+            "elapsed": record.elapsed,
+            "collected": record.collected,
+            "exited": record.exited,
+        })
+    return record
 
 
-def _tail_cap(s1_steps_per_token: int | None) -> int:
-    if s1_steps_per_token is None:
-        return S1_TAIL_SAFETY
-    return s1_steps_per_token
+def replay_frames(record: MoveRecord) -> Iterator[np.ndarray]:
+    """Rebuild the window. Yields the start frame, then one frame per action."""
+    from agent.game_io import game_from_settings_dict
+
+    game = game_from_settings_dict(record.start_settings)
+    cache = WallCache()
+    yield cache.render(game)
+    for action in record.actions:
+        apply_primitive(game, action)
+        yield cache.render(game)
 
 
 def _open_log(log_path: str | Path | None):
@@ -421,41 +425,19 @@ def _open_log(log_path: str | Path | None):
     return open(path, "a", encoding="utf-8")
 
 
-def _split_coords(row: torch.Tensor):
+def _split_coords(row: torch.Tensor) -> tuple[list[float], list[float]]:
     values = [round(float(v), 6) for v in row.detach().float().cpu()]
-    if len(values) != 6:
+    if len(values) != 4:
         raise RuntimeError(
-            f"coordinate head returned {len(values)} values, expected 6"
+            f"coordinate head returned {len(values)} values, expected 4 (s, v)"
         )
-    s_xy, v_xy, vbar_xy = values[0:2], values[2:4], values[4:6]
-    target = [
-        round((v_xy[0] + vbar_xy[0]) / 2, 6),
-        round((v_xy[1] + vbar_xy[1]) / 2, 6),
-    ]
-    return s_xy, v_xy, vbar_xy, target
+    return values[0:2], values[2:4]
 
 
 def _frames_tensor(frames: list[np.ndarray], device: torch.device) -> torch.Tensor:
     stacked = np.ascontiguousarray(np.stack(frames, axis=0))
     tensor = torch.from_numpy(stacked).permute(0, 3, 1, 2).contiguous()
     return tensor.to(device, non_blocking=device.type == "cuda")
-
-
-def _streams(device: torch.device):
-    if device.type != "cuda":
-        return None, None
-    return torch.cuda.Stream(device=device), torch.cuda.Stream(device=device)
-
-
-def _use_stream(stream):
-    if stream is None:
-        return contextlib.nullcontext()
-    return torch.cuda.stream(stream)
-
-
-def _sync(stream) -> None:
-    if stream is not None:
-        stream.synchronize()
 
 
 def _cohorts(lens: list[int]) -> Iterator[list[int]]:
@@ -496,7 +478,11 @@ def _messages(prompt: str | list[dict], image: Image.Image) -> list[dict]:
     if isinstance(content, str):
         last["content"] = [{"type": "text", "text": content}, image_part]
     elif isinstance(content, list):
-        content.append(image_part)
+        if not any(
+            isinstance(part, dict) and part.get("type") == "image"
+            for part in content
+        ):
+            content.append(image_part)
     else:
         raise TypeError(
             "the last message content must be a string or a list of parts, "

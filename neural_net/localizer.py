@@ -32,7 +32,9 @@ LOCALIZER_MLP_DIM = 2048
 GRID_SIDE = 16
 GRID_CELLS = GRID_SIDE * GRID_SIDE
 NO_IMAGE_COORD = 0.5
-COORD_ORDER = ("s", "v", "v_bar")
+COORD_ORDER = ("s", "v")
+LOCALIZER_COORDS = COORD_ORDER
+N_COORD_HEADS = len(COORD_ORDER)
 
 
 def cell_centers(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -65,11 +67,11 @@ def cell_index(points: torch.Tensor) -> torch.Tensor:
 
 
 class Localizer(nn.Module):
-    """Three query heads over a refined 16x16 grid. fp32 throughout.
+    """Two query heads over a refined 16x16 grid. fp32 throughout.
 
-    ``s``, ``v``, and ``v_bar`` each attend the same keys. The point is
-    the attention-weighted cell centre plus a zero-initialised offset,
-    so step 0 is exactly the softmax expectation.
+    ``s`` and ``v`` each attend the same keys. The point is the
+    attention-weighted cell centre plus a zero-initialised offset, so
+    step 0 is exactly the softmax expectation.
     """
 
     def __init__(
@@ -98,9 +100,9 @@ class Localizer(nn.Module):
         )
         self.refine = nn.TransformerEncoder(layer, num_layers=self.refine_layers)
         self.q_norm = nn.LayerNorm(self.hidden_size)
-        self.q_proj = nn.Linear(self.hidden_size, 3 * self.dim)
+        self.q_proj = nn.Linear(self.hidden_size, N_COORD_HEADS * self.dim)
         self.offset = nn.ModuleList(
-            nn.Linear(self.dim, 2) for _ in range(3)
+            nn.Linear(self.dim, 2) for _ in range(N_COORD_HEADS)
         )
         for linear in self.offset:
             nn.init.zeros_(linear.weight)
@@ -116,8 +118,8 @@ class Localizer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``grid [B, 256, H]``, ``query [B, Q, H]`` -> coords, cell logits.
 
-        Returns ``coords [B, Q, 6]`` and ``cell_logits [B, Q, 3, 256]``,
-        both fp32. Column order is ``COORD_ORDER``.
+        Returns ``coords [B, Q, 4]`` and ``cell_logits [B, Q, 2, 256]``,
+        both fp32. Column order is ``COORD_ORDER`` (``s``, then ``v``).
         """
         if grid.shape[1] != GRID_CELLS:
             raise ValueError(
@@ -138,14 +140,14 @@ class Localizer(nn.Module):
         )
         keys = self.refine(self.in_proj(g))
         q = self.q_proj(self.q_norm(query.float()))
-        q = q.view(q.shape[0], q.shape[1], 3, self.dim)
+        q = q.view(q.shape[0], q.shape[1], N_COORD_HEADS, self.dim)
         scale = self.dim ** 0.5
         cell_logits = torch.einsum("bqhd,bkd->bqhk", q, keys) / scale
         attn = torch.softmax(cell_logits, dim=-1)
         expect = attn @ centers.to(dtype=attn.dtype)
         attended = attn @ keys
         points = []
-        for head in range(3):
+        for head in range(N_COORD_HEADS):
             points.append(
                 expect[..., head, :] + self.offset[head](attended[..., head, :])
             )
@@ -154,9 +156,10 @@ class Localizer(nn.Module):
 
 
 def no_image_coords(batch: int, n_query: int, device: torch.device) -> torch.Tensor:
-    """``[batch, n_query, 6]`` filled with ``NO_IMAGE_COORD``."""
+    """``[batch, n_query, 4]`` filled with ``NO_IMAGE_COORD`` (``s``, then ``v``)."""
     return torch.full(
-        (batch, n_query, 6), NO_IMAGE_COORD, dtype=torch.float32, device=device,
+        (batch, n_query, 2 * N_COORD_HEADS),
+        NO_IMAGE_COORD, dtype=torch.float32, device=device,
     )
 
 

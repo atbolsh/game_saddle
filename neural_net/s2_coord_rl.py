@@ -1,7 +1,7 @@
 """Archived online-RL task for the coordinate embedder.
 
 Off by default. ``--rl`` on the teacher-force trainer runs this sampler
-instead of the sixteen-reply cache. The anchor coin stays in the trainer.
+instead of the eight-reply cache. The anchor coin stays in the trainer.
 
 Replies are sampled, not teacher-forced. A reward of 0 is skipped. One
 quarter of the slots are teacher-forced on the correct line so the format
@@ -30,7 +30,6 @@ from neural_net.s2_coord_oracle import (
     clock_hour,
     correct_line,
     direction_label,
-    gaze_vbar,
     hour_is_unique,
     parse_reply,
     reply_reward,
@@ -41,8 +40,6 @@ from training.train import TrainingExample, weighted_loss
 BOOTSTRAP = 0.25
 MAX_NEW_TOKENS = 24
 V_TRIES = 400
-COORD_LOW = -1.0
-COORD_HIGH = 2.0
 NOTEPAD = [{"key": "target", "value": "the upper-left gold", "updated_round": 1}]
 
 
@@ -109,12 +106,6 @@ def scenario(trainer: Any) -> dict[str, Any] | None:
         expected = "yes" if mode == "move" else "no"
     else:
         raise RuntimeError(f"unhandled kind {kind}")
-    looking = mode != "move"
-    vbx, vby = gaze_vbar(sx, sy, vx, vy, looking=looking)
-    if not (COORD_LOW <= vbx <= COORD_HIGH and COORD_LOW <= vby <= COORD_HIGH):
-        raise RuntimeError(
-            f"v_bar {(vbx, vby)} outside [-1, 2] for s {(sx, sy)} v {(vx, vy)}"
-        )
     frame = canonical_frame(game)
     path = trainer.tmp / f"rl_{trainer.step}_{time.time_ns()}.png"
     Image.fromarray(frame).save(path)
@@ -131,7 +122,7 @@ def scenario(trainer: Any) -> dict[str, Any] | None:
         "kind": kind,
         "expected": expected,
         "agent": agent,
-        "points": ((sx, sy), (vx, vy), (vbx, vby)),
+        "points": ((sx, sy), (vx, vy)),
         "messages": messages,
         "path": path,
         "line": line,
@@ -191,7 +182,7 @@ def generate(
                     )
                 coord = torch.tensor(row, dtype=torch.float32, device=trainer.device)
                 positions = torch.zeros(1, 1, dtype=torch.long, device=trainer.device)
-                trainer.embedder.set_pending(coord.view(1, 1, 6), positions)
+                trainer.embedder.set_pending(coord.view(1, 1, 4), positions)
                 try:
                     out = trainer.model(**step_inputs, use_cache=True)
                 finally:

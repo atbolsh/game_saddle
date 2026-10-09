@@ -333,10 +333,11 @@ DEFAULT_PLAYER_QUESTION = "Please make the right move for this position."
 
 # --------------------------------------------------------------- S2 look
 #
-# The learn-to-look pretraining prompt. No primitive move tokens, no
-# [HOLD], no end-message token. A reply finishes by ending this message
-# (the model's ordinary stop). The confirmation lines below are the only
-# copy: the trainer samples them from these tuples.
+# The learn-to-look prompt. No primitive move tokens and no [HOLD].
+# A look reply ends by ending the message. A move reply ends with
+# [MOVE] on its own last line, which ends the message and wakes S1.
+# The confirmation lines below are the only copy: the trainer samples
+# them from these tuples.
 
 _S2_LOOK_LINES = (
     "Acknowledged, looking there.",
@@ -351,12 +352,29 @@ _S2_MOVE_LINES = (
     "Yes. Heading there now.",
 )
 
+S2_MOVE_TOKEN = "[MOVE]"
+S2_MOVE_RE = re.compile(r"\[MOVE\]\s*\Z")
+S2_MOVE_VERDICT_LINES = (
+    "The move reached the gold.",
+    "The move did not reach the gold.",
+)
+
+
+def s2_move_reply(line: str) -> str:
+    """A move confirmation plus the ``[MOVE]`` line that ends it."""
+    return f"{line}\n{S2_MOVE_TOKEN}"
+
+
+def ends_with_move(text: str) -> bool:
+    """True when ``text`` ends with ``[MOVE]``, ignoring trailing space."""
+    return S2_MOVE_RE.search(text) is not None
+
+
 _BLOCK_S2_IDENTITY = (
     "You are a modified Gemma 4. Besides the words you write, every token "
-    "also sets three points: s, where your body is; v, the place you are "
-    "attending to; and v_bar, the point that together with v tells the fast "
-    "controller where to go. You will learn to control these points. Later "
-    "you will learn to describe, accurately, how you set them."
+    "also sets two points: s, where your body is, and v, the place you are "
+    "attending to. You will learn to control these points. Later you will "
+    "learn to describe, accurately, how you set them."
 )
 
 _BLOCK_S2_WORLD = (
@@ -367,19 +385,34 @@ _BLOCK_S2_WORLD = (
 )
 
 _BLOCK_S2_LOOK_MOVE = (
-    "A message may ask you to look at a place or to move to a place.\n"
+    "A message may ask you to look at a place, to move to a place, or to "
+    "answer a question about the picture or about where you are looking.\n"
     "\n"
     "Look at a place: attend to it and leave your body where it is. Confirm "
-    "with one of these lines, and nothing else on that line:\n"
+    "with one of these lines, and nothing else on that line, then end the "
+    "message:\n"
     "\n"
     + "\n".join(f"  {line}" for line in _S2_LOOK_LINES)
     + "\n\n"
-    "Move to a place: attend to it and send the controller there. Confirm "
-    "with one of these lines, and nothing else on that line:\n"
+    "Move to a place: attend to it, confirm with one of these lines, and "
+    "then write [MOVE] on its own last line. [MOVE] ends the message and "
+    "sends your body toward v. Do not write anything after [MOVE]:\n"
     "\n"
     + "\n".join(f"  {line}" for line in _S2_MOVE_LINES)
-    + "\n\n"
-    "Ending this message finishes the reply."
+    + "\n"
+    "  [MOVE]\n"
+    "\n"
+    "A question about the picture or about your gaze gets an answer and "
+    "then the message ends. Do not write [MOVE] unless you were asked to "
+    "move."
+)
+
+_BLOCK_S2_MOVE_REPORT = (
+    "After you move, the next message begins with a Board update that says "
+    "whether that move ate a gold. Open your reply with exactly one of "
+    "these lines, then continue:\n"
+    "\n"
+    + "\n".join(f"  {line}" for line in S2_MOVE_VERDICT_LINES)
 )
 
 _BLOCK_S2_TARGET = (
@@ -399,13 +432,20 @@ SYSTEM_PROMPT_S2 = "\n\n".join([
     _BLOCK_S2_IDENTITY,
     _BLOCK_S2_WORLD,
     _BLOCK_S2_LOOK_MOVE,
+    _BLOCK_S2_MOVE_REPORT,
     _BLOCK_S2_TARGET,
 ])
 
-#: User line for the 64 pretraining beginnings. Not part of the system prompt.
+#: User line for a beginning that looks. Not part of the system prompt.
 S2_BEGINNING_USER = (
     "For the first message this game, select a target as usual, and look "
     "at it, then end the message."
+)
+
+#: User line for a beginning that moves. The reply ends with [MOVE].
+S2_BEGINNING_MOVE_USER = (
+    "For the first message this game, select a target as usual, and move "
+    "to it."
 )
 
 _BLOCK_S2_ANALYST = (

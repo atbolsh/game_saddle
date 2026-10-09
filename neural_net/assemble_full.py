@@ -13,8 +13,10 @@ file is optional. A prefix that matches one checkpoint is that
 checkpoint. A prefix that matches several is an error.
 
 The directory is what :meth:`neural_net.loop.S1S2.load` reads: a
-``save_all`` Gemma slice, the readout, and ``s1.pt``. Run this on the
-GPU box. It loads Gemma.
+``save_all`` Gemma slice, the readout, and ``s1.pt``. The readout and
+the coordinate file must already be the ``(s, v)`` format
+(``python -m neural_net.convert_to_sv``); the loaders reject a 3-point
+file. Run this on the GPU box. It loads Gemma.
 """
 
 from __future__ import annotations

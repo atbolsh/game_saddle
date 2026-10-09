@@ -44,14 +44,18 @@ from torch import nn
 from agent import game_io
 from agent import memory as mem
 from agent.config import CONFIG
+from agent.game_io import compose_s2_question
 from agent.modes import (
+    S2_BEGINNING_MOVE_USER,
     S2_BEGINNING_USER,
+    S2_MOVE_VERDICT_LINES,
     SYSTEM_PROMPT_S2,
     SYSTEM_PROMPT_S2_ANALYST,
     _S2_LOOK_LINES,
     _S2_MOVE_LINES,
     _build_game_messages,
     parse_target,
+    s2_move_reply,
 )
 from agent.model import ADAPTERS, VLModel, spec_for
 from neural_net.s2 import _find_lm_head, _hidden_size
@@ -194,7 +198,7 @@ def standard_user_questions() -> list[str]:
     phrases = [corner_phrase(name) for name, _x, _y in _CORNERS]
     phrases.extend(gold_region_phrases())
     phrases.extend(["the gold", "the exit"])
-    questions = [S2_BEGINNING_USER]
+    questions = [S2_BEGINNING_USER, S2_BEGINNING_MOVE_USER]
     for kind in ("look", "move"):
         for phrase in phrases:
             questions.append(_ask(kind, phrase))
@@ -202,18 +206,10 @@ def standard_user_questions() -> list[str]:
     return questions
 
 
-def _coords(kind: str, agent: tuple[float, float],
+def _coords(agent: tuple[float, float],
             target: tuple[float, float]) -> list[float]:
-    """s, v, v_bar. Look leaves the body; move sends S1 to the target."""
-    sx, sy = agent
-    vx, vy = target
-    if kind == "look":
-        bx, by = (2.0 * sx - vx, 2.0 * sy - vy)
-    elif kind == "move":
-        bx, by = (2.0 * vx - vx, 2.0 * vy - vy)
-    else:
-        raise ValueError(f"bad kind {kind!r}")
-    return [sx, sy, vx, vy, bx, by]
+    """``(s, v)``. Look and move share the same two points."""
+    return [float(agent[0]), float(agent[1]), float(target[0]), float(target[1])]
 
 
 def _targets_on_board(
@@ -299,10 +295,20 @@ class SyntheticPrompt:
     notepad: str
 
 
-def beginning_messages(image_path: str, notepad: str) -> list[dict]:
-    """The beginnings user turn: empty context, the notepad, the picture."""
+def beginning_messages(image_path: str, notepad: str, kind: str) -> list[dict]:
+    """The beginnings user turn: empty context, the notepad, the picture.
+
+    ``kind`` is ``look`` or ``move``. Every target on one image uses the
+    same kind, so the shared stem stays one prompt.
+    """
+    if kind == "look":
+        user = S2_BEGINNING_USER
+    elif kind == "move":
+        user = S2_BEGINNING_MOVE_USER
+    else:
+        raise ValueError(f"beginning kind must be look or move, got {kind!r}")
     return _build_game_messages(
-        SYSTEM_PROMPT_S2, image_path, "", S2_BEGINNING_USER, notepad=notepad,
+        SYSTEM_PROMPT_S2, image_path, "", user, notepad=notepad,
     )
 
 
@@ -316,6 +322,7 @@ def _fake_rounds(
     if n_rounds < 1:
         return lines
     start = 0
+    pending: dict[str, int | str] | None = None
     if target_note:
         lines.append(("user", S2_BEGINNING_USER))
         lines.append((
@@ -331,11 +338,26 @@ def _fake_rounds(
     for _round in range(start, n_rounds):
         hist_kind = "look" if rng.random() < 0.5 else "move"
         _cand_kind, hist_phrase, _point = rng.choice(pool)
-        hist_lines = (
-            _S2_LOOK_LINES if hist_kind == "look" else _S2_MOVE_LINES
-        )
-        lines.append(("user", _ask(hist_kind, hist_phrase)))
-        lines.append(("assistant", rng.choice(hist_lines)))
+        asked = _ask(hist_kind, hist_phrase)
+        user = compose_s2_question(asked, pending)
+        if hist_kind == "move":
+            body = s2_move_reply(rng.choice(_S2_MOVE_LINES))
+        else:
+            body = rng.choice(_S2_LOOK_LINES)
+        if pending is not None:
+            verdict = S2_MOVE_VERDICT_LINES[0 if int(pending["collected"]) else 1]
+            body = f"{verdict}\n{body}"
+        lines.append(("user", user))
+        lines.append(("assistant", body))
+        if hist_kind == "move":
+            pending = {
+                "collected": 1 if rng.random() < 0.5 else 0,
+                "gold_remaining": rng.randint(0, 3),
+                "n_steps": rng.randint(1, 40),
+                "stopped_by": rng.choice(("noops", "time", "exit")),
+            }
+        else:
+            pending = None
     return lines
 
 
@@ -437,7 +459,7 @@ def draw_question(ctx: BoardContext, rng: random.Random) -> DrawnQuestion:
         candidate_kind=out_cand,
         question_kind=question_kind,
         question=asked,
-        coords=_coords(out_kind, ctx.agent, out_point),
+        coords=_coords(ctx.agent, out_point),
     )
 
 
@@ -668,7 +690,7 @@ def _align_hidden(hidden: torch.Tensor, weights: torch.Tensor,
 
 def _coord_l2(head: nn.Linear, hidden: torch.Tensor, weights: torch.Tensor,
               targets: torch.Tensor) -> torch.Tensor:
-    """MSE of s, v, and v_bar, as a length-3 tensor.
+    """MSE of s and v, as a length-2 tensor.
 
     Each pair is the mean of its two squared errors, then the masked mean
     over reply positions, then the mean over the batch. ``parts.mean()``
@@ -682,7 +704,7 @@ def _coord_l2(head: nn.Linear, hidden: torch.Tensor, weights: torch.Tensor,
         raise RuntimeError("coordinate loss row has no reply tokens")
     denom = counts.to(diff.dtype)
     parts = []
-    for start in (0, 2, 4):
+    for start in (0, 2):
         err = diff[..., start:start + 2].mean(dim=-1)
         per = (err * mask).sum(dim=1) / denom
         parts.append(per.mean())
@@ -698,7 +720,7 @@ def _merge_step_parts(
     replay_parts: list[dict[str, Any]],
 ) -> dict[str, Any]:
     merged: dict[str, Any] = {}
-    for key in ("look_ce", "l2_s", "l2_v", "l2_vbar"):
+    for key in ("look_ce", "l2_s", "l2_v"):
         vals = [row[key] for row in look_parts if key in row]
         if vals:
             merged[key] = sum(vals) / len(vals)
@@ -719,16 +741,14 @@ def _format_step(step: int, kind: str, loss_value: float,
         return (
             f"step {step} beginning "
             f"rms s {_rms(parts['l2_s']):.2f} "
-            f"v {_rms(parts['l2_v']):.2f} "
-            f"vbar {_rms(parts['l2_vbar']):.2f} | {tail}"
+            f"v {_rms(parts['l2_v']):.2f} | {tail}"
         )
     kinds = ", ".join(str(item) for item in parts.get("replay_kind") or [])
     return (
         f"step {step} synthetic loss {loss_value:.3f} | "
         f"look ce {parts.get('look_ce', 0.0):.3f} "
         f"rms s {_rms(parts['l2_s']):.3f} "
-        f"v {_rms(parts['l2_v']):.3f} "
-        f"vbar {_rms(parts['l2_vbar']):.3f} | "
+        f"v {_rms(parts['l2_v']):.3f} | "
         f"replay {parts.get('replay_loss', 0.0):.2f} [{kinds}] | {tail}"
     )
 
@@ -864,7 +884,7 @@ class Run:
 
         hidden = _hidden_size(self.model)
         device = torch.device(cfg.device)
-        self.head = nn.Linear(hidden, 6).to(device=device, dtype=torch.float32)
+        self.head = nn.Linear(hidden, 4).to(device=device, dtype=torch.float32)
         self._load_head()
 
         self.vl = VLModel(self.spec)
@@ -1192,7 +1212,6 @@ class Run:
             return loss, {
                 "l2_s": float(parts_t[0].detach()),
                 "l2_v": float(parts_t[1].detach()),
-                "l2_vbar": float(parts_t[2].detach()),
             }
 
         captured: dict[str, torch.Tensor] = {}
@@ -1226,7 +1245,6 @@ class Run:
             "look_ce": float(ce.detach()),
             "l2_s": float(coord[0].detach()),
             "l2_v": float(coord[1].detach()),
-            "l2_vbar": float(coord[2].detach()),
         }
 
     def _replay_loss(self, exs: list[TrainingExample],
@@ -1358,7 +1376,7 @@ class Run:
         self.session_ids.append(sid)
         notes = loop.run_until_complete(mem.get_session_notes(client, sid))
         notepad = mem.format_notepad(notes)
-        messages = beginning_messages(str(seen), notepad)
+        messages = beginning_messages(str(seen), notepad, "look")
         reply = _generate_text(
             self.vl, self.model, messages, BEGINNING_MAX_NEW_TOKENS,
         )
@@ -1415,7 +1433,7 @@ class Run:
                         float(settings["agent_x"]),
                         float(settings["agent_y"]),
                     )
-                    coords = _coords("look", agent, point)
+                    coords = _coords(agent, point)
         status = "skipped" if reason else "kept"
         record = {
             "messages": messages,
@@ -1547,10 +1565,12 @@ class Run:
         built = synthetic_prompt(settings, self.rng, str(path))
         if built.coords is None:
             raise RuntimeError("synthetic prompt has no coordinate label")
-        reply_lines = (
+        reply_line = self.rng.choice(
             _S2_LOOK_LINES if built.kind == "look" else _S2_MOVE_LINES
         )
-        reply = self.rng.choice(reply_lines)
+        reply = (
+            reply_line if built.kind == "look" else s2_move_reply(reply_line)
+        )
         record = {
             "messages": built.messages,
             "target_text": reply,

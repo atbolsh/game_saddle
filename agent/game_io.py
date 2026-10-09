@@ -880,6 +880,50 @@ def compose_player_question(
     return prefix + "\n\n" + question
 
 
+def s2_board_update_line(
+    gold_collected: int,
+    gold_remaining: int,
+    n_steps: int,
+    stopped_by: str,
+) -> str:
+    """Board report after an S1 window. No classic move token.
+
+    ``stopped_by`` is ``noops``, ``time``, or ``exit``.
+    """
+    how = (
+        f"The controller took {int(n_steps)} steps and stopped "
+        f"({stopped_by})."
+    )
+    if gold_collected > 0:
+        return (
+            "Board update: your last move ATE a gold. "
+            f"{gold_remaining} gold(s) now remain. {how} If the eaten gold "
+            "was your saved target, that gold no longer exists -- pick a new "
+            "target and save it with [REMEMBER target: ...] before you move."
+        )
+    return (
+        "Board update: your last move did not eat a gold. "
+        f"{gold_remaining} gold(s) remain on the board. {how}"
+    )
+
+
+def compose_s2_question(question: str, last_move: dict[str, Any] | None) -> str:
+    """Prefix ``question`` with the S2 board report when a move just ran.
+
+    ``last_move`` carries ``collected``, ``gold_remaining``, ``n_steps``,
+    and ``stopped_by``. Absent means this is the first turn.
+    """
+    if not last_move:
+        return question
+    prefix = s2_board_update_line(
+        int(last_move["collected"]),
+        int(last_move["gold_remaining"]),
+        int(last_move["n_steps"]),
+        str(last_move["stopped_by"]),
+    )
+    return prefix + "\n\n" + question
+
+
 def find_bare_move(text: str) -> str | None:
     """Return the LAST bare (unbracketed) move word in ``text`` -- e.g.
     'ANTICLOCK' without brackets -- or ``None``.

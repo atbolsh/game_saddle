@@ -40,11 +40,13 @@ import torch.nn.functional as F
 
 from agent.config import CONFIG
 from agent.modes import (
+    S2_BEGINNING_MOVE_USER,
     S2_BEGINNING_USER,
     SYSTEM_PROMPT_S2,
     _S2_LOOK_LINES,
     _S2_MOVE_LINES,
     _build_game_messages,
+    s2_move_reply,
 )
 from agent.memory import format_notepad
 from agent.model import ADAPTERS, repeat_kv_cache, spec_for
@@ -215,7 +217,7 @@ def _begin_reply(phrase: str, kind: str) -> str:
     if kind == "look":
         line = BEGIN_LOOK_LINE
     elif kind == "move":
-        line = BEGIN_MOVE_LINE
+        line = s2_move_reply(BEGIN_MOVE_LINE)
     else:
         raise ValueError(f"bad begin kind {kind!r}")
     return f"[REMEMBER target: {phrase}]\n{line}"
@@ -246,7 +248,7 @@ def _close_content_index(tokenizer: Any, text: str) -> int:
 
 
 def _reply_cap(tokenizer: Any, reply_positions: int) -> int:
-    lines = list(_S2_LOOK_LINES) + list(_S2_MOVE_LINES)
+    lines = list(_S2_LOOK_LINES) + [s2_move_reply(line) for line in _S2_MOVE_LINES]
     phrases = ["the gold", "the exit", "the exit on the bottom wall"]
     phrases.extend(gold_region_phrases())
     phrases.append("the upper-middle gold, further right")
@@ -293,15 +295,15 @@ class _Floors:
 
     def __init__(self) -> None:
         self.count = 0
-        self.mean = torch.zeros(6, dtype=torch.float64)
-        self.m2 = torch.zeros(6, dtype=torch.float64)
+        self.mean = torch.zeros(4, dtype=torch.float64)
+        self.m2 = torch.zeros(4, dtype=torch.float64)
         self.s_sum = torch.zeros(2, dtype=torch.float64)
         self.s_count = 0
         self.phrase_sum: dict[int, torch.Tensor] = {}
         self.phrase_count: dict[int, int] = {}
 
     def update(self, labels: torch.Tensor, phrase_ids: list[int]) -> None:
-        """``labels [n, 6]`` on CPU."""
+        """``labels [n, 4]`` on CPU."""
         for row, phrase in zip(labels, phrase_ids):
             x = row.detach().to(dtype=torch.float64, device="cpu")
             self.count += 1
@@ -325,33 +327,28 @@ class _Floors:
         return {
             "s": math.sqrt(float(var[0:2].mean())),
             "v": math.sqrt(float(var[2:4].mean())),
-            "v_bar": math.sqrt(float(var[4:6].mean())),
         }
 
     def text_only(
         self,
         labels: torch.Tensor,
         phrase_ids: list[int],
-        move_kinds: list[int],
     ) -> dict[str, float]:
         if self.s_count < 1:
             return {name: float("nan") for name in COORD_ORDER}
         s_hat = (self.s_sum / self.s_count).to(dtype=torch.float32)
         pred = torch.empty_like(labels)
-        for i, (phrase, kind) in enumerate(zip(phrase_ids, move_kinds)):
+        for i, phrase in enumerate(phrase_ids):
             count = self.phrase_count.get(phrase, 0)
             if count < 1:
                 raise RuntimeError(f"text-only floor has no mean for phrase {phrase}")
             v_hat = (self.phrase_sum[phrase] / count).to(dtype=torch.float32)
-            vbar = (2.0 * s_hat - v_hat) if kind == 0 else v_hat
             pred[i, 0:2] = s_hat
             pred[i, 2:4] = v_hat
-            pred[i, 4:6] = vbar
         err = (labels - pred).pow(2)
         return {
             "s": math.sqrt(float(err[:, 0:2].mean())),
             "v": math.sqrt(float(err[:, 2:4].mean())),
-            "v_bar": math.sqrt(float(err[:, 4:6].mean())),
         }
 
 
@@ -373,7 +370,7 @@ class _Buffer:
             n, k, r_max, hidden, dtype=torch.bfloat16, device=device,
         )
         self.valid_r = torch.zeros(n, k, r_max, dtype=torch.bool, device=device)
-        self.labels = torch.empty(n, k, 6, dtype=torch.float32, device=device)
+        self.labels = torch.empty(n, k, 4, dtype=torch.float32, device=device)
         self.move_kind = torch.zeros(n, k, dtype=torch.int8, device=device)
         self.cand_kind = torch.zeros(n, k, dtype=torch.int8, device=device)
         self.phrase_id = torch.zeros(n, k, dtype=torch.int32, device=device)
@@ -630,6 +627,11 @@ class Trainer:
                 f"--kept-layer {self.args.kept_layer}"
             )
         blob = torch.load(path / "localizer.pt", map_location="cpu", weights_only=True)
+        if list(blob.get("coord_order") or []) != list(COORD_ORDER):
+            raise RuntimeError(
+                f"{path / 'localizer.pt'} is a 3-point localizer.pt; "
+                "run python -m neural_net.convert_to_sv"
+            )
         if int(blob["hidden_size"]) != self.hidden:
             raise RuntimeError(
                 f"snapshot hidden_size {blob['hidden_size']} != model {self.hidden}"
@@ -695,47 +697,49 @@ class Trainer:
     def _encode_begin(
         self, raw: dict, path: Path, kept: str | None, index: int, bench: bool,
     ) -> dict[str, Any]:
-        """One stem, one look and one move reply per gold.
+        """One stem, one reply per target, all the same kind.
 
-        The picture is the shared stem, so stage A records it once.
-        Spare slots are duplicates of the last reply and are not sampled.
+        A coin picks look or move for the image. The picture is the
+        shared stem, so stage A records it once. Spare slots are
+        duplicates of the last reply and are not sampled.
         """
         assert self.collator is not None and self.tokenizer is not None
         settings = raw["settings"]
         agent = (float(settings["agent_x"]), float(settings["agent_y"]))
         notepad = format_notepad([])
-        messages = beginning_messages(str(path), notepad)
+        kind = "look" if self.rng.random() < 0.5 else "move"
+        user_line = (
+            S2_BEGINNING_USER if kind == "look" else S2_BEGINNING_MOVE_USER
+        )
+        messages = beginning_messages(str(path), notepad, kind)
         k = self.args.questions_per_image
         questions: list[dict[str, Any]] = []
         builds = []
         for cand_kind, phrase, point in self._begin_targets(settings):
-            if len(questions) + 2 > k:
+            if len(questions) + 1 > k:
                 break
-            for kind in ("look", "move"):
-                reply = _begin_reply(phrase, kind)
-                coords = _coords(kind, agent, point)
-                builds.append(self.collator.build(TrainingExample(
-                    messages=messages,
-                    target_text=reply,
-                    loss="ce",
-                    source="s2_localizer",
-                    meta={"coords": coords},
-                )))
-                questions.append({
-                    "kind": kind,
-                    "phrase": phrase,
-                    "point": list(point),
-                    "candidate_kind": cand_kind,
-                    "question_kind": "beginning",
-                    "question": S2_BEGINNING_USER,
-                    "coords": coords,
-                    "dup": False,
-                    "close_reply": _close_content_index(self.tokenizer, reply),
-                })
-        if len(questions) < 2:
-            raise RuntimeError(
-                f"a beginning needs a look and a move, got {len(questions)}"
-            )
+            reply = _begin_reply(phrase, kind)
+            coords = _coords(agent, point)
+            builds.append(self.collator.build(TrainingExample(
+                messages=messages,
+                target_text=reply,
+                loss="ce",
+                source="s2_localizer",
+                meta={"coords": coords},
+            )))
+            questions.append({
+                "kind": kind,
+                "phrase": phrase,
+                "point": list(point),
+                "candidate_kind": cand_kind,
+                "question_kind": "beginning",
+                "question": user_line,
+                "coords": coords,
+                "dup": False,
+                "close_reply": _close_content_index(self.tokenizer, reply),
+            })
+        if len(questions) < 1:
+            raise RuntimeError("a beginning needs at least one target")
         while len(questions) < k:
             questions.append({**questions[-1], "dup": True})
             builds.append(builds[-1])
@@ -780,9 +784,10 @@ class Trainer:
                 SYSTEM_PROMPT_S2, str(path), ctx.context, item.question,
                 notepad=ctx.notepad,
             )
-            reply = self.rng.choice(
+            line = self.rng.choice(
                 _S2_LOOK_LINES if item.kind == "look" else _S2_MOVE_LINES
             )
+            reply = line if item.kind == "look" else s2_move_reply(line)
             example = TrainingExample(
                 messages=messages,
                 target_text=reply,
@@ -1082,8 +1087,8 @@ class Trainer:
             [q["coords"] for q in image["questions"]],
             dtype=torch.float32, device=self.device,
         )
-        if labels.shape != (k, 6):
-            raise RuntimeError(f"labels shape {tuple(labels.shape)}, expected {(k, 6)}")
+        if labels.shape != (k, 4):
+            raise RuntimeError(f"labels shape {tuple(labels.shape)}, expected {(k, 4)}")
         move = torch.tensor(
             [_KIND_MOVE[q["kind"]] for q in image["questions"]],
             dtype=torch.int8, device=self.device,
@@ -1482,19 +1487,15 @@ class Trainer:
         weights: list[int] = []
         if bool(full.any()):
             l2_v = err[full][:, 2:4].mean()
-            l2_vbar = err[full][:, 4:6].mean()
-            look_l2 = (err[full][:, 0:2].mean() + l2_v + l2_vbar) / 3
+            look_l2 = (err[full][:, 0:2].mean() + l2_v) / 2
             parts.append(look_l2)
             weights.append(int(full.sum()))
         else:
             l2_v = err.new_zeros(())
-            l2_vbar = err.new_zeros(())
             look_l2 = err.new_zeros(())
         if bool(mid.any()):
-            midpoint = (pred[mid, 2:4] + pred[mid, 4:6]) * 0.5
-            mid_l2 = (midpoint - labels[mid, 0:2]).pow(2).mean()
-            mid_term = (err[mid][:, 0:2].mean() + mid_l2) / 2
-            parts.append(mid_term)
+            mid_l2 = err[mid][:, 0:2].mean()
+            parts.append(mid_l2)
             weights.append(int(mid.sum()))
         else:
             mid_l2 = err.new_zeros(())
@@ -1506,7 +1507,7 @@ class Trainer:
         coord = coord / float(sum(weights))
         ces = []
         accs = []
-        for head, sl in enumerate((slice(0, 2), slice(2, 4), slice(4, 6))):
+        for head, sl in enumerate((slice(0, 2), slice(2, 4))):
             target = cell_index(labels[:, sl]).clone()
             if head > 0:
                 target = target.clone()
@@ -1545,7 +1546,7 @@ class Trainer:
         err_v = err_v.clone()
         err_v[mid] = float("nan")
         record = self._metrics(
-            loss, l2_s, l2_v, l2_vbar, cell_ce, accs,
+            loss, l2_s, l2_v, cell_ce, accs,
             err_v, labels, ii, qq, float(grad_norm),
             mid_l2=mid_l2, look_l2=look_l2,
             report_full=bool(full.any()), report_mid=bool(mid.any()),
@@ -1569,7 +1570,6 @@ class Trainer:
         loss: torch.Tensor,
         l2_s: torch.Tensor,
         l2_v: torch.Tensor,
-        l2_vbar: torch.Tensor,
         cell_ce: torch.Tensor,
         accs: list[float],
         err_v: torch.Tensor,
@@ -1584,13 +1584,12 @@ class Trainer:
         report_mid: bool,
     ) -> dict[str, Any]:
         assert self.buffer is not None and self.coord_embed is not None
-        move = self.buffer.move_kind[ii, qq].tolist()
         cand = self.buffer.cand_kind[ii, qq].tolist()
         phrases = self.buffer.phrase_id[ii, qq].tolist()
         cpu_labels = labels.detach().float().cpu()
         const = self.floors.constant()
         text = self.floors.text_only(
-            cpu_labels, [int(p) for p in phrases], [int(m) for m in move],
+            cpu_labels, [int(p) for p in phrases],
         )
         err_v = err_v.detach().float().cpu()
         by_kind = {}
@@ -1612,12 +1611,8 @@ class Trainer:
             "loss": float(loss.detach()),
             "l2_s": float(l2_s.detach()),
             "l2_v": float(l2_v.detach()) if report_full else float("nan"),
-            "l2_vbar": float(l2_vbar.detach()) if report_full else float("nan"),
             "rms_s": math.sqrt(max(0.0, float(l2_s.detach()))),
             "rms_v": math.sqrt(max(0.0, float(l2_v.detach()))) if report_full else float("nan"),
-            "rms_vbar": (
-                math.sqrt(max(0.0, float(l2_vbar.detach()))) if report_full else float("nan")
-            ),
             "mid_l2": float(mid_l2.detach()) if report_mid else float("nan"),
             "look_l2": float(look_l2.detach()) if report_full else float("nan"),
             "rms_v_gold": by_kind["gold"],
@@ -1628,12 +1623,9 @@ class Trainer:
             "cell_acc_v": accs[1],
             "floor_const_s": const["s"],
             "floor_const_v": const["v"],
-            "floor_const_vbar": const["v_bar"],
             "floor_text_s": text["s"],
             "floor_text_v": text["v"],
-            "floor_text_vbar": text["v_bar"],
             "gate_v": float(self.coord_embed.gate_v.detach()),
-            "gate_vbar": float(self.coord_embed.gate_vbar.detach()),
             "lr": self._lr(),
             "grad_norm": grad_norm,
             "gpu": _gpu_mem_snapshot(),
@@ -1661,6 +1653,7 @@ class Trainer:
             "heads": self.localizer.heads,
             "mlp_dim": self.localizer.mlp_dim,
             "hidden_size": self.localizer.hidden_size,
+            "coord_order": list(COORD_ORDER),
         }
         for directory in (
             self.loc_root / f"{self.label}_step_{self.step:06d}",
@@ -1849,8 +1842,7 @@ def _format_log(record: dict[str, Any]) -> str:
 
     return (
         f"step {record['step']} loc "
-        f"rms s {num(record['rms_s'], '.3f')} v {num(record['rms_v'], '.3f')} "
-        f"vbar {num(record['rms_vbar'], '.3f')} | "
+        f"rms s {num(record['rms_s'], '.3f')} v {num(record['rms_v'], '.3f')} | "
         f"mid {num(record.get('mid_l2'), '.4f')} "
         f"look {num(record.get('look_l2'), '.4f')} | "
         f"v by kind gold {kind(record['rms_v_gold'])} "
@@ -1859,11 +1851,9 @@ def _format_log(record: dict[str, Any]) -> str:
         f"cell acc s {num(record['cell_acc_s'], '.2f')} "
         f"v {num(record['cell_acc_v'], '.2f')} | "
         f"floor const s {num(record['floor_const_s'], '.3f')} "
-        f"v {num(record['floor_const_v'], '.3f')} "
-        f"vbar {num(record['floor_const_vbar'], '.3f')} | "
+        f"v {num(record['floor_const_v'], '.3f')} | "
         f"floor text s {num(record['floor_text_s'], '.3f')} "
-        f"v {num(record['floor_text_v'], '.3f')} "
-        f"vbar {num(record['floor_text_vbar'], '.3f')} | "
+        f"v {num(record['floor_text_v'], '.3f')} | "
         f"images {record['images_seen']} labels {record['labels_seen']} | "
         f"lr {record['lr']:.1e}"
     )

@@ -4,7 +4,7 @@ Nothing here trains in the learn-to-look phase. The gates and
 projections receive gradient only in the later
 learn-to-tell-where-you-are-looking phase, after a Localizer hits the
 floors. That phase sets ``enabled = True``, teacher-forces label
-``v``, ``v_bar`` at reply positions, later mixes in the Localizer's
+``s`` and ``v`` at reply positions, later mixes in the Localizer's
 own detached predictions, and adds a read-back loss in which a later
 position's Localizer output must reproduce an earlier position's
 injected coordinates, with LoRA at a real learning rate and the KD
@@ -19,8 +19,7 @@ rather than ``sigmoid`` (which is 0.5 at init) or ``ReLU`` (zero
 gradient at 0).
 
 Phase 2 calls ``set_magnitude`` and freezes the gates and the Linears.
-Only the LoRA trains. ``s`` is a third channel, same Fourier and same
-``tanh``; a 4-column payload still means ``(v, v_bar)``.
+Only the LoRA trains. A payload is four columns, ``(s, v)``.
 
 Ablation, not built: replace the Fourier path for ``v`` with bilinear
 interpolation into ``embed_vision.pos_embedding``.
@@ -40,12 +39,11 @@ from torch import nn
 
 logger = logging.getLogger("coord_embed")
 
-COORD_INPUT_LOW = -1.0  # v_bar = 2 s - v, s and v in [0, 1]^2, lies in [-1, 2]
+COORD_INPUT_LOW = -1.0
 COORD_INPUT_HIGH = 2.0
 COORD_FOURIER_BANDS = 8
-COORD_CODES = ("s", "v", "v_bar")
+COORD_CODES = ("s", "v")
 _FEATURES = 4 * COORD_FOURIER_BANDS
-_S_KEYS = ("gate_s", "proj_s.weight", "proj_s.bias")
 #: ``tanh(gate)`` for the phase-2 probe and trainer. Shared so the two
 #: scripts cannot drift apart.
 MAGNITUDES = {"barely": 0.05, "half": 0.5, "recommended": 0.25}
@@ -87,12 +85,11 @@ def muted_coord_embed() -> Iterator[None]:
 
 
 class CoordEmbedder(nn.Module):
-    """Add a code for ``s``, ``v``, and ``v_bar`` on selected token embeddings.
+    """Add a code for ``s`` and ``v`` on selected token embeddings.
 
-    Four columns are ``(v, v_bar)``, the path ``decode`` already uses.
-    Six columns are ``(s, v, v_bar)``. ``enabled`` stays False until a
-    caller turns it on. ``set_magnitude`` freezes every gate and Linear:
-    phase 2 trains the LoRA, not this module.
+    Four columns are ``(s, v)``. ``enabled`` stays False until a caller
+    turns it on. ``set_magnitude`` freezes every gate and Linear: phase 2
+    trains the LoRA, not this module.
     """
 
     def __init__(self, hidden_size: int) -> None:
@@ -101,13 +98,11 @@ class CoordEmbedder(nn.Module):
         self.enabled = False
         self.proj_s = nn.Linear(_FEATURES, self.hidden_size)
         self.proj_v = nn.Linear(_FEATURES, self.hidden_size)
-        self.proj_vbar = nn.Linear(_FEATURES, self.hidden_size)
-        for proj in (self.proj_s, self.proj_v, self.proj_vbar):
+        for proj in (self.proj_s, self.proj_v):
             nn.init.normal_(proj.weight, std=0.02)
             nn.init.zeros_(proj.bias)
         self.gate_s = nn.Parameter(torch.zeros(()))
         self.gate_v = nn.Parameter(torch.zeros(()))
-        self.gate_vbar = nn.Parameter(torch.zeros(()))
         self._handle: Any = None
         self._pending: tuple[torch.Tensor, torch.Tensor] | None = None
         self._muted = False
@@ -142,19 +137,14 @@ class CoordEmbedder(nn.Module):
         return torch.tanh(gate) * proj(self.featurize(point))
 
     def code(self, coords: torch.Tensor) -> torch.Tensor:
-        """``[B, P, 4]`` is ``(v, v_bar)``. ``[B, P, 6]`` is ``(s, v, v_bar)``."""
+        """``[B, P, 4]`` is ``(s, v)``."""
         width = int(coords.shape[-1])
-        if width == 4:
-            return self._channel(self.gate_v, self.proj_v, coords[..., 0:2]) + (
-                self._channel(self.gate_vbar, self.proj_vbar, coords[..., 2:4])
-            )
-        if width == 6:
-            return (
-                self._channel(self.gate_s, self.proj_s, coords[..., 0:2])
-                + self._channel(self.gate_v, self.proj_v, coords[..., 2:4])
-                + self._channel(self.gate_vbar, self.proj_vbar, coords[..., 4:6])
-            )
-        raise ValueError(f"code expects 4 or 6 columns, got {width}")
+        if width != 4:
+            raise ValueError(f"code expects 4 columns (s, v), got {width}")
+        return (
+            self._channel(self.gate_s, self.proj_s, coords[..., 0:2])
+            + self._channel(self.gate_v, self.proj_v, coords[..., 2:4])
+        )
 
     def set_magnitude(self, magnitude: float) -> None:
         """Set every gate so ``tanh(gate) == magnitude``, then freeze.
@@ -168,16 +158,14 @@ class CoordEmbedder(nn.Module):
         with torch.no_grad():
             self.gate_s.fill_(gate)
             self.gate_v.fill_(gate)
-            self.gate_vbar.fill_(gate)
         self.freeze_readout()
 
     def freeze_readout(self) -> None:
         """Gates and Linears do not train."""
         for param in (
-            self.gate_s, self.gate_v, self.gate_vbar,
+            self.gate_s, self.gate_v,
             *self.proj_s.parameters(),
             *self.proj_v.parameters(),
-            *self.proj_vbar.parameters(),
         ):
             param.requires_grad_(False)
 
@@ -232,9 +220,9 @@ class CoordEmbedder(nn.Module):
             return
         if self._pending is not None:
             raise RuntimeError("CoordEmbedder already has a live payload")
-        if coords.shape[-1] not in (4, 6):
+        if coords.shape[-1] != 4:
             raise ValueError(
-                f"set_pending coords have {coords.shape[-1]} columns; expected 4 or 6"
+                f"set_pending coords have {coords.shape[-1]} columns; expected 4 (s, v)"
             )
         if positions.shape[:2] != coords.shape[:2]:
             raise ValueError(
@@ -266,12 +254,19 @@ class CoordEmbedder(nn.Module):
                 "input_low": COORD_INPUT_LOW,
                 "input_high": COORD_INPUT_HIGH,
                 "hidden_size": self.hidden_size,
+                "codes": list(COORD_CODES),
             },
             path,
         )
 
     def load(self, path: str | Path) -> None:
         blob = torch.load(Path(path), map_location="cpu", weights_only=True)
+        codes = blob.get("codes")
+        if list(codes or []) != list(COORD_CODES):
+            raise RuntimeError(
+                f"{path} is a 3-point coord_embed.pt; "
+                "run python -m neural_net.convert_to_sv"
+            )
         for key, expected in (
             ("bands", COORD_FOURIER_BANDS),
             ("input_low", COORD_INPUT_LOW),
@@ -287,18 +282,10 @@ class CoordEmbedder(nn.Module):
         current = self.state_dict()
         missing = [key for key in current if key not in incoming]
         unexpected = [key for key in incoming if key not in current]
-        if set(missing) == set(_S_KEYS) and not unexpected:
-            logger.warning(
-                "coord_embed %s has no s channel; initializing s at gate 0 "
-                "and proj std 0.02",
-                path,
-            )
-            self.load_state_dict(incoming, strict=False)
-        elif missing or unexpected:
+        if missing or unexpected:
             raise RuntimeError(
                 f"coord_embed {path} does not match this module: "
                 f"missing {missing}, unexpected {unexpected}"
             )
-        else:
-            self.load_state_dict(incoming)
+        self.load_state_dict(incoming)
         self.enabled = bool(blob["enabled"])

@@ -2,7 +2,7 @@
 
 Each optimizer step is an anchor with probability 1/2, otherwise one
 board. The board is prefilled once (system prompt and picture together).
-Sixteen short replies are teacher-forced on that cache, then the cache
+Eight short replies are teacher-forced on that cache, then the cache
 is dropped. It is not kept for the next image: the LoRA that wrote those
 keys changes at the optimizer step.
 
@@ -12,9 +12,9 @@ adapter with the coordinate code muted. ``--rl`` replaces the board
 with the archived online sampler. The anchor coin stays.
 
 The logged loss stays that one backward scalar. Beside it, the same
-tokens are averaged per task: direction and hour, looking and moving,
-each compass direction, and anchor CE versus KD. The sixteen replies
-are in ``task_detail``. Nothing extra is forwarded.
+tokens are averaged per task: direction and hour, each compass
+direction, and anchor CE versus KD. The eight replies are in
+``task_detail``. Nothing extra is forwarded.
 
 ``--hours`` requires ``--cosine-steps``. Past that horizon the
 learning-rate multiplier stays at the floor. ``--bench`` loads the
@@ -63,7 +63,6 @@ from neural_net.s2_coord_oracle import (
     clock_hour,
     correct_line,
     direction_label,
-    gaze_vbar,
     hour_is_unique,
 )
 from neural_net.s2_coord_rl import rl_loss
@@ -133,19 +132,16 @@ def _holdout_count(n: int) -> int:
 
 
 # One reply, or one anchor, is one task. Image keys are
-# ``look|move / up|down|left|right / direction|hour``. Anchor keys are
+# ``up|down|left|right / direction|hour``. Anchor keys are
 # ``anchor/ce|kd/<dataset>``. RL keys are ``rl/<oracle kind>``.
-_GAZES = ("look", "move")
 _QUESTIONS = ("direction", "hour")
 _ROLLUP = (
     ("direction", lambda key: key.endswith("/direction")),
     ("hour", lambda key: key.endswith("/hour")),
-    ("looking", lambda key: key.startswith("look/")),
-    ("moving", lambda key: key.startswith("move/")),
-    ("up", lambda key: "/up/" in key),
-    ("down", lambda key: "/down/" in key),
-    ("left", lambda key: "/left/" in key),
-    ("right", lambda key: "/right/" in key),
+    ("up", lambda key: "/up/" in key or key.startswith("up/")),
+    ("down", lambda key: "/down/" in key or key.startswith("down/")),
+    ("left", lambda key: "/left/" in key or key.startswith("left/")),
+    ("right", lambda key: "/right/" in key or key.startswith("right/")),
     ("anchor_ce", lambda key: key.startswith("anchor/ce/")),
     ("anchor_kd", lambda key: key.startswith("anchor/kd/")),
     ("rl", lambda key: key.startswith("rl/")),
@@ -153,11 +149,9 @@ _ROLLUP = (
 
 
 def _check_task_key(key: str) -> None:
-    gaze, _, rest = key.partition("/")
-    if gaze in _GAZES:
-        direction, _, question = rest.partition("/")
-        if direction in DIRECTIONS and question in _QUESTIONS and "/" not in question:
-            return
+    direction, _, question = key.partition("/")
+    if direction in DIRECTIONS and question in _QUESTIONS and "/" not in question:
+        return
     family, _, rest = key.partition("/")
     if family == "anchor":
         kind, sep, source = rest.partition("/")
@@ -600,7 +594,7 @@ class Trainer:
                 f"coord rows {len(rows)} != reply tokens {int(index.shape[0])}"
             )
         coords = torch.tensor(rows, dtype=torch.float32, device=self.device)
-        self.embedder.set_pending(coords.view(1, -1, 6), index.view(1, -1))
+        self.embedder.set_pending(coords.view(1, -1, 4), index.view(1, -1))
 
     def _jitter(self, points: tuple[tuple[float, float], ...],
                 agent: tuple[float, float] | None) -> list[float]:
@@ -625,11 +619,7 @@ class Trainer:
     def _anchor_rows(self, n: int) -> list[list[float]]:
         s = (self.rng.random(), self.rng.random())
         v = (self.rng.random(), self.rng.random())
-        v_bar = (
-            self.rng.uniform(COORD_LOW, COORD_HIGH),
-            self.rng.uniform(COORD_LOW, COORD_HIGH),
-        )
-        return self._jitter_rows((s, v, v_bar), None, n)
+        return self._jitter_rows((s, v), None, n)
 
     def _anchor_loss(self) -> tuple[torch.Tensor, dict[str, tuple[float, int]]]:
         assert self.collator is not None and self.model is not None and self.vram is not None
@@ -694,10 +684,6 @@ class Trainer:
                 continue
             if not hour_is_unique(sx, sy, vx, vy):
                 continue
-            look = gaze_vbar(sx, sy, vx, vy, looking=True)
-            move = gaze_vbar(sx, sy, vx, vy, looking=False)
-            if not (_in_box(*look) and _in_box(*move)):
-                continue
             got = direction_label(kind, sx, sy, vx, vy)
             if got != direction:
                 raise RuntimeError(
@@ -728,16 +714,13 @@ class Trainer:
                 vx, vy = placed[direction]
                 kind = _direction_kind(direction)
                 hour = clock_hour(sx, sy, vx, vy)
-                for looking in (True, False):
-                    vbx, vby = gaze_vbar(sx, sy, vx, vy, looking=looking)
-                    specs.append({
-                        "points": ((sx, sy), (vx, vy), (vbx, vby)),
-                        "agent": agent,
-                        "direction": direction,
-                        "gaze": "look" if looking else "move",
-                        "dir_line": correct_line(kind, direction),
-                        "hour_line": correct_line(KIND_HOUR, hour),
-                    })
+                specs.append({
+                    "points": ((sx, sy), (vx, vy)),
+                    "agent": agent,
+                    "direction": direction,
+                    "dir_line": correct_line(kind, direction),
+                    "hour_line": correct_line(KIND_HOUR, hour),
+                })
             frame = canonical_frame(game)
             path = self.tmp / f"tf_{self.step}_{time.time_ns()}.png"
             Image.fromarray(frame).save(path)
@@ -768,15 +751,15 @@ class Trainer:
                     source="coord_tf",
                 )
                 builds.append(self.collator.build(example))
-                task = f"{spec['gaze']}/{spec['direction']}/{question_name}"
+                task = f"{spec['direction']}/{question_name}"
                 _check_task_key(task)
                 metas.append({
                     "points": spec["points"],
                     "agent": spec["agent"],
                     "task": task,
                 })
-        if len(builds) != 16:
-            raise RuntimeError(f"expected 16 replies, got {len(builds)}")
+        if len(builds) != 8:
+            raise RuntimeError(f"expected 8 replies, got {len(builds)}")
         return builds, metas
 
     def _prefill(self, model_inputs: dict[str, Any], lcp: int) -> Any:

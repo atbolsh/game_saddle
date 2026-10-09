@@ -5,7 +5,7 @@ Every stage map is queried with the target point and the four pooled
 vectors are concatenated into the decision layer. On a 768 frame those
 maps are stride 4, 8, 16, and 32. The eye is about four cells wide on
 the stride-8 map and about one cell on the stride-32 map; both are
-inputs. ``s`` is not an input. The target is ``(v + v_bar) / 2``.
+inputs. ``s`` is not an input. The target is ``v``, the point the Localizer named.
 
 ``init_from_imagenet`` is the only ImageNet entry point. Checkpoints are
 a plain ``state_dict`` via :meth:`save` / :meth:`load_weights`.

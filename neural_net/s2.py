@@ -2,7 +2,7 @@
 
 The Localizer reads the image-token states at ``KEPT_LAYER`` and the
 hidden state of the token being generated, and emits
-``(s_x, s_y, v_x, v_y, v_bar_x, v_bar_y)``. A prompt with no image
+``(s_x, s_y, v_x, v_y)``. A prompt with no image
 yields ``NO_IMAGE_COORD`` (0.5) for every coordinate.
 
 ``CoordEmbedder`` is installed on the token embedding and stays
@@ -16,6 +16,10 @@ Save / load slices:
 * load_parts — a Gemma directory and a Localizer directory, separately
 * load_coord_checkpoint — a PEFT adapter plus coord_embed.pt, no Localizer file
 * S1S2.save / S1S2.load — a save_all directory plus s1.pt (weights/full/)
+
+A readout file without ``coord_order`` (and a coord file without
+``codes: ["s", "v"]``) is a 3-point checkpoint. Loaders raise and name
+``python -m neural_net.convert_to_sv``.
 
 A PEFT adapter (the aug27 checkpoints) is saved with save_pretrained.
 A bare HuggingFace Gemma is saved as a full state_dict; that file is
@@ -36,6 +40,7 @@ from torch import nn
 from agent.model import VLModel, spec_for
 from neural_net.coord_embed import CoordEmbedder
 from neural_net.localizer import (
+    COORD_ORDER,
     KEPT_LAYER,
     LayerTap,
     Localizer,
@@ -176,8 +181,10 @@ class GemmaS2:
 
         token_ids is [B], the tokens just produced. seq_len is how many
         real tokens are already in the cache; the new token sits at that
-        index. ``prev_coords`` is the previous step's ``[B, 6]``; while
-        the embedder is disabled, passing it changes nothing.
+        index. ``prev_coords`` is the previous step's ``[B, 4]``
+        (``s``, then ``v``). While the embedder is disabled, passing it
+        changes nothing. The returned coords are the Localizer output
+        at the token just fed.
         """
         self._require_loaded()
         if token_ids.dim() != 1:
@@ -198,7 +205,7 @@ class GemmaS2:
         }
         if prev_coords is not None:
             self.coord_embed.set_pending(
-                prev_coords[:, 2:6].unsqueeze(1).to(device),
+                prev_coords.unsqueeze(1).to(device),
                 positions=torch.zeros(batch, 1, dtype=torch.long, device=device),
             )
         try:
@@ -318,6 +325,7 @@ class GemmaS2:
                 "heads": self.localizer.heads,
                 "mlp_dim": self.localizer.mlp_dim,
                 "hidden_size": self.localizer.hidden_size,
+                "coord_order": list(COORD_ORDER),
             },
             path / "localizer.pt",
         )
@@ -340,6 +348,11 @@ class GemmaS2:
 
     def _load_readout_files(self, path: Path) -> None:
         blob = torch.load(path / "localizer.pt", map_location="cpu", weights_only=True)
+        if list(blob.get("coord_order") or []) != list(COORD_ORDER):
+            raise RuntimeError(
+                f"{path / 'localizer.pt'} is a 3-point localizer.pt; "
+                "run python -m neural_net.convert_to_sv"
+            )
         self.kept_layer = int(blob["kept_layer"])
         self._build_readout()
         assert self.localizer is not None
