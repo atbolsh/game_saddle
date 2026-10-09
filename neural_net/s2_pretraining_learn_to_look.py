@@ -48,6 +48,8 @@ from agent.game_io import compose_s2_question
 from agent.modes import (
     S2_BEGINNING_MOVE_USER,
     S2_BEGINNING_USER,
+    S2_LOOK_TARGET_USER,
+    S2_MOVE_TARGET_USER,
     S2_MOVE_VERDICT_LINES,
     SYSTEM_PROMPT_S2,
     SYSTEM_PROMPT_S2_ANALYST,
@@ -167,7 +169,7 @@ def _ask(kind: str, phrase: str) -> str:
     raise ValueError(f"bad kind {kind!r}")
 
 
-S2_YOUR_TARGET_LINES = ("Look at your target.", "Move to your target.")
+S2_YOUR_TARGET_LINES = (S2_LOOK_TARGET_USER, S2_MOVE_TARGET_USER)
 
 _KIND_WEIGHT = {"gold": 0.5, "exit": 0.2, "corner": 0.3}
 
@@ -354,7 +356,7 @@ def _fake_rounds(
                 "collected": 1 if rng.random() < 0.5 else 0,
                 "gold_remaining": rng.randint(0, 3),
                 "n_steps": rng.randint(1, 40),
-                "stopped_by": rng.choice(("noops", "time", "exit")),
+                "stopped_by": rng.choice(("noops", "time")),
             }
         else:
             pending = None

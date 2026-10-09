@@ -756,6 +756,11 @@ def gold_remaining(game: discreteGame) -> int:
     return len(game.settings.gold)
 
 
+def sealed_empty(settings: dict[str, Any]) -> bool:
+    """No gold and no openings. The only board on which ``[END_GAME]`` wins."""
+    return not (settings.get("gold") or []) and not (settings.get("openings") or [])
+
+
 def _parsed_if_valid(m: re.Match[str]) -> tuple[str, int] | None:
     """Action + count if ``m`` is a valid move token, else None.
 

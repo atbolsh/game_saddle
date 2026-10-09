@@ -2,7 +2,9 @@
 
 Notes live in a dict. A turn shows S2 the current frame and the
 question, and wakes S1 only when the reply ends with ``[MOVE]``.
-``replay`` rebuilds that window from the recorded actions.
+A reply that ends with ``[END_GAME]``, or an S1 window that walks
+out, ends the game. ``replay`` rebuilds a move window from the
+recorded actions. ``play`` runs the default question sequence.
 """
 
 from __future__ import annotations
@@ -19,12 +21,19 @@ from PIL import Image
 from agent.config import CONFIG
 from agent.game_io import (
     compose_s2_question,
+    game_to_settings_dict,
     gold_remaining,
     new_multi_gold_game,
     parse_remember_notes,
+    sealed_empty,
 )
 from agent.memory import format_notepad
-from agent.modes import SYSTEM_PROMPT_S2, _build_game_messages
+from agent.modes import (
+    S2_BEGINNING_MOVE_USER,
+    S2_MOVE_TARGET_USER,
+    SYSTEM_PROMPT_S2,
+    _build_game_messages,
+)
 from game.discreteEngine import discreteGame
 from neural_net.loop import MoveRecord, S1S2, replay_frames
 from neural_net.render import canonical_frame
@@ -41,6 +50,8 @@ class TurnResult:
     exited: bool
     user_text: str
     frame: np.ndarray
+    ended: bool
+    outcome: dict[str, Any] | None
 
 
 class S2GameSession:
@@ -63,11 +74,12 @@ class S2GameSession:
         self.game: discreteGame | None = None
         self.notes: dict[str, tuple[str, int]] = {}
         self.last_move: dict[str, Any] | None = None
+        self.outcome: dict[str, Any] | None = None
         self.round = 0
         self.new_game()
 
     def new_game(self) -> discreteGame:
-        """Deal a fresh board and clear notes, the round, and the last report."""
+        """Deal a fresh board and clear notes, the round, the report, and the outcome."""
         state = random.getstate()
         if self.seed is not None:
             random.seed(self.seed)
@@ -82,8 +94,20 @@ class S2GameSession:
                 random.setstate(state)
         self.notes = {}
         self.last_move = None
+        self.outcome = None
         self.round = 0
         return self.game
+
+    @property
+    def over(self) -> bool:
+        """True after ``[END_GAME]`` or after the agent walks out."""
+        return self.outcome is not None
+
+    def next_question(self) -> str:
+        """The default user line for the turn that has not been played yet."""
+        if self.round == 0:
+            return S2_BEGINNING_MOVE_USER
+        return S2_MOVE_TARGET_USER
 
     def notepad(self) -> str:
         rows = [
@@ -101,7 +125,10 @@ class S2GameSession:
     ) -> TurnResult:
         if self.game is None:
             raise RuntimeError("S2GameSession has no game")
+        if self.over:
+            raise RuntimeError("S2GameSession is over")
         self.round += 1
+        board_sealed_empty = sealed_empty(game_to_settings_dict(self.game))
         frame = np.array(canonical_frame(self.game), copy=True)
         user_text = compose_s2_question(question, self.last_move)
         self.last_move = None
@@ -116,6 +143,7 @@ class S2GameSession:
                 record["v"],
                 bool(record["eos"]),
                 bool(record["move_close"]),
+                bool(record["end_close"]),
             )
             tokens.append(item)
             if on_token is not None:
@@ -145,6 +173,20 @@ class S2GameSession:
                 "n_steps": move.n_steps,
                 "stopped_by": move.stopped_by,
             }
+        outcome: dict[str, Any] | None = None
+        if result.ended:
+            outcome = {
+                "reason": "end_game",
+                "won": board_sealed_empty,
+                "round": self.round,
+            }
+        elif move is not None and move.exited:
+            outcome = {
+                "reason": "exit",
+                "won": gold_remaining(self.game) == 0,
+                "round": self.round,
+            }
+        self.outcome = outcome
         return TurnResult(
             text=result.text,
             tokens=tokens,
@@ -153,7 +195,25 @@ class S2GameSession:
             exited=bool(self.game.agent_exited()),
             user_text=user_text,
             frame=frame,
+            ended=bool(result.ended),
+            outcome=outcome,
         )
+
+    def play(
+        self,
+        max_turns: int,
+        on_turn: Callable[[TurnResult], None] | None = None,
+    ) -> Iterator[TurnResult]:
+        """Run ``next_question`` until the game is over or ``max_turns`` replies."""
+        if max_turns < 1:
+            raise ValueError(f"max_turns must be >= 1, got {max_turns}")
+        for _ in range(max_turns):
+            if self.over:
+                break
+            result = self.turn(self.next_question())
+            if on_turn is not None:
+                on_turn(result)
+            yield result
 
     def replay(self, move: MoveRecord) -> Iterator[np.ndarray]:
         return replay_frames(move)

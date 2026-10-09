@@ -42,6 +42,8 @@ from agent.config import CONFIG
 from agent.modes import (
     S2_BEGINNING_MOVE_USER,
     S2_BEGINNING_USER,
+    S2_END_REPLY,
+    S2_SEALED_NOTE,
     SYSTEM_PROMPT_S2,
     _S2_LOOK_LINES,
     _S2_MOVE_LINES,
@@ -116,7 +118,7 @@ _EQUIV_TOL = 0.05
 # disagreement is far above this.
 _EQUIV_MAX_TOL = 0.25
 _KIND_MOVE = {"look": 0, "move": 1}
-_KIND_CAND = {"gold": 0, "exit": 1, "corner": 2}
+_KIND_CAND = {"gold": 0, "exit": 1, "corner": 2, "none": 3}
 MODE_FULL = 0
 MODE_MID = 1
 BEGIN_LOOK_LINE = "Confirmed. Looking at that spot."
@@ -212,8 +214,14 @@ def _separate_gold_phrases(
     return named
 
 
-def _begin_reply(phrase: str, kind: str) -> str:
-    """One start-of-game reply. The collator appends the terminator."""
+def _begin_reply(phrase: str, kind: str, cand_kind: str) -> str:
+    """One start-of-game reply. The collator appends the terminator.
+
+    A sealed empty board ends the game. Both beginning lines get that
+    reply, so the coin still picks the user text and the answer does not.
+    """
+    if cand_kind == "none":
+        return S2_END_REPLY
     if kind == "look":
         line = BEGIN_LOOK_LINE
     elif kind == "move":
@@ -253,8 +261,9 @@ def _reply_cap(tokenizer: Any, reply_positions: int) -> int:
     phrases.extend(gold_region_phrases())
     phrases.append("the upper-middle gold, further right")
     for phrase in phrases:
-        lines.append(_begin_reply(phrase, "look"))
-        lines.append(_begin_reply(phrase, "move"))
+        lines.append(_begin_reply(phrase, "look", "gold"))
+        lines.append(_begin_reply(phrase, "move", "gold"))
+    lines.append(S2_END_REPLY)
     longest = 0
     for line in lines:
         n = len(tokenizer(line, add_special_tokens=False)["input_ids"])
@@ -543,7 +552,7 @@ class Trainer:
         )
         self.pump = BoardPump(
             self.args.workers, CONFIG.game_size, (0, 1, 2, 3), self.rng,
-            require_target=True,
+            require_target=False,
         )
         self.tmp = Path(tempfile.mkdtemp(prefix=f"loc_{self.label}_"))
         return time.perf_counter() - t0
@@ -662,9 +671,10 @@ class Trainer:
     ) -> list[tuple[str, str, tuple[float, float]]]:
         """Every gold, or every exit when the board has no gold.
 
-        The point stored with each phrase is that gold's coordinate.
-        Corners are not targets. A shared region is split by
-        ``_separate_gold_phrases``.
+        A sealed empty board is one target: the sealed note, at the
+        agent. The point stored with a gold phrase is that gold's
+        coordinate. Corners are not targets. A shared region is split
+        by ``_separate_gold_phrases``.
         """
         raw = settings.get("gold") or []
         if raw:
@@ -675,9 +685,10 @@ class Trainer:
                 ])
             ]
         exits = [item for item in _targets_on_board(settings) if item[0] == "exit"]
-        if not exits:
-            raise RuntimeError("begin session has no gold and no exit")
-        return exits
+        if exits:
+            return exits
+        agent = (float(settings["agent_x"]), float(settings["agent_y"]))
+        return [("none", S2_SEALED_NOTE, agent)]
 
     def _write_board(self, raw: dict, bench: bool) -> tuple[Path, str | None, int]:
         assert self.tmp is not None
@@ -718,7 +729,8 @@ class Trainer:
         for cand_kind, phrase, point in self._begin_targets(settings):
             if len(questions) + 1 > k:
                 break
-            reply = _begin_reply(phrase, kind)
+            reply = _begin_reply(phrase, kind, cand_kind)
+            v_free = cand_kind == "none"
             coords = _coords(agent, point)
             builds.append(self.collator.build(TrainingExample(
                 messages=messages,
@@ -736,7 +748,10 @@ class Trainer:
                 "question": user_line,
                 "coords": coords,
                 "dup": False,
-                "close_reply": _close_content_index(self.tokenizer, reply),
+                "close_reply": (
+                    None if v_free else _close_content_index(self.tokenizer, reply)
+                ),
+                "v_free": v_free,
             })
         if len(questions) < 1:
             raise RuntimeError("a beginning needs at least one target")
@@ -1107,10 +1122,13 @@ class Trainer:
         )
         mode = torch.zeros(k, self.r_max, dtype=torch.int8, device=self.device)
         for q, question in enumerate(image["questions"]):
+            n_valid = int(valid[q].sum())
+            if question.get("v_free"):
+                mode[q, :n_valid] = MODE_MID
+                continue
             close = question.get("close_reply")
             if close is None or question.get("dup"):
                 continue
-            n_valid = int(valid[q].sum())
             mode[q, : min(int(close) + 1, n_valid)] = MODE_MID
         if record:
             fresh = [q for q in image["questions"] if not q["dup"]]

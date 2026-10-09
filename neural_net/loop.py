@@ -1,11 +1,13 @@
 """S1 and S2 together.
 
 generate / batched_generate freeze one frame for S2 and decode until
-eos or a reply that ends with ``[MOVE]``. S1 stays dormant. A reply
-that closes ``[MOVE]`` ends immediately; ``v`` is the Localizer output
-at the token that completed ``[MOVE]``, and ``run_s1_window`` steps
-the live game toward that point for ``S1_WINDOW_SECONDS`` or
-``S1_NOOP_STOP`` consecutive noops, and also stops if the agent exits.
+eos, a reply that ends with ``[MOVE]``, or a reply that ends with
+``[END_GAME]``. S1 stays dormant. A reply that closes ``[MOVE]`` ends
+immediately; ``v`` is the Localizer output at the token that completed
+``[MOVE]``, and ``run_s1_window`` steps the live game toward that
+point for ``S1_WINDOW_SECONDS`` or ``S1_NOOP_STOP`` consecutive noops,
+and also stops if the agent exits. ``[END_GAME]`` ends the reply and
+does not wake S1.
 
 Every token, every primitive, and the window's stop reason are
 appended to a jsonl log. ``replay_frames`` rebuilds the window from
@@ -69,6 +71,7 @@ class GenerateResult:
     n_s1_steps: int
     log_path: str
     moved: bool
+    ended: bool
     v: list[float] | None
     move: MoveRecord | None
 
@@ -194,7 +197,7 @@ class S1S2:
         on_token=None,
     ) -> list[GenerateResult]:
         from agent.config import CONFIG
-        from agent.modes import ends_with_move
+        from agent.modes import ends_with_end_game, ends_with_move
 
         limit = CONFIG.max_new_tokens if max_new_tokens is None else max_new_tokens
         if limit < 1:
@@ -213,6 +216,7 @@ class S1S2:
         generated: list[list[int]] = [[] for _ in range(batch)]
         finished = [False] * batch
         moved = [False] * batch
+        ended = [False] * batch
         move_v: list[list[float] | None] = [None] * batch
         records: list[MoveRecord | None] = [None] * batch
         log_path = log_file.name
@@ -244,6 +248,7 @@ class S1S2:
                 text = tokenizer.decode(generated[row], skip_special_tokens=True)
                 s_xy, v_xy = _split_coords(coords[row])
                 move_close = ends_with_move(text)
+                end_close = ends_with_end_game(text)
                 emit({
                     "kind": "token",
                     "row": row_ids[row],
@@ -253,6 +258,7 @@ class S1S2:
                     "s": s_xy,
                     "v": v_xy,
                     "move_close": move_close,
+                    "end_close": end_close,
                     "eos": tid in eos,
                 })
                 if on_token is not None:
@@ -263,11 +269,15 @@ class S1S2:
                         "v": v_xy,
                         "eos": tid in eos,
                         "move_close": move_close,
+                        "end_close": end_close,
                     })
                 if move_close:
                     finished[row] = True
                     moved[row] = True
                     move_v[row] = v_xy
+                elif end_close:
+                    finished[row] = True
+                    ended[row] = True
                 elif tid in eos:
                     finished[row] = True
             if all(finished):
@@ -294,6 +304,7 @@ class S1S2:
                 n_s1_steps=0 if records[row] is None else records[row].n_steps,
                 log_path=log_path,
                 moved=moved[row],
+                ended=ended[row],
                 v=move_v[row],
                 move=records[row],
             )

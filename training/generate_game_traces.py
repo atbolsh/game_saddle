@@ -146,6 +146,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from agent.game_io import sealed_empty as _sealed_empty
 from training.image_noise import INFERENCE_STRENGTH, make_image_filter
 
 logger = logging.getLogger("train.generate_game_traces")
@@ -584,13 +585,6 @@ def _oracle_meta(settings: dict, target: dict | None = None) -> dict:
         "oracle_ray_hit": ray_hit,
     })
     return stamped
-
-
-def _sealed_empty(settings: dict) -> bool:
-    """No gold and no openings -- the only board on which [END_GAME] wins."""
-    return not (settings.get("gold") or []) and not (
-        settings.get("openings") or []
-    )
 
 
 def _multi_gold_stop(

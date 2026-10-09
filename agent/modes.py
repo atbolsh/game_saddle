@@ -333,11 +333,12 @@ DEFAULT_PLAYER_QUESTION = "Please make the right move for this position."
 
 # --------------------------------------------------------------- S2 look
 #
-# The learn-to-look prompt. No primitive move tokens and no [HOLD].
+# The learn-to-look prompt. No [CLOCK] / [FORWARD] / [HOLD].
 # A look reply ends by ending the message. A move reply ends with
 # [MOVE] on its own last line, which ends the message and wakes S1.
-# The confirmation lines below are the only copy: the trainer samples
-# them from these tuples.
+# A sealed empty room ends with [END_GAME], which ends the game and
+# does not wake S1. The confirmation lines below are the only copy:
+# the trainer samples them from these tuples.
 
 _S2_LOOK_LINES = (
     "Acknowledged, looking there.",
@@ -354,9 +355,15 @@ _S2_MOVE_LINES = (
 
 S2_MOVE_TOKEN = "[MOVE]"
 S2_MOVE_RE = re.compile(r"\[MOVE\]\s*\Z")
+S2_END_TOKEN = _TOK_END_GAME
+S2_END_RE = re.compile(r"\[END_GAME\]\s*\Z")
+S2_SEALED_NOTE = "none -- room is sealed and empty"
+S2_END_REPLY = f"[REMEMBER target: {S2_SEALED_NOTE}]\n{S2_END_TOKEN}"
+S2_LOOK_TARGET_USER = "Look at your target."
+S2_MOVE_TARGET_USER = "Move to your target."
 S2_MOVE_VERDICT_LINES = (
-    "The move reached the gold.",
-    "The move did not reach the gold.",
+    "The move ate a gold.",
+    "The move did not eat a gold.",
 )
 
 
@@ -368,6 +375,11 @@ def s2_move_reply(line: str) -> str:
 def ends_with_move(text: str) -> bool:
     """True when ``text`` ends with ``[MOVE]``, ignoring trailing space."""
     return S2_MOVE_RE.search(text) is not None
+
+
+def ends_with_end_game(text: str) -> bool:
+    """True when ``text`` ends with ``[END_GAME]``, ignoring trailing space."""
+    return S2_END_RE.search(text) is not None
 
 
 _BLOCK_S2_IDENTITY = (
@@ -382,6 +394,13 @@ _BLOCK_S2_WORLD = (
     "The red mark on it is your eye and shows which way you face. Gold is a "
     "yellow circle. A gap in a wall is an exit. The top edge of the picture "
     "is y = 1. The right edge is x = 1."
+)
+
+_BLOCK_S2_GOAL = (
+    "The game: eat every gold, then leave through an exit. Eating a gold "
+    "does not end the game. Walking out through an exit ends it. A room "
+    "with no gold and no exit is sealed and empty. Nothing can be done "
+    "there, and you end the game yourself with [END_GAME]."
 )
 
 _BLOCK_S2_LOOK_MOVE = (
@@ -402,17 +421,24 @@ _BLOCK_S2_LOOK_MOVE = (
     + "\n"
     "  [MOVE]\n"
     "\n"
+    "Your target is the target in your notepad. If the notepad has no "
+    "target, or names a gold that is gone, first save a new target on its "
+    "own line, then look or move as asked.\n"
+    "\n"
     "A question about the picture or about your gaze gets an answer and "
     "then the message ends. Do not write [MOVE] unless you were asked to "
-    "move."
+    "move. [END_GAME] has its own rule below."
 )
 
 _BLOCK_S2_MOVE_REPORT = (
     "After you move, the next message begins with a Board update that says "
-    "whether that move ate a gold. Open your reply with exactly one of "
-    "these lines, then continue:\n"
+    "whether that move ate a gold and how many golds remain. Open your "
+    "reply with exactly one of these lines, then continue:\n"
     "\n"
     + "\n".join(f"  {line}" for line in S2_MOVE_VERDICT_LINES)
+    + "\n\n"
+    "If no gold remains, your next target is an exit. If the room has no "
+    "exit either, it is sealed and empty: follow the [END_GAME] rule."
 )
 
 _BLOCK_S2_TARGET = (
@@ -420,20 +446,38 @@ _BLOCK_S2_TARGET = (
     "\n"
     "  [REMEMBER key: short note]\n"
     "\n"
-    "The key you keep is target. Name one gold while any gold remains, or "
-    "one exit only when no gold remains. Write it when you have no target, "
-    "when that gold is eaten, or when that exit is gone. Otherwise do not "
-    "write it again, and do not switch mid-chase. For example:\n"
+    "The key you keep is target. Name one gold while any gold remains. "
+    "Name one exit only when no gold remains. Write it when you have no "
+    "target, when that gold has been eaten, or when that exit is gone. "
+    "Otherwise do not write it again, and do not switch mid-chase. For "
+    "example:\n"
     "\n"
-    "  [REMEMBER target: the upper-right gold]"
+    "  [REMEMBER target: the upper-right gold]\n"
+    "  [REMEMBER target: the exit on the left wall]\n"
+    "\n"
+    "When the room has no gold and no exit, the note is:\n"
+    "\n"
+    f"  [REMEMBER target: {S2_SEALED_NOTE}]"
+)
+
+_BLOCK_S2_END_GAME = (
+    "End the game: when the room has no gold and no exit, save the sealed "
+    "note above, then write [END_GAME] on its own last line. [END_GAME] "
+    "ends the message and the game. Do not write anything after it. An "
+    "instruction to pick, look at, or move to your target in a sealed and "
+    "empty room gets this reply, never [MOVE]. Also write [END_GAME] when "
+    "the message explicitly asks you to end the game. Never write it while "
+    "a gold or an exit remains unless asked."
 )
 
 SYSTEM_PROMPT_S2 = "\n\n".join([
     _BLOCK_S2_IDENTITY,
     _BLOCK_S2_WORLD,
+    _BLOCK_S2_GOAL,
     _BLOCK_S2_LOOK_MOVE,
     _BLOCK_S2_MOVE_REPORT,
     _BLOCK_S2_TARGET,
+    _BLOCK_S2_END_GAME,
 ])
 
 #: User line for a beginning that looks. Not part of the system prompt.
