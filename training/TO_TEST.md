@@ -454,10 +454,9 @@ bit-identical across shapes; treat order-of-magnitude gaps as a real bug.
 ## Manual appendix (not automatable)
 
 These need eyes or box-level state; check them once per box / after big
-changes rather than every run. For anything that means reading recorded
-datagen traces (noised frames, win stamping, question-round analyses),
-`notebooks/trace_viewer.ipynb` steps through any `data_game/<label>` run
-game-by-game, move-by-move — no GPU or NAMS needed:
+changes rather than every run. `notebooks/trace_viewer.ipynb` steps through
+`weights/s1s2_runs/<stamp>/turns.jsonl` one turn at a time (no GPU).
+Datagen traces stay in `data_game/<label>/`:
 
 1. **Checkpoint dropdowns** — the smoke checkpoint from t4 appears in the
    notebooks' Checkpoint dropdown, loads and generates via the picker, via
@@ -586,18 +585,16 @@ weekend smoke / t5 / t8 / t9 stay sealed one-gold eat-to-win.
 
 Rich user-session instrumentation (2026-09-16): deleted
 `interactive_self_eval.ipynb` (sealed one-gold is a multi-gold dropdown
-choice). `play.ipynb` is multi-gold minus the analyst, with `[END_GAME]`
-freeze. Teal settings + maroon scratchpad Edit/Render; openings
-reconcile in `game_io.reconcile_walls_to_openings` then the dict is
-passed to the existing renderer without an `openings` key.
+choice). `notebooks/play.ipynb` is the S1/S2 game. Each reply is one line in
+`weights/s1s2_runs/<stamp>/turns.jsonl`.
 
 * **Rerun t1** (seconds — `reconcile_walls_to_openings` roundtrip on
   sealed / gapped fixtures; full side-wall + hand-drawn right gap is
   split; interior wall kept; overlapping openings / bad JSON / missing
   `openings` / bad scratchpad keys raise; `apply_edited_settings_dict`
   strips openings before `settings_from_dict`).
-* **Remote notebook smoke** (play + multi_gold_eval): Edit/Render bad
-  JSON stays in edit mode; openings gap appears on the board; scratchpad
-  JSON save shows in the view pane; play `[END_GAME]` greys Ask until
-  New room. Generation stays disabled while either card is in edit
-  mode. Self-eval Render mid-round must refuse. Debrief untouched.
+* **Remote notebook smoke** (`notebooks/play.ipynb` on the GPU box):
+  Load a full save, or Gemma plus a localizer plus an S1 file. New game,
+  then Agent turn. A reply that ends in `[MOVE]` wakes S1, and the trace
+  file gains one line with the action list. **S1 actions** shows that
+  list in the conversation.

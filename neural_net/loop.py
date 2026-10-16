@@ -9,10 +9,10 @@ point for ``S1_WINDOW_SECONDS`` or ``S1_NOOP_STOP`` consecutive noops,
 and also stops if the agent exits. ``[END_GAME]`` ends the reply and
 does not wake S1.
 
-Every token, every primitive, and the window's stop reason are
-appended to a jsonl log. ``replay_frames`` rebuilds the window from
-the recorded actions. The engine is deterministic, so no frames are
-stored.
+Each reply is one object in a jsonl log: the text, the tokens, and,
+when the reply closed ``[MOVE]``, the S1 action list. ``replay_frames``
+rebuilds the window from the recorded actions. The engine is
+deterministic, so no frames are stored.
 
 Equal prompt lengths share a prefill. Mixed lengths are separate
 cohorts and are never left-padded (transformers#47651).
@@ -27,7 +27,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
@@ -129,6 +129,7 @@ class S1S2:
         max_new_tokens: int | None = None,
         log_path: str | Path | None = None,
         on_token=None,
+        describe: Callable[[int, GenerateResult], dict[str, Any] | None] | None = None,
     ) -> GenerateResult:
         return self.batched_generate(
             [game],
@@ -136,6 +137,7 @@ class S1S2:
             max_new_tokens=max_new_tokens,
             log_path=log_path,
             on_token=on_token,
+            describe=describe,
         )[0]
 
     def batched_generate(
@@ -146,6 +148,7 @@ class S1S2:
         max_new_tokens: int | None = None,
         log_path: str | Path | None = None,
         on_token=None,
+        describe: Callable[[int, GenerateResult], dict[str, Any] | None] | None = None,
     ) -> list[GenerateResult]:
         if len(games) != len(prompts):
             raise ValueError(
@@ -170,6 +173,8 @@ class S1S2:
                     log_file=log_file,
                     row_ids=cohort,
                     on_token=on_token,
+                    user_texts=[_prompt_text(prompts[i]) for i in cohort],
+                    describe=describe,
                 )
                 for index, result in zip(cohort, sub):
                     results[index] = result
@@ -195,6 +200,8 @@ class S1S2:
         log_file,
         row_ids: list[int],
         on_token=None,
+        user_texts: list[str | None],
+        describe: Callable[[int, GenerateResult], dict[str, Any] | None] | None,
     ) -> list[GenerateResult]:
         from agent.config import CONFIG
         from agent.modes import ends_with_end_game, ends_with_move
@@ -202,6 +209,10 @@ class S1S2:
         limit = CONFIG.max_new_tokens if max_new_tokens is None else max_new_tokens
         if limit < 1:
             raise ValueError(f"max_new_tokens must be >= 1, got {limit}")
+        if len(user_texts) != len(games):
+            raise ValueError(
+                f"user_texts has {len(user_texts)} rows, games has {len(games)}"
+            )
         sampling = self.s2.vl._sampling_kwargs()
         eos = _eos_ids(self.s2.vl)
         tokenizer = getattr(self.s2.vl.processor, "tokenizer", self.s2.vl.processor)
@@ -219,13 +230,8 @@ class S1S2:
         ended = [False] * batch
         move_v: list[list[float] | None] = [None] * batch
         records: list[MoveRecord | None] = [None] * batch
+        tokens: list[list[dict[str, Any]]] = [[] for _ in range(batch)]
         log_path = log_file.name
-
-        def emit(record: dict) -> None:
-            line = json.dumps(record, separators=(",", ":")) + "\n"
-            log_file.write(line)
-            log_file.flush()
-            os.fsync(log_file.fileno())
 
         eos_feed = min(eos)
         for token_index in range(limit):
@@ -246,31 +252,21 @@ class S1S2:
                     continue
                 tid = generated[row][-1]
                 text = tokenizer.decode(generated[row], skip_special_tokens=True)
+                piece = tokenizer.decode([tid], skip_special_tokens=False)
                 s_xy, v_xy = _split_coords(coords[row])
                 move_close = ends_with_move(text)
                 end_close = ends_with_end_game(text)
-                emit({
-                    "kind": "token",
-                    "row": row_ids[row],
-                    "token_index": token_index,
-                    "token_id": tid,
-                    "piece": tokenizer.decode([tid], skip_special_tokens=False),
+                token = {
+                    "piece": piece,
                     "s": s_xy,
                     "v": v_xy,
+                    "eos": tid in eos,
                     "move_close": move_close,
                     "end_close": end_close,
-                    "eos": tid in eos,
-                })
+                }
+                tokens[row].append(token)
                 if on_token is not None:
-                    on_token({
-                        "row": row_ids[row],
-                        "piece": tokenizer.decode([tid], skip_special_tokens=False),
-                        "s": s_xy,
-                        "v": v_xy,
-                        "eos": tid in eos,
-                        "move_close": move_close,
-                        "end_close": end_close,
-                    })
+                    on_token({"row": row_ids[row], **token})
                 if move_close:
                     finished[row] = True
                     moved[row] = True
@@ -291,12 +287,12 @@ class S1S2:
                 games[row],
                 move_v[row],
                 device=device,
-                emit=emit,
                 row_id=row_ids[row],
             )
 
-        return [
-            GenerateResult(
+        results: list[GenerateResult] = []
+        for row in range(batch):
+            result = GenerateResult(
                 text=tokenizer.decode(
                     generated[row], skip_special_tokens=True
                 ).strip(),
@@ -308,8 +304,23 @@ class S1S2:
                 v=move_v[row],
                 move=records[row],
             )
-            for row in range(batch)
-        ]
+            fields = _turn_fields(describe, row_ids[row], result)
+            user_text = (
+                fields["user_text"] if "user_text" in fields else user_texts[row]
+            )
+            _write_turn(
+                log_file,
+                turn_record(
+                    round=fields.get("round"),
+                    user_text=user_text,
+                    text=result.text,
+                    tokens=tokens[row],
+                    move=records[row],
+                    outcome=fields.get("outcome"),
+                ),
+            )
+            results.append(result)
+        return results
 
 
 def run_s1_window(
@@ -425,14 +436,88 @@ def replay_frames(record: MoveRecord) -> Iterator[np.ndarray]:
         yield cache.render(game)
 
 
+def new_turns_path() -> Path:
+    """A fresh ``weights/s1s2_runs/<stamp>/turns.jsonl``. The file is empty."""
+    root = weights_root() / "s1s2_runs"
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    path = root / stamp / "turns.jsonl"
+    n = 2
+    while path.exists():
+        path = root / f"{stamp}_{n}" / "turns.jsonl"
+        n += 1
+    path.parent.mkdir(parents=True)
+    path.touch()
+    return path
+
+
+def turn_record(
+    *,
+    round: int | None,
+    user_text: str | None,
+    text: str,
+    tokens: list[dict[str, Any]],
+    move: MoveRecord | None,
+    outcome: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """One reply. ``s1`` is null when the reply did not end in ``[MOVE]``."""
+    if round is not None and not isinstance(round, int):
+        raise TypeError(f"round must be an int or null, got {type(round).__name__}")
+    if user_text is not None and not isinstance(user_text, str):
+        raise TypeError(
+            f"user_text must be a string or null, got {type(user_text).__name__}"
+        )
+    if outcome is not None and not isinstance(outcome, dict):
+        raise TypeError(
+            f"outcome must be a dict or null, got {type(outcome).__name__}"
+        )
+    return {
+        "round": round,
+        "user_text": user_text,
+        "text": text,
+        "tokens": tokens,
+        "s1": None if move is None else {
+            "v": list(move.v),
+            "actions": list(move.actions),
+            "start_settings": move.start_settings,
+            "collected": move.collected,
+            "exited": move.exited,
+            "n_steps": move.n_steps,
+            "elapsed": move.elapsed,
+            "stopped_by": move.stopped_by,
+        },
+        "outcome": outcome,
+    }
+
+
+def _turn_fields(describe, row: int, result: GenerateResult) -> dict[str, Any]:
+    if describe is None:
+        return {}
+    fields = describe(row, result)
+    if fields is None:
+        return {}
+    if not isinstance(fields, dict):
+        raise TypeError(
+            f"describe must return a dict or null, got {type(fields).__name__}"
+        )
+    return fields
+
+
+def _write_turn(log_file, record: dict[str, Any]) -> None:
+    log_file.write(json.dumps(record, separators=(",", ":")) + "\n")
+    log_file.flush()
+    os.fsync(log_file.fileno())
+
+
+def _prompt_text(prompt: str | list[dict]) -> str | None:
+    return prompt if isinstance(prompt, str) else None
+
+
 def _open_log(log_path: str | Path | None):
     if log_path is None:
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        path = weights_root() / "s1s2_runs" / stamp / "moves.jsonl"
+        path = new_turns_path()
     else:
         path = Path(log_path)
-    path = path.resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
     return open(path, "a", encoding="utf-8")
 
 

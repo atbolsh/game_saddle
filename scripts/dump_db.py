@@ -2,8 +2,7 @@
 """Dump the current Neo4j memory graph (all nodes + relationships) to a
 ``.dump`` JSON file, over the live bolt connection.
 
-Same functionality as the "Dump DB status" button in ``notebooks/play.ipynb``:
-a *logical* snapshot for offline inspection -- distinct from the native binary
+A *logical* snapshot for offline inspection -- distinct from the native binary
 ``neo4j-admin`` dump that ``scripts/neo4j_db.sh save`` produces. The DB stays
 up; this is safe to run mid-session.
 

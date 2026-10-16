@@ -3,8 +3,11 @@
 Notes live in a dict. A turn shows S2 the current frame and the
 question, and wakes S1 only when the reply ends with ``[MOVE]``.
 A reply that ends with ``[END_GAME]``, or an S1 window that walks
-out, ends the game. ``replay`` rebuilds a move window from the
-recorded actions. ``play`` runs the default question sequence.
+out, ends the game. ``new_game`` opens
+``weights/s1s2_runs/<stamp>/turns.jsonl`` and every ``turn`` appends
+one record, including the S1 action list. ``replay`` rebuilds a move
+window from the recorded actions. ``play`` runs the default question
+sequence.
 """
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ from agent.modes import (
     _build_game_messages,
 )
 from game.discreteEngine import discreteGame
-from neural_net.loop import MoveRecord, S1S2, replay_frames
+from neural_net.loop import MoveRecord, S1S2, new_turns_path, replay_frames
 from neural_net.render import canonical_frame
 
 TokenHook = Callable[[dict[str, Any]], None]
@@ -76,6 +79,7 @@ class S2GameSession:
         self.last_move: dict[str, Any] | None = None
         self.outcome: dict[str, Any] | None = None
         self.round = 0
+        self.turns_path = None
         self.new_game()
 
     def new_game(self) -> discreteGame:
@@ -96,6 +100,7 @@ class S2GameSession:
         self.last_move = None
         self.outcome = None
         self.round = 0
+        self.turns_path = new_turns_path()
         return self.game
 
     @property
@@ -158,11 +163,34 @@ class S2GameSession:
                 self.game,
                 messages,
                 max_new_tokens=max_new_tokens,
+                log_path=self.turns_path,
                 on_token=_hook,
+                describe=lambda _row, generated: self._settle(
+                    generated, user_text, board_sealed_empty,
+                ),
             )
         finally:
             if os.path.exists(path):
                 os.unlink(path)
+        return TurnResult(
+            text=result.text,
+            tokens=tokens,
+            move=result.move,
+            gold_remaining=gold_remaining(self.game),
+            exited=bool(self.game.agent_exited()),
+            user_text=user_text,
+            frame=frame,
+            ended=bool(result.ended),
+            outcome=self.outcome,
+        )
+
+    def _settle(
+        self,
+        result,
+        user_text: str,
+        board_sealed_empty: bool,
+    ) -> dict[str, Any]:
+        """Notes, the move report, and the outcome. Returns the turn's log fields."""
         for key, value in parse_remember_notes(result.text):
             self.notes[key] = (value, self.round)
         move = result.move
@@ -187,17 +215,7 @@ class S2GameSession:
                 "round": self.round,
             }
         self.outcome = outcome
-        return TurnResult(
-            text=result.text,
-            tokens=tokens,
-            move=move,
-            gold_remaining=gold_remaining(self.game),
-            exited=bool(self.game.agent_exited()),
-            user_text=user_text,
-            frame=frame,
-            ended=bool(result.ended),
-            outcome=outcome,
-        )
+        return {"round": self.round, "user_text": user_text, "outcome": outcome}
 
     def play(
         self,

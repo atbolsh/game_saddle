@@ -43,7 +43,7 @@ only interior walls (and an engine-native walk-out terminal) remain.
 
 **2026-08-12 notebook-only cut:** `agent/game_io.new_multi_gold_game` +
 `boundary_openings` (non-AI oracle of boundary gaps) +
-`MultiGoldSelfEvalSession` (`notebooks/multi_gold_eval.ipynb`) exercise
+`MultiGoldSelfEvalSession` exercises
 0–3 golds, sealed vs open rooms, target commitment (`TARGET:` line),
 walking out an opening, and `[END_GAME]` when the room is sealed and
 empty. **2026-08-25:** training datagen uses that factory (`--multi-gold`);
