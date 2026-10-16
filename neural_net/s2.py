@@ -147,7 +147,11 @@ def prefill_step(
         return logits, coords, past, None
     positions = grid_positions(inputs)
     grid = gather_grid(hidden, positions).to(torch.bfloat16)
-    coords = localizer(grid, hidden[:, -1:, :])[0][:, 0, :]
+    # ``hidden`` was captured inside ``_cached_forward``'s inference_mode.
+    # The localizer has to run there too: LayerNorm otherwise tries to
+    # save that tensor for backward and raises.
+    with torch.inference_mode():
+        coords = localizer(grid, hidden[:, -1:, :])[0][:, 0, :]
     return logits, coords, past, grid
 
 
@@ -198,7 +202,8 @@ def decode_step(
         if grid is None:
             coords = no_image_coords(batch, 1, device)[:, 0, :]
         else:
-            coords = localizer(grid, hidden)[0][:, 0, :]
+            with torch.inference_mode():
+                coords = localizer(grid, hidden)[0][:, 0, :]
     finally:
         embedder.clear_pending()
     return logits, coords, past_out
