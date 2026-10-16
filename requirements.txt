@@ -86,8 +86,7 @@ sentencepiece>=0.2.0
 # Pydantic v2 (NAMS SecretStr / settings models).
 pydantic>=2.7.0
 
-# Interactive notebooks: play.ipynb (ipywidgets UI over a live game) and
-# visualize_memory.ipynb (interactive Neo4j graph via pyvis).
+# Interactive notebooks: play.ipynb (ipywidgets UI over a live game).
 jupyter>=1.0.0
 notebook>=7.0.0
 ipywidgets>=8.0.0

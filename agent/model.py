@@ -640,6 +640,37 @@ def expand_kv_cache(cache: Any, batch_size: int) -> Any:
     )
 
 
+def repeat_kv_cache(cache: Any, repeats: int) -> Any:
+    """Copy a cache with each batch row repeated ``repeats`` times.
+
+    Row ``i`` becomes rows ``i * repeats .. i * repeats + repeats - 1``.
+    Empty or missing layer tensors (layers above a truncated forward)
+    are left alone. Only the HF 5 ``layers`` shape is accepted; this
+    is called on caches produced by ``truncated_forward``.
+    """
+    if cache is None:
+        raise ValueError("repeat_kv_cache: cache is None")
+    if repeats < 1:
+        raise ValueError(f"repeat_kv_cache: repeats must be >= 1, got {repeats}")
+    if not hasattr(cache, "layers"):
+        raise TypeError(
+            f"repeat_kv_cache: unsupported cache type {type(cache)!r}"
+        )
+    new = copy.deepcopy(cache)
+
+    def _repeat(tensor: Any) -> Any:
+        if not torch.is_tensor(tensor) or tensor.numel() == 0:
+            return tensor
+        return tensor.repeat_interleave(repeats, dim=0)
+
+    for layer in new.layers:
+        if getattr(layer, "keys", None) is not None:
+            layer.keys = _repeat(layer.keys)
+        if getattr(layer, "values", None) is not None:
+            layer.values = _repeat(layer.values)
+    return new
+
+
 def slice_seq_suffix(enc: dict[str, Any], prefix_len: int) -> dict[str, Any]:
     """Drop the leading ``prefix_len`` positions from sequence-aligned ints.
 

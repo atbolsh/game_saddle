@@ -5,7 +5,8 @@
 ``[END_GAME]`` freeze hook. Two concrete classes use it:
 
 * :class:`MultiGoldSelfEvalSession` -- player/analyst (notebook + datagen).
-* :class:`MultiGoldPlaySession` -- player only (``notebooks/play.ipynb``).
+* :class:`MultiGoldPlaySession` -- player only. The S1/S2 game notebook
+  is ``notebooks/play.ipynb`` (``neural_net.s2_session.S2GameSession``).
 """
 
 from __future__ import annotations

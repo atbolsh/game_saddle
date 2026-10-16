@@ -169,9 +169,7 @@ class InteractiveSelfEvalSession(InteractiveSession):
         ``human_reply`` (notebook takeover only): skip ``model.generate``
         and the ``[SEARCH]`` loop; the string is the final reply after
         :func:`game_io.truncate_at_first_move_token`. Snapshot, context,
-        persist, and parse are unchanged. Datagen never passes this;
-        ``play.ipynb`` uses :meth:`InteractiveSession.ask` with the same
-        argument.
+        persist, and parse are unchanged. Datagen never passes this.
         """
         if self.phase != "player":
             raise ValueError(

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="1139" viewBox="0 0 760 1139" preserveAspectRatio="xMidYMid meet">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="24" y="32" font-family="Helvetica, Arial, sans-serif" font-size="22" fill="#222">zone of allowance</text>
+<text x="24" y="58" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#222">Dark band: beam, half-width 0.6 × agent radius. Facing straight up.</text>
+<text x="24" y="80" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#222">Pale band: that beam swept 12° (6° either side). Dashed circle: noop, 0.7 × radius.</text>
+<polygon points="284.54,632.49 285.61,622.32 286.68,612.14 287.75,601.96 288.82,591.78 289.89,581.61 290.96,571.43 292.03,561.25 293.10,551.08 294.17,540.90 295.24,530.72 296.31,520.55 297.38,510.37 298.45,500.19 299.52,490.02 300.59,479.84 301.66,469.66 302.73,459.48 303.80,449.31 304.87,439.13 305.94,428.95 307.01,418.78 308.08,408.60 309.15,398.42 310.21,388.25 311.28,378.07 312.35,367.89 313.42,357.72 314.49,347.54 315.56,337.36 316.63,327.18 317.70,317.01 318.77,306.83 319.84,296.65 320.91,286.48 321.98,276.30 323.05,266.12 324.12,255.95 325.19,245.77 326.26,235.59 327.33,225.42 328.40,215.24 329.47,205.06 330.54,194.88 331.61,184.71 332.68,174.53 333.75,164.35 334.82,154.18 335.89,144.00 140.11,144.00 141.18,154.18 142.25,164.35 143.32,174.53 144.39,184.71 145.46,194.88 146.53,205.06 147.60,215.24 148.67,225.42 149.74,235.59 150.81,245.77 151.88,255.95 152.95,266.12 154.02,276.30 155.09,286.48 156.16,296.65 157.23,306.83 158.30,317.01 159.37,327.18 160.44,337.36 161.51,347.54 162.58,357.72 163.65,367.89 164.72,378.07 165.79,388.25 166.85,398.42 167.92,408.60 168.99,418.78 170.06,428.95 171.13,439.13 172.20,449.31 173.27,459.48 174.34,469.66 175.41,479.84 176.48,490.02 177.55,500.19 178.62,510.37 179.69,520.55 180.76,530.72 181.83,540.90 182.90,551.08 183.97,561.25 185.04,571.43 186.11,581.61 187.18,591.78 188.25,601.96 189.32,612.14 190.39,622.32 191.46,632.49" fill="#f6c1c1"/>
+<polygon points="191.20,627.60 284.80,627.60 284.80,144.00 191.20,144.00" fill="#e07070"/>
+<line x1="238.00" y1="1075.32" x2="335.89" y2="144.00" stroke="#888" stroke-width="1.5" stroke-dasharray="6 5"/>
+<line x1="238.00" y1="1075.32" x2="140.11" y2="144.00" stroke="#888" stroke-width="1.5" stroke-dasharray="6 5"/>
+<path d="M 230.66,1005.51 L 231.12,1005.46 L 231.58,1005.42 L 232.03,1005.38 L 232.49,1005.34 L 232.95,1005.31 L 233.41,1005.28 L 233.87,1005.25 L 234.33,1005.22 L 234.78,1005.20 L 235.24,1005.18 L 235.70,1005.16 L 236.16,1005.15 L 236.62,1005.14 L 237.08,1005.13 L 237.54,1005.13 L 238.00,1005.12 L 238.46,1005.13 L 238.92,1005.13 L 239.38,1005.14 L 239.84,1005.15 L 240.30,1005.16 L 240.76,1005.18 L 241.22,1005.20 L 241.67,1005.22 L 242.13,1005.25 L 242.59,1005.28 L 243.05,1005.31 L 243.51,1005.34 L 243.97,1005.38 L 244.42,1005.42 L 244.88,1005.46 L 245.34,1005.51" fill="none" stroke="#c0392b" stroke-width="2.5"/>
+<circle cx="238.00" cy="627.60" r="78.00" fill="#00ff00" stroke="#111" stroke-width="2"/>
+<circle cx="238.00" cy="627.60" r="54.60" fill="none" stroke="#333" stroke-width="1.5" stroke-dasharray="5 4"/>
+<circle cx="238.00" cy="580.80" r="31.20" fill="#ff0000" stroke="#111" stroke-width="1.5"/>
+<text x="238.0" y="327.8" font-family="Helvetica, Arial, sans-serif" font-size="18" fill="#7a1212" text-anchor="middle" dominant-baseline="middle">sweep</text>
+<text x="298.8" y="600.3" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#7a1212" text-anchor="start" dominant-baseline="middle">beam</text>
+<text x="148.0" y="627.6" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#333" text-anchor="end" dominant-baseline="middle">sprite</text>
+<text x="173.4" y="662.7" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#333" text-anchor="end" dominant-baseline="middle">noop</text>
+<text x="253.6" y="1032.4" font-family="Helvetica, Arial, sans-serif" font-size="20" fill="#c0392b" text-anchor="start" dominant-baseline="middle">12°</text>
+</svg>

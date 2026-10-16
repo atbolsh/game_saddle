@@ -566,12 +566,25 @@ class TrainLogger:
                   **record}
         self._append(self.jsonl, json.dumps(record, default=str) + "\n")
         parts = [f"step {record.get('step', '?'):>6}"]
-        for k in ("epoch", "loss", "scaled_loss", "lr", "grad_norm"):
-            if k in record:
-                v = record[k]
-                parts.append(f"{k}={v:.3g}" if isinstance(v, float) else f"{k}={v}")
+        for k in ("epoch", "loss", "scaled_loss", "lr", "grad_norm",
+                  "reward_mean", "parse_rate"):
+            if k not in record or record[k] is None:
+                continue
+            v = record[k]
+            parts.append(f"{k}={v:.3g}" if isinstance(v, float) else f"{k}={v}")
         if "source_loss" in record:
             parts.append("per-source " + json.dumps(record["source_loss"]))
+        tasks = record.get("tasks")
+        if tasks:
+            counts = record.get("task_n") or {}
+            bits = []
+            for key, value in tasks.items():
+                n = counts.get(key)
+                if isinstance(value, float) and n is not None:
+                    bits.append(f"{key}={value:.4g} n={n}")
+                else:
+                    bits.append(f"{key}={value}")
+            parts.append("tasks " + " ".join(bits))
         self._append(self.txt, "  ".join(parts) + "\n")
 
     def eval_row(self, step: int, epoch: int, metrics: dict[str, float]) -> None:
@@ -1109,21 +1122,24 @@ def _base_model_logits(model: Any, model_inputs: dict,
     use_anchor = (teacher == "anchor"
                   and ANCHOR_ADAPTER in getattr(model, "peft_config", {}))
 
+    from neural_net.coord_embed import muted_coord_embed
+
     was_training = model.training
     model.eval()
     try:
         with torch.no_grad():
-            if use_anchor:
-                try:
-                    model.set_adapter(ANCHOR_ADAPTER)
-                    out = model(**model_inputs,
-                                logits_to_keep=logits_to_keep)
-                finally:
-                    model.set_adapter("default")
-            else:
-                with model.disable_adapter():
-                    out = model(**model_inputs,
-                                logits_to_keep=logits_to_keep)
+            with muted_coord_embed():
+                if use_anchor:
+                    try:
+                        model.set_adapter(ANCHOR_ADAPTER)
+                        out = model(**model_inputs,
+                                    logits_to_keep=logits_to_keep)
+                    finally:
+                        model.set_adapter("default")
+                else:
+                    with model.disable_adapter():
+                        out = model(**model_inputs,
+                                    logits_to_keep=logits_to_keep)
     finally:
         if was_training:
             model.train()
@@ -1266,19 +1282,22 @@ def _teacher_hidden(
         raise ValueError(f"_teacher_hidden: bad teacher {teacher!r}")
     use_anchor = (teacher == "anchor"
                   and ANCHOR_ADAPTER in getattr(model, "peft_config", {}))
+    from neural_net.coord_embed import muted_coord_embed
+
     was_training = model.training
     model.eval()
     try:
         with torch.no_grad():
-            if use_anchor:
-                try:
-                    model.set_adapter(ANCHOR_ADAPTER)
-                    hidden = _forward_last_hidden(model, model_inputs)
-                finally:
-                    model.set_adapter("default")
-            else:
-                with model.disable_adapter():
-                    hidden = _forward_last_hidden(model, model_inputs)
+            with muted_coord_embed():
+                if use_anchor:
+                    try:
+                        model.set_adapter(ANCHOR_ADAPTER)
+                        hidden = _forward_last_hidden(model, model_inputs)
+                    finally:
+                        model.set_adapter("default")
+                else:
+                    with model.disable_adapter():
+                        hidden = _forward_last_hidden(model, model_inputs)
     finally:
         if was_training:
             model.train()

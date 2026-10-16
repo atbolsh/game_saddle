@@ -14,9 +14,10 @@
 - :func:`player_takeover_controls` is the sticky human-player takeover
   used by play and multi-gold self-eval (reply box + Submit +
   pictographic move buttons).
-- :func:`room_scenario_bar`, :func:`live_board_row`, and
-  :class:`UiBusy` are the shared gold/opening bar, floating
-  frame+settings+scratchpad editors, and generating/editing lock.
+- :func:`room_scenario_bar`, :func:`settings_editor`, :func:`live_board_row`,
+  and :class:`UiBusy` are the shared gold/opening bar, the teal
+  game-settings card, the floating frame+settings+scratchpad row, and
+  the generating/editing lock.
 """
 
 from __future__ import annotations
@@ -1218,6 +1219,21 @@ def _settings_card(
         set_disabled=set_disabled,
         textarea=None,
     )
+
+
+def settings_editor(
+    *,
+    height_px: int = 360,
+    on_form_change: Callable[[], None] | None = None,
+) -> SimpleNamespace:
+    """The teal game-settings card from the play notebook.
+
+    Summary until Edit, then the form (pose, direction, radii, game
+    size, gold, openings, walls). ``edit_btn`` and ``render_btn`` are
+    unbound: the caller applies ``collect()`` to its own game, the
+    same way :func:`live_board_row` does.
+    """
+    return _settings_card(height_px=height_px, on_form_change=on_form_change)
 
 
 def live_board_row(

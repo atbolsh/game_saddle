@@ -279,8 +279,7 @@ per session with `InteractiveSession(enable_logging=False)`.
 **DB dump.** Snapshot the whole memory graph (all nodes + relationships) to a
 `.dump` JSON file in the run directory, over the *live* bolt connection (does
 **not** stop Neo4j, so it is safe mid-session). Embedding vectors are dropped by
-default. From the `play.ipynb` **"Dump DB status"** cell, from a session
-(`session.dump_db()`), or from the shell:
+default. From a session (`session.dump_db()`), or from the shell:
 
 ```bash
 python -m agent.runner dump                 # -> logs/dump_<stamp>/db_snapshot_<stamp>.dump
@@ -296,87 +295,38 @@ native binary `neo4j-admin database dump` produced by `scripts/neo4j_db.sh save`
 
 ## Interactive notebooks
 
-The Jupyter notebooks live in `notebooks/`: `play` (mode-1 play, no
-analyst), `multi_gold_eval` (the player/analyst loop), `debrief`
-(privileged post-game analysis, mode 4), `trace_viewer` (step through
-recorded datagen traces — no GPU/NAMS needed), `noise_tuner` (tune the
-image-noise magnitudes on a live board — no GPU/NAMS needed), and
-`visualize_memory` (the memory graph). Install the extra deps (`pip install -r
-requirements.txt` pulls in `ipywidgets` and `pyvis`) and launch Jupyter
-from the repo root:
+The Jupyter notebooks live in `notebooks/`. `play` is the S1/S2 game.
+`testing_s2`, `testing_s1`, `testing_learn_to_look`, and
+`debugging_localizer_loop` each load one piece of the system.
+`trace_viewer` steps through `weights/s1s2_runs/<stamp>/turns.jsonl`
+(no GPU). `noise_tuner` tunes the image-noise magnitudes on a training
+board (no GPU). Install the extra deps (`pip install -r requirements.txt`
+pulls in `ipywidgets`) and launch Jupyter from the repo root:
 
 ```bash
 jupyter notebook   # or: jupyter lab
 ```
 
-**Architecture + checkpoint dropdowns.** The play, multi-gold self-eval, and
-debrief notebooks all start their control panel with a shared
-model picker (`agent.notebook_ui.model_picker`): an **Architecture** dropdown
-over every `agent.model.MODEL_REGISTRY` entry in recommendation order (see
-`MODEL_CANDIDATES.md`), a **Checkpoint** dropdown listing `[default]` (bare
-HuggingFace weights) plus every trained adapter found under
-`weights/<architecture>/` (newest first, rescanned when the architecture
-changes — see `training/TRAINING_OVERVIEW.md`), an explicit **Switch model**
-button (a
-misclick on a dropdown never starts a download), and a **"Save only one set
-of weights at a time"** checkbox. Unchecked (default), switching keeps the
-conversation and leaves other models' weights cached on disk; checked, a
-switch first restarts the conversation (debrief: a fresh thread over the same
-play conversation), then deletes every other registry model's cached HF
-weights before downloading the new ones — non-registry caches (GLiNER, spaCy,
-sentence-transformers) and trained checkpoints under `weights/` are never
-touched. The registry currently holds the two Gemma 4 variants (12B Unified,
-E4B); the wider 2026-07 candidate field, and why it lost, is recorded in
-`MODEL_CANDIDATES.md`.
+* **`notebooks/play.ipynb`** — one S1/S2 game. **Full save** loads an
+  assembled directory under `weights/full/` with `S1S2.load`. **Gemma
+  from here, localizer from here** loads those two directories plus an
+  S1 file. **Coord checkpoint** loads a LoRA plus `coord_embed.pt` and
+  an S1 file; the readout is a fresh Localizer. **Agent turn** sends the
+  question box. A reply that ends in `[MOVE]` runs S1. A reply that ends
+  in `[END_GAME]`, or an exit, ends the game. Every reply is one line in
+  `weights/s1s2_runs/<stamp>/turns.jsonl`. **S1 actions** shows that
+  turn's action list in the conversation. The session is
+  [`neural_net/s2_session.py`](neural_net/s2_session.py)
+  (`S2GameSession`).
 
-* **`notebooks/play.ipynb`** — interactive mode-1 play over a **multi-gold
-  room** (0–3 golds, openings; sealed one-gold is `Golds: 1` + `Opening:
-  forbid`). It holds **one persistent game** and **one conversation
-  thread**. One click is **one generation**: the agent sees the *current*
-  live frame plus its (settings-stripped) memory context and emits at most
-  one move token (`[CLOCK n]`, `[ANTICLOCK n]`, `[FORWARD]`,
-  `[END_GAME]`). Generation stops at the token and the move is applied.
-  `[END_GAME]` applies no board action and freezes the session until
-  **New room**. Eating gold is not a win.   A live row shows the current frame on the left and teal settings stacked
-  over the maroon scratchpad on the right — user-only; settings never
-  enter the player prompt. Settings stay a solid teal summary until Edit.
-  Settings are the full scene (pose, gold, walls, radii, gameSize), a
-  direction slider (0…2π), and add/remove rows for gold, openings (side +
-  center + width), and walls; Render computes `from`/`to` and reconciles
-  openings into `walls` in `game_io.reconcile_walls_to_openings`, then
-  passes the dict to the existing renderer without an `openings` key.
-  Scratchpad is still JSON (bad format stays in edit mode). Generation
-  cannot start while the scratchpad is being edited or the settings form
-  is dirty. To
-  discard an unwanted conversation, run the gated reset cell
-  (`session.reset_memory_to_seed()`) or `bash scripts/reset_semantics.sh`.
-  The session class is
-  [`agent/multi_gold_session.py`](agent/multi_gold_session.py)
-  (`MultiGoldPlaySession`).
+* **`notebooks/trace_viewer.ipynb`** — the same turn file, one turn at a
+  time. No GPU.
 
-* **`notebooks/multi_gold_eval.ipynb`** — the same room controls and live
-  editors, plus the player/analyst two-phase loop. Scene/scratchpad
-  Render is refused while a round is open. Datagen still uses
-  `InteractiveSelfEvalSession` / `MultiGoldSelfEvalSession`; this notebook
-  is the interactive self-eval UI.
+* **`notebooks/noise_tuner.ipynb`** — sliders for
+  [`training/image_noise.py`](training/image_noise.py). **Regenerate**
+  deals a training board (0–3 golds, any opening). No GPU.
 
-* **`notebooks/debrief.ipynb`** — privileged post-game analysis. The analyst
-  rubric matches self-eval (`RATING: -1.0..1.0`, `WRONG` spans, target /
-  openings / `[END_GAME]`), plus navigation (`[SHOW]` / `[NEXT]` / `[BACK]`),
-  search, and tip tools. Old recordings may still contain reflection
-  messages; new play sessions do not produce them.
-
-* **`notebooks/visualize_memory.ipynb`** — an interactive view of the memory
-  graph via [`pyvis`](https://pyvis.readthedocs.io/). Pan/zoom/drag through all
-  `Message`, `GameSnapshot`, `Trace`/`Step`/`ToolCall`, `Entity`, and
-  `Preference` nodes and their relationships, with per-label captions and
-  colors; hover a node to see its full property set. Set `SESSION_ID` in the
-  per-session cell to scope the view to a single conversation. The graph is
-  rendered as a self-contained `<iframe srcdoc>` with vis.js inlined, so it
-  needs **no** Jupyter widget frontend extension (works in JupyterLab and
-  Notebook 7, online or offline).
-
-The play notebook's buttons do use `ipywidgets`; if they don't render, ensure
+The play notebook's buttons use `ipywidgets`; if they don't render, ensure
 `ipywidgets` is installed in the same environment as the Jupyter server
 (Notebook 7+ / JupyterLab 4+ ship the widget manager by default).
 
@@ -534,9 +484,8 @@ has the high-res frame on disk for re-feeding into the model.
 
 * Default **datagen** (`--multi-gold`) is 0–3 golds with openings
   (`new_multi_gold_game`); weekend **smoke** stays sealed one-gold
-  eat-to-win so those win rates stay comparable. The notebook
-  `notebooks/multi_gold_eval.ipynb` is the interactive version
-  (see `FUTURE_GOALS.md` goals 2 and 10).
+  eat-to-win so those win rates stay comparable. The interactive S1/S2
+  game is `notebooks/play.ipynb` (see `FUTURE_GOALS.md` goals 2 and 10).
 * The agent loop uses **image + text**. Audio/video comprehension is
   measurable with `python -m training.eval_av <checkpoint>` (LibriSpeech
   WER + NExT-QA); training-side KD replay is still future
@@ -564,7 +513,7 @@ agent/
   memory.py          # NAMS MemoryClient factory; context stripping; semantic-model seed; DB dump
   modes.py           # mode_game / mode_discuss / mode_self_eval
   interactive.py     # InteractiveSession: persistent-game mode-1 for notebooks
-  multi_gold_session.py  # MultiGoldRoomMixin + MultiGoldSelfEvalSession (datagen) + MultiGoldPlaySession (play.ipynb)
+  multi_gold_session.py  # MultiGoldRoomMixin + MultiGoldSelfEvalSession (datagen) + MultiGoldPlaySession
   notebook_ui.py     # shared notebook widgets (model picker, takeover, live editors)
   run_logging.py     # per-run LLM-call + DB-retrieval logs (on by default)
   runner.py          # CLI
@@ -593,12 +542,13 @@ weights/             # trained adapter checkpoints, weights/<architecture>/<name
 data_external/       # materialized replay datasets + probes (git-ignored; setup_env.sh)
 data_game/           # generated self-eval game traces + frames (git-ignored; setup_env.sh)
 notebooks/
-  play.ipynb            # interactive mode-1 play (multi-gold, no analyst)
-  multi_gold_eval.ipynb     # multi-gold / openings self-eval (player + analyst)
-  debrief.ipynb         # privileged post-game debrief (mode 4)
-  trace_viewer.ipynb    # step through recorded datagen traces (no GPU/NAMS)
-  noise_tuner.ipynb     # tune image-noise magnitudes by eye (no GPU/NAMS)
-  visualize_memory.ipynb# pyvis interactive graph of the memory graph
+  play.ipynb            # S1/S2 game; one turns.jsonl line per reply
+  testing_s2.ipynb      # one S2 reply on a training board
+  testing_s1.ipynb      # one S1 window
+  testing_learn_to_look.ipynb
+  debugging_localizer_loop.ipynb
+  trace_viewer.ipynb    # step through weights/s1s2_runs/<stamp>/turns.jsonl
+  noise_tuner.ipynb     # tune image-noise magnitudes by eye (no GPU)
 scripts/
   vast_neo4j_launch.sh       # bare-metal Neo4j setup (no Docker; Vast.ai)
   neo4j_db.sh                # save / wipe / load / status for the bare-metal DB

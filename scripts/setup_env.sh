@@ -141,8 +141,8 @@ import sys
 import spacy
 
 spacy.load(sys.argv[1])
-from neo4j_agent_memory.extraction import SpacyEntityExtractor, GLiNEREntityExtractor  # noqa: F401
-print("[setup-env] spaCy model loads and NAMS extractors import OK.", flush=True)
+from neo4j_agent_memory.extraction import SpacyEntityExtractor  # noqa: F401
+print("[setup-env] spaCy model loads and SpacyEntityExtractor imports OK.", flush=True)
 PY
 
 log "done. spaCy/GLiNER weights cached (auto-NER is off; see agent/memory.py)."
