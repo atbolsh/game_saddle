@@ -48,6 +48,7 @@ from agent.modes import (
     S2_BEGINNING_MOVE_USER,
     S2_BEGINNING_USER,
     S2_END_REPLY,
+    S2_MOVE_TOKEN,
     S2_SEALED_NOTE,
     SYSTEM_PROMPT_S2,
     _S2_LOOK_LINES,
@@ -219,21 +220,55 @@ def _separate_gold_phrases(
     return named
 
 
-def _begin_reply(phrase: str, kind: str, cand_kind: str) -> str:
+def _begin_reply(
+    phrase: str, kind: str, cand_kind: str, *, line: str | None = None,
+) -> str:
     """One start-of-game reply. The collator appends the terminator.
 
     A sealed empty board ends the game. Both beginning lines get that
     reply, so the coin still picks the user text and the answer does not.
+    ``line`` is the confirmation sentence. None keeps
+    :data:`BEGIN_LOOK_LINE` / :data:`BEGIN_MOVE_LINE`. A move line that
+    does not already end with ``[MOVE]`` is wrapped.
     """
     if cand_kind == "none":
         return S2_END_REPLY
     if kind == "look":
-        line = BEGIN_LOOK_LINE
+        if line is None:
+            line = BEGIN_LOOK_LINE
     elif kind == "move":
-        line = s2_move_reply(BEGIN_MOVE_LINE)
+        if line is None:
+            line = BEGIN_MOVE_LINE
+        if not line.rstrip().endswith(S2_MOVE_TOKEN):
+            line = s2_move_reply(line)
     else:
         raise ValueError(f"bad begin kind {kind!r}")
     return f"[REMEMBER target: {phrase}]\n{line}"
+
+
+def _begin_targets(
+    settings: dict,
+) -> list[tuple[str, str, tuple[float, float]]]:
+    """Every gold, or every exit when the board has no gold.
+
+    A sealed empty board is one target: the sealed note, at the
+    agent. The point stored with a gold phrase is that gold's
+    coordinate. Corners are not targets. A shared region is split
+    by ``_separate_gold_phrases``.
+    """
+    raw = settings.get("gold") or []
+    if raw:
+        return [
+            ("gold", phrase, point)
+            for phrase, point in _separate_gold_phrases([
+                (float(spot[0]), float(spot[1])) for spot in raw
+            ])
+        ]
+    exits = [item for item in _targets_on_board(settings) if item[0] == "exit"]
+    if exits:
+        return exits
+    agent = (float(settings["agent_x"]), float(settings["agent_y"]))
+    return [("none", S2_SEALED_NOTE, agent)]
 
 
 def _close_content_index(tokenizer: Any, text: str) -> int:
@@ -705,30 +740,6 @@ class Trainer:
             self.phrase_ids[phrase] = found
         return found
 
-    def _begin_targets(
-        self, settings: dict,
-    ) -> list[tuple[str, str, tuple[float, float]]]:
-        """Every gold, or every exit when the board has no gold.
-
-        A sealed empty board is one target: the sealed note, at the
-        agent. The point stored with a gold phrase is that gold's
-        coordinate. Corners are not targets. A shared region is split
-        by ``_separate_gold_phrases``.
-        """
-        raw = settings.get("gold") or []
-        if raw:
-            return [
-                ("gold", phrase, point)
-                for phrase, point in _separate_gold_phrases([
-                    (float(spot[0]), float(spot[1])) for spot in raw
-                ])
-            ]
-        exits = [item for item in _targets_on_board(settings) if item[0] == "exit"]
-        if exits:
-            return exits
-        agent = (float(settings["agent_x"]), float(settings["agent_y"]))
-        return [("none", S2_SEALED_NOTE, agent)]
-
     def _write_board(self, raw: dict, bench: bool) -> tuple[Path, str | None, int]:
         assert self.tmp is not None
         index = self.images_seen
@@ -765,7 +776,7 @@ class Trainer:
         k = self.args.questions_per_image
         questions: list[dict[str, Any]] = []
         builds = []
-        for cand_kind, phrase, point in self._begin_targets(settings):
+        for cand_kind, phrase, point in _begin_targets(settings):
             if len(questions) + 1 > k:
                 break
             reply = _begin_reply(phrase, kind, cand_kind)

@@ -94,6 +94,174 @@ def _write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def _cached_forward(model: nn.Module, inputs: dict[str, Any]) -> tuple[torch.Tensor, Any]:
+    """One cached Gemma forward. Logits are the last position, ``[B, V]``.
+
+    Runs under ``inference_mode``. ``S1S2.generate`` and the weekend
+    eval both go through this, so a training step must not: the LoRA
+    graph is the coord-tf suffix forward, not this function.
+    """
+    pos = inputs.get("position_ids")
+    if pos is not None and _wants_cache_position(model):
+        inputs = dict(inputs)
+        inputs["cache_position"] = pos[0]
+    with torch.inference_mode():
+        out = model(**inputs, use_cache=True, logits_to_keep=1)
+    logits = out.logits
+    if logits.dim() == 3:
+        logits = logits[:, -1, :]
+    elif logits.dim() != 2:
+        raise RuntimeError(f"logits rank {logits.dim()}, expected 2 or 3")
+    past = getattr(out, "past_key_values", None)
+    if past is None:
+        raise RuntimeError("Gemma forward returned no past_key_values")
+    return logits, past
+
+
+def prefill_step(
+    model: nn.Module,
+    tap: LayerTap,
+    localizer: Localizer,
+    embedder: CoordEmbedder,
+    inputs: dict[str, Any],
+) -> tuple[torch.Tensor, torch.Tensor, Any, torch.Tensor | None]:
+    """Cached prefill. Returns logits ``[B, V]``, coords ``[B, 4]``, past, grid.
+
+    ``grid`` is ``[B, 256, H]`` or None when the prompt has no image.
+    The caller keeps the grid and passes it to :func:`decode_step`.
+    ``inputs`` are already on the model device.
+    """
+    if embedder is None or tap is None or localizer is None:
+        raise RuntimeError("prefill_step needs a model, tap, localizer, and embedder")
+    inputs = dict(inputs)
+    mask = inputs["attention_mask"]
+    inputs["position_ids"] = (mask.long().cumsum(-1) - 1).clamp(min=0)
+    logits, past = _cached_forward(model, inputs)
+    hidden = tap.take()
+    batch = int(hidden.shape[0])
+    device = hidden.device
+    has_mask = "mm_token_type_ids" in inputs or "token_type_ids" in inputs
+    mask_tensor = inputs.get("mm_token_type_ids", inputs.get("token_type_ids"))
+    if not has_mask or mask_tensor is None or not bool((mask_tensor != 0).any()):
+        coords = no_image_coords(batch, 1, device)[:, 0, :]
+        return logits, coords, past, None
+    positions = grid_positions(inputs)
+    grid = gather_grid(hidden, positions).to(torch.bfloat16)
+    coords = localizer(grid, hidden[:, -1:, :])[0][:, 0, :]
+    return logits, coords, past, grid
+
+
+def decode_step(
+    model: nn.Module,
+    tap: LayerTap,
+    localizer: Localizer,
+    embedder: CoordEmbedder,
+    grid: torch.Tensor | None,
+    token_ids: torch.Tensor,
+    past: Any,
+    seq_len: int,
+    prev_coords: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, Any]:
+    """One cached decode step. Same contract as ``GemmaS2.decode``.
+
+    ``token_ids`` is ``[B]``. ``seq_len`` is how many real tokens are
+    already in the cache. ``prev_coords`` is ``[B, 4]`` (``s``, then
+    ``v``) and is injected on the token just fed. The returned coords
+    are the Localizer output at that token.
+    """
+    if embedder is None or tap is None or localizer is None:
+        raise RuntimeError("decode_step needs a model, tap, localizer, and embedder")
+    if token_ids.dim() != 1:
+        raise ValueError(
+            f"decode token_ids must be [B], got {tuple(token_ids.shape)}"
+        )
+    device = next(model.parameters()).device
+    batch = int(token_ids.shape[0])
+    step_inputs = {
+        "input_ids": token_ids.to(device).view(batch, 1),
+        "attention_mask": torch.ones(
+            batch, seq_len + 1, dtype=torch.long, device=device
+        ),
+        "position_ids": torch.full(
+            (batch, 1), seq_len, dtype=torch.long, device=device
+        ),
+        "past_key_values": past,
+    }
+    if prev_coords is not None:
+        embedder.set_pending(
+            prev_coords.unsqueeze(1).to(device),
+            positions=torch.zeros(batch, 1, dtype=torch.long, device=device),
+        )
+    try:
+        logits, past_out = _cached_forward(model, step_inputs)
+        hidden = tap.take()
+        if grid is None:
+            coords = no_image_coords(batch, 1, device)[:, 0, :]
+        else:
+            coords = localizer(grid, hidden)[0][:, 0, :]
+    finally:
+        embedder.clear_pending()
+    return logits, coords, past_out
+
+
+def write_gemma_meta(path: str | Path, spec: Any, fmt: str) -> None:
+    """``gemma_meta.json`` beside a Gemma slice. ``fmt`` is peft or state_dict."""
+    if fmt not in ("peft", "state_dict"):
+        raise ValueError(f"gemma format must be peft or state_dict, got {fmt!r}")
+    _write_json(Path(path) / "gemma_meta.json", {
+        "hf_id": spec.hf_id,
+        "model_key": spec.key,
+        "format": fmt,
+    })
+
+
+def write_readout(
+    path: str | Path,
+    localizer: Localizer,
+    coord_embed: CoordEmbedder,
+    kept_layer: int,
+) -> None:
+    """``localizer.pt`` and ``coord_embed.pt`` in ``path``."""
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "state_dict": localizer.state_dict(),
+            "kept_layer": int(kept_layer),
+            "dim": localizer.dim,
+            "refine_layers": localizer.refine_layers,
+            "heads": localizer.heads,
+            "mlp_dim": localizer.mlp_dim,
+            "hidden_size": localizer.hidden_size,
+            "coord_order": list(COORD_ORDER),
+        },
+        path / "localizer.pt",
+    )
+    coord_embed.save(path / "coord_embed.pt")
+
+
+def assert_readout_blob(blob: dict, localizer: Localizer, *, path: str) -> int:
+    """Raise unless ``blob`` is this build's ``(s, v)`` localizer. Returns kept_layer."""
+    if list(blob.get("coord_order") or []) != list(COORD_ORDER):
+        raise RuntimeError(
+            f"{path} is a 3-point localizer.pt; "
+            "run python -m neural_net.convert_to_sv"
+        )
+    if int(blob["hidden_size"]) != localizer.hidden_size:
+        raise RuntimeError(
+            f"localizer hidden_size {blob['hidden_size']} != "
+            f"model {localizer.hidden_size}"
+        )
+    for key in ("dim", "refine_layers", "heads", "mlp_dim"):
+        got = int(blob[key])
+        want = int(getattr(localizer, key))
+        if got != want:
+            raise RuntimeError(
+                f"localizer {key} is {got}, this build has {want}"
+            )
+    return int(blob["kept_layer"])
+
+
 class GemmaS2:
     """Loaded lazily. Call load, load_gemma, or load_all before prefill."""
 
@@ -148,26 +316,16 @@ class GemmaS2:
         self._grid = None
 
     def prefill(self, encoded: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor, Any]:
-        """Cached prefill. Returns (logits [B, V], coords [B, 6], past)."""
+        """Cached prefill. Returns (logits [B, V], coords [B, 4], past)."""
         self._require_loaded()
-        inputs = self.vl._move_inputs_to_model(encoded)
-        mask = inputs["attention_mask"]
-        inputs["position_ids"] = (mask.long().cumsum(-1) - 1).clamp(min=0)
-        logits, past = self._forward(inputs)
-        hidden = self._tap.take()
-        batch = int(hidden.shape[0])
-        device = hidden.device
-        has_mask = (
-            "mm_token_type_ids" in inputs or "token_type_ids" in inputs
+        logits, coords, past, grid = prefill_step(
+            self.vl.model,
+            self._tap,
+            self.localizer,
+            self.coord_embed,
+            self.vl._move_inputs_to_model(encoded),
         )
-        mask_tensor = inputs.get("mm_token_type_ids", inputs.get("token_type_ids"))
-        if not has_mask or mask_tensor is None or not bool((mask_tensor != 0).any()):
-            self._grid = None
-            coords = no_image_coords(batch, 1, device)[:, 0, :]
-        else:
-            positions = grid_positions(inputs)
-            self._grid = gather_grid(hidden, positions).to(torch.bfloat16)
-            coords = self.localizer(self._grid, hidden[:, -1:, :])[0][:, 0, :]
+        self._grid = grid
         return logits, coords, past
 
     def decode(
@@ -187,54 +345,20 @@ class GemmaS2:
         at the token just fed.
         """
         self._require_loaded()
-        if token_ids.dim() != 1:
-            raise ValueError(
-                f"decode token_ids must be [B], got {tuple(token_ids.shape)}"
-            )
-        device = next(self.vl.model.parameters()).device
-        batch = int(token_ids.shape[0])
-        inputs = {
-            "input_ids": token_ids.to(device).view(batch, 1),
-            "attention_mask": torch.ones(
-                batch, seq_len + 1, dtype=torch.long, device=device
-            ),
-            "position_ids": torch.full(
-                (batch, 1), seq_len, dtype=torch.long, device=device
-            ),
-            "past_key_values": past,
-        }
-        if prev_coords is not None:
-            self.coord_embed.set_pending(
-                prev_coords.unsqueeze(1).to(device),
-                positions=torch.zeros(batch, 1, dtype=torch.long, device=device),
-            )
-        try:
-            logits, past_out = self._forward(inputs)
-            hidden = self._tap.take()
-            if self._grid is None:
-                coords = no_image_coords(batch, 1, device)[:, 0, :]
-            else:
-                coords = self.localizer(self._grid, hidden)[0][:, 0, :]
-        finally:
-            self.coord_embed.clear_pending()
-        return logits, coords, past_out
+        return decode_step(
+            self.vl.model,
+            self._tap,
+            self.localizer,
+            self.coord_embed,
+            self._grid,
+            token_ids,
+            past,
+            seq_len,
+            prev_coords,
+        )
 
     def _forward(self, inputs: dict[str, Any]) -> tuple[torch.Tensor, Any]:
-        pos = inputs.get("position_ids")
-        if pos is not None and _wants_cache_position(self.vl.model):
-            inputs = dict(inputs)
-            inputs["cache_position"] = pos[0]
-        with torch.inference_mode():
-            out = self.vl.model(**inputs, use_cache=True, logits_to_keep=1)
-        logits = out.logits
-        if logits.dim() == 3:
-            logits = logits[:, -1, :]
-        elif logits.dim() != 2:
-            raise RuntimeError(f"logits rank {logits.dim()}, expected 2 or 3")
-        past = getattr(out, "past_key_values", None)
-        if past is None:
-            raise RuntimeError("Gemma forward returned no past_key_values")
-        return logits, past
+        return _cached_forward(self.vl.model, inputs)
 
     def _require_loaded(self) -> None:
         if (
@@ -262,17 +386,13 @@ class GemmaS2:
         path.mkdir(parents=True, exist_ok=True)
         from peft import PeftModel
 
-        meta: dict[str, Any] = {
-            "hf_id": self.vl.spec.hf_id,
-            "model_key": self.vl.spec.key,
-        }
         if isinstance(self.vl.model, PeftModel):
             self.vl.model.save_pretrained(path)
-            meta["format"] = "peft"
+            fmt = "peft"
         else:
             torch.save(self.vl.model.state_dict(), path / "gemma.pt")
-            meta["format"] = "state_dict"
-        _write_json(path / "gemma_meta.json", meta)
+            fmt = "state_dict"
+        write_gemma_meta(path, self.vl.spec, fmt)
 
     def load_gemma(self, path: str | Path) -> None:
         """Replace Gemma weights from a directory written by save_gemma.
@@ -316,20 +436,7 @@ class GemmaS2:
     def _save_readout(self, path: Path) -> None:
         if self.localizer is None or self.coord_embed is None:
             raise RuntimeError("save called before the readout exists")
-        torch.save(
-            {
-                "state_dict": self.localizer.state_dict(),
-                "kept_layer": self.kept_layer,
-                "dim": self.localizer.dim,
-                "refine_layers": self.localizer.refine_layers,
-                "heads": self.localizer.heads,
-                "mlp_dim": self.localizer.mlp_dim,
-                "hidden_size": self.localizer.hidden_size,
-                "coord_order": list(COORD_ORDER),
-            },
-            path / "localizer.pt",
-        )
-        self.coord_embed.save(path / "coord_embed.pt")
+        write_readout(path, self.localizer, self.coord_embed, self.kept_layer)
 
     def load_localizer(self, path: str | Path) -> GemmaS2:
         """Read the Localizer bundle onto an already-loaded trunk.
@@ -356,17 +463,9 @@ class GemmaS2:
         self.kept_layer = int(blob["kept_layer"])
         self._build_readout()
         assert self.localizer is not None
-        if int(blob["hidden_size"]) != self.localizer.hidden_size:
-            raise RuntimeError(
-                f"localizer hidden_size {blob['hidden_size']} != "
-                f"model {self.localizer.hidden_size}"
-            )
-        for key in ("dim", "refine_layers", "heads", "mlp_dim"):
-            if int(blob[key]) != getattr(self.localizer, key):
-                raise RuntimeError(
-                    f"localizer {key} is {blob[key]}, "
-                    f"this build has {getattr(self.localizer, key)}"
-                )
+        assert_readout_blob(
+            blob, self.localizer, path=str(path / "localizer.pt"),
+        )
         self.localizer.load_state_dict(blob["state_dict"])
         self.coord_embed.load(path / "coord_embed.pt")
         device = next(self.vl.model.parameters()).device

@@ -492,6 +492,9 @@ S2_BEGINNING_MOVE_USER = (
     "to it."
 )
 
+#: User line that asks for [END_GAME] even when gold or an exit remains.
+S2_END_GAME_USER = "End the game."
+
 _BLOCK_S2_ANALYST = (
     "Name the one object the player's reply selected. Write one line and "
     "then stop, in exactly one of these forms:\n"

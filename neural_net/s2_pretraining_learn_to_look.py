@@ -262,20 +262,28 @@ def _targets_on_board(
 def _draw_target(
     candidates: list[tuple[str, str, tuple[float, float]]],
     rng: random.Random,
+    weights: dict[str, float] | None = None,
 ) -> tuple[str, str, tuple[float, float]]:
-    """Gold 0.5, exit 0.2, corner 0.3, renormalised over kinds present."""
+    """Draw one target. ``weights`` overrides gold / exit / corner.
+
+    None keeps the default table (gold 0.5, exit 0.2, corner 0.3),
+    renormalised over the kinds present on this board.
+    """
+    table = _KIND_WEIGHT if weights is None else weights
     grouped: dict[str, list[tuple[str, str, tuple[float, float]]]] = {}
     for item in candidates:
         grouped.setdefault(item[0], []).append(item)
     kinds = [kind for kind in ("gold", "exit", "corner") if grouped.get(kind)]
     if not kinds:
         raise RuntimeError("board has no look or move target")
-    total = sum(_KIND_WEIGHT[kind] for kind in kinds)
+    total = sum(table[kind] for kind in kinds)
+    if total <= 0:
+        raise RuntimeError(f"target weights sum to {total} over {kinds}")
     pick = rng.random() * total
     acc = 0.0
     chosen = kinds[-1]
     for kind in kinds:
-        acc += _KIND_WEIGHT[kind]
+        acc += table[kind]
         if pick < acc:
             chosen = kind
             break
@@ -372,6 +380,7 @@ class BoardContext:
     notepad: str
     context: str
     agent: tuple[float, float]
+    weights: dict[str, float] | None = None
 
 
 @dataclass
@@ -386,7 +395,11 @@ class DrawnQuestion:
 
 
 def board_context(
-    settings: dict, rng: random.Random, *, forced_note: str | None = None,
+    settings: dict,
+    rng: random.Random,
+    *,
+    forced_note: str | None = None,
+    weights: dict[str, float] | None = None,
 ) -> BoardContext:
     """Notepad, fake history, and the agent point for one board.
 
@@ -394,6 +407,8 @@ def board_context(
     on this board (``"the gold"`` when there is one gold). The notepad
     is that phrase, with no region description added here. Omit it and
     the note is the training draw: a gold or an exit 75% of the time.
+    ``weights`` is stored for :func:`draw_question`. None keeps the
+    default gold / exit / corner table.
     """
     candidates = _targets_on_board(settings)
     note_pool = [item for item in candidates if item[0] in ("gold", "exit")]
@@ -433,12 +448,18 @@ def board_context(
         notepad=notepad,
         context=context,
         agent=agent,
+        weights=weights,
     )
 
 
-def draw_question(ctx: BoardContext, rng: random.Random) -> DrawnQuestion:
+def draw_question(
+    ctx: BoardContext,
+    rng: random.Random,
+    weights: dict[str, float] | None = None,
+) -> DrawnQuestion:
     """One look or move question against ``ctx``'s board."""
-    cand_kind, phrase, point = _draw_target(ctx.candidates, rng)
+    table = weights if weights is not None else ctx.weights
+    cand_kind, phrase, point = _draw_target(ctx.candidates, rng, table)
     move_kind = "look" if rng.random() < 0.5 else "move"
     if ctx.target_note is not None and rng.random() < 0.5:
         if ctx.note_point is None or ctx.note_kind is None:
@@ -466,7 +487,10 @@ def draw_question(ctx: BoardContext, rng: random.Random) -> DrawnQuestion:
 
 
 def draw_questions(
-    ctx: BoardContext, rng: random.Random, k: int,
+    ctx: BoardContext,
+    rng: random.Random,
+    k: int,
+    weights: dict[str, float] | None = None,
 ) -> list[DrawnQuestion]:
     """Up to ``k`` questions with no repeated ``(kind, phrase)``.
 
@@ -478,7 +502,7 @@ def draw_questions(
     for _attempt in range(8 * k):
         if len(drawn) >= k:
             break
-        item = draw_question(ctx, rng)
+        item = draw_question(ctx, rng, weights)
         key = (item.kind, item.phrase)
         if key in seen:
             continue
