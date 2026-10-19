@@ -4,10 +4,11 @@ One example is one image (or one anchor). The loss is reply-token CE
 plus the localizer's L2 and cell CE on detached tap-layer states. The
 coordinate code stays the frozen code in the start checkpoint.
 
-On a token through the ``]`` of ``[REMEMBER ...]``, and on every token
-of a sealed reply or ``End the game.``, the injected ``v`` and the
-localizer's L2 target are ``s``. Cell CE for ``v`` is still ignored
-there.
+On a token through the ``]`` that closes ``[REMEMBER ...]``, and on
+every token of a sealed reply or ``End the game.``, the injected ``v``
+and the localizer's L2 target are ``s``. A ``]`` that only closes
+``[MOVE]`` or ``[END_GAME]`` does not start that span. Cell CE for
+``v`` is still ignored on midpoint tokens.
 
 Launch (Monday 08:00 America/New_York, cosine from the startup bench):
 
@@ -72,7 +73,12 @@ from neural_net.s2_pretraining_localizer import (
     MODE_MID,
     _close_content_index,
 )
-from neural_net.s2_weekend_eval import build_train_family, messages_for, run_eval
+from neural_net.s2_weekend_eval import (
+    build_train_family,
+    messages_for,
+    reasoning_items,
+    run_eval,
+)
 from training.external_data import sources_from_manifest
 from training.run_weekend import VramMonitor
 from training.token_fence import measure_image_soft_tokens
@@ -144,8 +150,11 @@ def parse_mix(text: str | None) -> dict[str, float]:
 def supervision_span(tokenizer: Any, reply: str, all_mid: bool) -> tuple[int, int]:
     """Weighted reply tokens (content plus the terminator) and how many are mid.
 
-    Mid runs through the token that contains the first ``]``, not including
-    the terminator, unless ``all_mid`` marks the whole reply.
+    Mid is the ``[REMEMBER ...]`` span, through the token that contains
+    its closing ``]``, and not the terminator. A reply with no
+    ``[REMEMBER`` has no mid tokens, so a bare ``[MOVE]`` stays a full
+    look at the named place. ``all_mid`` marks the whole reply, including
+    the terminator: sealed rooms and ``End the game.``.
     """
     ids = tokenizer(reply, add_special_tokens=False)["input_ids"]
     n_content = len(ids)
@@ -154,8 +163,15 @@ def supervision_span(tokenizer: Any, reply: str, all_mid: bool) -> tuple[int, in
     n = n_content + 1
     if all_mid:
         return n, n
-    if "]" not in reply:
+    remember_at = reply.find("[REMEMBER")
+    if remember_at < 0:
         return n, 0
+    bracket_at = reply.find("]", remember_at)
+    if bracket_at < 0:
+        raise RuntimeError(f"[REMEMBER reply has no closing bracket: {reply!r}")
+    earlier = reply.find("]")
+    if earlier < remember_at:
+        raise RuntimeError(f"a ] appears before [REMEMBER in {reply!r}")
     close = _close_content_index(tokenizer, reply)
     if close < 0 or close >= n_content:
         raise RuntimeError(
@@ -209,6 +225,8 @@ class WeekendTrainer(Trainer):
         self.tlog = TrainLogger(self.label)
         self.vram = VramMonitor(self.label)
         self._require_start()
+        # The GSM8K probe has to be on disk before the trunk loads.
+        reasoning_items()
         cfg = TrainConfig(
             label=self.label,
             device=self.device,

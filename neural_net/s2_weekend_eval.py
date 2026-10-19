@@ -1,7 +1,9 @@
 """Greedy eval for the weekend joint S2 run, and the boards it trains on.
 
 Training and eval share :func:`build_train_family`. A generated reply is
-scored here, not by teacher-forced CE, except the anchor holdout.
+scored here, not by teacher-forced CE, except the anchor holdout. The
+reasoning slice is greedy exact match on the first 32 GSM8K test-split
+probe items.
 """
 
 from __future__ import annotations
@@ -71,6 +73,8 @@ from neural_net.s2_pretraining_learn_to_look import (
     gold_region_phrases,
 )
 from neural_net.s2_pretraining_localizer import _begin_reply, _begin_targets
+from training.external_data import load_manifest
+from training.probes import answers_match, extract_answer
 from training.train import weighted_loss
 
 logger = logging.getLogger("s2_weekend")
@@ -78,6 +82,9 @@ logger = logging.getLogger("s2_weekend")
 C_WEIGHTS = {"gold": 0.40, "exit": 0.35, "corner": 0.25}
 HOLDOUT_EVAL = 32
 MAX_NEW_TOKENS = 64
+REASONING_DATASET = "gsm8k"
+REASONING_N = 32
+REASONING_MAX_NEW = 192
 
 SAMPLE_FAMILY = {
     "A": "gaze/oracle",
@@ -302,7 +309,10 @@ def build_retarget(
 
 
 def run_eval(trainer: Any) -> dict[str, float]:
-    """Step-0 / periodic greedy eval. Writes summary.json and samples.jsonl."""
+    """Step-0 / periodic greedy eval.
+
+    Writes summary.json, samples.jsonl, and reasoning.jsonl.
+    """
     if trainer.tlog is None or trainer.collator is None:
         raise RuntimeError("eval before the trainer is loaded")
     if trainer.tap is None or trainer.localizer is None or trainer.embedder is None:
@@ -321,11 +331,13 @@ def run_eval(trainer: Any) -> dict[str, float]:
         samples.extend(_eval_begin(trainer, rng, tmp))
         samples.extend(_eval_retarget(trainer, rng, tmp))
         anchor = _eval_anchor(trainer)
+        reasoning = _eval_reasoning(trainer)
     finally:
         trainer.embedder.clear_pending()
         shutil.rmtree(tmp, ignore_errors=True)
-    summary = _summarize(int(trainer.step), samples, anchor)
+    summary = _summarize(int(trainer.step), samples, anchor, reasoning)
     _write_eval(out_dir, summary, samples)
+    _write_jsonl(out_dir / "reasoning.jsonl", reasoning["samples"])
     flat = dict(summary["metrics"])
     logger.info("eval step %d %s", trainer.step, _format_flat(flat))
     return flat
@@ -578,11 +590,16 @@ def _game_scores(
         point = extra["phrase_points"].get(value) if value is not None else None
         if point is not None:
             scores["v_dist"] = _dist(where, point)
+    if batch.family == "E":
+        scores["v_dist"] = _dist(where, turn.v)
     return scores
 
 
 def _summarize(
-    step: int, samples: list[dict[str, Any]], anchor: dict[str, float],
+    step: int,
+    samples: list[dict[str, Any]],
+    anchor: dict[str, float],
+    reasoning: dict[str, Any],
 ) -> dict[str, Any]:
     groups: dict[str, Any] = {}
     metrics: dict[str, float] = {}
@@ -610,6 +627,7 @@ def _summarize(
         "gaze/game": ("v_dist",),
         "look_move": ("v_dist",),
         "begin": ("v_dist",),
+        "retarget": ("v_dist",),
     }
     prefix = {
         "gaze/oracle": "A_",
@@ -644,10 +662,173 @@ def _summarize(
             metrics[prefix[name] + label] = stat["rms"]
             metrics[prefix[name] + label + "_n"] = float(stat["n"])
         groups[name] = group
+    look_move = groups.get("look_move")
+    if isinstance(look_move, dict):
+        for task in ("look", "move"):
+            task_rows = [
+                row for row in samples
+                if row["family"] == "look_move" and row["task"] == task
+            ]
+            hit = _rate(task_rows, "v_hit_0.05")
+            if hit is not None:
+                look_move[task + "_v_hit_0.05"] = hit
+                metrics["C_" + task + "_v_hit_0.05"] = hit["rate"]
+                metrics["C_" + task + "_v_hit_0.05_n"] = float(hit["n"])
+            dist = _rms(task_rows, "v_dist")
+            if dist is not None:
+                look_move[task + "_v_rms"] = dist
+                metrics["C_" + task + "_v_rms"] = dist["rms"]
+                metrics["C_" + task + "_v_rms_n"] = float(dist["n"])
     groups["anchor"] = {"ce": {"n": int(anchor["n"]), "mean": anchor["mean"]}}
     metrics["F_ce"] = float(anchor["mean"])
     metrics["F_ce_n"] = float(anchor["n"])
+    groups["reasoning"] = {
+        "dataset": reasoning["dataset"],
+        "slice": (
+            f"first {REASONING_N} rows of the {REASONING_DATASET} "
+            "test-split probe"
+        ),
+        "exact": {
+            "n": float(reasoning["n"]),
+            "correct": float(reasoning["correct"]),
+            "rate": float(reasoning["rate"]),
+        },
+    }
+    metrics["gsm8k_exact"] = float(reasoning["rate"])
+    metrics["gsm8k_exact_n"] = float(reasoning["n"])
     return {"step": step, "groups": groups, "metrics": metrics}
+
+
+def reasoning_items() -> list[dict[str, Any]]:
+    """First ``REASONING_N`` rows of the GSM8K test-split probe.
+
+    That probe is the held-out test split, not the train rows in family F.
+    The file is written by ``python -m training.download_external``.
+    """
+    matches = [entry for entry in load_manifest() if entry.name == REASONING_DATASET]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"manifest must contain one {REASONING_DATASET!r} entry, "
+            f"found {len(matches)}"
+        )
+    entry = matches[0]
+    if not entry.enabled:
+        raise RuntimeError(f"{REASONING_DATASET} is disabled in the manifest")
+    kind = (entry.probe or {}).get("kind")
+    if kind != "exact_match":
+        raise RuntimeError(
+            f"{REASONING_DATASET} probe kind is {kind!r}, expected 'exact_match'"
+        )
+    path = entry.probe_path
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"reasoning probe missing: {path} -- run: "
+            "python -m training.download_external --only gsm8k"
+        )
+    items = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if len(items) < REASONING_N:
+        raise RuntimeError(
+            f"{path} has {len(items)} items, need at least {REASONING_N}"
+        )
+    chosen = items[:REASONING_N]
+    for item in chosen:
+        if "answer" not in item or "messages" not in item:
+            raise RuntimeError(f"{path} item is missing messages or answer")
+    return chosen
+
+
+def _user_text(messages: list[dict]) -> str:
+    chunks: list[str] = []
+    for message in messages:
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            chunks.append(content)
+            continue
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                chunks.append(str(part.get("text") or ""))
+    return "\n".join(chunks)
+
+
+def _eval_reasoning(trainer: Any) -> dict[str, Any]:
+    """Greedy exact match. Text only: no coordinate payload is armed."""
+    if (
+        trainer.collator is None
+        or trainer.model is None
+        or trainer.processor is None
+        or trainer.embedder is None
+    ):
+        raise RuntimeError("reasoning eval before the model is loaded")
+    items = reasoning_items()
+    tokenizer = trainer.collator.tokenizer
+    adapter = trainer.collator.adapter
+    trainer.model.set_adapter("default")
+    trainer.embedder.clear_pending()
+    trainer._discard_tap()
+    correct = 0
+    samples: list[dict[str, Any]] = []
+    logger.info("gsm8k exact-match on %d held-out probe items", len(items))
+    with torch.inference_mode():
+        for index, item in enumerate(items):
+            norm = adapter.prepare_messages(item["messages"])
+            inputs = trainer.processor.apply_chat_template(
+                norm,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+            ).to(trainer.device)
+            out = trainer.model.generate(
+                **inputs,
+                max_new_tokens=REASONING_MAX_NEW,
+                do_sample=False,
+            )
+            prompt_len = int(inputs["input_ids"].shape[1])
+            if int(out.shape[1]) < prompt_len:
+                raise RuntimeError(
+                    f"gsm8k generate returned {int(out.shape[1])} tokens "
+                    f"for a prompt of {prompt_len}"
+                )
+            reply = tokenizer.decode(out[0][prompt_len:], skip_special_tokens=True)
+            pred = extract_answer(reply)
+            ok = answers_match(pred, str(item["answer"]))
+            if ok:
+                correct += 1
+            samples.append({
+                "step": int(trainer.step),
+                "dataset": REASONING_DATASET,
+                "index": index,
+                "question": _user_text(item["messages"]),
+                "reply": reply,
+                "answer": str(item["answer"]),
+                "pred": pred,
+                "correct": ok,
+            })
+            trainer.embedder.clear_pending()
+            trainer._discard_tap()
+            done = index + 1
+            if done % 8 == 0 or done == len(items):
+                logger.info("gsm8k %d/%d correct %d", done, len(items), correct)
+    return {
+        "dataset": REASONING_DATASET,
+        "n": len(items),
+        "correct": correct,
+        "rate": correct / len(items),
+        "samples": samples,
+    }
+
+
+def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    lines = [json.dumps(row) for row in rows]
+    _write_text(path, ("\n".join(lines) + "\n") if lines else "")
 
 
 def _write_eval(out_dir: Path, summary: dict[str, Any], samples: list[dict[str, Any]]) -> None:

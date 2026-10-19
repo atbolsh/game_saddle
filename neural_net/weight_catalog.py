@@ -137,3 +137,61 @@ def list_s1(root: Path | None = None) -> list[Path]:
         return []
     files = [path for path in s1.rglob("*.pt") if path.is_file()]
     return _newest(files, _mtime)
+
+
+def adapter_dir(path: Path) -> Path | None:
+    """LoRA directory for ``path``.
+
+    A coordinate checkpoint keeps the adapter beside ``coord_embed.pt``.
+    An assembled full save keeps it under ``gemma/``. ``None`` when
+    neither is present. An ``anchor/`` directory is not a choice.
+    """
+    if not path.is_dir() or path.name == "anchor":
+        return None
+    if (path / "adapter_config.json").is_file() and (
+        path / "adapter_model.safetensors"
+    ).is_file():
+        return path
+    nested = path / "gemma"
+    if (nested / "adapter_config.json").is_file() and (
+        nested / "adapter_model.safetensors"
+    ).is_file():
+        return nested
+    return None
+
+
+def is_coord_loadable(path: Path) -> bool:
+    """``coord_embed.pt`` plus a LoRA, including an assembled full save.
+
+    The localizer and ``s1.pt`` may sit beside the coordinate file.
+    A caller that only needs the coordinate code leaves them unread.
+    """
+    return (
+        path.is_dir()
+        and (path / "coord_embed.pt").is_file()
+        and adapter_dir(path) is not None
+    )
+
+
+def list_coord_loads(root: Path | None = None) -> list[Path]:
+    """Coordinate checkpoints and full saves, newest first."""
+    base = weights_root() if root is None else root
+    return _newest(_walk(base, "coord_embed.pt", is_coord_loadable), _mtime)
+
+
+def list_s1_loads(root: Path | None = None) -> list[Path]:
+    """S1 state dicts: ``weights/s1/**/*.pt`` and each full save's ``s1.pt``.
+
+    A full save's ``localizer.pt`` and ``coord_embed.pt`` are not S1
+    weights and are not listed.
+    """
+    files = list_s1(root)
+    seen = {path.resolve() for path in files}
+    for directory in list_assembled(root):
+        path = directory / "s1.pt"
+        key = path.resolve()
+        if key in seen:
+            continue
+        seen.add(key)
+        files.append(path)
+    return _newest(files, _mtime)
