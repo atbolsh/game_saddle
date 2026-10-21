@@ -10,6 +10,10 @@ and the localizer's L2 target are ``s``. A ``]`` that only closes
 ``[MOVE]`` or ``[END_GAME]`` does not start that span. Cell CE for
 ``v`` is still ignored on midpoint tokens.
 
+Family B does not inject a coordinate. The reply is still the hour or
+the direction of the one place on that image, and the localizer target
+is still that place. The picture has to carry the point.
+
 Launch (Monday 08:00 America/New_York, cosine from the startup bench):
 
     cd /workspace/game_saddle && source /venv/main/bin/activate && PYTHONUNBUFFERED=1 python -m neural_net.s2_weekend_train --start localizer_finetuned_v1 --label joint_v1 --monday
@@ -100,8 +104,8 @@ from training.train import (
 logger = logging.getLogger("s2_weekend")
 
 DEFAULT_MIX = {
-    "A": 0.30,
-    "B": 0.10,
+    "A": 0.20,
+    "B": 0.20,
     "C": 0.20,
     "D": 0.15,
     "E": 0.15,
@@ -603,7 +607,10 @@ class WeekendTrainer(Trainer):
         packed["past_key_values"] = expand_train_kv(cache, len(builds))
         width = int(packed["input_ids"].shape[1])
         self._heartbeat(STAGE_NAME[family], "suffix", len(builds), lcp + width)
-        self.embedder.set_pending(coords, positions)
+        # B is scored from the picture. Writing the true point onto the
+        # reply lets the hour line and the localizer copy it instead.
+        if family != "B":
+            self.embedder.set_pending(coords, positions)
         out = self.model(
             **packed, use_cache=True, output_hidden_states=True, logits_to_keep=1,
         )
@@ -1059,7 +1066,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--mix", default=None,
-        help="A=0.30,B=0.10,C=0.20,D=0.15,E=0.15,F=0.10. "
+        help="A=0.20,B=0.20,C=0.20,D=0.15,E=0.15,F=0.10. "
              "A zero weight drops that family and the rest are renormalized.",
     )
     parser.add_argument("--no-supervise", action="store_true")

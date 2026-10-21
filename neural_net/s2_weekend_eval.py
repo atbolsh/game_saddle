@@ -154,7 +154,9 @@ def build_train_family(
     if family == "A":
         return build_gaze(rng, place_image, mode="train")
     if family == "B":
-        return build_gaze_game(rng, tmp, step, n_turns=3, question=None)
+        # One place, as in the eval. Several places share the early
+        # reply tokens and give the localizer different targets.
+        return build_gaze_game(rng, tmp, step, n_turns=1, question=None)
     if family == "C":
         return build_look_move(rng, tmp, step, force_kind=None)
     if family == "D":
