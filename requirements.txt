@@ -1,12 +1,27 @@
 # Core deep learning
 # transformers >=4.60 references torch.float8_e8m0fnu (added in torch 2.7).
-# NOTE: on hosts with NVIDIA driver < 580 (i.e. CUDA <= 12.x), do NOT take the
-# default pip wheel for torch -- it pulls a cu13 build that can't see the GPU.
-# Install explicitly from the CUDA 12 index, e.g.:
-#   pip install -U "torch>=2.7" torchvision torchaudio \
-#       --index-url https://download.pytorch.org/whl/cu124
-torch>=2.7.0
-torchvision>=0.22.0
+# The floor is torch >= 2.14: that release fixes the mem-efficient SDPA
+# last-position bug (pytorch#191984, pytorch#192138, transformers#47651).
+# torchvision 0.29.1 is the wheel published with torch 2.14 and accepts
+# torch >= 2.14 (0.29.0 pins torch==2.14.0 exactly, so a 2.14.1 install
+# would be forced back).
+# 2.14 Linux wheels: cu126, cu130, cu132. There is no cu124 build.
+# Driver >= 580 / Blackwell uses cu130 (or the default cu13 wheel).
+# A driver that only speaks CUDA 12.4 cannot install 2.14. A driver new
+# enough for CUDA 12.6 uses the cu126 index instead.
+#
+# torchaudio 2.11 is the last release. It is built on the stable ABI, so
+# it loads with torch >= 2.11, but its CUDA build must match torch's or
+# `import torchaudio` raises. This repo never calls it; transformers does,
+# while importing a model (loss_rnnt), and that import is on the GLiNER
+# setup path. A leftover cu128 torchaudio next to cu130 torch fails there.
+# Install it from the SAME index as torch. The PyPI wheel is the cu130 build.
+#   pip install -U "torch>=2.14.0" "torchvision>=0.29.1" "torchaudio>=2.11.0,<2.12" \
+#       --index-url https://download.pytorch.org/whl/cu130
+# Kernel check, no Gemma weights: python scripts/torch_sdpa_residue_check.py
+torch>=2.14.0
+torchvision>=0.29.1
+torchaudio>=2.11.0,<2.12
 einops>=0.7.0
 
 # Hugging Face ecosystem
@@ -21,14 +36,11 @@ einops>=0.7.0
 #     5.13.x with no conflict; manually forcing 5.14.1 alongside it was also
 #     verified OK (healthy differentiated GLiNER scores -- its historical
 #     transformers-v5 failure mode was uniform ~0.05 scores on every entity).
-#   * The Gemma 4 Unified left-pad prefill corruption is present and
-#     bit-identical on 5.13.1 and 5.14.1 (scripts/gemma4_pad_batch_repro.py;
-#     reported at https://github.com/huggingface/transformers/issues/47651
-#     and https://huggingface.co/google/gemma-4-12B-it/discussions/50).
-#     The harness works around it (generate_batch dodges the poisoned
-#     widths and parity-checks every padded prefill before decoding -- see
-#     the banner in agent/model.py); after any transformers bump, rerun
-#     the repro script and training/probe_hacky_pads.py.
+#   * The Gemma 4 left-pad corruption (transformers#47651) was the
+#     mem-efficient SDPA kernel, fixed in torch >= 2.14, not in Gemma's
+#     mask code. Do not bump this cap to chase that fix. After a
+#     transformers bump, rerun scripts/torch_sdpa_residue_check.py and
+#     GS_PAD_PARITY=1 python -m training.selftest t6.
 transformers>=5.10.0,<5.15
 datasets>=2.18.0
 huggingface_hub>=0.30.0

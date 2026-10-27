@@ -68,10 +68,11 @@ perception-question rate halved vs datagen) whose win rate / mean rating /
 degeneracy fraction / gold-distance deltas are logged (`grep smoke_eval`)
 and stored under `smoke` in the state file — every checkpoint gets a
 game-performance reading even when nothing runs after it. Datagen is
-parallel by default: the Gemma 4 left-pad prefill bug
-([huggingface/transformers#47651](https://github.com/huggingface/transformers/issues/47651))
-has a verified workaround (stage-6 notes in [TO_TEST.md](TO_TEST.md)),
-and measured scaling (2026-07-30, 96 GB box) never inverts: serial
+parallel by default. Torch >= 2.14 fixed the mem-efficient SDPA
+last-position bug
+([huggingface/transformers#47651](https://github.com/huggingface/transformers/issues/47651)),
+so mixed-length rows left-pad to the real longest length (stage-6 notes
+in [TO_TEST.md](TO_TEST.md)). Measured scaling (2026-07-30, 96 GB box) never inverts: serial
 24.1 s/gen, `--parallel 10` 8.5, `--parallel 24` 6.4. The default is 12
 (12-wide T~8k is 57.5 GiB; 12×12288 leftover-pad is 93.3 GiB, so
 `T>=8700` isolates to GPU B≤3; 16 concurrent KV caches plus the NAMS

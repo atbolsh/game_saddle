@@ -130,13 +130,16 @@ sees Settings.
    bash scripts/setup_env.sh
    ```
 
-   If your host has NVIDIA driver < 580 (CUDA ≤ 12.x), install torch from
-   the CUDA 12 index first, then run the setup script with `SKIP_TORCH=1`
-   (see the note at the top of `requirements.txt`):
+   Torch, torchvision, and torchaudio have to come from the same CUDA
+   index. Torch 2.14 has no cu124 wheel. Driver ≥ 580 / Blackwell uses
+   cu130, and a plain `pip install -r requirements.txt` gets that build,
+   including torchaudio 2.11 (the last release; its PyPI wheel is cu130).
+   A driver that speaks CUDA 12.6 but not 13 installs the cu126 wheels
+   first, then skips them in setup:
 
    ```bash
-   pip install -U "torch>=2.7" torchvision torchaudio \
-       --index-url https://download.pytorch.org/whl/cu124
+   pip install -U "torch>=2.14.0" "torchvision>=0.29.1" "torchaudio>=2.11.0,<2.12" \
+       --index-url https://download.pytorch.org/whl/cu126
    SKIP_TORCH=1 bash scripts/setup_env.sh
    ```
 
@@ -409,9 +412,8 @@ token is the model's default behavior — staged plan in
 datagen runs `--parallel 12` game sessions by default, merged into batched
 decode calls on the one shared model (`agent/parallel_gen.py` — decode is
 bandwidth-bound, so extra rows are cheap: measured 24.1 s/gen serial vs
-6.4 at `--parallel 24`; mixed-length prompts batch via a verified left-pad
-workaround for a Gemma 4 prefill bug, see the banner in
-`agent/model.py`), and
+6.4 at `--parallel 24`; mixed-length prompts left-pad to the longest
+row, now that torch >= 2.14 fixes the old SDPA residue bug), and
 finishes by writing signal-check plots to `logs/datagen_stats_<label>_*/`
 (look at the rating histogram before spending training hours). Training
 runs micro-batched (`micro_batch=4` x `grad_accum=4` = the same effective

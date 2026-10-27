@@ -55,9 +55,9 @@ tensor is a hard error (no silent text-only degradation). Vision/audio
 towers stay frozen (name-excluded from LoRA); the vision embedder
 (``embed_vision`` on Gemma 4) trains via PEFT ``modules_to_save`` and so
 rides inside the adapter checkpoint. Micro-batches are length-bucketed and
-RIGHT-padded (:meth:`Collator.build_batch`; safe under causal attention +
-weight-0 pads, unlike inference-side LEFT padding -- see the workaround
-banner in agent/model.py); effective batch = micro_batch * grad_accum. A
+RIGHT-padded (:meth:`Collator.build_batch`; causal attention with
+weight-0 pads). Inference left-pads mixed lengths so every row ends on
+the same last index. Effective batch = micro_batch * grad_accum. A
 source may cap its own micro-batch (``TrainingExample.batch_cap``) when its
 loss needs more VRAM per example than the default allows -- the four VRAM
 rules that shape the loss live in :func:`weighted_loss`'s docstring.

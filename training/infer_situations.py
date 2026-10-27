@@ -137,8 +137,6 @@ def _import_runtime() -> dict[str, Any]:
     load_dotenv(REPO_ROOT / ".env")
     from agent import game_io
     from agent.model import (
-        PAD_POISON_MOD,
-        PAD_POISON_RESIDUE,
         get_model,
         set_default_checkpoint,
     )
@@ -153,8 +151,6 @@ def _import_runtime() -> dict[str, Any]:
     from training.generate_game_traces import _oracle_meta
     return {
         "game_io": game_io,
-        "PAD_POISON_MOD": PAD_POISON_MOD,
-        "PAD_POISON_RESIDUE": PAD_POISON_RESIDUE,
         "get_model": get_model,
         "set_default_checkpoint": set_default_checkpoint,
         "DEFAULT_ANALYST_QUESTION": DEFAULT_ANALYST_QUESTION,
@@ -353,8 +349,6 @@ def _path_tag(lines: list[str]) -> str:
         tags.append("prefix-kv")
     if "padded batch" in joined:
         tags.append("padded")
-    if "POISON MODE 2 RESCUE" in joined:
-        tags.append("nudge")
     if any("equal-length cohort" in ln for ln in lines) and not tags:
         tags.append("cohorts-only")
     return "+".join(tags) if tags else "no-batch-log"
@@ -378,23 +372,18 @@ def _pick_length_grid(
     model: Any,
     make_messages,
     n: int,
-    rt: dict,
 ) -> list[list[dict]]:
-    """Distinct paddable token lengths, encode-first (not char buckets)."""
-    residue = rt["PAD_POISON_RESIDUE"]
-    mod = rt["PAD_POISON_MOD"]
+    """Distinct token lengths, encode-first (not char buckets)."""
     by_len: dict[int, list[dict]] = {}
     for k in range(64):
         msgs = make_messages(k)
         length = int(model.encode_messages(msgs)["input_ids"].shape[1])
-        if length % mod == residue:
-            continue
         by_len.setdefault(length, msgs)
         if len(by_len) >= n:
             break
     if len(by_len) < 2:
         raise RuntimeError(
-            f"could not find 2+ paddable prompt lengths "
+            f"could not find 2+ prompt lengths "
             f"(got {sorted(by_len)}); generate_batch cannot show leftover "
             f"left-pad without mixed lengths"
         )
@@ -418,7 +407,7 @@ def _build_player_prompts(
             sys_p, frame, "", base + " again" * k, notepad=None,
         )
 
-    return _pick_length_grid(model, make, n if n is not None else _PLAYER_N, rt)
+    return _pick_length_grid(model, make, n if n is not None else _PLAYER_N)
 
 
 def _build_analyst_prompts(
@@ -442,7 +431,7 @@ def _build_analyst_prompts(
             player_notepad=None,
         )
 
-    return _pick_length_grid(model, make, n if n is not None else _ANALYST_N, rt)
+    return _pick_length_grid(model, make, n if n is not None else _ANALYST_N)
 
 
 def _time_serial(

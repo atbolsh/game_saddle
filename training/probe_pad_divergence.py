@@ -1,14 +1,11 @@
 """Diagnose the Gemma 4 left-pad divergence: precision noise or mask bug?
 
-STATUS: question ANSWERED -- it is a real upstream bug (mask/vision
-defect, transformers#47651), not precision noise. This probe produced the
-first evidence (the second fingerprint below, at specific pad lengths); the full
-characterization (poison modes, mod-32 rule) lives in
-training/probe_hacky_pads.py, and the shipped workaround in
-agent/model.py's KNOWN TRANSFORMERS BUG WORKAROUND banner. Kept as the
-minimal single-row prefill probe.
+STATUS: the divergence was the mem-efficient SDPA kernel
+(transformers#47651), fixed in torch >= 2.14. This file is the original
+single-row prefill probe. The random-tensor check is
+scripts/torch_sdpa_residue_check.py.
 
-Background (historical, pre-workaround): left-padded variable-length
+Background (historical): left-padded variable-length
 multimodal decode diverged from solo generate even when every collated
 tensor was suffix-identical to the solo encoding, so ``generate_batch``
 at the time only true-batched equal-length rows. The open question was
@@ -163,11 +160,10 @@ def run_probe() -> int:
         "\nVERDICT GUIDE: max|dLogit| ~1e-2 flat across pad lengths and no "
         "argmax flips => bf16 kernel noise. Deltas >~0.5, growing with pad "
         "length, or flips toward caption-style tokens ('a', 'an') => real "
-        "mask/position defect. (Historical guide -- the defect verdict "
-        "WON, reported as transformers#47651; production now pads through "
-        "the parity-checked workaround in agent/model.py. Rerun this "
-        "probe after transformers upgrades: all-tame output at every pad "
-        "would mean the upstream fix landed.)"
+        "mask/position defect. (Historical guide. Torch >= 2.14 fixes "
+        "the SDPA kernel, transformers#47651. Rerun after a torch "
+        "downgrade: deltas at a 1-mod-32 width mean the kernel bug is "
+        "back.)"
     )
     return 1 if suspicious else 0
 

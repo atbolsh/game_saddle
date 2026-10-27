@@ -1477,11 +1477,8 @@ def t1_pure() -> str:
     assert max_gpu_batch_for_lens([t_hi]) == 1
     checks += 1
 
-    # ---- 1-mod-32 dodge + prefix-KV helpers (no GPU)
+    # ---- prefix-KV helpers (no GPU)
     from agent.model import (
-        PAD_POISON_MOD,
-        PAD_POISON_RESIDUE,
-        clean_stack_width,
         expand_kv_cache,
         system_only_messages,
     )
@@ -1490,15 +1487,6 @@ def t1_pure() -> str:
         n_images_in,
         system_prefix_hash,
     )
-
-    assert 33 % PAD_POISON_MOD == PAD_POISON_RESIDUE
-    assert clean_stack_width(33) == 34
-    assert clean_stack_width(32) == 32
-    assert clean_stack_width(1) == 2
-    # suffix width T plus prefix P must also dodge residue
-    assert clean_stack_width(31, 2) != 31  # 2+31=33 ≡ 1
-    assert (2 + clean_stack_width(31, 2)) % PAD_POISON_MOD != PAD_POISON_RESIDUE
-    checks += 1
 
     sys_m = system_only_messages([
         {"role": "system", "content": [{"type": "text", "text": "dump"}]},
@@ -1679,10 +1667,8 @@ def t1_pure() -> str:
                          ).resume_unfinished is False
     checks += 1
 
-    # ---- stack_equal_length: generate_batch's equal-length-cohort
-    #      collation (mixed lengths must be a hard error, not a silent pad:
-    #      only the parity-checked path in _plan_padded_batch may left-pad
-    #      on Gemma 4 -- see the workaround banner in agent/model.py)
+    # ---- stack_equal_length: equal-length cohort collation. Mixed
+    #      lengths are a hard error here; left-pad is left_pad_stack.
 
     a = {
         "input_ids": torch.tensor([[1, 2, 3]]),
@@ -2746,28 +2732,19 @@ def t6_ab() -> str:
     """Batched vs solo generation A/B.
 
       (1) identical prompts x3 -- true GPU batch (no pad); must match solo.
-      (2) variable-length prompts -- the KNOWN TRANSFORMERS BUG WORKAROUND
-          in agent/model.py (transformers#47651): rows decode as ONE
-          verified left-padded batch. A row whose own length ~= 1 mod 32
-          is unpaddable (poison mode 2, discovered by THIS test on
-          2026-07-30) and gets the POISON MODE 2 RESCUE: one harmless
-          filler token nudges it off the residue so it joins the batch,
-          so its byte-parity reference is the NUDGED prompt's solo
-          reply. Prompt lengths are chosen AT RUNTIME: two distinct
-          paddable lengths (so padding genuinely engages -- asserted via
-          the generate_batch log; silent cohort fallback = FAIL) plus,
-          when the token grid allows, one unpaddable row to exercise the
-          rescue. All rows must match their solo reference byte-for-byte.
+      (2) variable-length prompts. The longest row's length is 1 mod 32,
+          so the padded total is the historical SDPA residue width, and
+          that row's own length is the same residue. ``generate_batch``
+          must left-pad those prompts with no filler nudge and match
+          each row's solo greedy reply. Run with ``GS_PAD_PARITY=1`` so
+          the prefill logits are compared too.
     """
     import logging as _logging
 
-    from agent.model import (
-        PAD_POISON_MOD,
-        PAD_POISON_RESIDUE,
-        get_model,
-        stack_equal_length,
-    )
+    from agent.model import get_model, stack_equal_length
 
+    residue_mod = 32
+    residue = 1
     model = get_model()
     with tempfile.TemporaryDirectory(prefix="selftest_t6_") as tmp:
         img = _tiny_png(Path(tmp) / "board.png", seed=9)
@@ -2785,14 +2762,9 @@ def t6_ab() -> str:
         stacked = stack_equal_length(same_enc)
         assert stacked["input_ids"].shape[0] == 3
 
-        # Variable-length prompts, chosen AT RUNTIME around the poison
-        # arithmetic (KNOWN TRANSFORMERS BUG WORKAROUND banner in
-        # agent/model.py): repeated " again" nudges the token length ~1
-        # per rep, giving a spread of lengths to pick from. We need two
-        # DISTINCT lengths not ~= 1 mod 32 (so the padded path genuinely
-        # engages) and, if the token grid yields one, a length ~= 1 mod
-        # 32 (unpaddable, poison mode 2) to exercise the hybrid
-        # padded+cohorts split.
+        # Repeated " again" moves the token length. Pick a length that is
+        # 1 mod 32 as the LONGEST row (padded total ≡ 1, and that row's
+        # own length ≡ 1) plus two shorter distinct lengths.
         base_q = ("Answer briefly: is the grid mostly empty? Explain in "
                   "one sentence why you think so.")
 
@@ -2803,27 +2775,32 @@ def t6_ab() -> str:
             ]}]
 
         len_to_text: dict[int, str] = {}
-        for k in range(48):
+        var_lens: list[int] = []
+        for k in range(128):
             text = base_q + " again" * k
             n = int(
                 model.encode_messages(_var_prompt(text))["input_ids"].shape[1]
             )
             len_to_text.setdefault(n, text)
-            paddable = sorted(
-                n for n in len_to_text
-                if n % PAD_POISON_MOD != PAD_POISON_RESIDUE
+            residues = sorted(
+                length for length in len_to_text
+                if length % residue_mod == residue
             )
-            unpaddable = sorted(
-                n for n in len_to_text
-                if n % PAD_POISON_MOD == PAD_POISON_RESIDUE
+            if not residues:
+                continue
+            longest = residues[-1]
+            shorter = sorted(
+                length for length in len_to_text if length < longest
             )
-            if len(paddable) >= 2 and unpaddable:
+            if len(shorter) >= 2:
+                var_lens = [shorter[0], shorter[len(shorter) // 2], longest]
                 break
-        assert len(paddable) >= 2, (
-            f"could not build 2 distinct paddable lengths from the filler "
-            f"scan: {sorted(len_to_text)}"
+        assert len(var_lens) == 3, (
+            f"could not build a 1-mod-32 padded width plus two shorter "
+            f"rows from the filler scan: {sorted(len_to_text)}"
         )
-        var_lens = [paddable[0], paddable[-1]] + unpaddable[:1]
+        assert max(var_lens) % residue_mod == residue, var_lens
+        assert any(n % residue_mod == residue for n in var_lens)
         var_prompts = [_var_prompt(len_to_text[n]) for n in var_lens]
 
         original = model._sampling_kwargs
@@ -2835,23 +2812,9 @@ def t6_ab() -> str:
             batched_same = model.generate_batch(
                 [{"messages": p} for p in same_prompts], max_new_tokens=48,
             )
-            solo_var = []
-            for n, p in zip(var_lens, var_prompts):
-                if n % PAD_POISON_MOD == PAD_POISON_RESIDUE:
-                    # The padded batch decodes the NUDGED prompt (POISON
-                    # MODE 2 RESCUE, banner in agent/model.py), so this
-                    # row's byte-parity reference is the nudged prompt's
-                    # solo reply, built with the same canonical helper.
-                    nudge = model._nudge_unpaddable(p)
-                    assert nudge is not None, (
-                        f"POISON MODE 2 RESCUE could not nudge the L={n} "
-                        "prompt off the residue"
-                    )
-                    solo_var.append(
-                        model.generate(nudge[0], max_new_tokens=48)
-                    )
-                else:
-                    solo_var.append(model.generate(p, max_new_tokens=48))
+            solo_var = [
+                model.generate(p, max_new_tokens=48) for p in var_prompts
+            ]
 
             class _Capture(_logging.Handler):
                 def __init__(self) -> None:
@@ -2879,17 +2842,13 @@ def t6_ab() -> str:
     )
     assert padded_engaged, (
         "variable-length batch did NOT take the padded / prefix-kv path "
-        "(KNOWN TRANSFORMERS BUG WORKAROUND, transformers#47651) -- it "
-        "fell back to length cohorts, which kills parallel-datagen "
+        "-- it fell back to length cohorts, which kills parallel-datagen "
         "throughput. generate_batch log: " + " | ".join(cap.lines)
     )
-    if unpaddable:
-        assert any("POISON MODE 2 RESCUE" in line for line in cap.lines), (
-            f"row of length {unpaddable[0]} (~= "
-            f"{PAD_POISON_RESIDUE} mod {PAD_POISON_MOD}) was NOT nudged "
-            "off the poison residue -- mode 2 rescue missing? "
-            "generate_batch log: " + " | ".join(cap.lines)
-        )
+    assert not any("POISON MODE 2 RESCUE" in line for line in cap.lines), (
+        "generate_batch nudged a 1-mod-32 row; that dodge is gone. "
+        "generate_batch log: " + " | ".join(cap.lines)
+    )
 
     mism_same = [
         (i, s, b) for i, (s, b) in enumerate(zip(solo_same, batched_same))
@@ -2906,16 +2865,11 @@ def t6_ab() -> str:
         )
     )
     assert not mism_var, (
-        "variable-length padded / prefix-kv batch != solo "
-        "(transformers#47651 workaround assumption broken?): "
+        "variable-length padded / prefix-kv batch != solo at a "
+        "1-mod-32 width: "
         + "; ".join(
             f"[{i}] solo={s!r} batched={b!r}" for i, s, b in mism_var
         )
-    )
-    hybrid = (
-        f" + unpaddable {unpaddable[0]} nudged into the batch"
-        if unpaddable
-        else " (no unpaddable length on the filler grid this run)"
     )
 
     # Shared system dump so prefix-KV can engage (B). Same image, two
@@ -2970,8 +2924,8 @@ def t6_ab() -> str:
 
     return (
         f"equal-len 3/3 identical (true batch); var-len "
-        f"{len(var_prompts)}/{len(var_prompts)} identical, padded rows "
-        f"{paddable[0]}+{paddable[-1]}{hybrid}; {pk_note}; "
+        f"{len(var_prompts)}/{len(var_prompts)} identical at widths "
+        f"{var_lens} (max % 32 == 1, no nudge); {pk_note}; "
         f"e.g. same0={solo_same[0][:50]!r}"
     )
 
@@ -3122,10 +3076,9 @@ def t9_parallel() -> str:
     ``seconds_per_generation``. GPU + NAMS; run t8 FIRST (its
     generation_stats.json is the serial baseline).
 
-    With the phase-locking dispatcher (agent/parallel_gen.py) plus the
-    verified left-pad workaround (TO_TEST stage-6 note,
-    transformers#47651), concurrent sessions should lock into the same
-    round phase and decode as real batches -- expect a solid speedup, not
+    With the phase-locking dispatcher (agent/parallel_gen.py), concurrent
+    sessions should lock into the same round phase and left-pad mixed
+    lengths into one batch -- expect a solid speedup, not
     the x1.18 the old fixed-window dispatcher measured. If it reads
     x~1.0-1.2, check the `dispatch: group of N [reason]` lines in the run
     log (are groups forming?) and `batch_mode` in llm_calls.jsonl (did
