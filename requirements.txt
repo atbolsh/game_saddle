@@ -6,14 +6,22 @@
 # torch >= 2.14 (0.29.0 pins torch==2.14.0 exactly, so a 2.14.1 install
 # would be forced back).
 # 2.14 Linux wheels: cu126, cu130, cu132. There is no cu124 build.
-# Driver >= 580 / Blackwell uses cu130 (or the default cu13 wheel):
-#   pip install -U "torch>=2.14.0" "torchvision>=0.29.1" \
-#       --index-url https://download.pytorch.org/whl/cu130
+# Driver >= 580 / Blackwell uses cu130 (or the default cu13 wheel).
 # A driver that only speaks CUDA 12.4 cannot install 2.14. A driver new
 # enough for CUDA 12.6 uses the cu126 index instead.
+#
+# torchaudio 2.11 is the last release. It is built on the stable ABI, so
+# it loads with torch >= 2.11, but its CUDA build must match torch's or
+# `import torchaudio` raises. This repo never calls it; transformers does,
+# while importing a model (loss_rnnt), and that import is on the GLiNER
+# setup path. A leftover cu128 torchaudio next to cu130 torch fails there.
+# Install it from the SAME index as torch. The PyPI wheel is the cu130 build.
+#   pip install -U "torch>=2.14.0" "torchvision>=0.29.1" "torchaudio>=2.11.0,<2.12" \
+#       --index-url https://download.pytorch.org/whl/cu130
 # Kernel check, no Gemma weights: python scripts/torch_sdpa_residue_check.py
 torch>=2.14.0
 torchvision>=0.29.1
+torchaudio>=2.11.0,<2.12
 einops>=0.7.0
 
 # Hugging Face ecosystem

@@ -21,9 +21,11 @@
 # re-enabled -- keep them in sync with agent/memory.py if you change models):
 #   SPACY_MODEL     (default en_core_web_sm)
 #   GLINER_MODEL    (default urchade/gliner_medium-v2.1)
-#   SKIP_TORCH      (unset)  -- if set, do NOT let requirements.txt pull torch;
-#                              install torch yourself first (see the CUDA note in
-#                              requirements.txt for driver < 580 / CUDA <= 12.x).
+#   SKIP_TORCH      (unset)  -- if set, do NOT let requirements.txt pull torch,
+#                              torchvision, or torchaudio. Install those yourself
+#                              first, from the same CUDA index (see requirements.txt).
+#                              torchaudio 2.11 must match torch's CUDA build:
+#                              transformers imports it while loading a model.
 
 set -euo pipefail
 
@@ -40,12 +42,14 @@ command -v python >/dev/null 2>&1 || die "python not found on PATH"
 # ------------------------------------------------------------- 1. pip install
 REQ_FILE="${REPO_ROOT}/requirements.txt"
 if [ -n "${SKIP_TORCH:-}" ]; then
-  # Honour a pre-installed CUDA-specific torch: strip torch/torchvision so pip
-  # can't pull a wheel that overrides it (install those yourself first -- see
-  # the CUDA note at the top of requirements.txt).
-  log "SKIP_TORCH set: excluding torch/torchvision from the install"
+  # Honour a pre-installed CUDA-specific torch stack: strip torch, torchvision,
+  # and torchaudio so pip can't pull a wheel that overrides it. Those three
+  # come from one index (see the CUDA note at the top of requirements.txt).
+  # A cu130 torch with a leftover cu128 torchaudio fails at `import torchaudio`,
+  # which transformers does while loading a model.
+  log "SKIP_TORCH set: excluding torch/torchvision/torchaudio from the install"
   REQ_FILE="$(mktemp)"
-  grep -viE '^\s*(torch|torchvision)\b' "${REPO_ROOT}/requirements.txt" > "${REQ_FILE}"
+  grep -viE '^\s*(torch|torchvision|torchaudio)\b' "${REPO_ROOT}/requirements.txt" > "${REQ_FILE}"
 fi
 log "installing Python dependencies from ${REQ_FILE}"
 python -m pip install -r "${REQ_FILE}"

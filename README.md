@@ -130,13 +130,16 @@ sees Settings.
    bash scripts/setup_env.sh
    ```
 
-   If your host has NVIDIA driver < 580 (CUDA ≤ 12.x), install torch from
-   the CUDA 12 index first, then run the setup script with `SKIP_TORCH=1`
-   (see the note at the top of `requirements.txt`):
+   Torch, torchvision, and torchaudio have to come from the same CUDA
+   index. Torch 2.14 has no cu124 wheel. Driver ≥ 580 / Blackwell uses
+   cu130, and a plain `pip install -r requirements.txt` gets that build,
+   including torchaudio 2.11 (the last release; its PyPI wheel is cu130).
+   A driver that speaks CUDA 12.6 but not 13 installs the cu126 wheels
+   first, then skips them in setup:
 
    ```bash
-   pip install -U "torch>=2.7" torchvision torchaudio \
-       --index-url https://download.pytorch.org/whl/cu124
+   pip install -U "torch>=2.14.0" "torchvision>=0.29.1" "torchaudio>=2.11.0,<2.12" \
+       --index-url https://download.pytorch.org/whl/cu126
    SKIP_TORCH=1 bash scripts/setup_env.sh
    ```
 
