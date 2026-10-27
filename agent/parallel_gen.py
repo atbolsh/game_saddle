@@ -16,10 +16,9 @@ The pieces:
     ``generate_batch`` (a per-row mix would let an analyst quoting
     "[FORWARD]" be truncated by a player row's stop string). Prompt length
     is deliberately NOT part of the signature: ``generate_batch`` itself
-    decides how a group decodes -- mixed lengths go through the VERIFIED
-    LEFT-PAD path (the KNOWN TRANSFORMERS BUG WORKAROUND for
-    transformers#47651, see agent/model.py's banner), with exact-length
-    cohorts only as its fallback.
+    decides how a group decodes -- mixed lengths are left-padded to the
+    longest row (torch >= 2.14; do not dodge a width that is 1 mod 32),
+    with exact-length cohorts only as the fallback.
 
     SCHEDULING = PHASE LOCKING, not a fixed gather window. Each datagen
     round alternates a player generation and an analyst generation, and

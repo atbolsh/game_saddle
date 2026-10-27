@@ -409,9 +409,8 @@ token is the model's default behavior — staged plan in
 datagen runs `--parallel 12` game sessions by default, merged into batched
 decode calls on the one shared model (`agent/parallel_gen.py` — decode is
 bandwidth-bound, so extra rows are cheap: measured 24.1 s/gen serial vs
-6.4 at `--parallel 24`; mixed-length prompts batch via a verified left-pad
-workaround for a Gemma 4 prefill bug, see the banner in
-`agent/model.py`), and
+6.4 at `--parallel 24`; mixed-length prompts left-pad to the longest
+row, now that torch >= 2.14 fixes the old SDPA residue bug), and
 finishes by writing signal-check plots to `logs/datagen_stats_<label>_*/`
 (look at the rating histogram before spending training hours). Training
 runs micro-batched (`micro_batch=4` x `grad_accum=4` = the same effective

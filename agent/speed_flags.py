@@ -2,7 +2,7 @@
 
 Defaults match production after the B+C / train 1+3+4 land:
 
-* ``GS_PAD_PARITY`` — off. Logit tripwire only; 1-mod-32 arithmetic stays.
+* ``GS_PAD_PARITY`` — off. Logit tripwire: padded prefill vs solo.
 * ``GS_PREFIX_KV`` — on. Resident system-prefix KV at inference.
 * ``GS_CHUNKED_KD`` — on. Hidden-then-chunked ``lm_head`` for KD.
 * ``GS_TRAIN_PREFIX_KV`` — on. Frozen system-prefix KV at train time.

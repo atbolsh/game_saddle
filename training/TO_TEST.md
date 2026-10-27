@@ -16,7 +16,7 @@ lines back for review. On a FAIL, also paste the traceback that precedes it.
 | 3 | `python -m training.selftest t3` | minutes | 4-bit QLoRA load; LoRA target discovery + projector resolution; terminator id; one collated forward+backward per loss kind (image example included); fresh-adapter KD loss equals teacher entropy (the `disable_adapter()` teacher path); kd_anchor with NO anchor adapter loaded equals kd (the epoch-1 base fallback); `example_weight` ×0.1 scales the loss by EXACTLY 0.1 (the 2026-08-05 shape/scale regression — the old code normalized reply-wide reward away); the negative-span smoke example yields a FINITE NON-NEGATIVE loss (bounded unlikelihood, not negative CE); `kd` with negative span weights raises ValueError |
 | 4 | `python -m training.selftest t4` | ~15–30 min | batch-4 vs batch-1 per-example loss parity (mixed CE/KD/image/negative-span buckets); CLI smoke train lands a checkpoint + `eval_log.jsonl` rows (INCLUDING the new step-0 baseline eval); destructive-LR variant fires the rollback path via the HARD tier (`--hard-multiplier 1.0` pins any regression to hard) AND must now END EARLY on the second consecutive rollback (2026-08-05): asserts a `consecutive_rollback_stop` event, exit 0, and a `done` event carrying `ended_early` + a usable `last_good_checkpoint` (the orchestrator hand-off contract) |
 | 5 | `python -m training.selftest t5` | ~10–20 min | datagen 2 games x 5 moves at `--parallel 2`: traces + stored frames + stats + plots written, one record per generation, tripwire silent, ratings parsed; `analyst_traces.jsonl` has one record per round (minus counted truncated-search skips), analyses nonempty, frames shared with player records |
-| 6 | `python -m training.selftest t6` | minutes | equal-length identical-prompt true GPU batch vs solo; variable-length via leftover left-pad **or** prefix-KV mid-pad vs solo (must byte-match AND must actually take that path, not the cohort fallback). Does **not** require `"padded batch verified clean"` unless `GS_PAD_PARITY=1` |
+| 6 | `python -m training.selftest t6` | minutes | equal-length identical-prompt true GPU batch vs solo; variable-length via leftover left-pad **or** prefix-KV mid-pad vs solo, including a padded width ≡ 1 mod 32 and a row whose own length ≡ 1 mod 32 (must byte-match, must not log `POISON MODE 2 RESCUE`, and must actually take the padded / prefix-KV path). Run with `GS_PAD_PARITY=1` so prefill logits are compared, not only later tokens |
 | 7 | `python -m training.selftest t7` | minutes | t5's traces through `GameTraceSource` + `PlayerAnchorSource` + `AnalystTraceSource` and real train steps (RL weights + player trust region + KD-vs-base analyst anchor, mixed ce/kd/kd_anchor buckets, per-run noised frames, finite losses; the tiny epoch is drained so every KD bucket is guaranteed to train) |
 | 8 | `python -m training.selftest t8` | ~15–40 min | REAL **serial** datagen timing (3 games × 4 moves, `--parallel 1`): diagnosis / control. Reports warmup vs steady and a 3000-gen number. Extrapolating t8 × 3000 is the *serial* epoch, not the overnight. Its `generation_stats.json` is t9's baseline |
 | 9 | `python -m training.selftest t9` | ~10–25 min | t8's EXACT workload at `--parallel 3` (run t8 first). Answers “did phase-lock + padded / prefix-KV batch actually engage?” Speedup vs t8 is reported; only asserts no ≥1.6× slowdown. t8+t9 together can exceed 1h and are **not** the weekend estimate (`run_weekend` default `--parallel 12`) |
@@ -68,35 +68,24 @@ PID holding VRAM.
 Stage 6 note: greedy equality is the strict criterion. If it fails only on
 a near-tie token deep into a reply (both outputs sane, divergence late),
 that is bf16 batched-matmul nondeterminism — paste both replies and we
-judge. KNOWN TRANSFORMERS BUG WORKAROUND in play (full banner in
-`agent/model.py`): Gemma 4 Unified corrupts a left-padded multimodal
-prefill in two measured modes — (1) padded TOTAL width ≡ 1 mod 32
-(~35–52-logit deltas, argmax flipping to junk like `<audio|>`; 6/6
-across prompt lengths 282–2867, `training/probe_hacky_pads.py`), and
-(2) a row whose OWN length ≡ 1 mod 32 corrupts under ANY left pad
-(found by the 2026-07-30 t6 run: L=289 rejected at every T in 290–297,
-~24.8-logit deltas). Standalone repro `scripts/gemma4_pad_batch_repro.py`;
-upstream https://github.com/huggingface/transformers/issues/47651 and
-https://huggingface.co/google/gemma-4-12B-it/discussions/50. The poison
-is prefill-only — decode steps crossing the residue are harmless (probe
-test 4). Probe test 5 (2026-07-30) measured a natural-residue prompt
-poisoned at 32/32 pads and validated the rescue: one harmless filler
-token (" .") moves it off the residue and it pads cleanly, with a
-content-identical greedy reply. So `generate_batch` NUDGES unpaddable
-rows off the residue (POISON MODE 2 RESCUE — serving-stack-only, traces
-keep the un-nudged prompt; ~1/32 of mixed-length rows) and then either
-(B) mid-pads suffixes after a resident system-prefix KV or (C leftover)
-left-pads to the longest remaining length. Both stacks dodge mode 1
-(never a total width ≡ 1 mod 32) and mode 2 (a row whose own `L ≡ 1`
-is nudged or excluded). The solo+batch `prefill_last_logits` loop is a
-**third-mode tripwire**, not what dodges 1-mod-32; it is **off** unless
-`GS_PAD_PARITY=1` (or `VLModel.verify_pad_parity`). Production does not
-pay N solo prefills plus a batched prefill before `generate()` prefills
-again. t6 asserts the padded / prefix-KV path **engaged** and greedy
-batch==solo. It does not require `"padded batch verified clean"` unless
-parity is on. A silent cohort fallback would pass equality while
-quietly serializing parallel datagen. Equal-length early divergence is
-a true-batch bug.
+judge. Torch >= 2.14 fixed the mem-efficient SDPA last-position bug
+(pytorch#191984, transformers#47651): a wrong last position when
+`kv_len % 32 == 1` and K/V are a stride-0 `repeat_kv` view. Two forms,
+one kernel condition — a left-padded total ≡ 1 mod 32, and a prompt
+whose own length ≡ 1 mod 32. `generate_batch` left-pads to the real
+longest length and does not append a filler. Do not put that dodge
+back. `scripts/torch_sdpa_residue_check.py` is the random-tensor check
+(no Gemma weights); `scripts/torch_sdpa_issue.md` is the historical
+report. Decode crossing that width was already clean (probe test 4).
+t6 builds a variable-length batch whose padded width is ≡ 1 mod 32 and,
+when the token grid allows, a row whose own length is ≡ 1 mod 32. It
+asserts the log has no `POISON MODE 2 RESCUE`, that the padded or
+prefix-KV path engaged, and that greedy batch equals solo on the
+original prompts. Run it with `GS_PAD_PARITY=1` so the prefill logits,
+not only the later tokens, are compared (`"padded batch verified
+clean"`). A silent cohort fallback would pass equality while quietly
+serializing parallel datagen. Equal-length early divergence is a true
+batch bug.
 
 Stage 8/9 note: these two stages measure, they mostly don't judge — the
 decision they feed is "is serial datagen fast enough for an overnight
@@ -105,8 +94,8 @@ the REAL harness (no synthetic prompts), so t8's `s/gen` already includes
 prompt building, NAMS retrieval, image noise, and the analyst call,
 amortized per player generation — the unit `--max-generations` caps. Read
 t8's epoch extrapolation first; then t9's speedup. Two mechanisms have to
-cooperate for a real speedup: the verified left-pad workaround (stage 6
-note) lets mixed-length rows decode as ONE padded batch, and the
+cooperate for a real speedup: mixed-length rows decode as one
+left-padded batch (stage 6 note; torch >= 2.14), and the
 PHASE-LOCKING dispatcher (agent/parallel_gen.py) gets compatible requests
 to be concurrent in the first place — player and analyst generations have
 different stop signatures and can never batch with each other, so with
@@ -119,7 +108,7 @@ number: (1) `dispatch: group of N [reason]` lines in the run log — N
 should reach the worker count with reason `full-batch` after the first
 round or two; persistent `phase-lock`/size-1 groups mean the sessions
 never aligned; (2) `batch_mode` in `llm_calls.jsonl` — `padded(...)`
-entries confirm the stage-6 workaround engaged; (3) frequent
+entries confirm mixed lengths took the left-pad path; (3) frequent
 `hold-timeout` reasons mean a worker keeps stalling >120 s in non-GPU
 work (NAMS?). The only assertion is that `--parallel 3` is not ≥1.6x
 SLOWER per generation than serial, which would indicate dispatcher

@@ -15,7 +15,7 @@ rebuilds the window from the recorded actions. The engine is
 deterministic, so no frames are stored.
 
 Equal prompt lengths share a prefill. Mixed lengths are separate
-cohorts and are never left-padded (transformers#47651).
+cohorts and are stacked with ``stack_equal_length`` (no left pad).
 """
 
 from __future__ import annotations
@@ -537,10 +537,10 @@ def _frames_tensor(frames: list[np.ndarray], device: torch.device) -> torch.Tens
 
 
 def _cohorts(lens: list[int]) -> Iterator[list[int]]:
-    """Equal token-length groups. Longs are chunked to the VRAM cap.
+    """    Equal token-length groups. Longs are chunked to the VRAM cap.
 
-    No left pad, so the #47651 nudge is not applied: mixed lengths never
-    share a prefill, and each cohort is stacked with ``stack_equal_length``.
+    Mixed lengths never share a prefill. Each cohort is stacked with
+    ``stack_equal_length``.
     """
     by_len: dict[int, list[int]] = {}
     for index, length in enumerate(lens):

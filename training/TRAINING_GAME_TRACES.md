@@ -137,13 +137,12 @@ Housekeeping baked into the generator:
   MiniLM embed + 16 KV caches on one 96 GB GPU died with
   `CUBLAS_STATUS_ALLOC_FAILED`. Default 12 after the 2026-09-09 probes
   (12-wide T~8k is 57.5 GiB; 12×12288 leftover-pad is 93.3 GiB, so
-  `T>=8700` isolates to GPU B≤3). Caveat for Gemma 4
-  Unified: a left-padded multimodal prefill is corrupted at specific
-  widths (upstream transformers#47651), so `generate_batch` pads
-  mixed-length rows around the poisoned widths and parity-checks every
-  padded row's prefill before decoding (KNOWN TRANSFORMERS BUG WORKAROUND
-  banner in `agent/model.py`); rows that fail the check fall back to
-  equal-length cohorts that decode sequentially inside the call.
+  `T>=8700` isolates to GPU B≤3). Torch >= 2.14 fixed the mem-efficient
+  SDPA bug (transformers#47651) that used to corrupt a left-padded
+  prefill when the width was 1 mod 32, so `generate_batch` left-pads
+  mixed-length rows to the real longest length. `GS_PAD_PARITY=1` still
+  compares each padded prefill to solo before decoding; that check is
+  off by default, and a failure falls back to equal-length cohorts.
   Requests batch only with identical stop signatures,
   so player-phase and analyst-phase generations never truncate each other.
   A concurrent session's analyst text is exactly as visible to another

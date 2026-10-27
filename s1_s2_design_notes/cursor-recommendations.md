@@ -233,9 +233,9 @@ that is ~300× decode — out of the question. At N = 32 it is ~10× in
 FLOPs, but wall clock is much kinder: decode is memory-bandwidth-bound
 (the whole model streams per token) while a few-hundred-token prefill
 is one compute-bound pass costing a handful of decode steps, so
-N = 32 lands near ~10% wall-clock overhead. Every refresh re-runs the
-multimodal prefill path — i.e. the #47651 left-pad workaround — so
-that path stays in the loop's tests.
+N = 32 lands near ~10% wall-clock overhead. A refresh is an ordinary
+prefill: torch >= 2.14 fixed the old 1-mod-32 SDPA bug, so do not
+special-case that width.
 
 Stale vision makes the emitted `s` stale too: the head reports the
 agent position in the frame S2 saw, not the live engine state, and
@@ -254,8 +254,8 @@ coordinate head: the hidden state that predicts the next word has
 already attended to the raw patches.
 
 The vocabulary is huge, so decode stays heavy no matter how small the
-coordinate head is. The left-pad multimodal prefill bug
-(`transformers` #47651, residue 1 mod 32) is still in this stack.
+coordinate head is. Torch >= 2.14 fixed the old left-pad SDPA bug
+(`transformers` #47651, residue 1 mod 32).
 Qwen3-VL-8B was the closest alternative, and it lost that bake-off.
 E4B is faster and has a real vision tower. It is a worse decider. Do
 not change families to make the six floats easier.
@@ -264,7 +264,7 @@ not change families to make the six floats easier.
 
 Stay in this repo. Put the new loop in `neural_net/` and call the engine,
 the renderer, and the oracle from there. A new repo would mean
-re-paying for the geometry, the Gemma loader, and the pad workaround.
+re-paying for the geometry and the Gemma loader.
 The debt that hurts is writing this inside `interactive.py` and
 `modes.py`, where every ask inherits `OBS:`, NAMS, and the analyst
 round. Do not do that.
