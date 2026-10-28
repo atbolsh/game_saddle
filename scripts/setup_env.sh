@@ -21,11 +21,10 @@
 # re-enabled -- keep them in sync with agent/memory.py if you change models):
 #   SPACY_MODEL     (default en_core_web_sm)
 #   GLINER_MODEL    (default urchade/gliner_medium-v2.1)
-#   SKIP_TORCH      (unset)  -- if set, do NOT let requirements.txt pull torch,
-#                              torchvision, or torchaudio. Install those yourself
-#                              first, from the same CUDA index (see requirements.txt).
-#                              torchaudio 2.11 must match torch's CUDA build:
-#                              transformers imports it while loading a model.
+#   SKIP_TORCH      (unset)  -- if set, do NOT let requirements.txt pull torch
+#                              or torchvision. torchaudio is still force-reinstalled
+#                              afterwards from the index that matches the installed
+#                              torch (a version pin cannot see +cu128 vs +cu130).
 
 set -euo pipefail
 
@@ -53,6 +52,41 @@ if [ -n "${SKIP_TORCH:-}" ]; then
 fi
 log "installing Python dependencies from ${REQ_FILE}"
 python -m pip install -r "${REQ_FILE}"
+
+# A version pin cannot see the CUDA local tag. Vast images ship
+# torchaudio +cu128, and 2.11.0+cu128 satisfies torchaudio>=2.11,<2.12, so
+# the requirements install leaves it in place next to a cu130 torch.
+# transformers imports torchaudio while loading a model (the GLiNER step).
+# Reinstall 2.11 from the index that matches this torch. --no-deps so pip
+# does not touch the torch wheel that was just installed.
+log "reinstalling torchaudio to match torch's CUDA build"
+python - <<'PY'
+import subprocess
+import sys
+
+import torch
+
+cuda = torch.version.cuda
+if not cuda:
+    print("[setup-env] torch has no CUDA build; leaving torchaudio alone",
+          flush=True)
+    sys.exit(0)
+tag = "cu" + cuda.replace(".", "")
+cmd = [
+    sys.executable, "-m", "pip", "install",
+    "-U", "--force-reinstall", "--no-deps",
+    "torchaudio>=2.11.0,<2.12",
+    "--index-url", f"https://download.pytorch.org/whl/{tag}",
+]
+print("[setup-env] " + " ".join(cmd), flush=True)
+subprocess.check_call(cmd)
+import torchaudio
+print(
+    f"[setup-env] torch {torch.__version__} cuda {cuda}; "
+    f"torchaudio {torchaudio.__version__}",
+    flush=True,
+)
+PY
 
 # -------------------------------------------------------- 2. spaCy model dl
 # `spacy download` fetches the model wheel matching the installed spaCy version.

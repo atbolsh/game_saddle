@@ -14,8 +14,10 @@
 # it loads with torch >= 2.11, but its CUDA build must match torch's or
 # `import torchaudio` raises. This repo never calls it; transformers does,
 # while importing a model (loss_rnnt), and that import is on the GLiNER
-# setup path. A leftover cu128 torchaudio next to cu130 torch fails there.
-# Install it from the SAME index as torch. The PyPI wheel is the cu130 build.
+# setup path. The version range does not select the CUDA build:
+# 2.11.0+cu128 satisfies it, and pip will not replace that wheel.
+# scripts/setup_env.sh force-reinstalls torchaudio from the index matching
+# torch.version.cuda. The PyPI wheel is the cu130 build.
 #   pip install -U "torch>=2.14.0" "torchvision>=0.29.1" "torchaudio>=2.11.0,<2.12" \
 #       --index-url https://download.pytorch.org/whl/cu130
 # Kernel check, no Gemma weights: python scripts/torch_sdpa_residue_check.py

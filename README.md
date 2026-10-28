@@ -130,12 +130,15 @@ sees Settings.
    bash scripts/setup_env.sh
    ```
 
-   Torch, torchvision, and torchaudio have to come from the same CUDA
-   index. Torch 2.14 has no cu124 wheel. Driver ≥ 580 / Blackwell uses
-   cu130, and a plain `pip install -r requirements.txt` gets that build,
-   including torchaudio 2.11 (the last release; its PyPI wheel is cu130).
-   A driver that speaks CUDA 12.6 but not 13 installs the cu126 wheels
-   first, then skips them in setup:
+   Torch and torchvision have to come from the same CUDA index. Torch
+   2.14 has no cu124 wheel. Driver ≥ 580 / Blackwell uses cu130, and a
+   plain `pip install -r requirements.txt` gets that torch. It does not
+   replace a preinstalled torchaudio whose version already satisfies the
+   pin but was built for a different CUDA (Vast images ship +cu128).
+   `scripts/setup_env.sh` force-reinstalls torchaudio 2.11 from the index
+   matching the installed torch. A driver that speaks CUDA 12.6 but not
+   13 installs the cu126 wheels first, then skips torch and torchvision
+   in setup (torchaudio is still realigned):
 
    ```bash
    pip install -U "torch>=2.14.0" "torchvision>=0.29.1" "torchaudio>=2.11.0,<2.12" \
