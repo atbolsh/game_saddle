@@ -10,9 +10,13 @@ and the localizer's L2 target are ``s``. A ``]`` that only closes
 ``[MOVE]`` or ``[END_GAME]`` does not start that span. Cell CE for
 ``v`` is still ignored on midpoint tokens.
 
-Family B does not inject a coordinate. The reply is still the hour or
-the direction of the one place on that image, and the localizer target
-is still that place. The picture has to carry the point.
+Family B asks "Look at X." and the gaze question in one user turn; the
+reply is a look line and the answer. Its reply tokens do not carry the
+true point. They carry the codes the game would inject: the localizer's
+own output, read one token earlier (``_record_feedback``), so neither
+the answer line nor the localizer can copy the label. The localizer is
+also supervised at the last prompt token, where the game's first read
+happens with no code on it.
 
 Launch (Monday 08:00 America/New_York, cosine from the startup bench):
 
@@ -53,6 +57,8 @@ from neural_net.paths import full_weights_dir
 from neural_net.s2 import (
     _hidden_size,
     assert_readout_blob,
+    decode_step,
+    prefill_step,
     write_gemma_meta,
     write_readout,
 )
@@ -595,6 +601,13 @@ class WeekendTrainer(Trainer):
         seen = _tokens_seen(cache)
         if seen != lcp:
             raise RuntimeError(f"prefix cache saw {seen} tokens, common prefix is {lcp}")
+        # B is scored from the picture. The true point on its reply would
+        # let the answer line and the localizer copy it, so B carries the
+        # codes the game would inject: the localizer's own reads, one
+        # token behind. Recorded in eval, as the game runs.
+        recorded = None
+        if family == "B":
+            recorded = self._record_feedback(builds, metas, STAGE_NAME[family])
         self.model.train()
         if hasattr(self.model, "gradient_checkpointing_disable"):
             self.model.gradient_checkpointing_disable()
@@ -604,13 +617,18 @@ class WeekendTrainer(Trainer):
             n_mid = int(meta["n_mid"])
             if n_mid:
                 coords[index, :n_mid, 2:4] = coords[index, :n_mid, 0:2]
+        if recorded is not None:
+            for index, codes in enumerate(recorded):
+                n = int(codes.shape[0])
+                if n != int(metas[index]["n_tokens"]):
+                    raise RuntimeError(
+                        f"recorded {n} codes for a reply of {metas[index]['n_tokens']} tokens"
+                    )
+                coords[index, :n] = codes
         packed["past_key_values"] = expand_train_kv(cache, len(builds))
         width = int(packed["input_ids"].shape[1])
         self._heartbeat(STAGE_NAME[family], "suffix", len(builds), lcp + width)
-        # B is scored from the picture. Writing the true point onto the
-        # reply lets the hour line and the localizer copy it instead.
-        if family != "B":
-            self.embedder.set_pending(coords, positions)
+        self.embedder.set_pending(coords, positions)
         out = self.model(
             **packed, use_cache=True, output_hidden_states=True, logits_to_keep=1,
         )
@@ -638,8 +656,20 @@ class WeekendTrainer(Trainer):
             logits.float(), target, reduction="none",
         )
         lm = token_loss.mean()
-        queries = self._reply_queries(self.tap.take(), positions, metas)
+        tapped = self.tap.take()
+        queries = self._reply_queries(tapped, positions, metas)
         label_rows, mode_rows = self._label_rows(metas)
+        if family == "B":
+            # The game's first read is at the last prompt token, with no
+            # code on it. Supervise the localizer at that position too.
+            queries = torch.cat(
+                [queries, self._prompt_queries(tapped, positions)], dim=0,
+            )
+            for meta in metas:
+                sx, sy = meta["points"][0]
+                vx, vy = meta["points"][1]
+                label_rows.append([float(sx), float(sy), float(vx), float(vy)])
+                mode_rows.append(MODE_FULL)
         if int(queries.shape[0]) != len(label_rows):
             raise RuntimeError(
                 f"localizer queries {int(queries.shape[0])} != labels {len(label_rows)}"
@@ -711,6 +741,76 @@ class WeekendTrainer(Trainer):
             else:
                 pref[key] = val
         return pref
+
+    def _record_feedback(
+        self, builds: list[dict[str, Any]], metas: list[dict[str, Any]], stage: str,
+    ) -> list[torch.Tensor]:
+        """The codes the game would inject on each reply token.
+
+        ``S1S2.generate`` injects, on reply token ``k``, the localizer
+        output read at token ``k - 1``; token 0 gets the prefill read at
+        the last prompt token. This runs that loop with the gold reply
+        tokens through :func:`prefill_step` and :func:`decode_step`, and
+        returns one ``[n_tokens, 4]`` tensor per reply. The model must
+        be in eval, as it is in the game.
+        """
+        assert self.model is not None and self.tap is not None
+        assert self.localizer is not None and self.embedder is not None
+        if self.model.training:
+            raise RuntimeError("feedback recording needs model.eval()")
+        recorded: list[torch.Tensor] = []
+        for build, meta in zip(builds, metas):
+            full = build["model_inputs"]
+            ids = full["input_ids"][0]
+            index = (build["weights"][0] != 0).nonzero(as_tuple=False).flatten()
+            n_tokens = int(meta["n_tokens"])
+            if int(index.numel()) != n_tokens:
+                raise RuntimeError(
+                    f"reply tokens {int(index.numel())} != supervision span {n_tokens}"
+                )
+            first = int(index[0])
+            if int(index[-1]) - first + 1 != n_tokens:
+                raise RuntimeError("reply tokens are not one contiguous span")
+            self._heartbeat(stage, "feedback", 1, first + n_tokens)
+            self._discard_tap()
+            _logits, coords, past, grid = prefill_step(
+                self.model, self.tap, self.localizer, self.embedder,
+                self._prefix_batch(full, first),
+            )
+            if grid is None:
+                raise RuntimeError("feedback recording found no image tokens")
+            codes = [coords]
+            seq_len = first
+            # The terminator is never fed in the game. Its position gets
+            # the read at the last content token, so one fewer step.
+            for k in range(n_tokens - 1):
+                _logits, coords, past = decode_step(
+                    self.model, self.tap, self.localizer, self.embedder,
+                    grid, ids[first + k].view(1), past, seq_len,
+                    prev_coords=coords,
+                )
+                seq_len += 1
+                codes.append(coords)
+            # These were made under inference_mode. A clone outside it
+            # is an ordinary tensor the suffix forward can read.
+            recorded.append(torch.cat(codes, dim=0).clone())
+        return recorded
+
+    def _prompt_queries(
+        self, hidden: torch.Tensor, positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Tap hidden at each row's last prompt token.
+
+        That is the position before the first reply token. It carries no
+        code, and it is where the game reads its first ``(s, v)``.
+        """
+        rows = []
+        for index in range(int(positions.shape[0])):
+            at = int(positions[index, 0]) - 1
+            if at < 0:
+                raise RuntimeError("the last prompt token is inside the cached prefix")
+            rows.append(hidden[index, at])
+        return torch.stack(rows, dim=0).detach()
 
     def _reply_queries(
         self, hidden: torch.Tensor, positions: torch.Tensor, metas: list[dict[str, Any]],

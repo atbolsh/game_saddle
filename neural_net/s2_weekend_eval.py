@@ -154,8 +154,8 @@ def build_train_family(
     if family == "A":
         return build_gaze(rng, place_image, mode="train")
     if family == "B":
-        # One place, as in the eval. Several places share the early
-        # reply tokens and give the localizer different targets.
+        # One place, as in the eval: "Look at X." and the gaze question
+        # in one user turn, a look line and the answer in one reply.
         return build_gaze_game(rng, tmp, step, n_turns=1, question=None)
     if family == "C":
         return build_look_move(rng, tmp, step, force_kind=None)
@@ -228,7 +228,9 @@ def build_gaze_game(
     n_turns: int,
     question: str | None,
 ) -> Batch:
-    """Notepad, one look round, then hour (2/3) or direction questions."""
+    """Notepad and fake history, then "Look at X." plus the hour (2/3) or
+    direction question in one user turn. The reply is a look line and
+    the answer line."""
     for _attempt in range(BOARD_TRIES):
         path: Path | None = None
         try:
@@ -539,15 +541,24 @@ def _sample(
 
 def _scores(batch: Batch, turn: Turn, text: str, where: list[float]) -> dict[str, Any]:
     scores: dict[str, Any] = {}
+    answer = text.strip()
+    expected = turn.reply.strip()
+    if batch.family == "B":
+        # A look line, then the answer line. The look line is any of
+        # the trainer's look lines, not the one this turn drew.
+        lines = [line.strip() for line in answer.splitlines()]
+        scores["assent_ok"] = len(lines) == 2 and lines[0] in _S2_LOOK_LINES
+        answer = lines[-1] if lines else ""
+        expected = expected.splitlines()[-1]
     if turn.task == "hour":
-        parsed = parse_reply(KIND_HOUR, text)
+        parsed = parse_reply(KIND_HOUR, answer)
         scores["hour_parse"] = parsed is not None
         scores["hour_exact"] = parsed == turn.extra["hour"]
         scores["hour_reward"] = (
             0.0 if parsed is None else hour_reward(int(turn.extra["hour"]), int(parsed))
         )
     if turn.task == "direction":
-        scores["direction_exact"] = text.strip() == turn.reply.strip()
+        scores["direction_exact"] = answer == expected
     if batch.family == "B":
         scores["v_dist"] = _dist(where, turn.v)
     if batch.family == "C":
@@ -607,7 +618,7 @@ def _summarize(
     metrics: dict[str, float] = {}
     rate_keys = {
         "gaze/oracle": ("hour_parse", "hour_exact", "direction_exact"),
-        "gaze/game": ("hour_parse", "hour_exact", "direction_exact"),
+        "gaze/game": ("assent_ok", "hour_parse", "hour_exact", "direction_exact"),
         "look_move": (
             "format_ok", "move_token_correct", "spurious_remember", "v_hit_0.05",
         ),
@@ -896,19 +907,19 @@ def _gaze_game_batch(
     if question not in ("hour", "direction"):
         raise ValueError(f"gaze question {question!r}")
     asked = QUESTION_HOUR if question == "hour" else QUESTION_DIRECTION
-    hist_user = _ask("look", chosen[0][1])
-    context = _append_round(ctx.context, hist_user, rng.choice(_S2_LOOK_LINES))
     turns = []
-    for _kind, _phrase, point, (axis, label, hour) in chosen:
+    for _kind, phrase, point, (axis, label, hour) in chosen:
         if question == "hour":
-            reply = correct_line(KIND_HOUR, hour)
+            answer = correct_line(KIND_HOUR, hour)
             task = "hour"
         else:
-            reply = correct_line(axis, label)
+            answer = correct_line(axis, label)
             task = "direction"
+        # The look and the question share one user turn; the reply is a
+        # look line, then the answer. ``_scores`` reads the last line.
         turns.append(Turn(
-            question=asked,
-            reply=reply,
+            question=f"{_ask('look', phrase)} {asked}",
+            reply=f"{rng.choice(_S2_LOOK_LINES)}\n{answer}",
             s=ctx.agent,
             v=(float(point[0]), float(point[1])),
             agent=ctx.agent,
@@ -920,7 +931,7 @@ def _gaze_game_batch(
     return Batch(
         family="B",
         path=path,
-        context=context,
+        context=ctx.context,
         notepad=ctx.notepad,
         settings=settings,
         turns=turns,
