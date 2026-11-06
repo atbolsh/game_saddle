@@ -745,6 +745,92 @@ async def search_session_messages(
     return hits
 
 
+# The joint weights were trained on one Recent-conversation block. The two
+# semantic hits are folded into that same block, in time order, rather than
+# a second header the weights never saw.
+CONVERSATION_RECENT = 7
+CONVERSATION_SEMANTIC = 2
+
+
+async def _session_message_rows(client: Any, session_id: str) -> list[dict[str, Any]]:
+    """Every message of one session, oldest first. Exact session match."""
+    rows = await client.query.cypher(
+        "MATCH (c:Conversation {session_id: $sid})-[:HAS_MESSAGE]->(m:Message) "
+        "RETURN m.id AS id, m.role AS role, m.content AS content, "
+        "m.timestamp AS timestamp "
+        "ORDER BY m.timestamp ASC",
+        {"sid": session_id},
+    )
+    out: list[dict[str, Any]] = []
+    for row in rows or []:
+        item = dict(row)
+        mid = item.get("id")
+        if not mid:
+            raise RuntimeError(
+                f"session {session_id} has a message with no id"
+            )
+        if item.get("timestamp") is None:
+            raise RuntimeError(
+                f"session {session_id} message {mid} has no timestamp"
+            )
+        out.append({
+            "id": str(mid),
+            "role": str(item.get("role") or "?"),
+            "content": _strip_settings_from_text(str(item.get("content") or "")),
+            "timestamp": item["timestamp"],
+        })
+    return out
+
+
+async def load_played_context(
+    client: Any,
+    session_id: str,
+    query: str,
+    recent_window: int = CONVERSATION_RECENT,
+    semantic_extra: int = CONVERSATION_SEMANTIC,
+) -> str:
+    """The conversation block for one play turn.
+
+    The last ``recent_window`` messages of this session, verbatim. When
+    older messages remain, semantic search adds up to ``semantic_extra``
+    of those, skipping any hit already in the recent window. The two
+    sets are one Recent-conversation block, oldest first. An empty
+    session is an empty string. A failed search keeps the recent window
+    and logs a warning; the exact session read does not have a fallback.
+    """
+    if recent_window < 1:
+        raise ValueError(f"recent_window must be >= 1, got {recent_window}")
+    messages = await _session_message_rows(client, session_id)
+    if not messages:
+        return ""
+    recent = messages[-recent_window:]
+    older = messages[:-recent_window]
+    chosen = list(recent)
+    if older and semantic_extra > 0 and query.strip():
+        allowed = {item["id"] for item in older}
+        try:
+            hits = await search_session_messages(
+                client, query, session_id, allowed, top_k=semantic_extra,
+            )
+        except Exception as exc:
+            logger.warning(
+                "semantic conversation search failed for %s: %s",
+                session_id, exc,
+            )
+            hits = []
+        by_id = {item["id"]: item for item in older}
+        have = {item["id"] for item in chosen}
+        for hit in hits:
+            hid = str(getattr(hit, "id", "") or "")
+            if hid in by_id and hid not in have:
+                chosen.append(by_id[hid])
+                have.add(hid)
+    chosen.sort(key=lambda item: item["timestamp"])
+    return format_recent_block(
+        [(item["role"], item["content"]) for item in chosen]
+    )
+
+
 # --------------------------------------------------------------------- tips
 
 async def add_tip(client: Any, tip: str, source_session: str | None = None) -> dict[str, Any]:
