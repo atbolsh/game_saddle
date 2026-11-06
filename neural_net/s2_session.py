@@ -1,7 +1,10 @@
-"""One S2 game, no memory graph.
+"""One S2 game.
 
-Notes live in a dict. A turn shows S2 the current frame and the
-question, and wakes S1 only when the reply ends with ``[MOVE]``.
+Notes live in a dict. The conversation lives in NAMS: a turn loads the
+last 7 messages of this session plus up to 2 older ones from semantic
+search, when any remain outside those 7. A look (no ``[MOVE]``, no
+``[END_GAME]``) is not written. A turn shows S2 the current frame and
+the question, and wakes S1 only when the reply ends with ``[MOVE]``.
 A reply that ends with ``[END_GAME]``, or an S1 window that walks
 out, ends the game. ``new_game`` opens
 ``weights/s1s2_runs/<stamp>/turns.jsonl`` and every ``turn`` appends
@@ -12,9 +15,11 @@ sequence.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import random
 import tempfile
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator
 
@@ -30,12 +35,21 @@ from agent.game_io import (
     parse_remember_notes,
     sealed_empty,
 )
-from agent.memory import format_notepad
+from agent.memory import (
+    add_assistant_message,
+    add_user_question,
+    connect,
+    format_notepad,
+    load_played_context,
+    new_session_id,
+)
 from agent.modes import (
     S2_BEGINNING_MOVE_USER,
     S2_MOVE_TARGET_USER,
     SYSTEM_PROMPT_S2,
     _build_game_messages,
+    ends_with_end_game,
+    ends_with_move,
 )
 from game.discreteEngine import discreteGame
 from neural_net.loop import MoveRecord, S1S2, new_turns_path, replay_frames
@@ -80,7 +94,34 @@ class S2GameSession:
         self.outcome: dict[str, Any] | None = None
         self.round = 0
         self.turns_path = None
+        self.session_id = ""
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._loop.run_forever, name="s2-nams", daemon=True,
+        )
+        self._thread.start()
+        try:
+            self.client = self._run(connect(CONFIG))
+        except Exception:
+            self.client = None
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._thread.join(timeout=5)
+            raise
         self.new_game()
+
+    def _run(self, coro: Any) -> Any:
+        """Run a NAMS coroutine on the background loop."""
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+
+    def close(self) -> None:
+        """Close the memory client and stop the background loop."""
+        try:
+            if self.client is not None:
+                self._run(self.client.close())
+        finally:
+            self.client = None
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._thread.join(timeout=5)
 
     def new_game(self) -> discreteGame:
         """Deal a fresh board and clear notes, the round, the report, and the outcome."""
@@ -100,6 +141,7 @@ class S2GameSession:
         self.last_move = None
         self.outcome = None
         self.round = 0
+        self.session_id = new_session_id()
         self.turns_path = new_turns_path()
         return self.game
 
@@ -156,8 +198,12 @@ class S2GameSession:
 
         try:
             Image.fromarray(frame, mode="RGB").save(path)
+            context = self._run(load_played_context(
+                self.client, self.session_id, user_text,
+            ))
             messages = _build_game_messages(
-                SYSTEM_PROMPT_S2, path, "", user_text, notepad=self.notepad(),
+                SYSTEM_PROMPT_S2, path, context, user_text,
+                notepad=self.notepad(),
             )
             result = self.net.generate(
                 self.game,
@@ -172,6 +218,7 @@ class S2GameSession:
         finally:
             if os.path.exists(path):
                 os.unlink(path)
+        self._record(user_text, result.text)
         return TurnResult(
             text=result.text,
             tokens=tokens,
@@ -216,6 +263,21 @@ class S2GameSession:
             }
         self.outcome = outcome
         return {"round": self.round, "user_text": user_text, "outcome": outcome}
+
+    def _record(self, user_text: str, reply: str) -> None:
+        """Write a move or an end-of-game turn. A look is not stored."""
+        if self.client is None:
+            raise RuntimeError("S2GameSession is closed")
+        if ends_with_move(reply):
+            kind = "move"
+        elif ends_with_end_game(reply):
+            kind = "end"
+        else:
+            return
+        self._run(add_user_question(self.client, self.session_id, user_text))
+        self._run(add_assistant_message(
+            self.client, self.session_id, reply, kind=kind,
+        ))
 
     def play(
         self,
