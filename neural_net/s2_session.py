@@ -2,8 +2,8 @@
 
 Notes live in a dict. The conversation lives in NAMS: a turn loads the
 last 7 messages of this session plus up to 2 older ones from semantic
-search, when any remain outside those 7. A look (no ``[MOVE]``, no
-``[END_GAME]``) is not written. A turn shows S2 the current frame and
+search, when any remain outside those 7. Every turn is written, look
+or move. A turn shows S2 the current frame and
 the question, and wakes S1 only when the reply ends with ``[MOVE]``.
 A reply that ends with ``[END_GAME]``, or an S1 window that walks
 out, ends the game. ``new_game`` opens
@@ -265,7 +265,7 @@ class S2GameSession:
         return {"round": self.round, "user_text": user_text, "outcome": outcome}
 
     def _record(self, user_text: str, reply: str) -> None:
-        """Write a move or an end-of-game turn. A look is not stored."""
+        """Write this turn, user line and reply. Looks included."""
         if self.client is None:
             raise RuntimeError("S2GameSession is closed")
         if ends_with_move(reply):
@@ -273,7 +273,7 @@ class S2GameSession:
         elif ends_with_end_game(reply):
             kind = "end"
         else:
-            return
+            kind = "look"
         self._run(add_user_question(self.client, self.session_id, user_text))
         self._run(add_assistant_message(
             self.client, self.session_id, reply, kind=kind,
