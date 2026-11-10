@@ -145,7 +145,11 @@ class Localizer(nn.Module):
         cell_logits = torch.einsum("bqhd,bkd->bqhk", q, keys) / scale
         attn = torch.softmax(cell_logits, dim=-1)
         expect = attn @ centers.to(dtype=attn.dtype)
-        attended = attn @ keys
+        # Pair each board's attention with its OWN keys. ``attn @ keys`` broadcast
+        # ``[B, Q, H, K] @ [B, K, D]`` over (B, Q) x (B,), so with Q == 1 and
+        # B > 1 every board's offset read board 0's keys (and Q not in {1, B}
+        # raised). B == 1 was exact.
+        attended = torch.einsum("bqhk,bkd->bqhd", attn, keys)
         points = []
         for head in range(N_COORD_HEADS):
             points.append(
