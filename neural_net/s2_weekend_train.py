@@ -10,13 +10,19 @@ and the localizer's L2 target are ``s``. A ``]`` that only closes
 ``[MOVE]`` or ``[END_GAME]`` does not start that span. Cell CE for
 ``v`` is still ignored on midpoint tokens.
 
-Family B asks "Look at X." and the gaze question in one user turn; the
-reply is a look line and the answer. Its reply tokens do not carry the
-true point. They carry the codes the game would inject: the localizer's
-own output, read one token earlier (``_record_feedback``), so neither
-the answer line nor the localizer can copy the label. The localizer is
-also supervised at the last prompt token, where the game's first read
-happens with no code on it.
+The families and their shares are the list in
+:mod:`neural_net.s2_families` (``FAMILIES``); ``--mix`` overrides the
+shares for one run.
+
+Families marked ``inject="feedback"`` (B, G) do not carry the true point
+on their reply tokens. They carry the codes the game would inject: the
+localizer's own output, read one token earlier (``_record_feedback``),
+so neither the answer line nor the localizer can copy the label. Those
+marked ``prompt_readout`` are also supervised at the last prompt token,
+where the game's first read happens with no code on it. A turn whose
+gaze moves inside the reply (family G's "Look at X. Now, look a little
+to the left." answers with two look lines) carries one ``v`` per reply
+line; the trainer maps reply tokens to lines by character offset.
 
 Launch (Monday 08:00 America/New_York, cosine from the startup bench):
 
@@ -83,8 +89,17 @@ from neural_net.s2_pretraining_localizer import (
     MODE_MID,
     _close_content_index,
 )
-from neural_net.s2_weekend_eval import (
+from neural_net.s2_families import (
+    FAMILIES,
+    Family,
     build_train_family,
+    family,
+    family_keys,
+    mix_help,
+    parse_mix,
+    stage_names,
+)
+from neural_net.s2_weekend_eval import (
     messages_for,
     reasoning_items,
     run_eval,
@@ -109,52 +124,50 @@ from training.train import (
 
 logger = logging.getLogger("s2_weekend")
 
-DEFAULT_MIX = {
-    "A": 0.20,
-    "B": 0.20,
-    "C": 0.20,
-    "D": 0.15,
-    "E": 0.15,
-    "F": 0.10,
-}
-FAMILY_ORDER = ("A", "B", "C", "D", "E", "F")
-STAGE_NAME = {
-    "A": "gaze",
-    "B": "gaze_game",
-    "C": "look_move",
-    "D": "begin",
-    "E": "retarget",
-    "F": "anchor",
-}
+# Kept for callers that read the old names; the list itself is FAMILIES.
+FAMILY_ORDER = family_keys()
+STAGE_NAME = stage_names()
 
 
-def parse_mix(text: str | None) -> dict[str, float]:
-    """Override weights. A zero drops that family; the rest are renormalized."""
-    mix = dict(DEFAULT_MIX)
-    if text:
-        for part in text.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            key, sep, raw = part.partition("=")
-            if not sep:
-                raise SystemExit(f"--mix entry {part!r} is not KEY=WEIGHT")
-            key = key.strip()
-            if key not in DEFAULT_MIX:
-                raise SystemExit(f"--mix key {key!r} is not one of A,B,C,D,E,F")
-            try:
-                mix[key] = float(raw)
-            except ValueError as exc:
-                raise SystemExit(f"--mix weight {raw!r} is not a float") from exc
-    if any(value < 0.0 for value in mix.values()):
-        raise SystemExit("--mix weights must be >= 0")
-    kept = {
-        key: mix[key] for key in FAMILY_ORDER if mix[key] > 0.0
-    }
-    total = sum(kept.values())
-    if total <= 0.0:
-        raise SystemExit("--mix dropped every family")
-    return {key: kept[key] / total for key in kept}
+def reply_line_targets(
+    tokenizer: Any, reply: str, v_lines: list[tuple[float, float]], n_tokens: int,
+) -> list[tuple[float, float]]:
+    """One ``v`` per supervised reply token (content tokens, then the terminator).
+
+    Token ``k`` belongs to the reply line its first character is on, so a
+    newline token stays with the line it closes. The terminator takes the
+    last line's ``v``. ``v_lines`` must have one entry per line of ``reply``.
+    """
+    lines = reply.split("\n")
+    if len(lines) != len(v_lines):
+        raise RuntimeError(
+            f"reply has {len(lines)} lines, v_lines has {len(v_lines)}: {reply!r}"
+        )
+    enc = tokenizer(reply, add_special_tokens=False, return_offsets_mapping=True)
+    offsets = enc.get("offset_mapping") or []
+    ids = enc["input_ids"]
+    if len(offsets) != len(ids):
+        # No offsets from this tokenizer: rebuild them from the decoded pieces.
+        offsets = []
+        cursor = 0
+        for tid in ids:
+            piece = tokenizer.decode([tid], skip_special_tokens=False)
+            at = reply.find(piece, cursor) if piece else cursor
+            if at < 0:
+                raise RuntimeError(f"token {piece!r} not found in {reply!r}")
+            offsets.append((at, at + len(piece)))
+            cursor = at + len(piece)
+    if len(ids) + 1 != n_tokens:
+        raise RuntimeError(
+            f"reply has {len(ids)} content tokens, supervision span is {n_tokens}"
+        )
+    out: list[tuple[float, float]] = []
+    for span in offsets:
+        start = int(span[0])
+        line = reply.count("\n", 0, start)
+        out.append((float(v_lines[line][0]), float(v_lines[line][1])))
+    out.append((float(v_lines[-1][0]), float(v_lines[-1][1])))
+    return out
 
 
 def supervision_span(tokenizer: Any, reply: str, all_mid: bool) -> tuple[int, int]:
@@ -512,28 +525,27 @@ class WeekendTrainer(Trainer):
         return chosen
 
     def _example_loss(
-        self, family: str,
+        self, key: str,
     ) -> tuple[torch.Tensor, Path | None, dict[str, tuple[float, int]]]:
         assert self.embedder is not None and self.vram is not None and self.tmp is not None
         self.embedder.clear_pending()
-        if family == "F":
+        spec = family(key)
+        if spec.build is None:
             loss, parts = self._anchor_loss()
             self._discard_tap()
             value = float(loss.detach())
             merged = dict(parts)
-            merged["F"] = (value, 1)
+            merged[spec.key] = (value, 1)
             merged["lm"] = (value, 1)
             return loss, None, merged
-        if family not in STAGE_NAME:
-            raise RuntimeError(f"unknown family {family!r}")
         batch = build_train_family(
-            family, self.rng, self.tmp, self.step, self._place_image,
+            spec.key, self.rng, self.tmp, self.step, self._place_image,
         )
-        self.vram.set_stage(STAGE_NAME[family])
+        self.vram.set_stage(spec.stage)
         try:
             self._use_cache(True)
             try:
-                loss, parts = self._joint(batch, family)
+                loss, parts = self._joint(batch, spec)
             finally:
                 self._use_cache(False)
         except Exception:
@@ -542,8 +554,9 @@ class WeekendTrainer(Trainer):
         return loss, batch.path, parts
 
     def _joint(
-        self, batch: Any, family: str,
+        self, batch: Any, spec: Family,
     ) -> tuple[torch.Tensor, dict[str, tuple[float, int]]]:
+        family = spec.key
         assert (
             self.model is not None and self.embedder is not None
             and self.localizer is not None and self.tap is not None
@@ -585,7 +598,7 @@ class WeekendTrainer(Trainer):
                 )
         pref = self._prefix_batch(builds[0]["model_inputs"], lcp)
         positions = grid_positions(pref)
-        self._heartbeat(STAGE_NAME[family], "prefill", 1, lcp)
+        self._heartbeat(spec.stage, "prefill", 1, lcp)
         with torch.no_grad():
             out = self.model(**pref, use_cache=True, logits_to_keep=1)
         if out.past_key_values is None:
@@ -601,13 +614,16 @@ class WeekendTrainer(Trainer):
         seen = _tokens_seen(cache)
         if seen != lcp:
             raise RuntimeError(f"prefix cache saw {seen} tokens, common prefix is {lcp}")
-        # B is scored from the picture. The true point on its reply would
-        # let the answer line and the localizer copy it, so B carries the
-        # codes the game would inject: the localizer's own reads, one
-        # token behind. Recorded in eval, as the game runs.
+        # Feedback families (B, G) are scored from the picture. The true
+        # point on their reply would let the answer line and the localizer
+        # copy it, so they carry the codes the game would inject: the
+        # localizer's own reads, one token behind. Recorded in eval, as
+        # the game runs.
         recorded = None
-        if family == "B":
-            recorded = self._record_feedback(builds, metas, STAGE_NAME[family])
+        if spec.inject == "feedback":
+            recorded = self._record_feedback(builds, metas, spec.stage)
+        elif spec.inject != "oracle":
+            raise RuntimeError(f"family {family!r} has inject {spec.inject!r}")
         self.model.train()
         if hasattr(self.model, "gradient_checkpointing_disable"):
             self.model.gradient_checkpointing_disable()
@@ -617,6 +633,13 @@ class WeekendTrainer(Trainer):
             n_mid = int(meta["n_mid"])
             if n_mid:
                 coords[index, :n_mid, 2:4] = coords[index, :n_mid, 0:2]
+            # Oracle codes on a reply whose gaze moves between lines: each
+            # token gets its own line's v (jittered like the rest).
+            if recorded is None and meta.get("v_tokens") is not None:
+                sx, sy = meta["points"][0]
+                for token, (vx, vy) in enumerate(meta["v_tokens"]):
+                    row = self._jitter(((sx, sy), (vx, vy)), meta["agent"])
+                    coords[index, token, 2:4] = torch.tensor(row[2:4], device=coords.device)
         if recorded is not None:
             for index, codes in enumerate(recorded):
                 n = int(codes.shape[0])
@@ -627,7 +650,7 @@ class WeekendTrainer(Trainer):
                 coords[index, :n] = codes
         packed["past_key_values"] = expand_train_kv(cache, len(builds))
         width = int(packed["input_ids"].shape[1])
-        self._heartbeat(STAGE_NAME[family], "suffix", len(builds), lcp + width)
+        self._heartbeat(spec.stage, "suffix", len(builds), lcp + width)
         self.embedder.set_pending(coords, positions)
         out = self.model(
             **packed, use_cache=True, output_hidden_states=True, logits_to_keep=1,
@@ -659,15 +682,17 @@ class WeekendTrainer(Trainer):
         tapped = self.tap.take()
         queries = self._reply_queries(tapped, positions, metas)
         label_rows, mode_rows = self._label_rows(metas)
-        if family == "B":
+        if spec.prompt_readout:
             # The game's first read is at the last prompt token, with no
-            # code on it. Supervise the localizer at that position too.
+            # code on it. Supervise the localizer at that position too,
+            # with the first reply token's gaze.
             queries = torch.cat(
                 [queries, self._prompt_queries(tapped, positions)], dim=0,
             )
             for meta in metas:
                 sx, sy = meta["points"][0]
-                vx, vy = meta["points"][1]
+                v_tokens = meta.get("v_tokens")
+                vx, vy = v_tokens[0] if v_tokens is not None else meta["points"][1]
                 label_rows.append([float(sx), float(sy), float(vx), float(vy)])
                 mode_rows.append(MODE_FULL)
         if int(queries.shape[0]) != len(label_rows):
@@ -712,11 +737,20 @@ class WeekendTrainer(Trainer):
             )
             n_tokens, n_mid = supervision_span(tokenizer, turn.reply, turn.all_mid)
             builds.append(self.collator.build(example))
+            v_tokens = None
+            if turn.v_lines is not None:
+                if n_mid:
+                    raise RuntimeError("per-line gaze targets on a reply with a mid span")
+                v_tokens = reply_line_targets(tokenizer, turn.reply, turn.v_lines, n_tokens)
+                last = v_tokens[-1]
+                if abs(last[0] - turn.v[0]) > 1e-9 or abs(last[1] - turn.v[1]) > 1e-9:
+                    raise RuntimeError("turn.v is not the last entry of v_lines")
             metas.append({
                 "points": (turn.s, turn.v),
                 "agent": turn.agent,
                 "n_tokens": n_tokens,
                 "n_mid": n_mid,
+                "v_tokens": v_tokens,
             })
         return builds, metas
 
@@ -832,19 +866,22 @@ class WeekendTrainer(Trainer):
     def _label_rows(
         self, metas: list[dict[str, Any]],
     ) -> tuple[list[list[float]], list[int]]:
-        """Clean ``(s, v)``. Mid tokens use ``v = s`` for the L2 target."""
+        """Clean ``(s, v)``. Mid tokens use ``v = s`` for the L2 target; a
+        reply with per-line targets uses its own token's ``v``."""
         rows: list[list[float]] = []
         modes: list[int] = []
         for meta in metas:
             sx, sy = meta["points"][0]
             vx, vy = meta["points"][1]
             n_mid = int(meta["n_mid"])
+            v_tokens = meta.get("v_tokens")
             for token in range(int(meta["n_tokens"])):
                 if token < n_mid:
                     rows.append([float(sx), float(sy), float(sx), float(sy)])
                     modes.append(MODE_MID)
                 else:
-                    rows.append([float(sx), float(sy), float(vx), float(vy)])
+                    tx, ty = v_tokens[token] if v_tokens is not None else (vx, vy)
+                    rows.append([float(sx), float(sy), float(tx), float(ty)])
                     modes.append(MODE_FULL)
         if not rows:
             raise RuntimeError("localizer labels are empty")
@@ -992,16 +1029,16 @@ class WeekendTrainer(Trainer):
         self._win_n.clear()
 
     def _bench_rate(self) -> float:
-        families = [key for key in FAMILY_ORDER if key in self.mix]
-        for family in families:
-            self._bench_once(family)
+        keys = [key for key in FAMILY_ORDER if key in self.mix]
+        for key in keys:
+            self._bench_once(key)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         started = time.perf_counter()
         timed = 0
         for _ in range(2):
-            for family in families:
-                self._bench_once(family)
+            for key in keys:
+                self._bench_once(key)
                 timed += 1
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -1033,6 +1070,13 @@ class WeekendTrainer(Trainer):
         payload = {
             **vars(self.args),
             "mixture": self.mix,
+            "families": [
+                {
+                    "key": spec.key, "stage": spec.stage, "default_weight": spec.weight,
+                    "inject": spec.inject, "prompt_readout": spec.prompt_readout,
+                }
+                for spec in FAMILIES
+            ],
             "cosine_steps": self.cosine_steps,
             "steps_per_s": rate,
             "start_dir": str(self.start_dir),
@@ -1164,11 +1208,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-steps", type=int, default=10)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument(
-        "--mix", default=None,
-        help="A=0.20,B=0.20,C=0.20,D=0.15,E=0.15,F=0.10. "
-             "A zero weight drops that family and the rest are renormalized.",
-    )
+    parser.add_argument("--mix", default=None, help=mix_help())
     parser.add_argument("--no-supervise", action="store_true")
     return parser
 

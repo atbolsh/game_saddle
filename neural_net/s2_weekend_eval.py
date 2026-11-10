@@ -1,9 +1,14 @@
 """Greedy eval for the weekend joint S2 run, and the boards it trains on.
 
-Training and eval share :func:`build_train_family`. A generated reply is
-scored here, not by teacher-forced CE, except the anchor holdout. The
-reasoning slice is greedy exact match on the first 32 GSM8K test-split
-probe items.
+The families, their shares, and the shift family's knobs are listed in
+:mod:`neural_net.s2_families`; this module holds the builders and the
+eval functions that list points at. Training and eval share the
+builders. A generated reply is scored here, not by teacher-forced CE,
+except the anchor holdout. The reasoning slice is greedy exact match on
+the first 32 GSM8K test-split probe items.
+
+:mod:`neural_net.s2_families` imports this module, so anything here that
+needs the list reads it through :func:`_families` at call time.
 """
 
 from __future__ import annotations
@@ -65,6 +70,7 @@ from neural_net.s2_coord_train import (
 from neural_net.s2_pretraining_learn_to_look import (
     _ask,
     _coords,
+    _draw_target,
     _targets_on_board,
     beginning_messages,
     board_context,
@@ -86,16 +92,17 @@ REASONING_DATASET = "gsm8k"
 REASONING_N = 32
 REASONING_MAX_NEW = 192
 
-SAMPLE_FAMILY = {
-    "A": "gaze/oracle",
-    "B": "gaze/game",
-    "C": "look_move",
-    "D": "begin",
-    "E": "retarget",
-    "F": "anchor",
-}
+SHIFT_HIT = 0.025            # a shift counts when the gaze lands within this of v
+SHIFT_EVAL_PER_CASE = 8      # eval boards per shift sub-case
 
 _REMEMBER = re.compile(r"\[REMEMBER target: ([^\]]*)\]")
+
+
+def _families():
+    """The family list, imported at call time (it imports this module)."""
+    from neural_net import s2_families
+
+    return s2_families
 
 
 class Redraw(Exception):
@@ -115,6 +122,11 @@ class Turn:
     expect_move: bool
     task: str
     extra: dict[str, Any] = field(default_factory=dict)
+    # One ``v`` per reply line when the gaze moves inside the reply (the
+    # shift family's "Look at X. Now, look a little to the left." answers
+    # with two look lines: the first on X, the second on X + d). ``v`` is
+    # then the last entry. None: every reply token carries ``v``.
+    v_lines: list[tuple[float, float]] | None = None
 
 
 @dataclass
@@ -143,27 +155,29 @@ def messages_for(batch: Batch, turn: Turn) -> list[dict]:
     )
 
 
-def build_train_family(
-    family: str,
+def build_shift(
     rng: random.Random,
     tmp: Path,
     step: int,
-    place_image: Callable[[], dict[str, Any]],
+    case: str | None,
 ) -> Batch:
-    """One training image. ``place_image`` is the coord-tf four-direction deal."""
-    if family == "A":
-        return build_gaze(rng, place_image, mode="train")
-    if family == "B":
-        # One place, as in the eval: "Look at X." and the gaze question
-        # in one user turn, a look line and the answer in one reply.
-        return build_gaze_game(rng, tmp, step, n_turns=1, question=None)
-    if family == "C":
-        return build_look_move(rng, tmp, step, force_kind=None)
-    if family == "D":
-        return build_begin(rng, tmp, step, board=None, limit_one=False)
-    if family == "E":
-        return build_retarget(rng, tmp, step, sub=None, board=None)
-    raise ValueError(f"no board family {family!r}")
+    """Family G: "look a little to the left" moves the gaze from the place
+    it is on. ``case`` is a key of ``s2_families.SHIFT_CASES`` or None for
+    the weighted draw."""
+    fam = _families()
+    for _attempt in range(BOARD_TRIES):
+        path: Path | None = None
+        try:
+            path, settings = _deal(rng, tmp, step, "c")
+            which = case if case is not None else _weighted_key(rng, fam.SHIFT_CASES)
+            return _shift_batch(rng, path, settings, which)
+        except Redraw as exc:
+            _drop(exc.path if exc.path is not None else path)
+            continue
+        except Exception:
+            _drop(path)
+            raise
+    raise RuntimeError(f"shift drew no board in {BOARD_TRIES} tries")
 
 
 def build_gaze(
@@ -329,11 +343,10 @@ def run_eval(trainer: Any) -> dict[str, float]:
     trainer.model.set_adapter("default")
     trainer.embedder.clear_pending()
     try:
-        samples.extend(_eval_gaze(trainer, rng, tmp))
-        samples.extend(_eval_gaze_game(trainer, rng, tmp))
-        samples.extend(_eval_look(trainer, rng, tmp))
-        samples.extend(_eval_begin(trainer, rng, tmp))
-        samples.extend(_eval_retarget(trainer, rng, tmp))
+        # Every family with a board eval, in list order, trained or not.
+        for spec in _families().FAMILIES:
+            if spec.eval is not None:
+                samples.extend(spec.eval(trainer, rng, tmp))
         anchor = _eval_anchor(trainer)
         reasoning = _eval_reasoning(trainer)
     finally:
@@ -410,6 +423,18 @@ def _eval_retarget(trainer: Any, rng: random.Random, tmp: Path) -> list[dict[str
             try:
                 if len(batch.turns) > 1:
                     batch.turns = [rng.choice(batch.turns)]
+                rows.extend(_generate_batch(trainer, batch))
+            finally:
+                batch.path.unlink(missing_ok=True)
+    return rows
+
+
+def _eval_shift(trainer: Any, rng: random.Random, tmp: Path) -> list[dict[str, Any]]:
+    rows = []
+    for case in _families().SHIFT_CASES:
+        for _ in range(SHIFT_EVAL_PER_CASE):
+            batch = build_shift(rng, tmp, trainer.step, case=case)
+            try:
                 rows.extend(_generate_batch(trainer, batch))
             finally:
                 batch.path.unlink(missing_ok=True)
@@ -527,7 +552,7 @@ def _sample(
 ) -> dict[str, Any]:
     return {
         "step": int(step),
-        "family": SAMPLE_FAMILY[batch.family],
+        "family": _families().family(batch.family).sample,
         "task": turn.task,
         "settings": batch.settings,
         "user": turn.question,
@@ -569,7 +594,30 @@ def _scores(batch: Batch, turn: Turn, text: str, where: list[float]) -> dict[str
         scores["v_hit_0.05"] = scores["v_dist"] < 0.05
     if batch.family in ("D", "E"):
         scores.update(_game_scores(batch, turn, text, where))
+    if batch.family == "G":
+        scores.update(_shift_scores(turn, text, where))
     return scores
+
+
+def _shift_scores(turn: Turn, text: str, where: list[float]) -> dict[str, Any]:
+    """One look line per instruction, and the final gaze on ``v``.
+
+    ``shift_sign_ok``: the gaze moved from the anchor the way the (summed)
+    instruction said, at all. ``shift_hit``: it landed within
+    :data:`SHIFT_HIT` of ``v``. ``v_dist`` feeds the rms.
+    """
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    n_expected = len(turn.reply.strip().splitlines())
+    anchor = turn.extra["anchor"]
+    total = (float(turn.v[0]) - float(anchor[0]), float(turn.v[1]) - float(anchor[1]))
+    moved = (float(where[0]) - float(anchor[0]), float(where[1]) - float(anchor[1]))
+    dist = _dist(where, turn.v)
+    return {
+        "format_ok": len(lines) == n_expected and all(line in _S2_LOOK_LINES for line in lines),
+        "shift_sign_ok": moved[0] * total[0] + moved[1] * total[1] > 0.0,
+        "shift_hit": dist < SHIFT_HIT,
+        "v_dist": dist,
+    }
 
 
 def _game_scores(
@@ -631,6 +679,7 @@ def _summarize(
             "end_game_when_sealed", "end_game_spurious", "end_ask_ok",
             "move_token_correct",
         ),
+        "shift": ("format_ok", "shift_sign_ok", "shift_hit"),
     }
     mean_keys = {
         "gaze/oracle": ("hour_reward",),
@@ -641,6 +690,7 @@ def _summarize(
         "look_move": ("v_dist",),
         "begin": ("v_dist",),
         "retarget": ("v_dist",),
+        "shift": ("v_dist",),
     }
     prefix = {
         "gaze/oracle": "A_",
@@ -648,6 +698,7 @@ def _summarize(
         "look_move": "C_",
         "begin": "D_",
         "retarget": "E_",
+        "shift": "G_",
     }
     for name, keys in rate_keys.items():
         rows = [row for row in samples if row["family"] == name]
@@ -692,6 +743,19 @@ def _summarize(
                 look_move[task + "_v_rms"] = dist
                 metrics["C_" + task + "_v_rms"] = dist["rms"]
                 metrics["C_" + task + "_v_rms_n"] = float(dist["n"])
+    shift = groups.get("shift")
+    if isinstance(shift, dict):
+        # Per sub-case hit rate (the task field of a shift sample is its case).
+        for case in sorted({row["task"] for row in samples if row["family"] == "shift"}):
+            case_rows = [
+                row for row in samples
+                if row["family"] == "shift" and row["task"] == case
+            ]
+            hit = _rate(case_rows, "shift_hit")
+            if hit is not None:
+                shift[case + "_shift_hit"] = hit
+                metrics["G_" + case + "_shift_hit"] = hit["rate"]
+                metrics["G_" + case + "_shift_hit_n"] = float(hit["n"])
     groups["anchor"] = {"ce": {"n": int(anchor["n"]), "mean": anchor["mean"]}}
     metrics["F_ce"] = float(anchor["mean"])
     metrics["F_ce_n"] = float(anchor["n"])
@@ -986,6 +1050,186 @@ def _look_move_batch(
         notepad=ctx.notepad,
         settings=settings,
         turns=turns,
+        inject="feedback",
+    )
+
+
+def _weighted_key(rng: random.Random, table: dict[str, float]) -> str:
+    total = sum(max(0.0, float(w)) for w in table.values())
+    if total <= 0.0:
+        raise RuntimeError(f"weights sum to {total}: {table}")
+    pick = rng.random() * total
+    acc = 0.0
+    chosen = next(iter(table))
+    for key, weight in table.items():
+        if weight <= 0.0:
+            continue
+        chosen = key
+        acc += float(weight)
+        if pick < acc:
+            break
+    return chosen
+
+
+def _shift_inside(point: tuple[float, float]) -> bool:
+    inner = _families().SHIFT_INNER
+    return inner <= point[0] <= 1.0 - inner and inner <= point[1] <= 1.0 - inner
+
+
+def _shift_step(
+    rng: random.Random,
+    start: tuple[float, float],
+    size: float,
+    exclude: tuple[str, ...] = (),
+) -> tuple[str, tuple[float, float]] | None:
+    """A direction whose step of ``size`` from ``start`` stays in the room."""
+    fam = _families()
+    names = [name for name in fam.SHIFT_DIRECTIONS if name not in exclude]
+    rng.shuffle(names)
+    for name in names:
+        ux, uy = fam.SHIFT_DIRECTIONS[name]
+        end = (start[0] + ux * size, start[1] + uy * size)
+        if _shift_inside(end):
+            return name, end
+    return None
+
+
+def _opposite(direction: str) -> str:
+    return {"left": "right", "right": "left", "up": "down", "down": "up"}[direction]
+
+
+def _shift_phrase(rng: random.Random, kind: str, direction: str) -> str:
+    fam = _families()
+    words = fam.SHIFT_DIRECTION_WORDS[direction]
+    # "look left" reads fine; "look a little left" is rarer than "a little
+    # to the left", so the sized forms keep the first (long) wording.
+    word = rng.choice(words) if kind == "bare" else words[0]
+    return rng.choice(fam.SHIFT_TEMPLATES[kind]).format(dir=word)
+
+
+def _shift_batch(
+    rng: random.Random,
+    path: Path,
+    settings: dict[str, Any],
+    case: str,
+) -> Batch:
+    """One board, one anchor place, one shift prompt of the given case.
+
+    The anchor is a named place drawn with ``SHIFT_TARGETS``; the shift
+    starts from it. Replies are look lines, one per instruction in the
+    user text; ``v_lines`` carries the gaze of each line.
+    """
+    fam = _families()
+    if case not in fam.SHIFT_CASES:
+        raise ValueError(f"shift case {case!r}; cases are {list(fam.SHIFT_CASES)}")
+    ctx = board_context(settings, rng, weights=fam.SHIFT_TARGETS)
+    # The anchor may sit in a wall (an exit); only the shifted points must
+    # be inside, which _shift_step checks, redrawing the board otherwise.
+    kind, phrase, anchor = _draw_target(ctx.candidates, rng, fam.SHIFT_TARGETS)
+    anchor = (float(anchor[0]), float(anchor[1]))
+    little = float(fam.SHIFT_LITTLE)
+    look = lambda: rng.choice(_S2_LOOK_LINES)  # noqa: E731
+    anchor_round = (_ask("look", phrase), look())
+    context = ctx.context
+    v_lines: list[tuple[float, float]] | None = None
+    if case == "two_turn":
+        step = _shift_step(rng, anchor, little)
+        if step is None:
+            raise Redraw(path)
+        direction, end = step
+        context = _append_round(context, *anchor_round)
+        question = _shift_phrase(rng, "little", direction)
+        reply = look()
+        directions = [direction]
+    elif case == "one_turn":
+        step = _shift_step(rng, anchor, little)
+        if step is None:
+            raise Redraw(path)
+        direction, end = step
+        question = f"{anchor_round[0]} {_shift_phrase(rng, 'little', direction)}"
+        reply = f"{look()}\n{look()}"
+        v_lines = [anchor, end]
+        directions = [direction]
+    elif case in ("stack_msg", "stack_turns"):
+        first = _shift_step(rng, anchor, little)
+        if first is None:
+            raise Redraw(path)
+        d1, mid = first
+        # The second step is the same way or perpendicular, never straight
+        # back (that would cancel the first and leave nothing to score).
+        second = _shift_step(rng, mid, little, exclude=(_opposite(d1),))
+        if second is None:
+            raise Redraw(path)
+        d2, end = second
+        phrase_1 = _shift_phrase(rng, "little", d1)
+        phrase_2 = _shift_phrase(rng, "little", d2)
+        if case == "stack_msg":
+            question = f"{anchor_round[0]} {phrase_1} {phrase_2}"
+            reply = f"{look()}\n{look()}\n{look()}"
+            v_lines = [anchor, mid, end]
+        else:
+            context = _append_round(context, *anchor_round)
+            context = _append_round(context, phrase_1, look())
+            question = phrase_2
+            reply = look()
+        directions = [d1, d2]
+    elif case == "more":
+        # Two steps the same way must fit; "more" repeats the prior one.
+        step = None
+        for _try in range(8):
+            cand = _shift_step(rng, anchor, little)
+            if cand is None:
+                break
+            direction, mid = cand
+            ux, uy = fam.SHIFT_DIRECTIONS[direction]
+            end = (mid[0] + ux * little, mid[1] + uy * little)
+            if _shift_inside(end):
+                step = (direction, end)
+                break
+        if step is None:
+            raise Redraw(path)
+        direction, end = step
+        context = _append_round(context, *anchor_round)
+        context = _append_round(context, _shift_phrase(rng, "little", direction), look())
+        question = _shift_phrase(rng, "more", direction)
+        reply = look()
+        directions = [direction, direction]
+    elif case == "bare":
+        step = _shift_step(rng, anchor, float(fam.SHIFT_BARE))
+        if step is None:
+            raise Redraw(path)
+        direction, end = step
+        context = _append_round(context, *anchor_round)
+        question = _shift_phrase(rng, "bare", direction)
+        reply = look()
+        directions = [direction]
+    else:
+        raise ValueError(f"shift case {case!r}")
+    turn = Turn(
+        question=question,
+        reply=reply,
+        s=ctx.agent,
+        v=(float(end[0]), float(end[1])),
+        agent=ctx.agent,
+        all_mid=False,
+        expect_move=False,
+        task=case,
+        extra={
+            "case": case,
+            "anchor": anchor,
+            "anchor_kind": kind,
+            "phrase": phrase,
+            "directions": directions,
+        },
+        v_lines=v_lines,
+    )
+    return Batch(
+        family="G",
+        path=path,
+        context=context,
+        notepad=ctx.notepad,
+        settings=settings,
+        turns=[turn],
         inject="feedback",
     )
 
