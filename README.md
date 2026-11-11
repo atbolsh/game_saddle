@@ -323,7 +323,12 @@ jupyter notebook   # or: jupyter lab
   `weights/s1s2_runs/<stamp>/turns.jsonl`. **S1 actions** shows that
   turn's action list in the conversation. The session is
   [`neural_net/s2_session.py`](neural_net/s2_session.py)
-  (`S2GameSession`).
+  (`S2GameSession`). Each reply goes into NAMS with its gaze trace, the
+  `(s, v)` read at every token. When a later turn recalls the reply, its
+  tokens in the prompt carry those codes again, and the token after it
+  carries where the eyes were left
+  ([`neural_net/gaze_replay.py`](neural_net/gaze_replay.py);
+  `S2_GAZE_REPLAY=full|anchor|off`, default `full`).
 
 * **`notebooks/trace_viewer.ipynb`** — the same turn file, one turn at a
   time. No GPU.

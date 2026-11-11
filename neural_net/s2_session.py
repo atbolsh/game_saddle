@@ -3,8 +3,13 @@
 Notes live in a dict. The conversation lives in NAMS: a turn loads the
 last 7 messages of this session plus up to 2 older ones from semantic
 search, when any remain outside those 7. Every turn is written, look
-or move. A turn shows S2 the current frame and
-the question, and wakes S1 only when the reply ends with ``[MOVE]``.
+or move, and each reply is written with its gaze trace: the ``(s, v)``
+the Localizer read at every token. When a later turn recalls the reply,
+its tokens in the prompt carry those codes again, and the token right
+after it carries where the eyes were left (:mod:`neural_net.gaze_replay`;
+``gaze_replay`` is ``full``, ``anchor`` or ``off``). A turn shows S2 the
+current frame and the question, and wakes S1 only when the reply ends
+with ``[MOVE]``.
 A reply that ends with ``[END_GAME]``, or an S1 window that walks
 out, ends the game. ``new_game`` opens
 ``weights/s1s2_runs/<stamp>/turns.jsonl`` and every ``turn`` appends
@@ -40,8 +45,9 @@ from agent.memory import (
     add_user_question,
     connect,
     format_notepad,
-    load_played_context,
+    load_played_messages,
     new_session_id,
+    played_block,
 )
 from agent.modes import (
     S2_BEGINNING_MOVE_USER,
@@ -52,6 +58,7 @@ from agent.modes import (
     ends_with_move,
 )
 from game.discreteEngine import discreteGame
+from neural_net.gaze_replay import GazeReplay, resolve_mode
 from neural_net.loop import MoveRecord, S1S2, new_turns_path, replay_frames
 from neural_net.render import canonical_frame
 
@@ -69,6 +76,10 @@ class TurnResult:
     frame: np.ndarray
     ended: bool
     outcome: dict[str, Any] | None
+    # ``(sx, sy, vx, vy)`` read at the last prompt token.
+    prefill: list[float] | None = None
+    # How many prompt tokens carried a gaze replayed from recalled replies.
+    n_replayed: int = 0
 
 
 class S2GameSession:
@@ -82,11 +93,15 @@ class S2GameSession:
         opening: str = "require",
         seed: int | None = None,
         game_size: int | None = None,
+        gaze_replay: str | None = None,
     ) -> None:
         self.net = net
         self.n_gold = n_gold
         self.opening = opening
         self.seed = seed
+        # ``full``, ``anchor`` or ``off``; None reads $S2_GAZE_REPLAY, then
+        # ``full``. May be reassigned between turns.
+        self.gaze_replay = resolve_mode(gaze_replay)
         self.game_size = CONFIG.game_size if game_size is None else int(game_size)
         self.game: discreteGame | None = None
         self.notes: dict[str, tuple[str, int]] = {}
@@ -198,11 +213,11 @@ class S2GameSession:
 
         try:
             Image.fromarray(frame, mode="RGB").save(path)
-            context = self._run(load_played_context(
+            recalled = self._run(load_played_messages(
                 self.client, self.session_id, user_text,
             ))
             messages = _build_game_messages(
-                SYSTEM_PROMPT_S2, path, context, user_text,
+                SYSTEM_PROMPT_S2, path, played_block(recalled), user_text,
                 notepad=self.notepad(),
             )
             result = self.net.generate(
@@ -214,11 +229,12 @@ class S2GameSession:
                 describe=lambda _row, generated: self._settle(
                     generated, user_text, board_sealed_empty,
                 ),
+                gaze_replay=GazeReplay(recalled, resolve_mode(self.gaze_replay)),
             )
         finally:
             if os.path.exists(path):
                 os.unlink(path)
-        self._record(user_text, result.text)
+        self._record(user_text, result.text, result.gaze)
         return TurnResult(
             text=result.text,
             tokens=tokens,
@@ -229,6 +245,8 @@ class S2GameSession:
             frame=frame,
             ended=bool(result.ended),
             outcome=self.outcome,
+            prefill=result.prefill,
+            n_replayed=result.n_replayed,
         )
 
     def _settle(
@@ -264,8 +282,14 @@ class S2GameSession:
         self.outcome = outcome
         return {"round": self.round, "user_text": user_text, "outcome": outcome}
 
-    def _record(self, user_text: str, reply: str) -> None:
-        """Write this turn, user line and reply. Looks included."""
+    def _record(
+        self, user_text: str, reply: str, gaze: dict[str, Any] | None = None,
+    ) -> None:
+        """Write this turn, user line and reply. Looks included.
+
+        ``gaze`` is the reply's gaze trace; it is stored with the reply
+        whatever ``gaze_replay`` is, so a later session can replay it.
+        """
         if self.client is None:
             raise RuntimeError("S2GameSession is closed")
         if ends_with_move(reply):
@@ -276,7 +300,7 @@ class S2GameSession:
             kind = "look"
         self._run(add_user_question(self.client, self.session_id, user_text))
         self._run(add_assistant_message(
-            self.client, self.session_id, reply, kind=kind,
+            self.client, self.session_id, reply, kind=kind, gaze=gaze,
         ))
 
     def play(

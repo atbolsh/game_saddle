@@ -124,19 +124,37 @@ def prefill_step(
     localizer: Localizer,
     embedder: CoordEmbedder,
     inputs: dict[str, Any],
+    prompt_codes: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, Any, torch.Tensor | None]:
     """Cached prefill. Returns logits ``[B, V]``, coords ``[B, 4]``, past, grid.
 
     ``grid`` is ``[B, 256, H]`` or None when the prompt has no image.
     The caller keeps the grid and passes it to :func:`decode_step`.
     ``inputs`` are already on the model device.
+
+    ``prompt_codes`` is ``(coords [B, P, 4], positions [B, P])``: prompt
+    tokens that carry a coordinate code, as a reply token does in decode.
+    Play uses it to replay the gaze stored with recalled replies
+    (:mod:`neural_net.gaze_replay`). None adds nothing.
     """
     if embedder is None or tap is None or localizer is None:
         raise RuntimeError("prefill_step needs a model, tap, localizer, and embedder")
     inputs = dict(inputs)
     mask = inputs["attention_mask"]
     inputs["position_ids"] = (mask.long().cumsum(-1) - 1).clamp(min=0)
-    logits, past = _cached_forward(model, inputs)
+    if prompt_codes is None:
+        logits, past = _cached_forward(model, inputs)
+    else:
+        coords_in, positions_in = prompt_codes
+        target = inputs["input_ids"].device
+        embedder.set_pending(
+            coords_in.to(device=target, dtype=torch.float32),
+            positions_in.to(device=target, dtype=torch.long),
+        )
+        try:
+            logits, past = _cached_forward(model, inputs)
+        finally:
+            embedder.clear_pending()
     hidden = tap.take()
     batch = int(hidden.shape[0])
     device = hidden.device
@@ -320,8 +338,17 @@ class GemmaS2:
         self.coord_embed.install(self.vl.model)
         self._grid = None
 
-    def prefill(self, encoded: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor, Any]:
-        """Cached prefill. Returns (logits [B, V], coords [B, 4], past)."""
+    def prefill(
+        self,
+        encoded: dict[str, Any],
+        prompt_codes: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, Any]:
+        """Cached prefill. Returns (logits [B, V], coords [B, 4], past).
+
+        ``prompt_codes`` is ``(coords [B, P, 4], positions [B, P])`` for
+        prompt tokens that carry a coordinate code; see
+        :func:`prefill_step`.
+        """
         self._require_loaded()
         logits, coords, past, grid = prefill_step(
             self.vl.model,
@@ -329,6 +356,7 @@ class GemmaS2:
             self.localizer,
             self.coord_embed,
             self.vl._move_inputs_to_model(encoded),
+            prompt_codes,
         )
         self._grid = grid
         return logits, coords, past

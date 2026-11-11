@@ -16,6 +16,11 @@ deterministic, so no frames are stored.
 
 Equal prompt lengths share a prefill. Mixed lengths are separate
 cohorts and are stacked with ``stack_equal_length`` (no left pad).
+
+``gaze_replay`` hands a prompt the gaze stored with the replies it
+recalls: those prompt tokens carry a coordinate code during the prefill
+(:mod:`neural_net.gaze_replay`). Every result carries the trace of its
+own reply (``GenerateResult.gaze``) for the caller to store.
 """
 
 from __future__ import annotations
@@ -38,6 +43,7 @@ from PIL import Image
 
 from agent.model import LONG_PREFILL_GPU_BATCH, LONG_PREFILL_TOKENS, stack_equal_length
 from game.discreteEngine import discreteGame
+from neural_net.gaze_replay import GazeReplay, plan_prompt_codes, reply_trace
 from neural_net.oracle import ACTIONS
 from neural_net.paths import weights_root
 from neural_net.render import WallCache, apply_primitive, canonical_frame, pose
@@ -74,6 +80,14 @@ class GenerateResult:
     ended: bool
     v: list[float] | None
     move: MoveRecord | None
+    # ``(sx, sy, vx, vy)`` read at the last prompt token: the code the
+    # first reply token carried.
+    prefill: list[float] | None = None
+    # The reply's gaze trace (``gaze_replay.reply_trace``), or None when
+    # the reply is empty or its tokens do not rebuild its text.
+    gaze: dict[str, Any] | None = None
+    # How many prompt tokens carried a replayed code.
+    n_replayed: int = 0
 
 
 class S1S2:
@@ -130,6 +144,7 @@ class S1S2:
         log_path: str | Path | None = None,
         on_token=None,
         describe: Callable[[int, GenerateResult], dict[str, Any] | None] | None = None,
+        gaze_replay: GazeReplay | None = None,
     ) -> GenerateResult:
         return self.batched_generate(
             [game],
@@ -138,6 +153,7 @@ class S1S2:
             log_path=log_path,
             on_token=on_token,
             describe=describe,
+            gaze_replay=None if gaze_replay is None else [gaze_replay],
         )[0]
 
     def batched_generate(
@@ -149,10 +165,18 @@ class S1S2:
         log_path: str | Path | None = None,
         on_token=None,
         describe: Callable[[int, GenerateResult], dict[str, Any] | None] | None = None,
+        gaze_replay: list[GazeReplay | None] | None = None,
     ) -> list[GenerateResult]:
+        """``gaze_replay`` is one entry per prompt (or None): the messages
+        that prompt recalled, whose stored gaze its tokens then carry."""
         if len(games) != len(prompts):
             raise ValueError(
                 f"batched_generate: {len(games)} games vs {len(prompts)} prompts"
+            )
+        if gaze_replay is not None and len(gaze_replay) != len(prompts):
+            raise ValueError(
+                f"batched_generate: {len(gaze_replay)} gaze replays vs "
+                f"{len(prompts)} prompts"
             )
         if not games:
             return []
@@ -164,8 +188,19 @@ class S1S2:
                 for game, prompt in zip(games, prompts)
             ]
             lens = [int(row["input_ids"].shape[1]) for row in encoded]
+            tokenizer = getattr(self.s2.vl.processor, "tokenizer", self.s2.vl.processor)
+            plans: list[tuple[list[int], list[list[float]]]] = [
+                plan_prompt_codes(
+                    tokenizer,
+                    row["input_ids"][0].tolist(),
+                    None if gaze_replay is None else gaze_replay[index],
+                )
+                for index, row in enumerate(encoded)
+            ]
             results: list[GenerateResult | None] = [None] * len(games)
-            for cohort in _cohorts(lens):
+            # Rows of one cohort share a prompt length and a code count,
+            # so the codes stack without padding.
+            for cohort in _cohorts(lens, [len(plan[0]) for plan in plans]):
                 sub = self._run_cohort(
                     [games[i] for i in cohort],
                     stack_equal_length([encoded[i] for i in cohort]),
@@ -175,6 +210,7 @@ class S1S2:
                     on_token=on_token,
                     user_texts=[_prompt_text(prompts[i]) for i in cohort],
                     describe=describe,
+                    prompt_codes=[plans[i] for i in cohort],
                 )
                 for index, result in zip(cohort, sub):
                     results[index] = result
@@ -202,6 +238,7 @@ class S1S2:
         on_token=None,
         user_texts: list[str | None],
         describe: Callable[[int, GenerateResult], dict[str, Any] | None] | None,
+        prompt_codes: list[tuple[list[int], list[list[float]]]] | None = None,
     ) -> list[GenerateResult]:
         from agent.config import CONFIG
         from agent.modes import ends_with_end_game, ends_with_move
@@ -222,7 +259,12 @@ class S1S2:
         prompt_len = int(encoded["input_ids"].shape[1])
         logger.info("S1S2 cohort rows=%s prompt_tokens=%d", row_ids, prompt_len)
 
-        logits, prev_coords, past = self.s2.prefill(encoded)
+        codes, n_replayed = _stack_prompt_codes(prompt_codes, batch, device)
+        logits, prev_coords, past = self.s2.prefill(encoded, prompt_codes=codes)
+        prefill_reads = [
+            [round(float(v), 6) for v in prev_coords[row].detach().float().cpu()]
+            for row in range(batch)
+        ]
         seq_len = prompt_len
         generated: list[list[int]] = [[] for _ in range(batch)]
         finished = [False] * batch
@@ -292,10 +334,11 @@ class S1S2:
 
         results: list[GenerateResult] = []
         for row in range(batch):
+            text = tokenizer.decode(
+                generated[row], skip_special_tokens=True
+            ).strip()
             result = GenerateResult(
-                text=tokenizer.decode(
-                    generated[row], skip_special_tokens=True
-                ).strip(),
+                text=text,
                 n_tokens=len(generated[row]),
                 n_s1_steps=0 if records[row] is None else records[row].n_steps,
                 log_path=log_path,
@@ -303,6 +346,15 @@ class S1S2:
                 ended=ended[row],
                 v=move_v[row],
                 move=records[row],
+                prefill=prefill_reads[row],
+                gaze=reply_trace(
+                    tokenizer,
+                    generated[row],
+                    [list(token["s"]) + list(token["v"]) for token in tokens[row]],
+                    prefill_reads[row],
+                    text,
+                ),
+                n_replayed=n_replayed,
             )
             fields = _turn_fields(describe, row_ids[row], result)
             user_text = (
@@ -317,6 +369,14 @@ class S1S2:
                     tokens=tokens[row],
                     move=records[row],
                     outcome=fields.get("outcome"),
+                    prefill=prefill_reads[row],
+                    replayed=(
+                        None if prompt_codes is None
+                        else [
+                            [position, *coords]
+                            for position, coords in zip(*prompt_codes[row])
+                        ]
+                    ),
                 ),
             )
             results.append(result)
@@ -458,8 +518,15 @@ def turn_record(
     tokens: list[dict[str, Any]],
     move: MoveRecord | None,
     outcome: dict[str, Any] | None,
+    prefill: list[float] | None = None,
+    replayed: list[list[float]] | None = None,
 ) -> dict[str, Any]:
-    """One reply. ``s1`` is null when the reply did not end in ``[MOVE]``."""
+    """One reply. ``s1`` is null when the reply did not end in ``[MOVE]``.
+
+    ``prefill`` is ``(sx, sy, vx, vy)`` read at the last prompt token.
+    ``replayed`` lists the prompt tokens that carried a stored gaze, as
+    ``[position, sx, sy, vx, vy]``; null when the caller passed none.
+    """
     if round is not None and not isinstance(round, int):
         raise TypeError(f"round must be an int or null, got {type(round).__name__}")
     if user_text is not None and not isinstance(user_text, str):
@@ -474,6 +541,8 @@ def turn_record(
         "round": round,
         "user_text": user_text,
         "text": text,
+        "prefill": prefill,
+        "replayed": replayed,
         "tokens": tokens,
         "s1": None if move is None else {
             "v": list(move.v),
@@ -536,19 +605,54 @@ def _frames_tensor(frames: list[np.ndarray], device: torch.device) -> torch.Tens
     return tensor.to(device, non_blocking=device.type == "cuda")
 
 
-def _cohorts(lens: list[int]) -> Iterator[list[int]]:
+def _cohorts(
+    lens: list[int], n_codes: list[int] | None = None,
+) -> Iterator[list[int]]:
     """    Equal token-length groups. Longs are chunked to the VRAM cap.
 
     Mixed lengths never share a prefill. Each cohort is stacked with
-    ``stack_equal_length``.
+    ``stack_equal_length``. ``n_codes`` (replayed prompt codes per row)
+    splits a length group further, so a cohort's codes stack unpadded.
     """
-    by_len: dict[int, list[int]] = {}
+    by_key: dict[tuple[int, int], list[int]] = {}
     for index, length in enumerate(lens):
-        by_len.setdefault(length, []).append(index)
-    for length, indices in by_len.items():
+        extra = 0 if n_codes is None else int(n_codes[index])
+        by_key.setdefault((length, extra), []).append(index)
+    for (length, _extra), indices in by_key.items():
         cap = LONG_PREFILL_GPU_BATCH if length >= LONG_PREFILL_TOKENS else len(indices)
         for start in range(0, len(indices), cap):
             yield indices[start:start + cap]
+
+
+def _stack_prompt_codes(
+    prompt_codes: list[tuple[list[int], list[list[float]]]] | None,
+    batch: int,
+    device: torch.device,
+) -> tuple[tuple[torch.Tensor, torch.Tensor] | None, int]:
+    """``(coords [B, P, 4], positions [B, P])`` for ``GemmaS2.prefill``.
+
+    None when no row replays anything. Every row of a cohort has the
+    same number of positions (``_cohorts`` groups them that way).
+    """
+    if prompt_codes is None:
+        return None, 0
+    if len(prompt_codes) != batch:
+        raise ValueError(
+            f"prompt_codes has {len(prompt_codes)} rows, the cohort has {batch}"
+        )
+    counts = {len(positions) for positions, _coords in prompt_codes}
+    if len(counts) != 1:
+        raise RuntimeError(f"a cohort mixes prompt-code counts {sorted(counts)}")
+    count = counts.pop()
+    if count == 0:
+        return None, 0
+    positions = torch.tensor(
+        [row[0] for row in prompt_codes], dtype=torch.long, device=device,
+    )
+    coords = torch.tensor(
+        [row[1] for row in prompt_codes], dtype=torch.float32, device=device,
+    )
+    return (coords, positions), count
 
 
 def _messages(prompt: str | list[dict], image: Image.Image) -> list[dict]:

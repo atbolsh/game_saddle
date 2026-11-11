@@ -18,6 +18,7 @@ The Settings dict is **never** injected into the agent prompt in mode 1.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import uuid
@@ -120,10 +121,16 @@ async def add_assistant_message(
     content: str,
     kind: str = "move",
     snapshot_id: str | None = None,
+    gaze: dict[str, Any] | None = None,
 ) -> Any:
-    meta = {"kind": kind}
+    """``gaze`` is the reply's gaze trace (``neural_net.gaze_replay``): the
+    ``(s, v)`` read at every token. It is stored in the message metadata
+    and comes back with the message in :func:`load_played_messages`."""
+    meta: dict[str, Any] = {"kind": kind}
     if snapshot_id:
         meta["snapshot_id"] = snapshot_id
+    if gaze is not None:
+        meta["gaze"] = gaze
     return await client.short_term.add_message(
         session_id=session_id, role="assistant", content=content, metadata=meta
     )
@@ -752,12 +759,32 @@ CONVERSATION_RECENT = 7
 CONVERSATION_SEMANTIC = 2
 
 
+def _message_gaze(raw: Any) -> dict[str, Any] | None:
+    """The gaze trace in a message's stored metadata, or None.
+
+    NAMS keeps metadata as a JSON string. A message written before
+    traces existed, or by a mode that stores none, has no ``gaze`` key.
+    """
+    if not raw:
+        return None
+    meta = raw
+    if isinstance(raw, str):
+        try:
+            meta = json.loads(raw)
+        except ValueError:
+            return None
+    if not isinstance(meta, dict):
+        return None
+    gaze = meta.get("gaze")
+    return gaze if isinstance(gaze, dict) else None
+
+
 async def _session_message_rows(client: Any, session_id: str) -> list[dict[str, Any]]:
     """Every message of one session, oldest first. Exact session match."""
     rows = await client.query.cypher(
         "MATCH (c:Conversation {session_id: $sid})-[:HAS_MESSAGE]->(m:Message) "
         "RETURN m.id AS id, m.role AS role, m.content AS content, "
-        "m.timestamp AS timestamp "
+        "m.timestamp AS timestamp, m.metadata AS metadata "
         "ORDER BY m.timestamp ASC",
         {"sid": session_id},
     )
@@ -778,8 +805,21 @@ async def _session_message_rows(client: Any, session_id: str) -> list[dict[str, 
             "role": str(item.get("role") or "?"),
             "content": _strip_settings_from_text(str(item.get("content") or "")),
             "timestamp": item["timestamp"],
+            "gaze": _message_gaze(item.get("metadata")),
         })
     return out
+
+
+def played_block(messages: list[dict[str, Any]]) -> str:
+    """The Recent-conversation block for :func:`load_played_messages` rows.
+
+    An empty list is an empty string, not a bare header.
+    """
+    if not messages:
+        return ""
+    return format_recent_block(
+        [(item["role"], item["content"]) for item in messages]
+    )
 
 
 async def load_played_context(
@@ -789,20 +829,42 @@ async def load_played_context(
     recent_window: int = CONVERSATION_RECENT,
     semantic_extra: int = CONVERSATION_SEMANTIC,
 ) -> str:
-    """The conversation block for one play turn.
+    """The conversation block for one play turn, as text.
+
+    :func:`load_played_messages` picks the messages; this is their
+    :func:`played_block`. An empty session is an empty string.
+    """
+    return played_block(await load_played_messages(
+        client, session_id, query, recent_window, semantic_extra,
+    ))
+
+
+async def load_played_messages(
+    client: Any,
+    session_id: str,
+    query: str,
+    recent_window: int = CONVERSATION_RECENT,
+    semantic_extra: int = CONVERSATION_SEMANTIC,
+) -> list[dict[str, Any]]:
+    """The messages one play turn recalls, oldest first.
 
     The last ``recent_window`` messages of this session, verbatim. When
     older messages remain, semantic search adds up to ``semantic_extra``
-    of those, skipping any hit already in the recent window. The two
-    sets are one Recent-conversation block, oldest first. An empty
-    session is an empty string. A failed search keeps the recent window
-    and logs a warning; the exact session read does not have a fallback.
+    of those, skipping any hit already in the recent window. Both sets
+    go into one Recent-conversation block (:func:`played_block`). An
+    empty session is an empty list. A failed search keeps the recent
+    window and logs a warning; the exact session read does not have a
+    fallback.
+
+    Each row has ``id``, ``role``, ``content``, ``timestamp`` and
+    ``gaze``: the gaze trace stored with an assistant reply (None when
+    it has none), which play replays on the reply's tokens.
     """
     if recent_window < 1:
         raise ValueError(f"recent_window must be >= 1, got {recent_window}")
     messages = await _session_message_rows(client, session_id)
     if not messages:
-        return ""
+        return []
     recent = messages[-recent_window:]
     older = messages[:-recent_window]
     chosen = list(recent)
@@ -826,9 +888,7 @@ async def load_played_context(
                 chosen.append(by_id[hid])
                 have.add(hid)
     chosen.sort(key=lambda item: item["timestamp"])
-    return format_recent_block(
-        [(item["role"], item["content"]) for item in chosen]
-    )
+    return chosen
 
 
 # --------------------------------------------------------------------- tips
