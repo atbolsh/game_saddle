@@ -457,6 +457,17 @@ _BLOCK_S2_FAILURE = (
     "Not a [REMEMBER] note."
 )
 
+_BLOCK_S2_TIP = (
+    "You may save a one-line tip for future games. Write it on its own "
+    "line, then go on with the reply:\n"
+    "\n"
+    "  [TIP: one line]\n"
+    "\n"
+    "It is saved at once and appears under Saved tips in later games. Save "
+    "one when a failure taught you something that will hold on other "
+    "boards. Not a [REMEMBER] note."
+)
+
 _BLOCK_S2_TARGET = (
     "Keep a short notepad. To save a note, write one line:\n"
     "\n"
@@ -486,16 +497,89 @@ _BLOCK_S2_END_GAME = (
     "a gold or an exit remains unless asked."
 )
 
-SYSTEM_PROMPT_S2 = "\n\n".join([
-    _BLOCK_S2_IDENTITY,
-    _BLOCK_S2_WORLD,
-    _BLOCK_S2_GOAL,
-    _BLOCK_S2_LOOK_MOVE,
-    _BLOCK_S2_MOVE_REPORT,
-    _BLOCK_S2_FAILURE,
-    _BLOCK_S2_TARGET,
-    _BLOCK_S2_END_GAME,
-])
+# Seed for the S2 system prompt. Numbers stay below 500; 500+ is reserved
+# for tips the agent or the user saves. Do not renumber.
+CORE_S2_TIPS: list[tuple[str, str]] = [
+    ("core_s2_010_identity", _BLOCK_S2_IDENTITY),
+    ("core_s2_020_world", _BLOCK_S2_WORLD),
+    ("core_s2_030_goal", _BLOCK_S2_GOAL),
+    ("core_s2_040_look_move", _BLOCK_S2_LOOK_MOVE),
+    ("core_s2_050_move_report", _BLOCK_S2_MOVE_REPORT),
+    ("core_s2_060_failure", _BLOCK_S2_FAILURE),
+    ("core_s2_070_tip", _BLOCK_S2_TIP),
+    ("core_s2_080_target", _BLOCK_S2_TARGET),
+    ("core_s2_090_end_game", _BLOCK_S2_END_GAME),
+]
+
+S2_SAVED_TIPS_HEADING = "Saved tips, from earlier games:"
+
+_S2_TIP_CAT_RE = re.compile(r"^core_s2_(\d{3})_[a-z0-9_]+$")
+
+
+def assemble_s2_prompt(rows: dict[str, str]) -> str:
+    """The S2 system prompt from core-tip rows, seed then saved tips.
+
+    Seed rows (number below 500) are joined with a blank line, in category
+    order. When any 500+ row is present, the saved-tips heading and one
+    indented line per tip follow, also in category order. A category that
+    is not an S2 tip name raises. No seed row raises.
+    """
+    seed: list[tuple[str, str]] = []
+    saved: list[tuple[str, str]] = []
+    for category, text in rows.items():
+        match = _S2_TIP_CAT_RE.match(category)
+        if match is None:
+            raise ValueError(f"not an S2 tip category: {category!r}")
+        number = int(match.group(1))
+        if number < 500:
+            seed.append((category, text))
+        else:
+            saved.append((category, text))
+    if not seed:
+        raise RuntimeError("assemble_s2_prompt: no seed tips")
+    seed.sort()
+    body = "\n\n".join(text for _category, text in seed)
+    if not saved:
+        return body
+    saved.sort()
+    lines = "\n".join(f"  {text}" for _category, text in saved)
+    return body + "\n\n" + S2_SAVED_TIPS_HEADING + "\n" + lines
+
+
+SYSTEM_PROMPT_S2 = assemble_s2_prompt(dict(CORE_S2_TIPS))
+
+
+async def load_s2_prompt(client: Any) -> str:
+    """The S2 system prompt as NAMS holds it. A read or heal failure raises.
+
+    ``ensure_core_tips`` heals the seed rows to this code first, so a
+    missing or drifted seed is rewritten before the dump. There is no
+    fallback to :data:`SYSTEM_PROMPT_S2`.
+    """
+    await mem.ensure_core_tips(client)
+    return assemble_s2_prompt(await mem.get_core_tips(client, "core_s2_"))
+
+
+def load_s2_prompt_sync() -> str:
+    """:func:`load_s2_prompt` from a notebook cell that already has a loop.
+
+    Opens its own event loop, connects, loads, and closes the client.
+    A NAMS failure raises. There is no fallback to the code constant.
+    """
+    import asyncio
+
+    loop = asyncio.new_event_loop()
+    try:
+        async def _go() -> str:
+            client = await mem.connect()
+            try:
+                return await load_s2_prompt(client)
+            finally:
+                await client.close()
+
+        return loop.run_until_complete(_go())
+    finally:
+        loop.close()
 
 #: User line for a beginning that looks. Not part of the system prompt.
 S2_BEGINNING_USER = (

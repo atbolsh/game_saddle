@@ -1141,6 +1141,8 @@ def _core_tip_seed_for_prefix(prefix: str) -> list[tuple[str, str]]:
         return list(modes.CORE_PLAYER_TIPS)
     if prefix == "core_analyst_":
         return list(modes.CORE_ANALYST_TIPS)
+    if prefix == "core_s2_":
+        return list(modes.CORE_S2_TIPS)
     raise ValueError(f"unknown core-tip prefix {prefix!r}")
 
 
@@ -1279,7 +1281,20 @@ async def ensure_core_tips(client: Any) -> dict[str, int]:
             healed += 1
         else:
             unchanged += 1
-    for prefix in ("core_player_", "core_analyst_"):
+    for category, text in modes.CORE_S2_TIPS:
+        if ANALYST_TAG in text:
+            raise RuntimeError(
+                f"core s2 tip {category} contains {ANALYST_TAG}; "
+                "s2 seed text must be stored untagged"
+            )
+        status = await _upsert_core_tip(client, category, text)
+        if status == "added":
+            added += 1
+        elif status == "healed":
+            healed += 1
+        else:
+            unchanged += 1
+    for prefix in ("core_player_", "core_analyst_", "core_s2_"):
         expected = {c for c, _ in _core_tip_seed_for_prefix(prefix)}
         found = set(await _core_tip_categories(client, prefix))
         for cat in _unexpected_core_tip_categories(prefix, expected, found):
@@ -1302,24 +1317,38 @@ async def ensure_core_tips(client: Any) -> dict[str, int]:
     }
 
 
-# Category shape shared with t1: core_(player|analyst)_NNN_slug, NNN zero-padded.
-_CORE_TIP_CAT_RE = re.compile(r"^core_(player|analyst)_(\d{3})_[a-z0-9_]+$")
+# Category shape shared with t1: core_(player|analyst|s2)_NNN_slug, NNN zero-padded.
+_CORE_TIP_CAT_RE = re.compile(r"^core_(player|analyst|s2)_(\d{3})_[a-z0-9_]+$")
+
+_CORE_TIP_PREFIX_ROLE = {
+    "core_player_": "player",
+    "core_analyst_": "analyst",
+    "core_s2_": "s2",
+}
+
+
+def _core_tip_prefix(category: str) -> str:
+    """The namespace prefix of one core-tip category, or a ValueError."""
+    for prefix in _CORE_TIP_PREFIX_ROLE:
+        if category.startswith(prefix):
+            return prefix
+    raise ValueError(f"not a core-tip category: {category!r}")
 
 
 def _is_agent_written_core_tip(prefix: str, category: str) -> bool:
     """True for a well-formed extra in the reserved 500+ range under
-    ``prefix`` (``core_player_`` / ``core_analyst_``). Seed numbers stay
-    below 500; this is the gate that lets agent-written rows into the
-    dump without treating them as graph corruption."""
-    m = _CORE_TIP_CAT_RE.match(category)
-    if not m:
+    ``prefix`` (``core_player_`` / ``core_analyst_`` / ``core_s2_``).
+    Seed numbers stay below 500; this is the gate that lets agent-written
+    rows into the dump without treating them as graph corruption."""
+    match = _CORE_TIP_CAT_RE.match(category)
+    if not match:
         return False
-    role = "player" if prefix == "core_player_" else "analyst"
-    if m.group(1) != role:
+    role = _CORE_TIP_PREFIX_ROLE.get(prefix)
+    if role is None or match.group(1) != role:
         return False
     if not category.startswith(prefix):
         return False
-    return int(m.group(2)) >= 500
+    return int(match.group(2)) >= 500
 
 
 def _unexpected_core_tip_categories(
@@ -1349,7 +1378,7 @@ async def _core_tip_categories(client: Any, prefix: str) -> list[str]:
 
 async def get_core_tips(client: Any, prefix: str) -> dict[str, str]:
     """Exact fetch of one core-tip namespace. ``prefix`` is
-    ``core_player_`` or ``core_analyst_``.
+    ``core_player_``, ``core_analyst_``, or ``core_s2_``.
 
     Seed categories must all be present (missing / duplicated rows
     raise). Well-formed extras in the 500+ range are kept and sorted
@@ -1393,6 +1422,124 @@ async def get_core_tips(client: Any, prefix: str) -> dict[str, str]:
     if prefix == "core_analyst_":
         return {c: untag_analyst_text(t) for c, t in found.items()}
     return found
+
+
+def _s2_tip_slug(text: str) -> str:
+    """The first four words of a tip, lowercased, as a category slug.
+
+    Non-letters become ``_``. Longer than 24 characters is cut. An empty
+    result raises: the category regex would reject it.
+    """
+    words = text.lower().split()[:4]
+    slug = re.sub(r"[^a-z0-9]+", "_", " ".join(words)).strip("_")[:24].strip("_")
+    if not slug or not re.fullmatch(r"[a-z0-9_]+", slug):
+        raise ValueError(f"tip {text!r} has no usable slug")
+    return slug
+
+
+def _require_s2_tip_line(text: str) -> str:
+    """One non-empty line. A blank or a newline raises."""
+    cleaned = text.strip()
+    if not cleaned or "\n" in cleaned:
+        raise ValueError("an S2 tip is one non-empty line")
+    return cleaned
+
+
+async def _next_s2_tip_number(client: Any) -> int:
+    """One past the highest saved ``core_s2_`` number, or 500 if none.
+
+    Uses the maximum, not a count, so deleting a row does not reuse its
+    number and collide with a row that is still there. 999 is the last
+    three-digit number; the next one raises.
+    """
+    rows = await client.query.cypher(
+        "MATCH (p:Preference) WHERE p.category STARTS WITH 'core_s2_' "
+        "RETURN p.category AS category",
+        {},
+    ) or []
+    highest = 499
+    for row in rows:
+        category = dict(row).get("category") or ""
+        match = _CORE_TIP_CAT_RE.match(category)
+        if match is None or match.group(1) != "s2":
+            continue
+        number = int(match.group(2))
+        if number >= 500:
+            highest = max(highest, number)
+    nxt = highest + 1
+    if nxt > 999:
+        raise RuntimeError("no free core_s2_ tip number; 500-999 are full")
+    return nxt
+
+
+async def add_s2_tip(client: Any, text: str) -> str:
+    """Store one S2 tip and return its category. The tool names the row.
+
+    The category is ``core_s2_{n}_{slug}`` with ``n`` from
+    :func:`_next_s2_tip_number`. The write is re-read and must match
+    byte for byte.
+    """
+    cleaned = _require_s2_tip_line(text)
+    number = await _next_s2_tip_number(client)
+    category = f"core_s2_{number:03d}_{_s2_tip_slug(cleaned)}"
+    if _CORE_TIP_CAT_RE.match(category) is None:
+        raise RuntimeError(f"tip category {category!r} is not well-formed")
+    await client.long_term.add_preference(
+        category=category, preference=cleaned,
+    )
+    await _assert_preference_text(client, category, cleaned)
+    logger.info("S2 tip saved: [%s] %s", category, cleaned)
+    return category
+
+
+async def replace_core_tip(client: Any, category: str, text: str) -> None:
+    """Replace one agent-written tip. A seed category raises.
+
+    Delete then add, never ``SET p.preference``: a raw property write
+    leaves the embedding stale.
+    """
+    prefix = _core_tip_prefix(category)
+    if not _is_agent_written_core_tip(prefix, category):
+        raise ValueError(
+            f"{category} is a seed tip; change it in the code seed"
+        )
+    cleaned = _require_s2_tip_line(text)
+    await client.graph.execute_write(
+        "MATCH (p:Preference {category: $cat}) DETACH DELETE p",
+        {"cat": category},
+    )
+    await client.long_term.add_preference(
+        category=category, preference=cleaned,
+    )
+    await _assert_preference_text(client, category, cleaned)
+
+
+async def delete_core_tip(client: Any, category: str) -> None:
+    """Delete one agent-written tip. A seed category raises."""
+    prefix = _core_tip_prefix(category)
+    if not _is_agent_written_core_tip(prefix, category):
+        raise ValueError(
+            f"{category} is a seed tip; change it in the code seed"
+        )
+    await client.graph.execute_write(
+        "MATCH (p:Preference {category: $cat}) DETACH DELETE p",
+        {"cat": category},
+    )
+
+
+async def list_saved_s2_tips(client: Any) -> list[dict[str, str]]:
+    """Saved S2 tips, oldest number first. Each row is category and text.
+
+    Seed rows are not included. For the play notebook's Tips panel.
+    """
+    found = await get_core_tips(client, "core_s2_")
+    rows = [
+        {"category": category, "text": text}
+        for category, text in found.items()
+        if _is_agent_written_core_tip("core_s2_", category)
+    ]
+    rows.sort(key=lambda item: item["category"])
+    return rows
 
 
 # ------------------------- session notes (scratchpad)

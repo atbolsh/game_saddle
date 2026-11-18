@@ -9,7 +9,9 @@ its tokens in the prompt carry those codes again, and the token right
 after it carries where the eyes were left (:mod:`neural_net.gaze_replay`;
 ``gaze_replay`` is ``full``, ``anchor`` or ``off``). A turn shows S2 the
 current frame and the question, and wakes S1 only when the reply ends
-with ``[MOVE]``.
+with ``[MOVE]``. The system prompt is loaded from the ``core_s2_*``
+tips in NAMS at the start of the session, and again after a tip is
+saved or the notebook edits one. It is not the code constant.
 A reply that contains ``[FLAG failure: ...]`` is stored like any other
 reply, gaze included. That message also gets two snapshots, ``before``
 and ``after``: the Settings dict and the board of the attempt. The
@@ -47,6 +49,7 @@ from agent.game_io import (
     new_multi_gold_game,
     parse_failure_flags,
     parse_remember_notes,
+    parse_tip_lines,
     sealed_empty,
 )
 from agent.image_store import (
@@ -56,6 +59,7 @@ from agent.image_store import (
 )
 from agent.memory import (
     add_assistant_message,
+    add_s2_tip,
     add_user_question,
     connect,
     format_notepad,
@@ -66,10 +70,10 @@ from agent.memory import (
 from agent.modes import (
     S2_BEGINNING_MOVE_USER,
     S2_MOVE_TARGET_USER,
-    SYSTEM_PROMPT_S2,
     _build_game_messages,
     ends_with_end_game,
     ends_with_move,
+    load_s2_prompt,
 )
 from game.discreteEngine import discreteGame
 from neural_net.gaze_replay import GazeReplay, resolve_mode
@@ -145,12 +149,19 @@ class S2GameSession:
             target=self._loop.run_forever, name="s2-nams", daemon=True,
         )
         self._thread.start()
+        self.client = None
+        self.system = ""
         try:
             self.client = self._run(connect(CONFIG))
+            self.system = self._run(load_s2_prompt(self.client))
         except Exception:
-            self.client = None
-            self._loop.call_soon_threadsafe(self._loop.stop)
-            self._thread.join(timeout=5)
+            try:
+                if self.client is not None:
+                    self._run(self.client.close())
+            finally:
+                self.client = None
+                self._loop.call_soon_threadsafe(self._loop.stop)
+                self._thread.join(timeout=5)
             raise
         self.new_game()
 
@@ -202,6 +213,15 @@ class S2GameSession:
             return S2_BEGINNING_MOVE_USER
         return S2_MOVE_TARGET_USER
 
+    def reload_prompt(self) -> None:
+        """Re-read the system prompt from NAMS. Call after a tip edit.
+
+        Ordinary turns do not call this. A tip the reply just saved does.
+        """
+        if self.client is None:
+            raise RuntimeError("S2GameSession is closed")
+        self.system = self._run(load_s2_prompt(self.client))
+
     def notepad(self) -> str:
         rows = [
             {"key": key, "value": value, "updated_round": updated}
@@ -249,7 +269,7 @@ class S2GameSession:
                 self.client, self.session_id, user_text,
             ))
             messages = _build_game_messages(
-                SYSTEM_PROMPT_S2, path, played_block(recalled), user_text,
+                self.system, path, played_block(recalled), user_text,
                 notepad=self.notepad(),
             )
             result = self.net.generate(
@@ -287,6 +307,12 @@ class S2GameSession:
             failure="\n".join(notes) if notes else None,
             attempt=chosen,
         )
+        tips = [line for line in parse_tip_lines(result.text) if line]
+        if tips:
+            for line in tips:
+                category = self._run(add_s2_tip(self.client, line))
+                print(f"tip saved as {category}")
+            self.reload_prompt()
         return TurnResult(
             text=result.text,
             tokens=tokens,

@@ -2133,11 +2133,12 @@ def t1_pure() -> str:
     from agent.memory import ANALYST_TAG, tag_analyst_text, untag_analyst_text
 
     import re as _re
-    cat_re = _re.compile(r"^core_(player|analyst)_(\d{3})_[a-z0-9_]+$")
+    cat_re = _re.compile(r"^core_(player|analyst|s2)_(\d{3})_[a-z0-9_]+$")
     seen_cats: set[str] = set()
     for table, role in (
         (modes.CORE_PLAYER_TIPS, "player"),
         (modes.CORE_ANALYST_TIPS, "analyst"),
+        (modes.CORE_S2_TIPS, "s2"),
     ):
         for cat, text in table:
             m = cat_re.match(cat)
@@ -2207,6 +2208,29 @@ def t1_pure() -> str:
     assert not _is_agent_written_core_tip("core_player_", "core_player_110_search_tool")
     assert not _is_agent_written_core_tip("core_player_", "core_analyst_500_note")
     assert not _is_agent_written_core_tip("core_player_", "tip_learned_1")
+    assert _is_agent_written_core_tip("core_s2_", "core_s2_500_note")
+    assert not _is_agent_written_core_tip("core_s2_", "core_player_500_note")
+    assert modes.assemble_s2_prompt(dict(modes.CORE_S2_TIPS)) == modes.SYSTEM_PROMPT_S2
+    saved = dict(modes.CORE_S2_TIPS)
+    saved["core_s2_500_x"] = "aim again after a miss"
+    assembled = modes.assemble_s2_prompt(saved)
+    assert assembled.startswith(modes.SYSTEM_PROMPT_S2 + "\n\n" + modes.S2_SAVED_TIPS_HEADING)
+    assert assembled.endswith("\n  aim again after a miss")
+    from agent.game_io import parse_tip_lines
+    assert parse_tip_lines("[TIP: keep the target]") == ["keep the target"]
+    assert parse_tip_lines("[TIP: keep]drop]") == ["keep"]
+    assert parse_tip_lines("[TIP: a\nb]") == []
+    assert parse_tip_lines("[REMEMBER target: x] [FLAG failure: y]") == []
+    from pathlib import Path as _Path
+    _root = _Path(__file__).resolve().parents[1]
+    for _rel in (
+        "neural_net/s2_session.py",
+        "notebooks/play.ipynb",
+        "notebooks/testing_s2.ipynb",
+        "notebooks/testing_learn_to_look.ipynb",
+    ):
+        _text = (_root / _rel).read_text()
+        assert "SYSTEM_PROMPT_S2" not in _text, _rel
     assert _unexpected_core_tip_categories(
         "core_player_",
         {"core_player_010_x"},

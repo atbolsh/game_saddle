@@ -859,6 +859,19 @@ def parse_failure_flags(text: str) -> list[tuple[str, str]]:
     return [("failure", m.group(1).strip()) for m in _FLAG_RE.finditer(text)]
 
 
+#: One saved tip: ``[TIP: one line]``. The note runs to the first ``]``.
+_TIP_RE = re.compile(r"\[TIP:\s*([^\]\n]+)\]")
+
+
+def parse_tip_lines(text: str) -> list[str]:
+    """All ``[TIP: one line]`` notes in ``text``, in order, stripped.
+
+    A ``]`` or a newline ends the note. The line stays in the message;
+    this only finds it. ``[REMEMBER`` and ``[FLAG`` do not match.
+    """
+    return [match.group(1).strip() for match in _TIP_RE.finditer(text) if match.group(1).strip()]
+
+
 def board_update_line(action: str, gold_collected: int, gold_remaining: int,
                       count: int = 1) -> str:
     """Engine-truth one-liner for the turn after an applied move (pure
