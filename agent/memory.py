@@ -122,15 +122,26 @@ async def add_assistant_message(
     kind: str = "move",
     snapshot_id: str | None = None,
     gaze: dict[str, Any] | None = None,
+    failure: str | None = None,
 ) -> Any:
     """``gaze`` is the reply's gaze trace (``neural_net.gaze_replay``): the
     ``(s, v)`` read at every token. It is stored in the message metadata
-    and comes back with the message in :func:`load_played_messages`."""
+    and comes back with the message in :func:`load_played_messages`.
+
+    ``failure`` is the note from a ``[FLAG failure: ...]`` line already
+    present in ``content``. When set, the metadata also gains ``failure``
+    and ``flagged_for``. The line itself stays in ``content``; loaders
+    return that text, not this metadata, and they never return a Settings
+    dict.
+    """
     meta: dict[str, Any] = {"kind": kind}
     if snapshot_id:
         meta["snapshot_id"] = snapshot_id
     if gaze is not None:
         meta["gaze"] = gaze
+    if failure is not None:
+        meta["failure"] = failure
+        meta["flagged_for"] = ["analyst", "user"]
     return await client.short_term.add_message(
         session_id=session_id, role="assistant", content=content, metadata=meta
     )
@@ -759,11 +770,11 @@ CONVERSATION_RECENT = 7
 CONVERSATION_SEMANTIC = 2
 
 
-def _message_gaze(raw: Any) -> dict[str, Any] | None:
-    """The gaze trace in a message's stored metadata, or None.
+def _metadata_dict(raw: Any) -> dict[str, Any] | None:
+    """Message metadata as a dict. NAMS stores it as a JSON string.
 
-    NAMS keeps metadata as a JSON string. A message written before
-    traces existed, or by a mode that stores none, has no ``gaze`` key.
+    Bad JSON or a non-dict is None. Callers that require the metadata
+    raise themselves.
     """
     if not raw:
         return None
@@ -774,6 +785,18 @@ def _message_gaze(raw: Any) -> dict[str, Any] | None:
         except ValueError:
             return None
     if not isinstance(meta, dict):
+        return None
+    return meta
+
+
+def _message_gaze(raw: Any) -> dict[str, Any] | None:
+    """The gaze trace in a message's stored metadata, or None.
+
+    A message written before traces existed, or by a mode that stores
+    none, has no ``gaze`` key.
+    """
+    meta = _metadata_dict(raw)
+    if meta is None:
         return None
     gaze = meta.get("gaze")
     return gaze if isinstance(gaze, dict) else None
@@ -859,6 +882,10 @@ async def load_played_messages(
     Each row has ``id``, ``role``, ``content``, ``timestamp`` and
     ``gaze``: the gaze trace stored with an assistant reply (None when
     it has none), which play replays on the reply's tokens.
+
+    A ``[FLAG failure: ...]`` line is ordinary ``content``. This load
+    does not add image paths or a Settings dict. Boards are
+    :func:`load_played_images`.
     """
     if recent_window < 1:
         raise ValueError(f"recent_window must be >= 1, got {recent_window}")
@@ -889,6 +916,173 @@ async def load_played_messages(
                 have.add(hid)
     chosen.sort(key=lambda item: item["timestamp"])
     return chosen
+
+
+def board_image_entries(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """``{role, path}`` for one message's snapshots, ``before`` then ``after``.
+
+    Settings keys are dropped. A row missing ``role`` or ``path`` raises.
+    """
+    entries: list[dict[str, str]] = []
+    for row in rows:
+        role = row.get("role")
+        path = row.get("path")
+        if not role or not path:
+            raise RuntimeError(
+                f"board snapshot is missing role or path: role={role!r} path={path!r}"
+            )
+        entries.append({"role": str(role), "path": str(path)})
+    entries.sort(key=lambda item: (
+        0 if item["role"] == "before" else 1 if item["role"] == "after" else 2,
+        item["role"],
+        item["path"],
+    ))
+    return _strip_settings(entries)
+
+
+async def _message_image_rows(
+    client: Any, session_id: str, message_ids: list[str],
+) -> dict[str, list[dict[str, str]]]:
+    """Before/after PNG paths for messages in this session. No settings."""
+    if not message_ids:
+        return {}
+    rows = await client.query.cypher(
+        "MATCH (c:Conversation {session_id: $sid})-[:HAS_MESSAGE]->(m:Message) "
+        "MATCH (m)-[r:CAPTURED_STATE]->(s:GameSnapshot) "
+        "WHERE m.id IN $ids "
+        "RETURN m.id AS id, r.role AS role, s.path AS path",
+        {"sid": session_id, "ids": list(message_ids)},
+    )
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows or []:
+        mid = row.get("id")
+        if not mid:
+            raise RuntimeError(
+                f"session {session_id} snapshot row has no message id"
+            )
+        grouped.setdefault(str(mid), []).append({
+            "role": row.get("role"),
+            "path": row.get("path"),
+        })
+    return {mid: board_image_entries(items) for mid, items in grouped.items()}
+
+
+async def load_played_images(
+    client: Any,
+    session_id: str,
+    query: str,
+    recent_window: int = CONVERSATION_RECENT,
+    semantic_extra: int = CONVERSATION_SEMANTIC,
+) -> list[dict[str, Any]]:
+    """:func:`load_played_messages`, plus each row's board images.
+
+    Same messages, same text, same gaze. ``images`` is a list of
+    ``{role, path}`` for PNGs linked to that message (``before`` then
+    ``after``), empty when it has none. Settings are not included.
+    ``load_played_full`` is not this and is not defined here.
+    """
+    messages = await load_played_messages(
+        client, session_id, query, recent_window, semantic_extra,
+    )
+    if not messages:
+        return []
+    images = await _message_image_rows(
+        client, session_id, [item["id"] for item in messages],
+    )
+    out: list[dict[str, Any]] = []
+    for item in messages:
+        row = dict(item)
+        row["images"] = images.get(item["id"], [])
+        out.append(_strip_settings(row))
+    return out
+
+
+def group_flagged_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Flagged messages from one session's message/snapshot rows.
+
+    Oldest first, in the order the rows arrive. A message is flagged when
+    its metadata has a non-empty ``failure`` string. Each result is
+    ``id``, ``content``, ``before`` and ``after``. A side is
+    ``{"path", "settings"}`` and ``settings`` is the stored Settings JSON
+    text. This is for a person looking at the game. It is not an agent
+    load, and it does not strip settings.
+
+    A flagged message missing a before or after board, or a path, or the
+    settings text, raises. An unflagged message's snapshots are ignored.
+    """
+    order: list[str] = []
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        mid = row.get("id")
+        if not mid:
+            raise RuntimeError("flagged-memory row has no message id")
+        mid = str(mid)
+        if mid not in grouped:
+            if row.get("timestamp") is None:
+                raise RuntimeError(f"message {mid} has no timestamp")
+            meta = _metadata_dict(row.get("metadata"))
+            failure = meta.get("failure") if meta else None
+            grouped[mid] = {
+                "id": mid,
+                "content": str(row.get("content") or ""),
+                "failure": failure if isinstance(failure, str) and failure else None,
+                "sides": {},
+            }
+            order.append(mid)
+        role = row.get("role")
+        if not role or not grouped[mid]["failure"]:
+            continue
+        role = str(role)
+        if role not in ("before", "after"):
+            continue
+        path = row.get("path")
+        settings = row.get("settings_json")
+        if not path or settings is None or settings == "":
+            raise RuntimeError(
+                f"message {mid} snapshot {role} is missing path or settings"
+            )
+        sides = grouped[mid]["sides"]
+        if role in sides:
+            raise RuntimeError(f"message {mid} has two {role} snapshots")
+        sides[role] = {"path": str(path), "settings": str(settings)}
+    out: list[dict[str, Any]] = []
+    for mid in order:
+        item = grouped[mid]
+        if not item["failure"]:
+            continue
+        sides = item["sides"]
+        if "before" not in sides or "after" not in sides:
+            raise RuntimeError(
+                f"flagged message {mid} is missing a before or after board"
+            )
+        out.append({
+            "id": mid,
+            "content": item["content"],
+            "before": sides["before"],
+            "after": sides["after"],
+        })
+    return out
+
+
+async def load_flagged_memories(
+    client: Any, session_id: str,
+) -> list[dict[str, Any]]:
+    """Every flagged reply in this session, oldest first.
+
+    For the person watching the game. The agent prompt does not call
+    this. Rows are :func:`group_flagged_rows`: message text, both board
+    paths, and both Settings JSON texts.
+    """
+    rows = await client.query.cypher(
+        "MATCH (c:Conversation {session_id: $sid})-[:HAS_MESSAGE]->(m:Message) "
+        "OPTIONAL MATCH (m)-[r:CAPTURED_STATE]->(s:GameSnapshot) "
+        "RETURN m.id AS id, m.content AS content, m.timestamp AS timestamp, "
+        "m.metadata AS metadata, r.role AS role, s.path AS path, "
+        "s.settings_json AS settings_json "
+        "ORDER BY m.timestamp ASC",
+        {"sid": session_id},
+    )
+    return group_flagged_rows(list(rows or []))
 
 
 # --------------------------------------------------------------------- tips

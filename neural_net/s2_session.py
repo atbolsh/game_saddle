@@ -10,6 +10,13 @@ after it carries where the eyes were left (:mod:`neural_net.gaze_replay`;
 ``gaze_replay`` is ``full``, ``anchor`` or ``off``). A turn shows S2 the
 current frame and the question, and wakes S1 only when the reply ends
 with ``[MOVE]``.
+A reply that contains ``[FLAG failure: ...]`` is stored like any other
+reply, gaze included. That message also gets two snapshots, ``before``
+and ``after``: the Settings dict and the board of the attempt. The
+attempt is this turn when the reply moved, otherwise the previous
+attempt the session held. A look leaves the board unchanged, so both
+labels are that same state. The default load returns the flag line with the
+message and does not return the dicts or the images.
 A reply that ends with ``[END_GAME]``, or an S1 window that walks
 out, ends the game. ``new_game`` opens
 ``weights/s1s2_runs/<stamp>/turns.jsonl`` and every ``turn`` appends
@@ -21,6 +28,7 @@ sequence.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import random
 import tempfile
@@ -37,8 +45,14 @@ from agent.game_io import (
     game_to_settings_dict,
     gold_remaining,
     new_multi_gold_game,
+    parse_failure_flags,
     parse_remember_notes,
     sealed_empty,
+)
+from agent.image_store import (
+    link_snapshot_to_message,
+    snapshot_id,
+    store_snapshot,
 )
 from agent.memory import (
     add_assistant_message,
@@ -63,6 +77,22 @@ from neural_net.loop import MoveRecord, S1S2, new_turns_path, replay_frames
 from neural_net.render import canonical_frame
 
 TokenHook = Callable[[dict[str, Any]], None]
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _Attempt:
+    """One turn's board before the reply and after S1.
+
+    A look does not move the game, so ``before`` and ``after`` are the
+    same settings dict and the same frame.
+    """
+
+    before: dict[str, Any]
+    after: dict[str, Any]
+    before_frame: np.ndarray
+    after_frame: np.ndarray
 
 
 @dataclass
@@ -139,7 +169,7 @@ class S2GameSession:
             self._thread.join(timeout=5)
 
     def new_game(self) -> discreteGame:
-        """Deal a fresh board and clear notes, the round, the report, and the outcome."""
+        """Deal a fresh board and clear notes, the held attempt, the round, the report, and the outcome."""
         state = random.getstate()
         if self.seed is not None:
             random.seed(self.seed)
@@ -155,6 +185,7 @@ class S2GameSession:
         self.notes = {}
         self.last_move = None
         self.outcome = None
+        self._attempt: _Attempt | None = None
         self.round = 0
         self.session_id = new_session_id()
         self.turns_path = new_turns_path()
@@ -190,7 +221,8 @@ class S2GameSession:
         if self.over:
             raise RuntimeError("S2GameSession is over")
         self.round += 1
-        board_sealed_empty = sealed_empty(game_to_settings_dict(self.game))
+        before_settings = game_to_settings_dict(self.game)
+        board_sealed_empty = sealed_empty(before_settings)
         frame = np.array(canonical_frame(self.game), copy=True)
         user_text = compose_s2_question(question, self.last_move)
         self.last_move = None
@@ -234,7 +266,27 @@ class S2GameSession:
         finally:
             if os.path.exists(path):
                 os.unlink(path)
-        self._record(user_text, result.text, result.gaze)
+        moved = result.move is not None
+        if moved:
+            after_settings = game_to_settings_dict(self.game)
+            after_frame = np.array(canonical_frame(self.game), copy=True)
+        else:
+            after_settings = before_settings
+            after_frame = frame
+        this = _Attempt(before_settings, after_settings, frame, after_frame)
+        notes = [note for _key, note in parse_failure_flags(result.text) if note]
+        if notes and (moved or self._attempt is None):
+            chosen: _Attempt | None = this
+        elif notes:
+            chosen = self._attempt
+        else:
+            chosen = None
+        self._attempt = this
+        self._record(
+            user_text, result.text, result.gaze,
+            failure="\n".join(notes) if notes else None,
+            attempt=chosen,
+        )
         return TurnResult(
             text=result.text,
             tokens=tokens,
@@ -283,12 +335,21 @@ class S2GameSession:
         return {"round": self.round, "user_text": user_text, "outcome": outcome}
 
     def _record(
-        self, user_text: str, reply: str, gaze: dict[str, Any] | None = None,
+        self,
+        user_text: str,
+        reply: str,
+        gaze: dict[str, Any] | None = None,
+        failure: str | None = None,
+        attempt: _Attempt | None = None,
     ) -> None:
         """Write this turn, user line and reply. Looks included.
 
         ``gaze`` is the reply's gaze trace; it is stored with the reply
         whatever ``gaze_replay`` is, so a later session can replay it.
+        ``failure`` is the flag note. The reply text, including the
+        ``[FLAG failure: ...]`` line, is stored unchanged. When the note
+        is set, ``attempt`` supplies the before and after Settings dicts
+        and frames, written as two snapshots on this message.
         """
         if self.client is None:
             raise RuntimeError("S2GameSession is closed")
@@ -299,9 +360,52 @@ class S2GameSession:
         else:
             kind = "look"
         self._run(add_user_question(self.client, self.session_id, user_text))
-        self._run(add_assistant_message(
+        message = self._run(add_assistant_message(
             self.client, self.session_id, reply, kind=kind, gaze=gaze,
+            failure=failure,
         ))
+        if failure is None:
+            return
+        if attempt is None:
+            raise RuntimeError("failure flag has no before/after board")
+        message_id = getattr(message, "id", None)
+        if message_id is None and isinstance(message, dict):
+            message_id = message.get("id")
+        if not message_id:
+            raise RuntimeError(
+                "assistant message has no id; failure boards were not stored"
+            )
+        message_id = str(message_id)
+        before_path = self._run(self._write_board(
+            message_id, "before", attempt.before, attempt.before_frame,
+        ))
+        after_path = self._run(self._write_board(
+            message_id, "after", attempt.after, attempt.after_frame,
+        ))
+        line = (
+            f"failure flag stored on message {message_id} "
+            f"(before {before_path}, after {after_path})"
+        )
+        logger.info("%s", line)
+        print(line)
+
+    async def _write_board(
+        self,
+        message_id: str,
+        role: str,
+        settings: dict[str, Any],
+        frame: np.ndarray,
+    ) -> str:
+        """One snapshot: Settings dict on the node, ``frame`` as the PNG."""
+        sid = snapshot_id()
+        path, _props = await store_snapshot(
+            self.client, self.session_id, sid, None, settings,
+            label=role, frame=frame,
+        )
+        await link_snapshot_to_message(
+            self.client, message_id, sid, role=role,
+        )
+        return path
 
     def play(
         self,

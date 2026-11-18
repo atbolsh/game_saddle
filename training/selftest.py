@@ -1794,12 +1794,16 @@ def t1_pure() -> str:
         find_bare_move,
         find_invalid_move_token,
         new_multi_gold_game,
+        parse_failure_flags,
         parse_move,
         parse_remember_notes,
         truncate_at_first_move_token,
     )
     from agent.memory import (
+        _strip_settings,
+        board_image_entries,
         format_notepad,
+        group_flagged_rows,
         retrieve_context,
         retrieval_enabled,
     )
@@ -1871,6 +1875,89 @@ def t1_pure() -> str:
         )
     ) == [("a", "b")]
     checks += 1
+    # [FLAG failure: note] is a fixed key. ] ends the note. It is not a
+    # notepad write, and a different key does not match.
+    assert parse_failure_flags(
+        "missed.\n[FLAG failure: expected the gold, the move did not eat]"
+    ) == [("failure", "expected the gold, the move did not eat")]
+    checks += 1
+    assert parse_failure_flags(
+        "[FLAG failure: first] then [FLAG failure: second]"
+    ) == [("failure", "first"), ("failure", "second")]
+    checks += 1
+    assert parse_failure_flags("[FLAG failure: keep]drop]") == [("failure", "keep")]
+    checks += 1
+    assert parse_failure_flags("[FLAG failure:   padded  ]") == [("failure", "padded")]
+    checks += 1
+    assert parse_failure_flags(
+        "[FLAG other: x] [FLAG Failure: y] [REMEMBER target: z] [FLAG failure:]"
+    ) == []
+    checks += 1
+    assert parse_failure_flags("[FLAG failure: a\nb]") == []
+    checks += 1
+    images = board_image_entries([
+        {"role": "after", "path": "b.png", "settings_json": "{\"gold\": []}"},
+        {"role": "before", "path": "a.png", "settings": {"walls": []}, "gold": []},
+    ])
+    assert images == [
+        {"role": "before", "path": "a.png"},
+        {"role": "after", "path": "b.png"},
+    ]
+    checks += 1
+    try:
+        board_image_entries([{"role": "before"}])
+    except RuntimeError:
+        checks += 1
+    else:
+        raise AssertionError("a snapshot row with no path must raise")
+    hidden = _strip_settings({
+        "content": "[FLAG failure: missed the gold]",
+        "settings_json": "{}",
+        "images": [{"role": "before", "path": "a.png", "settings_json": "{}"}],
+        "gaze": {"v": 1, "prefill": [0.0, 0.0, 0.5, 0.5]},
+    })
+    assert "settings_json" not in hidden
+    assert hidden["images"] == [{"role": "before", "path": "a.png"}]
+    assert hidden["content"] == "[FLAG failure: missed the gold]"
+    assert hidden["gaze"]["prefill"] == [0.0, 0.0, 0.5, 0.5]
+    checks += 1
+    flagged = group_flagged_rows([
+        {
+            "id": "m1", "content": "looked", "timestamp": 1,
+            "metadata": "{}", "role": None, "path": None, "settings_json": None,
+        },
+        {
+            "id": "m2", "content": "[FLAG failure: missed the gold]",
+            "timestamp": 2,
+            "metadata": '{"failure": "missed the gold", "flagged_for": ["analyst", "user"]}',
+            "role": "after", "path": "b.png",
+            "settings_json": '{"agent_x": 0.2}',
+        },
+        {
+            "id": "m2", "content": "[FLAG failure: missed the gold]",
+            "timestamp": 2,
+            "metadata": '{"failure": "missed the gold"}',
+            "role": "before", "path": "a.png",
+            "settings_json": '{"agent_x": 0.1}',
+        },
+    ])
+    assert flagged == [{
+        "id": "m2",
+        "content": "[FLAG failure: missed the gold]",
+        "before": {"path": "a.png", "settings": '{"agent_x": 0.1}'},
+        "after": {"path": "b.png", "settings": '{"agent_x": 0.2}'},
+    }]
+    checks += 1
+    try:
+        group_flagged_rows([{
+            "id": "m3", "content": "[FLAG failure: x]", "timestamp": 1,
+            "metadata": '{"failure": "x"}',
+            "role": "before", "path": "a.png", "settings_json": "{}",
+        }])
+    except RuntimeError:
+        checks += 1
+    else:
+        raise AssertionError("a flagged message with no after board must raise")
     eaten = board_update_line("FORWARD", 1, 2)
     assert "[FORWARD]" in eaten and "2 gold(s)" in eaten
     assert "[REMEMBER target:" in eaten

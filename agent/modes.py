@@ -383,10 +383,10 @@ def ends_with_end_game(text: str) -> bool:
 
 
 _BLOCK_S2_IDENTITY = (
-    "You are a modified Gemma 4. Besides the words you write, every token "
-    "also sets two points: s, where your body is, and v, the place you are "
-    "attending to. You will learn to control these points. Later you will "
-    "learn to describe, accurately, how you set them."
+    "You are an agent meant to explore an environment and learn from it. "
+    "Besides the words you write, every token also sets two points: s, "
+    "where your body is, and v, the place you are attending to. For now, "
+    "navigate a game of gold and exits."
 )
 
 _BLOCK_S2_WORLD = (
@@ -398,9 +398,7 @@ _BLOCK_S2_WORLD = (
 
 _BLOCK_S2_GOAL = (
     "The game: eat every gold, then leave through an exit. Eating a gold "
-    "does not end the game. Walking out through an exit ends it. A room "
-    "with no gold and no exit is sealed and empty. Nothing can be done "
-    "there, and you end the game yourself with [END_GAME]."
+    "does not end the game. Walking out through an exit ends it."
 )
 
 _BLOCK_S2_LOOK_MOVE = (
@@ -441,6 +439,18 @@ _BLOCK_S2_MOVE_REPORT = (
     "exit either, it is sealed and empty: follow the [END_GAME] rule."
 )
 
+_BLOCK_S2_FAILURE = (
+    "If you lack the skill for what was asked, note it and flag this "
+    "message for an Analyst version of you and for your user. Write one "
+    "line, then go on with the reply:\n"
+    "\n"
+    "  [FLAG failure: what you expected, and what happened]\n"
+    "\n"
+    "Do this when you expected to eat a gold and did not, or expected to "
+    "reach an exit and did not. This is not a notepad note. Do not write "
+    "it with [REMEMBER]."
+)
+
 _BLOCK_S2_TARGET = (
     "Keep a short notepad. To save a note, write one line:\n"
     "\n"
@@ -476,6 +486,7 @@ SYSTEM_PROMPT_S2 = "\n\n".join([
     _BLOCK_S2_GOAL,
     _BLOCK_S2_LOOK_MOVE,
     _BLOCK_S2_MOVE_REPORT,
+    _BLOCK_S2_FAILURE,
     _BLOCK_S2_TARGET,
     _BLOCK_S2_END_GAME,
 ])

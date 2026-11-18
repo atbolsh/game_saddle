@@ -844,6 +844,21 @@ def parse_remember_notes(text: str) -> list[tuple[str, str]]:
             for m in _REMEMBER_RE.finditer(text)]
 
 
+#: One failure flag: ``[FLAG failure: free text]``. The key is fixed.
+#: The note runs to the first ``]`` on the same line, same as ``[REMEMBER]``.
+_FLAG_RE = re.compile(r"\[FLAG failure:\s*([^\]\n]+)\]")
+
+
+def parse_failure_flags(text: str) -> list[tuple[str, str]]:
+    """All ``[FLAG failure: note]`` lines in ``text``, in order.
+
+    The key is always ``failure``. The note is the text before ``]``,
+    stripped. A ``]`` inside the note ends it. The line stays in the
+    message; this only finds it.
+    """
+    return [("failure", m.group(1).strip()) for m in _FLAG_RE.finditer(text)]
+
+
 def board_update_line(action: str, gold_collected: int, gold_remaining: int,
                       count: int = 1) -> str:
     """Engine-truth one-liner for the turn after an applied move (pure
