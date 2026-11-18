@@ -431,24 +431,30 @@ _BLOCK_S2_LOOK_MOVE = (
 _BLOCK_S2_MOVE_REPORT = (
     "After you move, the next message begins with a Board update that says "
     "whether that move ate a gold and how many golds remain. Open your "
-    "reply with exactly one of these lines, then continue:\n"
+    "reply with exactly one of these lines:\n"
     "\n"
     + "\n".join(f"  {line}" for line in S2_MOVE_VERDICT_LINES)
     + "\n\n"
-    "If no gold remains, your next target is an exit. If the room has no "
-    "exit either, it is sealed and empty: follow the [END_GAME] rule."
+    "After the second line, when your target was a gold, write the failure "
+    "flag below, then continue. If no gold remains, your next target is an "
+    "exit. If the room has no exit either, it is sealed and empty: follow "
+    "the [END_GAME] rule."
 )
 
 _BLOCK_S2_FAILURE = (
-    "If you lack the skill for what was asked, note it and flag this "
-    "message for an Analyst version of you and for your user. Write one "
-    "line, then go on with the reply:\n"
+    "A move to a gold succeeds only if the next Board update says it ate "
+    "a gold. A move to an exit succeeds only if the game ends. Any other "
+    "move failed. Flag it for an Analyst version of you and for your user, "
+    "on one line that names your notepad target:\n"
     "\n"
     "  [FLAG failure: what you expected, and what happened]\n"
     "\n"
-    "Do this when you expected to eat a gold and did not, or expected to "
-    "reach an exit and did not. This is not a notepad note. Do not write "
-    "it with [REMEMBER]."
+    "After a miss, for example:\n"
+    "\n"
+    f"  {S2_MOVE_VERDICT_LINES[1]}\n"
+    "  [FLAG failure: expected to eat the upper-middle gold; stopped short]\n"
+    "\n"
+    "Not a [REMEMBER] note."
 )
 
 _BLOCK_S2_TARGET = (
