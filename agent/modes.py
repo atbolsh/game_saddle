@@ -431,14 +431,18 @@ _BLOCK_S2_LOOK_MOVE = (
 _BLOCK_S2_MOVE_REPORT = (
     "After you move, the next message begins with a Board update that says "
     "whether that move ate a gold and how many golds remain. Open your "
-    "reply with exactly one of these lines:\n"
+    "reply with exactly one of these lines, then continue:\n"
     "\n"
-    + "\n".join(f"  {line}" for line in S2_MOVE_VERDICT_LINES)
-    + "\n\n"
-    "After the second line, when your target was a gold, write the failure "
-    "flag below, then continue. If no gold remains, your next target is an "
-    "exit. If the room has no exit either, it is sealed and empty: follow "
-    "the [END_GAME] rule."
+    f"  {S2_MOVE_VERDICT_LINES[0]}\n"
+    "\n"
+    "or\n"
+    "\n"
+    f"  {S2_MOVE_VERDICT_LINES[1]}\n"
+    "  [FLAG failure: what you expected, and what happened]\n"
+    "\n"
+    "Fill in the flag with your notepad target and what the Board update "
+    "said. If no gold remains, your next target is an exit. If the room "
+    "has no exit either, it is sealed and empty: follow the [END_GAME] rule."
 )
 
 _BLOCK_S2_FAILURE = (
