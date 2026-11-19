@@ -102,6 +102,13 @@ def new_session_id() -> str:
     return uuid.uuid4().hex
 
 
+# A flag on the first reply has no failed message and no picture that
+# message saw. The stored text is these placeholders, not a blank.
+FLAG_NO_PRIOR_MESSAGE = "[ERROR, no prior message]"
+FLAG_NO_PRIOR_IMAGE = "[ERROR, no prior image]"
+FLAG_NO_PRIOR_SETTINGS = "[ERROR, no prior settings]"
+
+
 # ---------------------------------------------------------------- short_term
 
 async def add_user_question(
@@ -123,6 +130,8 @@ async def add_assistant_message(
     snapshot_id: str | None = None,
     gaze: dict[str, Any] | None = None,
     failure: str | None = None,
+    failure_before: str | None = None,
+    failure_after: str | None = None,
 ) -> Any:
     """``gaze`` is the reply's gaze trace (``neural_net.gaze_replay``): the
     ``(s, v)`` read at every token. It is stored in the message metadata
@@ -130,7 +139,9 @@ async def add_assistant_message(
 
     ``failure`` is the note from a ``[FLAG failure: ...]`` line already
     present in ``content``. When set, the metadata also gains ``failure``
-    and ``flagged_for``. The line itself stays in ``content``; loaders
+    and ``flagged_for``, plus ``failure_before_message`` (the previous
+    reply, or :data:`FLAG_NO_PRIOR_MESSAGE`) and ``failure_after_message``
+    (this reply). The line itself stays in ``content``; the agent loaders
     return that text, not this metadata, and they never return a Settings
     dict.
     """
@@ -142,6 +153,12 @@ async def add_assistant_message(
     if failure is not None:
         meta["failure"] = failure
         meta["flagged_for"] = ["analyst", "user"]
+        meta["failure_before_message"] = (
+            failure_before if failure_before is not None else FLAG_NO_PRIOR_MESSAGE
+        )
+        meta["failure_after_message"] = (
+            failure_after if failure_after is not None else content
+        )
     return await client.short_term.add_message(
         session_id=session_id, role="assistant", content=content, metadata=meta
     )
@@ -1001,14 +1018,16 @@ def group_flagged_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Flagged messages from one session's message/snapshot rows.
 
     Oldest first, in the order the rows arrive. A message is flagged when
-    its metadata has a non-empty ``failure`` string. Each result is
-    ``id``, ``content``, ``before`` and ``after``. A side is
-    ``{"path", "settings"}`` and ``settings`` is the stored Settings JSON
-    text. This is for a person looking at the game. It is not an agent
-    load, and it does not strip settings.
+    its metadata has a non-empty ``failure`` string. Each result has
+    ``before_message`` (the reply the flag is about, or
+    :data:`FLAG_NO_PRIOR_MESSAGE`) and ``after_message`` (the reply that
+    contains the flag). ``before`` and ``after`` are the pictures those
+    replies saw: ``{"path", "settings"}``, or ``{"error": ...}`` when the
+    prior picture does not exist. This is for a person looking at the
+    game. It is not an agent load, and it does not strip settings.
 
-    A flagged message missing a before or after board, or a path, or the
-    settings text, raises. An unflagged message's snapshots are ignored.
+    The flagging reply's picture is required. A real prior message with
+    no picture raises. An unflagged message's snapshots are ignored.
     """
     order: list[str] = []
     grouped: dict[str, dict[str, Any]] = {}
@@ -1020,12 +1039,23 @@ def group_flagged_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if mid not in grouped:
             if row.get("timestamp") is None:
                 raise RuntimeError(f"message {mid} has no timestamp")
-            meta = _metadata_dict(row.get("metadata"))
-            failure = meta.get("failure") if meta else None
+            meta = _metadata_dict(row.get("metadata")) or {}
+            failure = meta.get("failure")
+            content = str(row.get("content") or "")
+            before_message = meta.get("failure_before_message")
+            after_message = meta.get("failure_after_message")
             grouped[mid] = {
                 "id": mid,
-                "content": str(row.get("content") or ""),
+                "content": content,
                 "failure": failure if isinstance(failure, str) and failure else None,
+                "before_message": (
+                    before_message if isinstance(before_message, str) and before_message
+                    else FLAG_NO_PRIOR_MESSAGE
+                ),
+                "after_message": (
+                    after_message if isinstance(after_message, str) and after_message
+                    else content
+                ),
                 "sides": {},
             }
             order.append(mid)
@@ -1051,14 +1081,27 @@ def group_flagged_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not item["failure"]:
             continue
         sides = item["sides"]
-        if "before" not in sides or "after" not in sides:
+        if "after" not in sides:
             raise RuntimeError(
-                f"flagged message {mid} is missing a before or after board"
+                f"flagged message {mid} is missing the picture it saw"
+            )
+        if "before" in sides:
+            before = sides["before"]
+        elif item["before_message"] == FLAG_NO_PRIOR_MESSAGE:
+            before = {
+                "error": FLAG_NO_PRIOR_IMAGE,
+                "settings": FLAG_NO_PRIOR_SETTINGS,
+            }
+        else:
+            raise RuntimeError(
+                f"flagged message {mid} names a prior reply and has no picture of it"
             )
         out.append({
             "id": mid,
             "content": item["content"],
-            "before": sides["before"],
+            "before_message": item["before_message"],
+            "after_message": item["after_message"],
+            "before": before,
             "after": sides["after"],
         })
     return out

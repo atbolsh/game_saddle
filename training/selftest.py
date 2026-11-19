@@ -1944,9 +1944,30 @@ def t1_pure() -> str:
     assert flagged == [{
         "id": "m2",
         "content": "[FLAG failure: missed the gold]",
+        "before_message": "[ERROR, no prior message]",
+        "after_message": "[FLAG failure: missed the gold]",
         "before": {"path": "a.png", "settings": '{"agent_x": 0.1}'},
         "after": {"path": "b.png", "settings": '{"agent_x": 0.2}'},
     }]
+    checks += 1
+    first = group_flagged_rows([{
+        "id": "m0",
+        "content": "[FLAG failure: too soon]",
+        "timestamp": 1,
+        "metadata": (
+            '{"failure": "too soon", '
+            '"failure_before_message": "[ERROR, no prior message]", '
+            '"failure_after_message": "[FLAG failure: too soon]"}'
+        ),
+        "role": "after", "path": "now.png", "settings_json": "{}",
+    }])
+    assert first[0]["before_message"] == "[ERROR, no prior message]"
+    assert first[0]["after_message"] == "[FLAG failure: too soon]"
+    assert first[0]["before"] == {
+        "error": "[ERROR, no prior image]",
+        "settings": "[ERROR, no prior settings]",
+    }
+    assert first[0]["after"]["path"] == "now.png"
     checks += 1
     try:
         group_flagged_rows([{

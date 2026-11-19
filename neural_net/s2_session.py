@@ -13,12 +13,12 @@ with ``[MOVE]``. The system prompt is loaded from the ``core_s2_*``
 tips in NAMS at the start of the session, and again after a tip is
 saved or the notebook edits one. It is not the code constant.
 A reply that contains ``[FLAG failure: ...]`` is stored like any other
-reply, gaze included. That message also gets two snapshots, ``before``
-and ``after``: the Settings dict and the board of the attempt. The
-attempt is this turn when the reply moved, otherwise the previous
-attempt the session held. A look leaves the board unchanged, so both
-labels are that same state. The default load returns the flag line with the
-message and does not return the dicts or the images.
+reply, gaze included. The previous reply is labeled before, and this
+reply is labeled after. The before picture is the one the previous
+reply was shown; the after picture is the one this reply was shown.
+A flag on the first reply stores an error placeholder for the missing
+message and the missing picture. The default load returns the flag
+line with the message and does not return the dicts or the images.
 A reply that ends with ``[END_GAME]``, or an S1 window that walks
 out, ends the game. ``new_game`` opens
 ``weights/s1s2_runs/<stamp>/turns.jsonl`` and every ``turn`` appends
@@ -58,6 +58,8 @@ from agent.image_store import (
     store_snapshot,
 )
 from agent.memory import (
+    FLAG_NO_PRIOR_IMAGE,
+    FLAG_NO_PRIOR_MESSAGE,
     add_assistant_message,
     add_s2_tip,
     add_user_question,
@@ -86,17 +88,16 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class _Attempt:
-    """One turn's board before the reply and after S1.
+class _Seen:
+    """One reply and the picture it was shown.
 
-    A look does not move the game, so ``before`` and ``after`` are the
-    same settings dict and the same frame.
+    ``frame`` and ``settings`` are the board at the start of that turn,
+    before S1 moves. The next flag calls this the failed message.
     """
 
-    before: dict[str, Any]
-    after: dict[str, Any]
-    before_frame: np.ndarray
-    after_frame: np.ndarray
+    text: str
+    frame: np.ndarray
+    settings: dict[str, Any]
 
 
 @dataclass
@@ -180,7 +181,7 @@ class S2GameSession:
             self._thread.join(timeout=5)
 
     def new_game(self) -> discreteGame:
-        """Deal a fresh board and clear notes, the held attempt, the round, the report, and the outcome."""
+        """Deal a fresh board and clear notes, the held reply, the round, the report, and the outcome."""
         state = random.getstate()
         if self.seed is not None:
             random.seed(self.seed)
@@ -196,7 +197,7 @@ class S2GameSession:
         self.notes = {}
         self.last_move = None
         self.outcome = None
-        self._attempt: _Attempt | None = None
+        self._seen: _Seen | None = None
         self.round = 0
         self.session_id = new_session_id()
         self.turns_path = new_turns_path()
@@ -286,26 +287,12 @@ class S2GameSession:
         finally:
             if os.path.exists(path):
                 os.unlink(path)
-        moved = result.move is not None
-        if moved:
-            after_settings = game_to_settings_dict(self.game)
-            after_frame = np.array(canonical_frame(self.game), copy=True)
-        else:
-            after_settings = before_settings
-            after_frame = frame
-        this = _Attempt(before_settings, after_settings, frame, after_frame)
         notes = [note for _key, note in parse_failure_flags(result.text) if note]
-        if notes and (moved or self._attempt is None):
-            chosen: _Attempt | None = this
-        elif notes:
-            chosen = self._attempt
-        else:
-            chosen = None
-        self._attempt = this
         self._record(
             user_text, result.text, result.gaze,
             failure="\n".join(notes) if notes else None,
-            attempt=chosen,
+            seen_frame=frame,
+            seen_settings=before_settings,
         )
         tips = [line for line in parse_tip_lines(result.text) if line]
         if tips:
@@ -366,16 +353,19 @@ class S2GameSession:
         reply: str,
         gaze: dict[str, Any] | None = None,
         failure: str | None = None,
-        attempt: _Attempt | None = None,
+        seen_frame: np.ndarray | None = None,
+        seen_settings: dict[str, Any] | None = None,
     ) -> None:
         """Write this turn, user line and reply. Looks included.
 
         ``gaze`` is the reply's gaze trace; it is stored with the reply
         whatever ``gaze_replay`` is, so a later session can replay it.
         ``failure`` is the flag note. The reply text, including the
-        ``[FLAG failure: ...]`` line, is stored unchanged. When the note
-        is set, ``attempt`` supplies the before and after Settings dicts
-        and frames, written as two snapshots on this message.
+        ``[FLAG failure: ...]`` line, is stored unchanged and labeled the
+        after message. The previous reply is the before message. The
+        before picture is the one that reply was shown; the after picture
+        is the one this reply was shown. A flag on the first reply stores
+        :data:`FLAG_NO_PRIOR_MESSAGE` and no before picture.
         """
         if self.client is None:
             raise RuntimeError("S2GameSession is closed")
@@ -385,35 +375,41 @@ class S2GameSession:
             kind = "end"
         else:
             kind = "look"
+        prior = self._seen
         self._run(add_user_question(self.client, self.session_id, user_text))
         message = self._run(add_assistant_message(
             self.client, self.session_id, reply, kind=kind, gaze=gaze,
             failure=failure,
+            failure_before=None if prior is None else prior.text,
+            failure_after=reply if failure is not None else None,
         ))
-        if failure is None:
-            return
-        if attempt is None:
-            raise RuntimeError("failure flag has no before/after board")
-        message_id = getattr(message, "id", None)
-        if message_id is None and isinstance(message, dict):
-            message_id = message.get("id")
-        if not message_id:
-            raise RuntimeError(
-                "assistant message has no id; failure boards were not stored"
+        if failure is not None:
+            if seen_frame is None or seen_settings is None:
+                raise RuntimeError("failure flag has no picture of this reply")
+            message_id = getattr(message, "id", None)
+            if message_id is None and isinstance(message, dict):
+                message_id = message.get("id")
+            if not message_id:
+                raise RuntimeError(
+                    "assistant message has no id; failure boards were not stored"
+                )
+            message_id = str(message_id)
+            before_path = FLAG_NO_PRIOR_IMAGE
+            if prior is not None:
+                before_path = self._run(self._write_board(
+                    message_id, "before", prior.settings, prior.frame,
+                ))
+            after_path = self._run(self._write_board(
+                message_id, "after", seen_settings, seen_frame,
+            ))
+            line = (
+                f"failure flag stored on message {message_id} "
+                f"(before {before_path}, after {after_path})"
             )
-        message_id = str(message_id)
-        before_path = self._run(self._write_board(
-            message_id, "before", attempt.before, attempt.before_frame,
-        ))
-        after_path = self._run(self._write_board(
-            message_id, "after", attempt.after, attempt.after_frame,
-        ))
-        line = (
-            f"failure flag stored on message {message_id} "
-            f"(before {before_path}, after {after_path})"
-        )
-        logger.info("%s", line)
-        print(line)
+            logger.info("%s", line)
+            print(line)
+        if seen_frame is not None and seen_settings is not None:
+            self._seen = _Seen(reply, seen_frame, seen_settings)
 
     async def _write_board(
         self,
