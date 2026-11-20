@@ -286,8 +286,9 @@ Still open:
 
 S2 play writes with `add_s2_tip`: a `[TIP: one line]` in a reply is
 stored as `core_s2_5NN_<slug>`, and `assemble_s2_prompt` puts those rows
-after the seed. The play notebook can edit and delete them. The analyst
-writing tool is still the remaining work.
+after the seed. The play notebook can edit and delete them. The failure
+analyst's `[NOTE]` is a scratchpad on that conversation, not a tip. The
+analyst tip-writing tool is still the remaining work.
 
 A future tool will let the player and the analyst write their own core
 tips into the same substrate the system prompts load from

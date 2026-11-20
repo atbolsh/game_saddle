@@ -164,7 +164,8 @@ class DebriefSession:
         rows = self._run(
             self.client.query.cypher(
                 "MATCH (c:Conversation) "
-                "WHERE c.kind IS NULL OR c.kind <> 'debrief' "
+                "WHERE c.kind IS NULL OR "
+                "(c.kind <> 'debrief' AND c.kind <> 'analyst') "
                 "OPTIONAL MATCH (c)-[:HAS_MESSAGE]->(m:Message) "
                 "RETURN c.session_id AS session_id, c.created_at AS created_at, "
                 "count(m) AS n_messages "

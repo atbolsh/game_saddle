@@ -669,6 +669,29 @@ def settings_to_dict(s: Settings) -> dict[str, Any]:
     return out
 
 
+def fmt3(value: Any) -> Any:
+    """Print-rule for floats: three decimals. Storage is unchanged.
+
+    A float becomes the text ``0.500`` (three places, not a rounded
+    float). A list or dict is walked. Ints, bools, and strings are
+    returned as themselves. A pair of floats is therefore a list of two
+    such strings.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        return f"{value:.3f}"
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return {key: fmt3(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [fmt3(item) for item in value]
+    return value
+
+
 def settings_json_with_openings(settings_json: str | None) -> str | None:
     """Backfill so every analyst view has an ``openings`` key.
 

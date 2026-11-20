@@ -96,6 +96,7 @@ class _Seen:
     """
 
     text: str
+    user_text: str
     frame: np.ndarray
     settings: dict[str, Any]
 
@@ -382,6 +383,8 @@ class S2GameSession:
             failure=failure,
             failure_before=None if prior is None else prior.text,
             failure_after=reply if failure is not None else None,
+            failure_before_question=None if prior is None else prior.user_text,
+            failure_after_question=user_text if failure is not None else None,
         ))
         if failure is not None:
             if seen_frame is None or seen_settings is None:
@@ -409,7 +412,7 @@ class S2GameSession:
             logger.info("%s", line)
             print(line)
         if seen_frame is not None and seen_settings is not None:
-            self._seen = _Seen(reply, seen_frame, seen_settings)
+            self._seen = _Seen(reply, user_text, seen_frame, seen_settings)
 
     async def _write_board(
         self,

@@ -11,14 +11,16 @@ run time. This is a design decision (2026-08-19, commit 88171ec; restored for
 S2 on 2026-11-18 after the S1/S2 rewrite dropped it), not an implementation
 detail to clean up.
 
-- `CORE_S2_TIPS`, `CORE_PLAYER_TIPS`, `CORE_ANALYST_TIPS` in `agent/modes.py`
-  are the seed tables. `ensure_core_tips` heals NAMS to them. Seed numbers
-  stay below 500; 500+ is the agent's. `get_core_tips` fails on any other
-  category. Keep all of that.
+- `CORE_S2_TIPS`, `CORE_PLAYER_TIPS`, `CORE_ANALYST_TIPS`,
+  `CORE_FAILURE_ANALYST_TIPS` in `agent/modes.py` are the seed tables.
+  `ensure_core_tips` heals NAMS to them. Seed numbers stay below 500;
+  500+ is the agent's. `get_core_tips` fails on any other category.
+  Keep all of that. The failure-analyst prefix is `core_fa_`.
 - Every harness or notebook that generates (play, testing_s2,
-  testing_learn_to_look, any future analyst) loads its system prompt with
-  `load_s2_prompt(client)` / `load_scene_prompts(client)`. Importing
-  `SYSTEM_PROMPT_S2` to generate at run time is a bug. t1 greps for it.
+  testing_learn_to_look, the failure analyst) loads its system prompt
+  with `load_s2_prompt(client)` / `load_scene_prompts(client)` /
+  `load_failure_analyst_prompt(client)`. Importing `SYSTEM_PROMPT_S2`
+  to generate at run time is a bug. t1 greps for it.
 - No fallback to the constant when NAMS is down. Fail (no-fuzzy-fallbacks).
 - Tip writing stays: the `[TIP: ...]` line, `parse_tip_lines`, `add_s2_tip`,
   `replace_core_tip`, `delete_core_tip`, the play.ipynb Tips panel, and the

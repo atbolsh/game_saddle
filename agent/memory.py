@@ -107,6 +107,7 @@ def new_session_id() -> str:
 FLAG_NO_PRIOR_MESSAGE = "[ERROR, no prior message]"
 FLAG_NO_PRIOR_IMAGE = "[ERROR, no prior image]"
 FLAG_NO_PRIOR_SETTINGS = "[ERROR, no prior settings]"
+FLAG_NO_PRIOR_QUESTION = "[ERROR, no prior question]"
 
 
 # ---------------------------------------------------------------- short_term
@@ -132,6 +133,8 @@ async def add_assistant_message(
     failure: str | None = None,
     failure_before: str | None = None,
     failure_after: str | None = None,
+    failure_before_question: str | None = None,
+    failure_after_question: str | None = None,
 ) -> Any:
     """``gaze`` is the reply's gaze trace (``neural_net.gaze_replay``): the
     ``(s, v)`` read at every token. It is stored in the message metadata
@@ -140,8 +143,11 @@ async def add_assistant_message(
     ``failure`` is the note from a ``[FLAG failure: ...]`` line already
     present in ``content``. When set, the metadata also gains ``failure``
     and ``flagged_for``, plus ``failure_before_message`` (the previous
-    reply, or :data:`FLAG_NO_PRIOR_MESSAGE`) and ``failure_after_message``
-    (this reply). The line itself stays in ``content``; the agent loaders
+    reply, or :data:`FLAG_NO_PRIOR_MESSAGE`), ``failure_after_message``
+    (this reply), ``failure_before_question`` (the question that reply
+    was answering, or :data:`FLAG_NO_PRIOR_QUESTION`) and
+    ``failure_after_question`` (the question this reply is answering).
+    The line itself stays in ``content``; the agent loaders
     return that text, not this metadata, and they never return a Settings
     dict.
     """
@@ -159,6 +165,11 @@ async def add_assistant_message(
         meta["failure_after_message"] = (
             failure_after if failure_after is not None else content
         )
+        meta["failure_before_question"] = (
+            failure_before_question if failure_before_question is not None
+            else FLAG_NO_PRIOR_QUESTION
+        )
+        meta["failure_after_question"] = failure_after_question or ""
     return await client.short_term.add_message(
         session_id=session_id, role="assistant", content=content, metadata=meta
     )
@@ -1044,6 +1055,8 @@ def group_flagged_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             content = str(row.get("content") or "")
             before_message = meta.get("failure_before_message")
             after_message = meta.get("failure_after_message")
+            before_question = meta.get("failure_before_question")
+            after_question = meta.get("failure_after_question")
             grouped[mid] = {
                 "id": mid,
                 "content": content,
@@ -1055,6 +1068,13 @@ def group_flagged_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "after_message": (
                     after_message if isinstance(after_message, str) and after_message
                     else content
+                ),
+                "before_question": (
+                    before_question if isinstance(before_question, str) and before_question
+                    else FLAG_NO_PRIOR_QUESTION
+                ),
+                "after_question": (
+                    after_question if isinstance(after_question, str) else ""
                 ),
                 "sides": {},
             }
@@ -1099,8 +1119,11 @@ def group_flagged_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         out.append({
             "id": mid,
             "content": item["content"],
+            "failure": item["failure"],
             "before_message": item["before_message"],
             "after_message": item["after_message"],
+            "before_question": item["before_question"],
+            "after_question": item["after_question"],
             "before": before,
             "after": sides["after"],
         })
@@ -1126,6 +1149,50 @@ async def load_flagged_memories(
         {"sid": session_id},
     )
     return group_flagged_rows(list(rows or []))
+
+
+async def load_all_flagged(client: Any) -> list[dict[str, Any]]:
+    """Every flagged reply in the database, oldest first, numbered.
+
+    One list across every game. ``n`` runs ``0 .. N-1``. Each row is a
+    :func:`group_flagged_rows` row plus ``session_id``, ``timestamp``,
+    and ``gaze`` (the BEFORE message's trace, the reply that acted).
+    The player prompt
+    never calls this.
+    """
+    rows = await client.query.cypher(
+        "MATCH (c:Conversation)-[:HAS_MESSAGE]->(m:Message) "
+        "WHERE m.metadata CONTAINS '\"failure\"' "
+        "OPTIONAL MATCH (c)-[:HAS_MESSAGE]->(prev:Message) "
+        "WHERE prev.role = 'assistant' AND prev.timestamp < m.timestamp "
+        "WITH c, m, prev "
+        "ORDER BY prev.timestamp DESC "
+        "WITH c, m, collect(prev)[0] AS before_msg "
+        "OPTIONAL MATCH (m)-[r:CAPTURED_STATE]->(s:GameSnapshot) "
+        "RETURN c.session_id AS session_id, m.id AS id, m.content AS content, "
+        "m.timestamp AS timestamp, m.metadata AS metadata, "
+        "before_msg.metadata AS before_metadata, r.role AS role, "
+        "s.path AS path, s.settings_json AS settings_json "
+        "ORDER BY m.timestamp ASC",
+    )
+    raw = list(rows or [])
+    extra: dict[str, dict[str, Any]] = {}
+    for row in raw:
+        mid = str(row.get("id") or "")
+        if not mid or mid in extra:
+            continue
+        extra[mid] = {
+            "session_id": str(row.get("session_id") or ""),
+            "timestamp": row.get("timestamp"),
+            "gaze": _message_gaze(row.get("before_metadata")),
+        }
+    out: list[dict[str, Any]] = []
+    for n, item in enumerate(group_flagged_rows(raw)):
+        row = dict(item)
+        row.update(extra.get(str(item["id"]), {}))
+        row["n"] = n
+        out.append(row)
+    return out
 
 
 # --------------------------------------------------------------------- tips
@@ -1186,6 +1253,8 @@ def _core_tip_seed_for_prefix(prefix: str) -> list[tuple[str, str]]:
         return list(modes.CORE_ANALYST_TIPS)
     if prefix == "core_s2_":
         return list(modes.CORE_S2_TIPS)
+    if prefix == "core_fa_":
+        return list(modes.CORE_FAILURE_ANALYST_TIPS)
     raise ValueError(f"unknown core-tip prefix {prefix!r}")
 
 
@@ -1324,6 +1393,19 @@ async def ensure_core_tips(client: Any) -> dict[str, int]:
             healed += 1
         else:
             unchanged += 1
+    for category, text in modes.CORE_FAILURE_ANALYST_TIPS:
+        if ANALYST_TAG in text:
+            raise RuntimeError(
+                f"core failure-analyst tip {category} contains {ANALYST_TAG}; "
+                "failure-analyst seed text must be stored untagged"
+            )
+        status = await _upsert_core_tip(client, category, text)
+        if status == "added":
+            added += 1
+        elif status == "healed":
+            healed += 1
+        else:
+            unchanged += 1
     for category, text in modes.CORE_S2_TIPS:
         if ANALYST_TAG in text:
             raise RuntimeError(
@@ -1337,7 +1419,7 @@ async def ensure_core_tips(client: Any) -> dict[str, int]:
             healed += 1
         else:
             unchanged += 1
-    for prefix in ("core_player_", "core_analyst_", "core_s2_"):
+    for prefix in ("core_player_", "core_analyst_", "core_s2_", "core_fa_"):
         expected = {c for c, _ in _core_tip_seed_for_prefix(prefix)}
         found = set(await _core_tip_categories(client, prefix))
         for cat in _unexpected_core_tip_categories(prefix, expected, found):
@@ -1360,13 +1442,16 @@ async def ensure_core_tips(client: Any) -> dict[str, int]:
     }
 
 
-# Category shape shared with t1: core_(player|analyst|s2)_NNN_slug, NNN zero-padded.
-_CORE_TIP_CAT_RE = re.compile(r"^core_(player|analyst|s2)_(\d{3})_[a-z0-9_]+$")
+# Category shape shared with t1: core_(player|analyst|s2|fa)_NNN_slug.
+_CORE_TIP_CAT_RE = re.compile(
+    r"^core_(player|analyst|s2|fa)_(\d{3})_[a-z0-9_]+$"
+)
 
 _CORE_TIP_PREFIX_ROLE = {
     "core_player_": "player",
     "core_analyst_": "analyst",
     "core_s2_": "s2",
+    "core_fa_": "fa",
 }
 
 
@@ -1380,7 +1465,8 @@ def _core_tip_prefix(category: str) -> str:
 
 def _is_agent_written_core_tip(prefix: str, category: str) -> bool:
     """True for a well-formed extra in the reserved 500+ range under
-    ``prefix`` (``core_player_`` / ``core_analyst_`` / ``core_s2_``).
+    ``prefix`` (``core_player_`` / ``core_analyst_`` / ``core_s2_`` /
+    ``core_fa_``).
     Seed numbers stay below 500; this is the gate that lets agent-written
     rows into the dump without treating them as graph corruption."""
     match = _CORE_TIP_CAT_RE.match(category)
@@ -1421,7 +1507,7 @@ async def _core_tip_categories(client: Any, prefix: str) -> list[str]:
 
 async def get_core_tips(client: Any, prefix: str) -> dict[str, str]:
     """Exact fetch of one core-tip namespace. ``prefix`` is
-    ``core_player_``, ``core_analyst_``, or ``core_s2_``.
+    ``core_player_``, ``core_analyst_``, ``core_s2_``, or ``core_fa_``.
 
     Seed categories must all be present (missing / duplicated rows
     raise). Well-formed extras in the 500+ range are kept and sorted
@@ -1628,6 +1714,22 @@ async def get_session_notes(client: Any, session_id: str) -> list[dict]:
         result=notes,
     )
     return notes
+
+
+async def delete_session_note(client: Any, session_id: str, key: str) -> None:
+    """Delete one scratchpad note. Exact key. A missing note is a no-op.
+
+    Write failures log at WARNING and re-raise.
+    """
+    try:
+        await client.graph.execute_write(
+            "MATCH (n:SessionNote {session_id: $sid, key: $key}) "
+            "DETACH DELETE n",
+            {"sid": session_id, "key": key},
+        )
+    except Exception as exc:
+        logger.warning("delete_session_note failed: %s", exc)
+        raise
 
 
 async def clear_session_notes(client: Any, session_id: str) -> None:
