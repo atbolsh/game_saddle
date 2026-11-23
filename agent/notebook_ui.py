@@ -1,9 +1,10 @@
 """Small ipywidgets UI helpers shared by the notebooks.
 
 - :func:`tame_shift_enter` makes Shift+Enter behave exactly like Enter
-  (insert a newline) inside notebook text boxes instead of reaching Jupyter's
-  run-cell shortcut -- which would re-run the widget cell and erase whatever
-  the user had typed. Buttons remain the only submit mechanism.
+  (insert a newline) inside every ipywidgets text box, instead of reaching
+  Jupyter's run-cell shortcut -- which would re-run the widget cell and
+  erase whatever the user had typed. A single-line box just swallows the
+  key. Buttons remain the only submit mechanism.
 - :func:`model_picker` is the architecture dropdown + checkpoint dropdown +
   "save only one set of weights at a time" checkbox + Switch button shown at
   the top of every notebook, wired to the session's ``switch_model``. The
@@ -44,8 +45,9 @@ _TAMED_CLASS = "tame-shift-enter"
 # always fires AFTER Jupyter's and cannot stop the run-cell command. A capture
 # listener on `window` is the only DOM node upstream of `document`, so it
 # preempts Jupyter reliably. One global listener (guarded against rebinding on
-# cell re-run) handles every tamed textarea; no per-widget binding or polling
-# is needed because the check happens per-event on the event's target.
+# cell re-run) handles every widget text box; the check is per-event on the
+# event's target, so a textarea created later (Edit on the settings card)
+# is covered too.
 _SCRIPT = """
 <script>
 (function () {
@@ -53,16 +55,26 @@ _SCRIPT = """
   window.__tameShiftEnterBound = true;
   window.addEventListener("keydown", function (ev) {
     if (ev.key !== "Enter" || !ev.shiftKey) { return; }
-    var ta = ev.target;
-    if (!ta || ta.tagName !== "TEXTAREA" || !ta.closest(".__CLASS__")) { return; }
-    ev.preventDefault();
-    ev.stopPropagation();
-    ev.stopImmediatePropagation();
-    var start = ta.selectionStart, end = ta.selectionEnd;
-    ta.value = ta.value.slice(0, start) + "\\n" + ta.value.slice(end);
-    ta.selectionStart = ta.selectionEnd = start + 1;
-    // Bubbling input event so ipywidgets syncs the value to the kernel.
-    ta.dispatchEvent(new Event("input", { bubbles: true }));
+    var el = ev.target;
+    if (!el || !el.closest) { return; }
+    var inWidget = el.closest(".jupyter-widgets") || el.closest(".__CLASS__");
+    if (!inWidget) { return; }
+    if (el.tagName === "TEXTAREA") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      ev.stopImmediatePropagation();
+      var start = el.selectionStart, end = el.selectionEnd;
+      el.value = el.value.slice(0, start) + "\\n" + el.value.slice(end);
+      el.selectionStart = el.selectionEnd = start + 1;
+      // Bubbling input event so ipywidgets syncs the value to the kernel.
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      return;
+    }
+    if (el.tagName === "INPUT" || el.tagName === "SELECT") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      ev.stopImmediatePropagation();
+    }
   }, true);
 })();
 </script>
@@ -259,6 +271,7 @@ def player_takeover_controls(
         description="Player:",
         layout=widgets.Layout(width="600px", height="90px"),
     )
+    reply_box.add_class(_TAMED_CLASS)
     submit_btn = widgets.Button(description="Submit", button_style="primary")
     move_btns: list[widgets.Button] = []
     for face, action in _TAKEOVER_MOVE_FACES:
@@ -327,6 +340,7 @@ def player_takeover_controls(
     takeover_btn.on_click(_on_takeover)
     resume_btn.on_click(_on_resume)
     submit_btn.on_click(lambda _: _fire(None))
+    tame_shift_enter(reply_box)
     for btn, (_face, action) in zip(move_btns, _TAKEOVER_MOVE_FACES):
         token = f"[{action}]"
         btn.on_click(lambda _, tok=token: _fire(tok))
@@ -384,17 +398,18 @@ def display_frame_with_scratchpad(
 
 
 def tame_shift_enter(*text_widgets) -> None:
-    """Make Shift+Enter insert a plain newline in the given Textarea widgets.
+    """Make Shift+Enter insert a newline in widget text boxes.
 
-    Shift+Enter must behave exactly like Enter inside the box: it does NOT
-    submit anything, and it must not reach Jupyter's run-cell shortcut (which
-    re-runs the widget cell and erases the input). Each widget is tagged with
-    a marker CSS class, and one injected window-level capture-phase keydown
-    listener intercepts Shift+Enter on any tagged textarea before Jupyter's
-    own document-level shortcut handler can see it.
+    Shift+Enter must behave exactly like Enter inside a multi-line box: it
+    does NOT submit anything, and it must not reach Jupyter's run-cell
+    shortcut (which re-runs the widget cell and erases the screen). A
+    single-line widget input just swallows the key. The listener covers
+    every ipywidgets text box on the page, not only the ones passed here.
+    Passed widgets are also tagged, so a textarea outside the widget DOM
+    is covered.
 
-    Call AFTER creating the widgets, in the same cell that displays them.
-    Safe to call repeatedly (cell re-runs): the listener binds once per page.
+    Call once in the cell that displays the UI. Safe to call repeatedly
+    (cell re-runs): the listener binds once per page.
     """
     for w in text_widgets:
         w.add_class(_TAMED_CLASS)
@@ -1352,6 +1367,7 @@ def live_board_row(
 
     scratch.edit_btn.on_click(_on_scratch_edit)
     scratch.render_btn.on_click(_on_scratch_render)
+    tame_shift_enter(scratch.textarea)
     settings.edit_btn.on_click(_on_settings_edit)
     settings.render_btn.on_click(_on_settings_render)
 
