@@ -412,6 +412,7 @@ class FailureAnalyst:
         self._marked = False
         self._note_round = 0
         self._system = ""
+        self.refresh_flags()
 
     def _run(self, coro: Any) -> Any:
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
@@ -441,7 +442,24 @@ class FailureAnalyst:
         self._marked = False
         self._note_round = 0
         self._system = ""
+        self.refresh_flags()
         return {"session_id": self.session_id}
+
+    def refresh_flags(self) -> list[dict[str, Any]]:
+        """Every flagged memory in NAMS, oldest first.
+
+        Called when the analyst is created, on restart, and at the start
+        of each ask, so the list is present before the user types.
+        """
+        self._flags = self._run(mem.load_all_flagged(self.client))
+        return self._flags
+
+    def catalog(self) -> str:
+        """The index line plus one line per flagged memory."""
+        listing = self._list()
+        if not listing:
+            return self.loaded_line()
+        return self.loaded_line() + "\n" + listing
 
     def switch_model(
         self,
@@ -537,7 +555,7 @@ class FailureAnalyst:
             raise RuntimeError("FailureAnalyst has no model; pass load_model=True")
         from . import modes
         self._system = self._run(modes.load_failure_analyst_prompt(self.client))
-        self._flags = self._run(mem.load_all_flagged(self.client))
+        self.refresh_flags()
         user_msg = self._run(
             self.client.short_term.add_message(
                 session_id=self.session_id, role="user", content=question,
@@ -647,7 +665,7 @@ class FailureAnalyst:
         suffix = f"[user] {end_text}"
         if recent.endswith(suffix):
             recent = recent[: -len(suffix)].rstrip("\n")
-        preamble = [index_line(len(self._flags), self._loaded_numbers())]
+        preamble = [self.catalog()]
         preamble.append(self.notepad())
         if recent:
             preamble.append(recent)
