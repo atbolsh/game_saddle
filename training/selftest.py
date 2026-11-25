@@ -2292,6 +2292,12 @@ def t1_pure() -> str:
     ):
         _text = (_root / _rel).read_text()
         assert "SYSTEM_PROMPT_S2" not in _text, _rel
+    assert "thinkingmachines/Inkling-2-Mini" in (
+        _root / "agent" / "inkling.py"
+    ).read_text()
+    assert "get_model(self.cfg)" not in (_root / "agent" / "analyst.py").read_text()
+    assert "load_inkling" in (_root / "notebooks" / "analyst.ipynb").read_text()
+    assert "load_gemma_dir" not in (_root / "notebooks" / "analyst.ipynb").read_text()
     assert _unexpected_core_tip_categories(
         "core_player_",
         {"core_player_010_x"},

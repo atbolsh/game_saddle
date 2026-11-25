@@ -403,8 +403,7 @@ class FailureAnalyst:
         self.client = self._run(mem.connect(self.cfg))
         self.model = None
         if load_model:
-            from .model import get_model
-            self.model = get_model(self.cfg)
+            self.load_inkling()
         self.session_id = "analyst-" + uuid.uuid4().hex
         self._loaded: dict[int, set[str]] = {}
         self._windows: dict[int, tuple[str, int, int | None]] = {}
@@ -469,6 +468,24 @@ class FailureAnalyst:
     ) -> dict[str, Any]:
         from .model import switch_session_model
         return switch_session_model(self, key, purge_others, checkpoint)
+
+    def load_inkling(self) -> dict[str, Any]:
+        """Load the unfinetuned Inkling 2 Mini. No Gemma checkpoint.
+
+        Frees whatever trunk this analyst was holding. Does not install
+        itself as the process-wide default, so a play session's Gemma
+        is left alone unless it was this object's previous model.
+        """
+        from . import model as model_mod
+        from .inkling import InklingAnalystModel
+
+        previous = self.model
+        if previous is not None:
+            previous.unload()
+        if model_mod._DEFAULT is previous:
+            model_mod._DEFAULT = None
+        self.model = InklingAnalystModel(self.cfg).load()
+        return {"key": self.model.key, "hf_id": self.model.hf_id}
 
     def load_gemma_dir(self, path: str) -> dict[str, Any]:
         """Load the Gemma trunk from a play-notebook checkpoint directory.
