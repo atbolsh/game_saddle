@@ -2298,6 +2298,7 @@ def t1_pure() -> str:
     for _needle in (
         "thinkingmachines/Inkling-2-Mini",
         "Qwen/Qwen3.8-27B",
+        "google/gemma-4-12B-it",
         "google/gemma-4-31B-it",
         "gpt-6-astra",
         "claude-fable-5-1",

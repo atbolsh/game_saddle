@@ -88,6 +88,10 @@ ANALYST_MODELS: dict[str, AnalystModelSpec] = {
             "Qwen/Qwen3.8-27B",
         ),
         _spec(
+            "gemma-4-12b", "Gemma 4 12B", "local",
+            "google/gemma-4-12B-it",
+        ),
+        _spec(
             "gemma-4-31b", "Gemma 4 31B", "local",
             "google/gemma-4-31B-it",
         ),
