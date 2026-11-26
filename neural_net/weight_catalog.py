@@ -9,6 +9,7 @@ choices for the parts Gemma dropdown.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from neural_net.paths import weights_root
@@ -177,6 +178,72 @@ def list_coord_loads(root: Path | None = None) -> list[Path]:
     """Coordinate checkpoints and full saves, newest first."""
     base = weights_root() if root is None else root
     return _newest(_walk(base, "coord_embed.pt", is_coord_loadable), _mtime)
+
+
+def _gemma_trunk(path: Path) -> bool:
+    """A directory ``FailureAnalyst.load_gemma_dir`` can open."""
+    if not path.is_dir() or path.name == "anchor":
+        return False
+    return (path / "gemma_meta.json").is_file() or (
+        path / "adapter_config.json"
+    ).is_file()
+
+
+def _trunk_mtime(checkpoint: Path, trunk: Path) -> float:
+    newest = 0.0
+    for path in (
+        checkpoint / "localizer.pt",
+        trunk / "adapter_model.safetensors",
+        trunk / "gemma.pt",
+        trunk / "gemma_meta.json",
+        trunk / "adapter_config.json",
+    ):
+        try:
+            newest = max(newest, path.stat().st_mtime)
+        except OSError:
+            continue
+    return newest
+
+
+def list_analyst_models(root: Path | None = None) -> list[tuple[str, Path]]:
+    """Gemma trunks under ``weights/``, newest first.
+
+    Each row is ``(label, directory)``. ``directory`` is what
+    ``load_gemma_dir`` opens. A checkpoint that stores the trunk in a
+    ``gemma/`` child is labeled by the checkpoint, and the directory is
+    that child. ``anchor/`` is skipped. The same directory is returned
+    once.
+    """
+    base = weights_root() if root is None else root
+    if not base.is_dir():
+        return []
+    base_key = base.resolve()
+    owners: dict[Path, Path] = {}
+    directs: dict[Path, Path] = {}
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = [name for name in dirnames if name != "anchor"]
+        folder = Path(dirpath)
+        if "gemma_meta.json" not in filenames and (
+            "adapter_config.json" not in filenames
+        ):
+            continue
+        if not _gemma_trunk(folder):
+            continue
+        if folder.name == "gemma" and folder.parent.resolve() != base_key:
+            owners[folder.parent] = folder
+        else:
+            directs[folder.resolve()] = folder
+    for parent in owners:
+        directs.pop(parent.resolve(), None)
+    for child in owners.values():
+        directs.pop(child.resolve(), None)
+    rows: list[tuple[float, str, Path]] = []
+    for parent, child in owners.items():
+        rows.append((_trunk_mtime(parent, child), label(parent, base), child))
+    for folder in directs.values():
+        rows.append((_trunk_mtime(folder, folder), label(folder, base), folder))
+    rows.sort(key=lambda row: row[0], reverse=True)
+    return [(text, path) for _, text, path in rows]
 
 
 def list_s1_loads(root: Path | None = None) -> list[Path]:

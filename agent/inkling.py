@@ -76,7 +76,9 @@ def _spec(
     )
 
 
-#: Insertion order is the dropdown order. The first row is the default.
+#: Insertion order is the top of the analyst dropdown. The first row is
+#: the default. Weight checkpoints are not in this dict; they are
+#: appended by :func:`analyst_menu_options`.
 ANALYST_MODELS: dict[str, AnalystModelSpec] = {
     spec.key: spec for spec in (
         _spec(
@@ -105,6 +107,28 @@ ANALYST_MODELS: dict[str, AnalystModelSpec] = {
         ),
     )
 }
+
+
+def analyst_menu_options() -> list[tuple[str, str]]:
+    """Dropdown rows: the catalog, then Gemma trunks under ``weights/``.
+
+    Weight rows are newest first. Their value is the directory
+    :meth:`agent.analyst.FailureAnalyst.load_gemma_dir` opens. An empty
+    weights directory adds no rows.
+    """
+    from neural_net.weight_catalog import list_analyst_models
+
+    options = [(spec.label, spec.key) for spec in ANALYST_MODELS.values()]
+    seen = {value for _, value in options}
+    for text, path in list_analyst_models():
+        value = str(path)
+        if value in seen:
+            raise RuntimeError(
+                f"weight checkpoint {value!r} collides with a catalog key"
+            )
+        seen.add(value)
+        options.append((text, value))
+    return options
 
 
 def analyst_model_spec(key: str) -> AnalystModelSpec:

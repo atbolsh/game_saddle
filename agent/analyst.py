@@ -559,6 +559,19 @@ class FailureAnalyst:
             "hf_id": self.model.model_id,
         }
 
+    def load_menu_choice(self, choice: str) -> dict[str, Any]:
+        """Load one dropdown row.
+
+        A catalog key loads that base model and does not install it as
+        the process-wide default. Any other value is a directory from
+        :func:`neural_net.weight_catalog.list_analyst_models`.
+        """
+        from .inkling import ANALYST_MODELS
+
+        if choice in ANALYST_MODELS:
+            return self.load_analyst_model(choice)
+        return self.load_gemma_dir(choice)
+
     def load_inkling(self) -> dict[str, Any]:
         """Load the unfinetuned Inkling 2 Mini."""
         return self.load_analyst_model("inkling-2-mini")
@@ -609,7 +622,20 @@ class FailureAnalyst:
             self.model.model.load_state_dict(state)
         self.model.model.eval()
         model_mod._DEFAULT = self.model
-        return {"key": key, "path": str(folder), "format": fmt}
+        from neural_net.paths import weights_root
+        from neural_net.weight_catalog import label as catalog_label
+
+        shown = folder
+        root = weights_root().resolve()
+        if folder.name == "gemma" and folder.parent.resolve() != root:
+            shown = folder.parent
+        return {
+            "key": key,
+            "path": str(folder),
+            "format": fmt,
+            "label": catalog_label(shown),
+            "model_id": str(folder),
+        }
 
     def _unload_model(self) -> None:
         from . import model as model_mod

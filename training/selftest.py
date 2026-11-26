@@ -2307,9 +2307,45 @@ def t1_pure() -> str:
         assert _needle in _analyst_nb, _needle
     assert "get_model(self.cfg)" not in _analyst_py
     assert "def reset_to_pre_analyst" in _analyst_py
-    assert "load_analyst_model" in _analyst_nb
+    assert "load_analyst_model" in _analyst_py
+    assert "def load_menu_choice" in _analyst_py
+    assert "def analyst_menu_options" in _inkling
+    assert "analyst_menu_options" in _analyst_nb
+    assert "load_menu_choice" in _analyst_nb
     assert "Reset to pre-analyst" in _analyst_nb
     assert "load_gemma_dir" not in _analyst_nb
+    import os as _os
+    import tempfile
+    from neural_net.weight_catalog import list_analyst_models
+    with tempfile.TemporaryDirectory() as _tmp:
+        _w = _Path(_tmp)
+        _full = _w / "full" / "save_a"
+        (_full / "gemma").mkdir(parents=True)
+        (_full / "gemma" / "gemma_meta.json").write_text("{}")
+        (_full / "gemma" / "adapter_config.json").write_text("{}")
+        (_full / "s1.pt").write_text("x")
+        _adapter = _w / "gemma-4-12b" / "epoch1"
+        _adapter.mkdir(parents=True)
+        (_adapter / "adapter_config.json").write_text("{}")
+        _anchor = _w / "s2" / "anchor"
+        _anchor.mkdir(parents=True)
+        (_anchor / "adapter_config.json").write_text("{}")
+        _both = _w / "runs" / "both"
+        (_both / "gemma").mkdir(parents=True)
+        (_both / "adapter_config.json").write_text("{}")
+        (_both / "gemma" / "gemma_meta.json").write_text("{}")
+        _os.utime(_adapter / "adapter_config.json", (2_000_000_000, 2_000_000_000))
+        _os.utime(_full / "gemma" / "gemma_meta.json", (1_500_000_000, 1_500_000_000))
+        _os.utime(_both / "gemma" / "gemma_meta.json", (1_000_000_000, 1_000_000_000))
+        _found = list_analyst_models(_w)
+        assert [row[0] for row in _found] == [
+            "gemma-4-12b/epoch1",
+            "full/save_a",
+            "runs/both",
+        ], _found
+        assert _found[0][1] == _adapter
+        assert _found[1][1] == _full / "gemma"
+        assert _found[2][1] == _both / "gemma"
     assert _unexpected_core_tip_categories(
         "core_player_",
         {"core_player_010_x"},
