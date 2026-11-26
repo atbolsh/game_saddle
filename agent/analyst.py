@@ -434,7 +434,11 @@ class FailureAnalyst:
         self.close()
 
     def restart(self) -> dict[str, Any]:
-        """A new analyst conversation. The loaded set is cleared."""
+        """A new analyst conversation. The loaded set is cleared.
+
+        NAMS keeps the previous analyst thread. Use
+        :meth:`reset_to_pre_analyst` to delete those writes.
+        """
         self.session_id = "analyst-" + uuid.uuid4().hex
         self._loaded = {}
         self._windows = {}
@@ -443,6 +447,69 @@ class FailureAnalyst:
         self._system = ""
         self.refresh_flags()
         return {"session_id": self.session_id}
+
+    def reset_to_pre_analyst(self) -> dict[str, Any]:
+        """Delete every analyst write, then start a fresh thread.
+
+        Play conversations, flagged messages, snapshots, entities, and
+        preferences stay. The loaded model stays. A move in the flagged
+        or snapshot count raises after the deletes, because those nodes
+        are not analyst data.
+        """
+        before = self._play_counts()
+        self._run(self._wipe_analyst_graph())
+        after = self._play_counts()
+        if before != after:
+            raise RuntimeError(
+                "reset_to_pre_analyst changed play data "
+                f"(flagged {before['flagged']}->{after['flagged']}, "
+                f"snapshots {before['snapshots']}->{after['snapshots']})"
+            )
+        info = self.restart()
+        info["flagged"] = after["flagged"]
+        info["snapshots"] = after["snapshots"]
+        return info
+
+    def _play_counts(self) -> dict[str, int]:
+        return {
+            "flagged": self._count(
+                "MATCH (m:Message) WHERE m.metadata CONTAINS '\"failure\"' "
+                "RETURN count(m) AS c"
+            ),
+            "snapshots": self._count(
+                "MATCH (g:GameSnapshot) RETURN count(g) AS c"
+            ),
+        }
+
+    def _count(self, query: str) -> int:
+        rows = self._run(self.client.graph.execute_write(query, {})) or []
+        if not rows:
+            raise RuntimeError(f"count query returned no row: {query}")
+        value = dict(rows[0]).get("c")
+        if value is None:
+            raise RuntimeError(f"count query returned no c: {rows[0]!r}")
+        return int(value)
+
+    async def _wipe_analyst_graph(self) -> None:
+        # Do not match the bare substring "analyst": flag text contains it.
+        queries = (
+            "MATCH (c:Conversation) "
+            "WHERE c.kind = 'analyst' OR c.session_id STARTS WITH 'analyst-' "
+            "OPTIONAL MATCH (c)-[:HAS_MESSAGE]->(m) "
+            "DETACH DELETE m, c",
+            "MATCH (t:ReasoningTrace) "
+            "WHERE t.session_id STARTS WITH 'analyst-' "
+            "DETACH DELETE t",
+            "MATCH (n:SessionNote) "
+            "WHERE n.session_id STARTS WITH 'analyst-' "
+            "DETACH DELETE n",
+            "MATCH (m:Message) "
+            "WHERE m.metadata CONTAINS '\"kind\": \"analyst\"' "
+            "OR m.metadata CONTAINS '\"kind\":\"analyst\"' "
+            "DETACH DELETE m",
+        )
+        for query in queries:
+            await self.client.graph.execute_write(query, {})
 
     def refresh_flags(self) -> list[dict[str, Any]]:
         """Every flagged memory in NAMS, oldest first.
@@ -469,23 +536,32 @@ class FailureAnalyst:
         from .model import switch_session_model
         return switch_session_model(self, key, purge_others, checkpoint)
 
-    def load_inkling(self) -> dict[str, Any]:
-        """Load the unfinetuned Inkling 2 Mini. No Gemma checkpoint.
+    def load_analyst_model(self, key: str) -> dict[str, Any]:
+        """Load one catalog model. No play checkpoint, no process default.
 
         Frees whatever trunk this analyst was holding. Does not install
         itself as the process-wide default, so a play session's Gemma
         is left alone unless it was this object's previous model.
         """
         from . import model as model_mod
-        from .inkling import InklingAnalystModel
+        from .inkling import build_analyst_model
 
         previous = self.model
         if previous is not None:
             previous.unload()
         if model_mod._DEFAULT is previous:
             model_mod._DEFAULT = None
-        self.model = InklingAnalystModel(self.cfg).load()
-        return {"key": self.model.key, "hf_id": self.model.hf_id}
+        self.model = build_analyst_model(key, self.cfg).load()
+        return {
+            "key": self.model.key,
+            "label": self.model.label,
+            "model_id": self.model.model_id,
+            "hf_id": self.model.model_id,
+        }
+
+    def load_inkling(self) -> dict[str, Any]:
+        """Load the unfinetuned Inkling 2 Mini."""
+        return self.load_analyst_model("inkling-2-mini")
 
     def load_gemma_dir(self, path: str) -> dict[str, Any]:
         """Load the Gemma trunk from a play-notebook checkpoint directory.

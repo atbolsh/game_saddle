@@ -2292,12 +2292,23 @@ def t1_pure() -> str:
     ):
         _text = (_root / _rel).read_text()
         assert "SYSTEM_PROMPT_S2" not in _text, _rel
-    assert "thinkingmachines/Inkling-2-Mini" in (
-        _root / "agent" / "inkling.py"
-    ).read_text()
-    assert "get_model(self.cfg)" not in (_root / "agent" / "analyst.py").read_text()
-    assert "load_inkling" in (_root / "notebooks" / "analyst.ipynb").read_text()
-    assert "load_gemma_dir" not in (_root / "notebooks" / "analyst.ipynb").read_text()
+    _inkling = (_root / "agent" / "inkling.py").read_text()
+    _analyst_py = (_root / "agent" / "analyst.py").read_text()
+    _analyst_nb = (_root / "notebooks" / "analyst.ipynb").read_text()
+    for _needle in (
+        "thinkingmachines/Inkling-2-Mini",
+        "Qwen/Qwen3.8-27B",
+        "google/gemma-4-31B-it",
+        "gpt-6-astra",
+        "claude-fable-5-1",
+    ):
+        assert _needle in _inkling, _needle
+        assert _needle in _analyst_nb, _needle
+    assert "get_model(self.cfg)" not in _analyst_py
+    assert "def reset_to_pre_analyst" in _analyst_py
+    assert "load_analyst_model" in _analyst_nb
+    assert "Reset to pre-analyst" in _analyst_nb
+    assert "load_gemma_dir" not in _analyst_nb
     assert _unexpected_core_tip_categories(
         "core_player_",
         {"core_player_010_x"},

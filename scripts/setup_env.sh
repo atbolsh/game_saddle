@@ -53,6 +53,27 @@ fi
 log "installing Python dependencies from ${REQ_FILE}"
 python -m pip install -r "${REQ_FILE}"
 
+# GLiNER 0.2.28 caps transformers<5.14. A resolver that honors that cap
+# downgrades the pin this branch needs (inkling2_loop, qwen3_5, gemma4
+# are all in 5.24.1; 5.8.0 is older and has no inkling2_loop). Put the
+# pin back. Auto-NER stays off.
+_transformers_ok() {
+  python - <<'PY'
+from packaging.version import Version
+import transformers
+installed = Version(transformers.__version__)
+low, high = Version("5.24.1"), Version("5.25")
+print("[setup-env] transformers %s" % transformers.__version__, flush=True)
+raise SystemExit(0 if low <= installed < high else 1)
+PY
+}
+log "checking the transformers pin"
+if ! _transformers_ok; then
+  log "transformers pin drifted; reinstalling transformers>=5.24.1,<5.25"
+  python -m pip install -U --force-reinstall 'transformers>=5.24.1,<5.25'
+  _transformers_ok
+fi
+
 # A version pin cannot see the CUDA local tag. Vast images ship
 # torchaudio +cu128, and 2.11.0+cu128 satisfies torchaudio>=2.11,<2.12, so
 # the requirements install leaves it in place next to a cu130 torch.
@@ -181,6 +202,27 @@ import spacy
 spacy.load(sys.argv[1])
 from neo4j_agent_memory.extraction import SpacyEntityExtractor  # noqa: F401
 print("[setup-env] spaCy model loads and SpacyEntityExtractor imports OK.", flush=True)
+PY
+
+# Packages only. The analyst's local checkpoints download on first Load.
+log "verifying analyst model dependencies import"
+python - <<'PY'
+import anthropic  # noqa: F401
+import openai  # noqa: F401
+import transformers
+from packaging.version import Version
+from transformers import AutoModelForMultimodalLM  # noqa: F401
+
+installed = Version(transformers.__version__)
+if not (Version("5.24.1") <= installed < Version("5.25")):
+    raise SystemExit(
+        "transformers %s is outside >=5.24.1,<5.25" % transformers.__version__
+    )
+print(
+    "[setup-env] openai, anthropic, AutoModelForMultimodalLM import OK "
+    "(transformers %s)." % transformers.__version__,
+    flush=True,
+)
 PY
 
 log "done. spaCy/GLiNER weights cached (auto-NER is off; see agent/memory.py)."
