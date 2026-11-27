@@ -102,6 +102,14 @@ def new_session_id() -> str:
     return uuid.uuid4().hex
 
 
+# A flag on the first reply has no failed message and no picture that
+# message saw. The stored text is these placeholders, not a blank.
+FLAG_NO_PRIOR_MESSAGE = "[ERROR, no prior message]"
+FLAG_NO_PRIOR_IMAGE = "[ERROR, no prior image]"
+FLAG_NO_PRIOR_SETTINGS = "[ERROR, no prior settings]"
+FLAG_NO_PRIOR_QUESTION = "[ERROR, no prior question]"
+
+
 # ---------------------------------------------------------------- short_term
 
 async def add_user_question(
@@ -122,15 +130,46 @@ async def add_assistant_message(
     kind: str = "move",
     snapshot_id: str | None = None,
     gaze: dict[str, Any] | None = None,
+    failure: str | None = None,
+    failure_before: str | None = None,
+    failure_after: str | None = None,
+    failure_before_question: str | None = None,
+    failure_after_question: str | None = None,
 ) -> Any:
     """``gaze`` is the reply's gaze trace (``neural_net.gaze_replay``): the
     ``(s, v)`` read at every token. It is stored in the message metadata
-    and comes back with the message in :func:`load_played_messages`."""
+    and comes back with the message in :func:`load_played_messages`.
+
+    ``failure`` is the note from a ``[FLAG failure: ...]`` line already
+    present in ``content``. When set, the metadata also gains ``failure``
+    and ``flagged_for``, plus ``failure_before_message`` (the previous
+    reply, or :data:`FLAG_NO_PRIOR_MESSAGE`), ``failure_after_message``
+    (this reply), ``failure_before_question`` (the question that reply
+    was answering, or :data:`FLAG_NO_PRIOR_QUESTION`) and
+    ``failure_after_question`` (the question this reply is answering).
+    The line itself stays in ``content``; the agent loaders
+    return that text, not this metadata, and they never return a Settings
+    dict.
+    """
     meta: dict[str, Any] = {"kind": kind}
     if snapshot_id:
         meta["snapshot_id"] = snapshot_id
     if gaze is not None:
         meta["gaze"] = gaze
+    if failure is not None:
+        meta["failure"] = failure
+        meta["flagged_for"] = ["analyst", "user"]
+        meta["failure_before_message"] = (
+            failure_before if failure_before is not None else FLAG_NO_PRIOR_MESSAGE
+        )
+        meta["failure_after_message"] = (
+            failure_after if failure_after is not None else content
+        )
+        meta["failure_before_question"] = (
+            failure_before_question if failure_before_question is not None
+            else FLAG_NO_PRIOR_QUESTION
+        )
+        meta["failure_after_question"] = failure_after_question or ""
     return await client.short_term.add_message(
         session_id=session_id, role="assistant", content=content, metadata=meta
     )
@@ -759,11 +798,11 @@ CONVERSATION_RECENT = 7
 CONVERSATION_SEMANTIC = 2
 
 
-def _message_gaze(raw: Any) -> dict[str, Any] | None:
-    """The gaze trace in a message's stored metadata, or None.
+def _metadata_dict(raw: Any) -> dict[str, Any] | None:
+    """Message metadata as a dict. NAMS stores it as a JSON string.
 
-    NAMS keeps metadata as a JSON string. A message written before
-    traces existed, or by a mode that stores none, has no ``gaze`` key.
+    Bad JSON or a non-dict is None. Callers that require the metadata
+    raise themselves.
     """
     if not raw:
         return None
@@ -774,6 +813,18 @@ def _message_gaze(raw: Any) -> dict[str, Any] | None:
         except ValueError:
             return None
     if not isinstance(meta, dict):
+        return None
+    return meta
+
+
+def _message_gaze(raw: Any) -> dict[str, Any] | None:
+    """The gaze trace in a message's stored metadata, or None.
+
+    A message written before traces existed, or by a mode that stores
+    none, has no ``gaze`` key.
+    """
+    meta = _metadata_dict(raw)
+    if meta is None:
         return None
     gaze = meta.get("gaze")
     return gaze if isinstance(gaze, dict) else None
@@ -859,6 +910,10 @@ async def load_played_messages(
     Each row has ``id``, ``role``, ``content``, ``timestamp`` and
     ``gaze``: the gaze trace stored with an assistant reply (None when
     it has none), which play replays on the reply's tokens.
+
+    A ``[FLAG failure: ...]`` line is ordinary ``content``. This load
+    does not add image paths or a Settings dict. Boards are
+    :func:`load_played_images`.
     """
     if recent_window < 1:
         raise ValueError(f"recent_window must be >= 1, got {recent_window}")
@@ -889,6 +944,255 @@ async def load_played_messages(
                 have.add(hid)
     chosen.sort(key=lambda item: item["timestamp"])
     return chosen
+
+
+def board_image_entries(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """``{role, path}`` for one message's snapshots, ``before`` then ``after``.
+
+    Settings keys are dropped. A row missing ``role`` or ``path`` raises.
+    """
+    entries: list[dict[str, str]] = []
+    for row in rows:
+        role = row.get("role")
+        path = row.get("path")
+        if not role or not path:
+            raise RuntimeError(
+                f"board snapshot is missing role or path: role={role!r} path={path!r}"
+            )
+        entries.append({"role": str(role), "path": str(path)})
+    entries.sort(key=lambda item: (
+        0 if item["role"] == "before" else 1 if item["role"] == "after" else 2,
+        item["role"],
+        item["path"],
+    ))
+    return _strip_settings(entries)
+
+
+async def _message_image_rows(
+    client: Any, session_id: str, message_ids: list[str],
+) -> dict[str, list[dict[str, str]]]:
+    """Before/after PNG paths for messages in this session. No settings."""
+    if not message_ids:
+        return {}
+    rows = await client.query.cypher(
+        "MATCH (c:Conversation {session_id: $sid})-[:HAS_MESSAGE]->(m:Message) "
+        "MATCH (m)-[r:CAPTURED_STATE]->(s:GameSnapshot) "
+        "WHERE m.id IN $ids "
+        "RETURN m.id AS id, r.role AS role, s.path AS path",
+        {"sid": session_id, "ids": list(message_ids)},
+    )
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows or []:
+        mid = row.get("id")
+        if not mid:
+            raise RuntimeError(
+                f"session {session_id} snapshot row has no message id"
+            )
+        grouped.setdefault(str(mid), []).append({
+            "role": row.get("role"),
+            "path": row.get("path"),
+        })
+    return {mid: board_image_entries(items) for mid, items in grouped.items()}
+
+
+async def load_played_images(
+    client: Any,
+    session_id: str,
+    query: str,
+    recent_window: int = CONVERSATION_RECENT,
+    semantic_extra: int = CONVERSATION_SEMANTIC,
+) -> list[dict[str, Any]]:
+    """:func:`load_played_messages`, plus each row's board images.
+
+    Same messages, same text, same gaze. ``images`` is a list of
+    ``{role, path}`` for PNGs linked to that message (``before`` then
+    ``after``), empty when it has none. Settings are not included.
+    ``load_played_full`` is not this and is not defined here.
+    """
+    messages = await load_played_messages(
+        client, session_id, query, recent_window, semantic_extra,
+    )
+    if not messages:
+        return []
+    images = await _message_image_rows(
+        client, session_id, [item["id"] for item in messages],
+    )
+    out: list[dict[str, Any]] = []
+    for item in messages:
+        row = dict(item)
+        row["images"] = images.get(item["id"], [])
+        out.append(_strip_settings(row))
+    return out
+
+
+def group_flagged_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Flagged messages from one session's message/snapshot rows.
+
+    Oldest first, in the order the rows arrive. A message is flagged when
+    its metadata has a non-empty ``failure`` string. Each result has
+    ``before_message`` (the reply the flag is about, or
+    :data:`FLAG_NO_PRIOR_MESSAGE`) and ``after_message`` (the reply that
+    contains the flag). ``before`` and ``after`` are the pictures those
+    replies saw: ``{"path", "settings"}``, or ``{"error": ...}`` when the
+    prior picture does not exist. This is for a person looking at the
+    game. It is not an agent load, and it does not strip settings.
+
+    The flagging reply's picture is required. A real prior message with
+    no picture raises. An unflagged message's snapshots are ignored.
+    """
+    order: list[str] = []
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        mid = row.get("id")
+        if not mid:
+            raise RuntimeError("flagged-memory row has no message id")
+        mid = str(mid)
+        if mid not in grouped:
+            if row.get("timestamp") is None:
+                raise RuntimeError(f"message {mid} has no timestamp")
+            meta = _metadata_dict(row.get("metadata")) or {}
+            failure = meta.get("failure")
+            content = str(row.get("content") or "")
+            before_message = meta.get("failure_before_message")
+            after_message = meta.get("failure_after_message")
+            before_question = meta.get("failure_before_question")
+            after_question = meta.get("failure_after_question")
+            grouped[mid] = {
+                "id": mid,
+                "content": content,
+                "failure": failure if isinstance(failure, str) and failure else None,
+                "before_message": (
+                    before_message if isinstance(before_message, str) and before_message
+                    else FLAG_NO_PRIOR_MESSAGE
+                ),
+                "after_message": (
+                    after_message if isinstance(after_message, str) and after_message
+                    else content
+                ),
+                "before_question": (
+                    before_question if isinstance(before_question, str) and before_question
+                    else FLAG_NO_PRIOR_QUESTION
+                ),
+                "after_question": (
+                    after_question if isinstance(after_question, str) else ""
+                ),
+                "sides": {},
+            }
+            order.append(mid)
+        role = row.get("role")
+        if not role or not grouped[mid]["failure"]:
+            continue
+        role = str(role)
+        if role not in ("before", "after"):
+            continue
+        path = row.get("path")
+        settings = row.get("settings_json")
+        if not path or settings is None or settings == "":
+            raise RuntimeError(
+                f"message {mid} snapshot {role} is missing path or settings"
+            )
+        sides = grouped[mid]["sides"]
+        if role in sides:
+            raise RuntimeError(f"message {mid} has two {role} snapshots")
+        sides[role] = {"path": str(path), "settings": str(settings)}
+    out: list[dict[str, Any]] = []
+    for mid in order:
+        item = grouped[mid]
+        if not item["failure"]:
+            continue
+        sides = item["sides"]
+        if "after" not in sides:
+            raise RuntimeError(
+                f"flagged message {mid} is missing the picture it saw"
+            )
+        if "before" in sides:
+            before = sides["before"]
+        elif item["before_message"] == FLAG_NO_PRIOR_MESSAGE:
+            before = {
+                "error": FLAG_NO_PRIOR_IMAGE,
+                "settings": FLAG_NO_PRIOR_SETTINGS,
+            }
+        else:
+            raise RuntimeError(
+                f"flagged message {mid} names a prior reply and has no picture of it"
+            )
+        out.append({
+            "id": mid,
+            "content": item["content"],
+            "failure": item["failure"],
+            "before_message": item["before_message"],
+            "after_message": item["after_message"],
+            "before_question": item["before_question"],
+            "after_question": item["after_question"],
+            "before": before,
+            "after": sides["after"],
+        })
+    return out
+
+
+async def load_flagged_memories(
+    client: Any, session_id: str,
+) -> list[dict[str, Any]]:
+    """Every flagged reply in this session, oldest first.
+
+    For the person watching the game. The agent prompt does not call
+    this. Rows are :func:`group_flagged_rows`: message text, both board
+    paths, and both Settings JSON texts.
+    """
+    rows = await client.query.cypher(
+        "MATCH (c:Conversation {session_id: $sid})-[:HAS_MESSAGE]->(m:Message) "
+        "OPTIONAL MATCH (m)-[r:CAPTURED_STATE]->(s:GameSnapshot) "
+        "RETURN m.id AS id, m.content AS content, m.timestamp AS timestamp, "
+        "m.metadata AS metadata, r.role AS role, s.path AS path, "
+        "s.settings_json AS settings_json "
+        "ORDER BY m.timestamp ASC",
+        {"sid": session_id},
+    )
+    return group_flagged_rows(list(rows or []))
+
+
+async def load_all_flagged(client: Any) -> list[dict[str, Any]]:
+    """Every flagged reply in the database, oldest first, numbered.
+
+    One list across every game. ``n`` runs ``0 .. N-1``. Each row is a
+    :func:`group_flagged_rows` row plus ``session_id``, ``timestamp``,
+    and ``gaze`` (the BEFORE message's trace, the reply that acted).
+    The player prompt
+    never calls this.
+    """
+    rows = await client.query.cypher(
+        "MATCH (c:Conversation)-[:HAS_MESSAGE]->(m:Message) "
+        "WHERE m.metadata CONTAINS '\"failure\"' "
+        "OPTIONAL MATCH (c)-[:HAS_MESSAGE]->(prev:Message) "
+        "WHERE prev.role = 'assistant' AND prev.timestamp < m.timestamp "
+        "WITH c, m, prev "
+        "ORDER BY prev.timestamp DESC "
+        "WITH c, m, collect(prev)[0] AS before_msg "
+        "OPTIONAL MATCH (m)-[r:CAPTURED_STATE]->(s:GameSnapshot) "
+        "RETURN c.session_id AS session_id, m.id AS id, m.content AS content, "
+        "m.timestamp AS timestamp, m.metadata AS metadata, "
+        "before_msg.metadata AS before_metadata, r.role AS role, "
+        "s.path AS path, s.settings_json AS settings_json "
+        "ORDER BY m.timestamp ASC",
+    )
+    raw = list(rows or [])
+    extra: dict[str, dict[str, Any]] = {}
+    for row in raw:
+        mid = str(row.get("id") or "")
+        if not mid or mid in extra:
+            continue
+        extra[mid] = {
+            "session_id": str(row.get("session_id") or ""),
+            "timestamp": row.get("timestamp"),
+            "gaze": _message_gaze(row.get("before_metadata")),
+        }
+    out: list[dict[str, Any]] = []
+    for n, item in enumerate(group_flagged_rows(raw)):
+        row = dict(item)
+        row.update(extra.get(str(item["id"]), {}))
+        row["n"] = n
+        out.append(row)
+    return out
 
 
 # --------------------------------------------------------------------- tips
@@ -947,6 +1251,10 @@ def _core_tip_seed_for_prefix(prefix: str) -> list[tuple[str, str]]:
         return list(modes.CORE_PLAYER_TIPS)
     if prefix == "core_analyst_":
         return list(modes.CORE_ANALYST_TIPS)
+    if prefix == "core_s2_":
+        return list(modes.CORE_S2_TIPS)
+    if prefix == "core_fa_":
+        return list(modes.CORE_FAILURE_ANALYST_TIPS)
     raise ValueError(f"unknown core-tip prefix {prefix!r}")
 
 
@@ -1085,7 +1393,33 @@ async def ensure_core_tips(client: Any) -> dict[str, int]:
             healed += 1
         else:
             unchanged += 1
-    for prefix in ("core_player_", "core_analyst_"):
+    for category, text in modes.CORE_FAILURE_ANALYST_TIPS:
+        if ANALYST_TAG in text:
+            raise RuntimeError(
+                f"core failure-analyst tip {category} contains {ANALYST_TAG}; "
+                "failure-analyst seed text must be stored untagged"
+            )
+        status = await _upsert_core_tip(client, category, text)
+        if status == "added":
+            added += 1
+        elif status == "healed":
+            healed += 1
+        else:
+            unchanged += 1
+    for category, text in modes.CORE_S2_TIPS:
+        if ANALYST_TAG in text:
+            raise RuntimeError(
+                f"core s2 tip {category} contains {ANALYST_TAG}; "
+                "s2 seed text must be stored untagged"
+            )
+        status = await _upsert_core_tip(client, category, text)
+        if status == "added":
+            added += 1
+        elif status == "healed":
+            healed += 1
+        else:
+            unchanged += 1
+    for prefix in ("core_player_", "core_analyst_", "core_s2_", "core_fa_"):
         expected = {c for c, _ in _core_tip_seed_for_prefix(prefix)}
         found = set(await _core_tip_categories(client, prefix))
         for cat in _unexpected_core_tip_categories(prefix, expected, found):
@@ -1108,24 +1442,42 @@ async def ensure_core_tips(client: Any) -> dict[str, int]:
     }
 
 
-# Category shape shared with t1: core_(player|analyst)_NNN_slug, NNN zero-padded.
-_CORE_TIP_CAT_RE = re.compile(r"^core_(player|analyst)_(\d{3})_[a-z0-9_]+$")
+# Category shape shared with t1: core_(player|analyst|s2|fa)_NNN_slug.
+_CORE_TIP_CAT_RE = re.compile(
+    r"^core_(player|analyst|s2|fa)_(\d{3})_[a-z0-9_]+$"
+)
+
+_CORE_TIP_PREFIX_ROLE = {
+    "core_player_": "player",
+    "core_analyst_": "analyst",
+    "core_s2_": "s2",
+    "core_fa_": "fa",
+}
+
+
+def _core_tip_prefix(category: str) -> str:
+    """The namespace prefix of one core-tip category, or a ValueError."""
+    for prefix in _CORE_TIP_PREFIX_ROLE:
+        if category.startswith(prefix):
+            return prefix
+    raise ValueError(f"not a core-tip category: {category!r}")
 
 
 def _is_agent_written_core_tip(prefix: str, category: str) -> bool:
     """True for a well-formed extra in the reserved 500+ range under
-    ``prefix`` (``core_player_`` / ``core_analyst_``). Seed numbers stay
-    below 500; this is the gate that lets agent-written rows into the
-    dump without treating them as graph corruption."""
-    m = _CORE_TIP_CAT_RE.match(category)
-    if not m:
+    ``prefix`` (``core_player_`` / ``core_analyst_`` / ``core_s2_`` /
+    ``core_fa_``).
+    Seed numbers stay below 500; this is the gate that lets agent-written
+    rows into the dump without treating them as graph corruption."""
+    match = _CORE_TIP_CAT_RE.match(category)
+    if not match:
         return False
-    role = "player" if prefix == "core_player_" else "analyst"
-    if m.group(1) != role:
+    role = _CORE_TIP_PREFIX_ROLE.get(prefix)
+    if role is None or match.group(1) != role:
         return False
     if not category.startswith(prefix):
         return False
-    return int(m.group(2)) >= 500
+    return int(match.group(2)) >= 500
 
 
 def _unexpected_core_tip_categories(
@@ -1155,7 +1507,7 @@ async def _core_tip_categories(client: Any, prefix: str) -> list[str]:
 
 async def get_core_tips(client: Any, prefix: str) -> dict[str, str]:
     """Exact fetch of one core-tip namespace. ``prefix`` is
-    ``core_player_`` or ``core_analyst_``.
+    ``core_player_``, ``core_analyst_``, ``core_s2_``, or ``core_fa_``.
 
     Seed categories must all be present (missing / duplicated rows
     raise). Well-formed extras in the 500+ range are kept and sorted
@@ -1201,6 +1553,124 @@ async def get_core_tips(client: Any, prefix: str) -> dict[str, str]:
     return found
 
 
+def _s2_tip_slug(text: str) -> str:
+    """The first four words of a tip, lowercased, as a category slug.
+
+    Non-letters become ``_``. Longer than 24 characters is cut. An empty
+    result raises: the category regex would reject it.
+    """
+    words = text.lower().split()[:4]
+    slug = re.sub(r"[^a-z0-9]+", "_", " ".join(words)).strip("_")[:24].strip("_")
+    if not slug or not re.fullmatch(r"[a-z0-9_]+", slug):
+        raise ValueError(f"tip {text!r} has no usable slug")
+    return slug
+
+
+def _require_s2_tip_line(text: str) -> str:
+    """One non-empty line. A blank or a newline raises."""
+    cleaned = text.strip()
+    if not cleaned or "\n" in cleaned:
+        raise ValueError("an S2 tip is one non-empty line")
+    return cleaned
+
+
+async def _next_s2_tip_number(client: Any) -> int:
+    """One past the highest saved ``core_s2_`` number, or 500 if none.
+
+    Uses the maximum, not a count, so deleting a row does not reuse its
+    number and collide with a row that is still there. 999 is the last
+    three-digit number; the next one raises.
+    """
+    rows = await client.query.cypher(
+        "MATCH (p:Preference) WHERE p.category STARTS WITH 'core_s2_' "
+        "RETURN p.category AS category",
+        {},
+    ) or []
+    highest = 499
+    for row in rows:
+        category = dict(row).get("category") or ""
+        match = _CORE_TIP_CAT_RE.match(category)
+        if match is None or match.group(1) != "s2":
+            continue
+        number = int(match.group(2))
+        if number >= 500:
+            highest = max(highest, number)
+    nxt = highest + 1
+    if nxt > 999:
+        raise RuntimeError("no free core_s2_ tip number; 500-999 are full")
+    return nxt
+
+
+async def add_s2_tip(client: Any, text: str) -> str:
+    """Store one S2 tip and return its category. The tool names the row.
+
+    The category is ``core_s2_{n}_{slug}`` with ``n`` from
+    :func:`_next_s2_tip_number`. The write is re-read and must match
+    byte for byte.
+    """
+    cleaned = _require_s2_tip_line(text)
+    number = await _next_s2_tip_number(client)
+    category = f"core_s2_{number:03d}_{_s2_tip_slug(cleaned)}"
+    if _CORE_TIP_CAT_RE.match(category) is None:
+        raise RuntimeError(f"tip category {category!r} is not well-formed")
+    await client.long_term.add_preference(
+        category=category, preference=cleaned,
+    )
+    await _assert_preference_text(client, category, cleaned)
+    logger.info("S2 tip saved: [%s] %s", category, cleaned)
+    return category
+
+
+async def replace_core_tip(client: Any, category: str, text: str) -> None:
+    """Replace one agent-written tip. A seed category raises.
+
+    Delete then add, never ``SET p.preference``: a raw property write
+    leaves the embedding stale.
+    """
+    prefix = _core_tip_prefix(category)
+    if not _is_agent_written_core_tip(prefix, category):
+        raise ValueError(
+            f"{category} is a seed tip; change it in the code seed"
+        )
+    cleaned = _require_s2_tip_line(text)
+    await client.graph.execute_write(
+        "MATCH (p:Preference {category: $cat}) DETACH DELETE p",
+        {"cat": category},
+    )
+    await client.long_term.add_preference(
+        category=category, preference=cleaned,
+    )
+    await _assert_preference_text(client, category, cleaned)
+
+
+async def delete_core_tip(client: Any, category: str) -> None:
+    """Delete one agent-written tip. A seed category raises."""
+    prefix = _core_tip_prefix(category)
+    if not _is_agent_written_core_tip(prefix, category):
+        raise ValueError(
+            f"{category} is a seed tip; change it in the code seed"
+        )
+    await client.graph.execute_write(
+        "MATCH (p:Preference {category: $cat}) DETACH DELETE p",
+        {"cat": category},
+    )
+
+
+async def list_saved_s2_tips(client: Any) -> list[dict[str, str]]:
+    """Saved S2 tips, oldest number first. Each row is category and text.
+
+    Seed rows are not included. For the play notebook's Tips panel.
+    """
+    found = await get_core_tips(client, "core_s2_")
+    rows = [
+        {"category": category, "text": text}
+        for category, text in found.items()
+        if _is_agent_written_core_tip("core_s2_", category)
+    ]
+    rows.sort(key=lambda item: item["category"])
+    return rows
+
+
 # ------------------------- session notes (scratchpad)
 
 async def set_session_note(
@@ -1244,6 +1714,22 @@ async def get_session_notes(client: Any, session_id: str) -> list[dict]:
         result=notes,
     )
     return notes
+
+
+async def delete_session_note(client: Any, session_id: str, key: str) -> None:
+    """Delete one scratchpad note. Exact key. A missing note is a no-op.
+
+    Write failures log at WARNING and re-raise.
+    """
+    try:
+        await client.graph.execute_write(
+            "MATCH (n:SessionNote {session_id: $sid, key: $key}) "
+            "DETACH DELETE n",
+            {"sid": session_id, "key": key},
+        )
+    except Exception as exc:
+        logger.warning("delete_session_note failed: %s", exc)
+        raise
 
 
 async def clear_session_notes(client: Any, session_id: str) -> None:

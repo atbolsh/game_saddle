@@ -1794,12 +1794,16 @@ def t1_pure() -> str:
         find_bare_move,
         find_invalid_move_token,
         new_multi_gold_game,
+        parse_failure_flags,
         parse_move,
         parse_remember_notes,
         truncate_at_first_move_token,
     )
     from agent.memory import (
+        _strip_settings,
+        board_image_entries,
         format_notepad,
+        group_flagged_rows,
         retrieve_context,
         retrieval_enabled,
     )
@@ -1871,6 +1875,139 @@ def t1_pure() -> str:
         )
     ) == [("a", "b")]
     checks += 1
+    # [FLAG failure: note] is a fixed key. ] ends the note. It is not a
+    # notepad write, and a different key does not match.
+    assert parse_failure_flags(
+        "missed.\n[FLAG failure: expected the gold, the move did not eat]"
+    ) == [("failure", "expected the gold, the move did not eat")]
+    checks += 1
+    assert parse_failure_flags(
+        "[FLAG failure: first] then [FLAG failure: second]"
+    ) == [("failure", "first"), ("failure", "second")]
+    checks += 1
+    assert parse_failure_flags("[FLAG failure: keep]drop]") == [("failure", "keep")]
+    checks += 1
+    assert parse_failure_flags("[FLAG failure:   padded  ]") == [("failure", "padded")]
+    checks += 1
+    assert parse_failure_flags(
+        "[FLAG other: x] [FLAG Failure: y] [REMEMBER target: z] [FLAG failure:]"
+    ) == []
+    checks += 1
+    assert parse_failure_flags("[FLAG failure: a\nb]") == []
+    checks += 1
+    images = board_image_entries([
+        {"role": "after", "path": "b.png", "settings_json": "{\"gold\": []}"},
+        {"role": "before", "path": "a.png", "settings": {"walls": []}, "gold": []},
+    ])
+    assert images == [
+        {"role": "before", "path": "a.png"},
+        {"role": "after", "path": "b.png"},
+    ]
+    checks += 1
+    try:
+        board_image_entries([{"role": "before"}])
+    except RuntimeError:
+        checks += 1
+    else:
+        raise AssertionError("a snapshot row with no path must raise")
+    hidden = _strip_settings({
+        "content": "[FLAG failure: missed the gold]",
+        "settings_json": "{}",
+        "images": [{"role": "before", "path": "a.png", "settings_json": "{}"}],
+        "gaze": {"v": 1, "prefill": [0.0, 0.0, 0.5, 0.5]},
+    })
+    assert "settings_json" not in hidden
+    assert hidden["images"] == [{"role": "before", "path": "a.png"}]
+    assert hidden["content"] == "[FLAG failure: missed the gold]"
+    assert hidden["gaze"]["prefill"] == [0.0, 0.0, 0.5, 0.5]
+    checks += 1
+    flagged = group_flagged_rows([
+        {
+            "id": "m1", "content": "looked", "timestamp": 1,
+            "metadata": "{}", "role": None, "path": None, "settings_json": None,
+        },
+        {
+            "id": "m2", "content": "[FLAG failure: missed the gold]",
+            "timestamp": 2,
+            "metadata": '{"failure": "missed the gold", "flagged_for": ["analyst", "user"]}',
+            "role": "after", "path": "b.png",
+            "settings_json": '{"agent_x": 0.2}',
+        },
+        {
+            "id": "m2", "content": "[FLAG failure: missed the gold]",
+            "timestamp": 2,
+            "metadata": '{"failure": "missed the gold"}',
+            "role": "before", "path": "a.png",
+            "settings_json": '{"agent_x": 0.1}',
+        },
+    ])
+    assert flagged == [{
+        "id": "m2",
+        "content": "[FLAG failure: missed the gold]",
+        "failure": "missed the gold",
+        "before_message": "[ERROR, no prior message]",
+        "after_message": "[FLAG failure: missed the gold]",
+        "before_question": "[ERROR, no prior question]",
+        "after_question": "",
+        "before": {"path": "a.png", "settings": '{"agent_x": 0.1}'},
+        "after": {"path": "b.png", "settings": '{"agent_x": 0.2}'},
+    }]
+    checks += 1
+    first = group_flagged_rows([{
+        "id": "m0",
+        "content": "[FLAG failure: too soon]",
+        "timestamp": 1,
+        "metadata": (
+            '{"failure": "too soon", '
+            '"failure_before_message": "[ERROR, no prior message]", '
+            '"failure_after_message": "[FLAG failure: too soon]"}'
+        ),
+        "role": "after", "path": "now.png", "settings_json": "{}",
+    }])
+    assert first[0]["before_message"] == "[ERROR, no prior message]"
+    assert first[0]["after_message"] == "[FLAG failure: too soon]"
+    assert first[0]["before_question"] == "[ERROR, no prior question]"
+    assert first[0]["after_question"] == ""
+    asked = group_flagged_rows([
+        {
+            "id": "m4",
+            "content": "[FLAG failure: missed]",
+            "timestamp": 1,
+            "metadata": (
+                '{"failure": "missed", '
+                '"failure_before_question": "Move to your target.", '
+                '"failure_after_question": "What happened?", '
+                '"failure_before_message": "I move.", '
+                '"failure_after_message": "[FLAG failure: missed]"}'
+            ),
+            "role": "after", "path": "now.png", "settings_json": "{}",
+        },
+        {
+            "id": "m4",
+            "content": "[FLAG failure: missed]",
+            "timestamp": 1,
+            "metadata": "{}",
+            "role": "before", "path": "then.png", "settings_json": "{}",
+        },
+    ])
+    assert asked[0]["before_question"] == "Move to your target."
+    assert asked[0]["after_question"] == "What happened?"
+    assert first[0]["before"] == {
+        "error": "[ERROR, no prior image]",
+        "settings": "[ERROR, no prior settings]",
+    }
+    assert first[0]["after"]["path"] == "now.png"
+    checks += 1
+    try:
+        group_flagged_rows([{
+            "id": "m3", "content": "[FLAG failure: x]", "timestamp": 1,
+            "metadata": '{"failure": "x"}',
+            "role": "before", "path": "a.png", "settings_json": "{}",
+        }])
+    except RuntimeError:
+        checks += 1
+    else:
+        raise AssertionError("a flagged message with no after board must raise")
     eaten = board_update_line("FORWARD", 1, 2)
     assert "[FORWARD]" in eaten and "2 gold(s)" in eaten
     assert "[REMEMBER target:" in eaten
@@ -2046,11 +2183,13 @@ def t1_pure() -> str:
     from agent.memory import ANALYST_TAG, tag_analyst_text, untag_analyst_text
 
     import re as _re
-    cat_re = _re.compile(r"^core_(player|analyst)_(\d{3})_[a-z0-9_]+$")
+    cat_re = _re.compile(r"^core_(player|analyst|s2|fa)_(\d{3})_[a-z0-9_]+$")
     seen_cats: set[str] = set()
     for table, role in (
         (modes.CORE_PLAYER_TIPS, "player"),
         (modes.CORE_ANALYST_TIPS, "analyst"),
+        (modes.CORE_S2_TIPS, "s2"),
+        (modes.CORE_FAILURE_ANALYST_TIPS, "fa"),
     ):
         for cat, text in table:
             m = cat_re.match(cat)
@@ -2120,6 +2259,39 @@ def t1_pure() -> str:
     assert not _is_agent_written_core_tip("core_player_", "core_player_110_search_tool")
     assert not _is_agent_written_core_tip("core_player_", "core_analyst_500_note")
     assert not _is_agent_written_core_tip("core_player_", "tip_learned_1")
+    assert _is_agent_written_core_tip("core_s2_", "core_s2_500_note")
+    assert not _is_agent_written_core_tip("core_s2_", "core_player_500_note")
+    assert _is_agent_written_core_tip("core_fa_", "core_fa_500_note")
+    assert not _is_agent_written_core_tip("core_fa_", "core_s2_500_note")
+    assert modes.assemble_tip_prompt(
+        dict(modes.CORE_S2_TIPS), "core_s2_", modes.S2_SAVED_TIPS_HEADING,
+    ) == modes.SYSTEM_PROMPT_S2
+    assert modes.assemble_s2_prompt(dict(modes.CORE_S2_TIPS)) == modes.SYSTEM_PROMPT_S2
+    assert modes.assemble_tip_prompt(
+        dict(modes.CORE_FAILURE_ANALYST_TIPS), "core_fa_", None,
+    ) == modes.SYSTEM_PROMPT_FAILURE_ANALYST
+    saved = dict(modes.CORE_S2_TIPS)
+    saved["core_s2_500_x"] = "aim again after a miss"
+    assembled = modes.assemble_s2_prompt(saved)
+    assert assembled.startswith(modes.SYSTEM_PROMPT_S2 + "\n\n" + modes.S2_SAVED_TIPS_HEADING)
+    assert assembled.endswith("\n  aim again after a miss")
+    from agent.game_io import parse_tip_lines
+    assert parse_tip_lines("[TIP: keep the target]") == ["keep the target"]
+    assert parse_tip_lines("[TIP: keep]drop]") == ["keep"]
+    assert parse_tip_lines("[TIP: a\nb]") == []
+    assert parse_tip_lines("[REMEMBER target: x] [FLAG failure: y]") == []
+    from pathlib import Path as _Path
+    _root = _Path(__file__).resolve().parents[1]
+    for _rel in (
+        "neural_net/s2_session.py",
+        "notebooks/play.ipynb",
+        "notebooks/testing_s2.ipynb",
+        "notebooks/testing_learn_to_look.ipynb",
+        "agent/analyst.py",
+        "notebooks/analyst.ipynb",
+    ):
+        _text = (_root / _rel).read_text()
+        assert "SYSTEM_PROMPT_S2" not in _text, _rel
     assert _unexpected_core_tip_categories(
         "core_player_",
         {"core_player_010_x"},
@@ -2129,6 +2301,83 @@ def t1_pure() -> str:
             "core_player_500_note",
         },
     ) == ["core_player_030_scene_scope"]
+    from agent.analyst import (
+        format_gaze_summary,
+        format_gaze_window,
+        image_cap_refusal,
+        parse_analyst_call,
+    )
+    from agent.game_io import fmt3
+    assert fmt3(0.5) == "0.500"
+    assert fmt3((0.1, 2)) == ["0.100", 2]
+    assert fmt3({
+        "gameSize": 768, "name": "room", "agent_x": 0.5,
+        "gold": [[0.25, 1.0]],
+    }) == {
+        "gameSize": 768, "name": "room", "agent_x": "0.500",
+        "gold": [["0.250", "1.000"]],
+    }
+    assert parse_analyst_call("[LOAD 7: bs as]")[0] == {
+        "tool": "LOAD", "n": 7, "parts": ["bs", "as"],
+    }
+    assert parse_analyst_call("[DROP ALL]")[0] == {
+        "tool": "DROP", "n": None, "parts": None,
+    }
+    assert parse_analyst_call("[GAZE 3]")[0] == {
+        "tool": "GAZE", "n": 3, "window": None,
+    }
+    assert parse_analyst_call("[GAZE 3: 8-13]")[0]["window"] == ("range", 8, 13)
+    assert parse_analyst_call("[GAZE 3: -5]")[0]["window"] == ("tail", 5, None)
+    assert parse_analyst_call("[NOTE k: v]")[0] == {
+        "tool": "NOTE", "key": "k", "text": "v",
+    }
+    assert parse_analyst_call("[ load 7 : bs as ]")[0]["parts"] == ["bs", "as"]
+    assert parse_analyst_call("no tool")[0] is None
+    loaded = {3: {"bi", "ai"}, 7: {"bi", "ai"}}
+    refusal = image_cap_refusal(loaded, 8, {"bi"}, cap=4)
+    assert refusal == (
+        "4 images are loaded: 3 before, 3 after, 7 before, 7 after. "
+        "Drop one first."
+    )
+    assert image_cap_refusal({1: {"bi"}}, 2, {"bi"}, cap=4) is None
+    gaze_text = "right gold]\nmove there.\n[MOVE]"
+    pieces = ["right gold]", "\n", "move there.", "\n", "[MOVE]"]
+    spans = []
+    cursor = 0
+    for piece in pieces:
+        spans.append([cursor, cursor + len(piece)])
+        cursor += len(piece)
+    reads = [
+        [0.1, 0.2, 0.3, 0.4],
+        [0.1, 0.2, 0.0, 0.0],
+        [0.5, 0.5, 0.6994, 0.4212],
+        [0.1, 0.2, 0.0, 0.0],
+        [0.51234, 0.30111, 0.70049, 0.42001],
+    ]
+    trace = {
+        "v": 1,
+        "chars": len(gaze_text),
+        "prefill": [0.51234, 0.3006, 0.4982, 0.2874],
+        "spans": spans,
+        "reads": reads,
+    }
+    summary = format_gaze_summary(3, gaze_text, trace)
+    assert summary.splitlines()[0] == "gaze, memory 3, BEFORE message (5 tokens):"
+    assert 'line 1 "right gold]"' in summary
+    assert 'line 2 "move there."' in summary
+    assert 'line 3 "[MOVE]"' in summary
+    assert "s=(0.512, 0.301)" in summary
+    assert "v=(0.700, 0.420)" in summary
+    assert summary.endswith("On a move, S1 walked toward that v.")
+    window = format_gaze_window(3, gaze_text, trace, ("range", 8, 13))
+    assert "clipped to nothing; that range is past the end." in window
+    shown = format_gaze_window(3, gaze_text, trace, ("range", 2, 13))
+    assert "tokens 2-4 of 5:" in shown
+    assert "clipped to 2-4 of 5." in shown
+    assert "(0.699, 0.421)" in shown
+    tail = format_gaze_window(3, gaze_text, trace, ("tail", 2, None))
+    assert "tokens 3-4 of 5:" in tail
+    assert "clipped" not in tail
     checks += 1
 
     analyst_cats = {c for c, _ in modes.CORE_ANALYST_TIPS}

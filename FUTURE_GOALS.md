@@ -282,7 +282,13 @@ Still open:
 * drop the player-facing "END_GAME is not available in this mode" notice
   on the sealed smoke path (still correct there).
 
-## 11. Agent-written core tips (the "always after" plan) — *Not started*
+## 11. Agent-written core tips (the "always after" plan) — *In progress*
+
+S2 play writes with `add_s2_tip`: a `[TIP: one line]` in a reply is
+stored as `core_s2_5NN_<slug>`, and `assemble_s2_prompt` puts those rows
+after the seed. The play notebook can edit and delete them. The failure
+analyst's `[NOTE]` is a scratchpad on that conversation, not a tip. The
+analyst tip-writing tool is still the remaining work.
 
 A future tool will let the player and the analyst write their own core
 tips into the same substrate the system prompts load from
@@ -301,7 +307,8 @@ gates (category prefix and `[ANALYST]` text scrub) hold; player-authored
 tips stay untagged.
 
 `get_core_tips` already keeps well-formed extras in the 500+ range.
-The remaining work is the writing tool itself.
+The S2 writing tool is `add_s2_tip`. The analyst writing tool is the
+remaining work.
 
 Trigger to pick it up: player-written `tip_learned_*` tips seeing real
 use (2026-08-19 discussion).

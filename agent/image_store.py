@@ -49,6 +49,14 @@ def snapshot_id() -> str:
     return uuid.uuid4().hex
 
 
+def _save_frame_png(frame: Any, path: Path) -> tuple[int, int]:
+    """Write an HxWx3 RGB array. ``Image.fromarray`` raises when it is not one."""
+    img = Image.fromarray(frame, mode="RGB")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(path)
+    return img.size
+
+
 async def store_snapshot(
     client: Any,
     session_id: str,
@@ -58,18 +66,27 @@ async def store_snapshot(
     cfg: AgentConfig | None = None,
     label: str = "step",
     extra: dict[str, Any] | None = None,
+    frame: Any = None,
 ) -> tuple[str, dict[str, Any]]:
-    """Render the current game frame to disk, write a ``GameSnapshot`` node
-    to Neo4j, and return ``(path, node_dict)``.
+    """Write a ``GameSnapshot`` node and return ``(path, node_dict)``.
 
     ``client`` is a NAMS ``MemoryClient`` with a bolt backend (so
     ``client.graph.execute_write`` is available).
+
+    The PNG is ``render_frame_png(game)`` unless ``frame`` is an HxWx3 RGB
+    array, in which case that array is the PNG and ``game`` is not drawn.
+    ``settings_dict`` is stored either way, as ``settings_json``.
     """
     cfg = cfg or CONFIG
     img_root = Path(cfg.image_dir)
     rel_path = img_root / session_id / f"{sid}.png"
     abs_path = rel_path.resolve()
-    width, height = render_frame_png(game, abs_path)
+    if frame is None:
+        if game is None:
+            raise ValueError("store_snapshot requires a game when frame is omitted")
+        width, height = render_frame_png(game, abs_path)
+    else:
+        width, height = _save_frame_png(frame, abs_path)
     thumb_b64 = make_thumbnail_b64(abs_path, size=64)
     # Store a relative-ish path so the DB is portable across hosts.
     path_str = str(rel_path)

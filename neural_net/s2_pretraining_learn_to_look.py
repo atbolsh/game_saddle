@@ -46,6 +46,7 @@ from agent import memory as mem
 from agent.config import CONFIG
 from agent.game_io import compose_s2_question
 from agent.modes import (
+    CORE_S2_TIPS,
     S2_BEGINNING_MOVE_USER,
     S2_BEGINNING_USER,
     S2_LOOK_TARGET_USER,
@@ -56,6 +57,7 @@ from agent.modes import (
     _S2_LOOK_LINES,
     _S2_MOVE_LINES,
     _build_game_messages,
+    assemble_s2_prompt,
     parse_target,
     s2_move_reply,
 )
@@ -305,11 +307,17 @@ class SyntheticPrompt:
     notepad: str
 
 
-def beginning_messages(image_path: str, notepad: str, kind: str) -> list[dict]:
+def beginning_messages(
+    image_path: str,
+    notepad: str,
+    kind: str,
+    system: str | None = None,
+) -> list[dict]:
     """The beginnings user turn: empty context, the notepad, the picture.
 
     ``kind`` is ``look`` or ``move``. Every target on one image uses the
-    same kind, so the shared stem stays one prompt.
+    same kind, so the shared stem stays one prompt. ``system`` None is
+    :data:`SYSTEM_PROMPT_S2`.
     """
     if kind == "look":
         user = S2_BEGINNING_USER
@@ -318,8 +326,52 @@ def beginning_messages(image_path: str, notepad: str, kind: str) -> list[dict]:
     else:
         raise ValueError(f"beginning kind must be look or move, got {kind!r}")
     return _build_game_messages(
-        SYSTEM_PROMPT_S2, image_path, "", user, notepad=notepad,
+        system if system is not None else SYSTEM_PROMPT_S2,
+        image_path, "", user, notepad=notepad,
     )
+
+
+# One-line tips in the game's voice. Weekend draws 0-3 of these per batch
+# so a training prompt can carry a Saved tips section, as a loaded prompt would.
+_S2_FAKE_TIPS = (
+    "When the controller stops on noops, the aim was off, not the distance.",
+    "A move to a gold succeeds only when the Board update says it ate one.",
+    "After a miss, flag it, then aim again at the same notepad target.",
+    "If the gold is still on the board, the last move did not eat it.",
+    "Name the target from the notepad, not from a guess about the picture.",
+    "Stopped short of a gold means the eyes were not on the gold.",
+    "An exit move succeeds only when the game ends.",
+    "Keep the same target after a miss. Do not pick a new gold.",
+    "The controller stopping on time means it ran out of time, not that it arrived.",
+    "Write the failure flag on the line after the did-not-eat verdict.",
+    "A look does not move the body, so it cannot eat a gold.",
+    "When no gold remains, the target is an exit, not another gold.",
+)
+
+
+def fake_saved_tips(rng: random.Random) -> dict[str, str]:
+    """Zero tips 60% of the time, else one to three, numbered from 500.
+
+    Categories follow draw order, so the same draw always sorts the same way.
+    """
+    if rng.random() < 0.6:
+        return {}
+    count = rng.randint(1, 3)
+    chosen = rng.sample(list(_S2_FAKE_TIPS), count)
+    out: dict[str, str] = {}
+    for index, text in enumerate(chosen):
+        words = text.lower().split()[:4]
+        slug = "".join(ch if ch.isalnum() else "_" for ch in " ".join(words))
+        while "__" in slug:
+            slug = slug.replace("__", "_")
+        slug = slug.strip("_")[:24].strip("_")
+        out[f"core_s2_{500 + index:03d}_{slug}"] = text
+    return out
+
+
+def fake_s2_system(rng: random.Random) -> str:
+    """A system prompt with this draw's fabricated saved tips, if any."""
+    return assemble_s2_prompt({**dict(CORE_S2_TIPS), **fake_saved_tips(rng)})
 
 
 def _fake_rounds(
@@ -381,6 +433,7 @@ class BoardContext:
     context: str
     agent: tuple[float, float]
     weights: dict[str, float] | None = None
+    system: str = SYSTEM_PROMPT_S2
 
 
 @dataclass
@@ -400,6 +453,7 @@ def board_context(
     *,
     forced_note: str | None = None,
     weights: dict[str, float] | None = None,
+    system: str | None = None,
 ) -> BoardContext:
     """Notepad, fake history, and the agent point for one board.
 
@@ -449,6 +503,7 @@ def board_context(
         context=context,
         agent=agent,
         weights=weights,
+        system=system if system is not None else SYSTEM_PROMPT_S2,
     )
 
 
@@ -518,6 +573,7 @@ def synthetic_prompt(
     *,
     question: str | None = None,
     forced_note: str | None = None,
+    system: str | None = None,
 ) -> SyntheticPrompt:
     """One synthetic user turn, including the fake notepad and history.
 
@@ -529,7 +585,7 @@ def synthetic_prompt(
     notepad is drawn before the question, so the same seed does not
     replay the old random stream.
     """
-    ctx = board_context(settings, rng, forced_note=forced_note)
+    ctx = board_context(settings, rng, forced_note=forced_note, system=system)
     if question is not None:
         cand_kind, phrase, point = _draw_target(ctx.candidates, rng)
         move_kind = "look" if rng.random() < 0.5 else "move"
@@ -548,7 +604,7 @@ def synthetic_prompt(
         )
         coords = drawn.coords
     messages = _build_game_messages(
-        SYSTEM_PROMPT_S2, image_path, ctx.context, asked, notepad=ctx.notepad,
+        ctx.system, image_path, ctx.context, asked, notepad=ctx.notepad,
     )
     return SyntheticPrompt(
         messages=messages,

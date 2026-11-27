@@ -238,6 +238,16 @@ class AgentConfig:
         default_factory=lambda: _env_int("DEBRIEF_MAX_TOOL_CALLS", 64)
     )
 
+    # Failure analyst. At most this many pictures in context at once
+    # (before and after images count separately). Tool calls per ask,
+    # then the turn ends.
+    analyst_max_images: int = field(
+        default_factory=lambda: _env_int("ANALYST_MAX_IMAGES", 4)
+    )
+    analyst_max_tool_calls: int = field(
+        default_factory=lambda: _env_int("ANALYST_MAX_TOOL_CALLS", 24)
+    )
+
     # ``get_context`` semantic dump into play/discuss. Off on this branch:
     # the model still gets the scene prompt, last-K recency, scratchpad,
     # and `[SEARCH]`. Re-enable the dump with NAMS_RETRIEVAL=1.

@@ -669,6 +669,29 @@ def settings_to_dict(s: Settings) -> dict[str, Any]:
     return out
 
 
+def fmt3(value: Any) -> Any:
+    """Print-rule for floats: three decimals. Storage is unchanged.
+
+    A float becomes the text ``0.500`` (three places, not a rounded
+    float). A list or dict is walked. Ints, bools, and strings are
+    returned as themselves. A pair of floats is therefore a list of two
+    such strings.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        return f"{value:.3f}"
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return {key: fmt3(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [fmt3(item) for item in value]
+    return value
+
+
 def settings_json_with_openings(settings_json: str | None) -> str | None:
     """Backfill so every analyst view has an ``openings`` key.
 
@@ -842,6 +865,34 @@ def parse_remember_notes(text: str) -> list[tuple[str, str]]:
     them in order, so a repeated key means last-one-wins."""
     return [(m.group(1).lower(), m.group(2).strip())
             for m in _REMEMBER_RE.finditer(text)]
+
+
+#: One failure flag: ``[FLAG failure: free text]``. The key is fixed.
+#: The note runs to the first ``]`` on the same line, same as ``[REMEMBER]``.
+_FLAG_RE = re.compile(r"\[FLAG failure:\s*([^\]\n]+)\]")
+
+
+def parse_failure_flags(text: str) -> list[tuple[str, str]]:
+    """All ``[FLAG failure: note]`` lines in ``text``, in order.
+
+    The key is always ``failure``. The note is the text before ``]``,
+    stripped. A ``]`` inside the note ends it. The line stays in the
+    message; this only finds it.
+    """
+    return [("failure", m.group(1).strip()) for m in _FLAG_RE.finditer(text)]
+
+
+#: One saved tip: ``[TIP: one line]``. The note runs to the first ``]``.
+_TIP_RE = re.compile(r"\[TIP:\s*([^\]\n]+)\]")
+
+
+def parse_tip_lines(text: str) -> list[str]:
+    """All ``[TIP: one line]`` notes in ``text``, in order, stripped.
+
+    A ``]`` or a newline ends the note. The line stays in the message;
+    this only finds it. ``[REMEMBER`` and ``[FLAG`` do not match.
+    """
+    return [match.group(1).strip() for match in _TIP_RE.finditer(text) if match.group(1).strip()]
 
 
 def board_update_line(action: str, gold_collected: int, gold_remaining: int,

@@ -269,6 +269,10 @@ The debt that hurts is writing this inside `interactive.py` and
 `modes.py`, where every ask inherits `OBS:`, NAMS, and the analyst
 round. Do not do that.
 
+OBS: and the analyst round stay out of the S2 loop. NAMS tips do not:
+the S2 system prompt is assembled from `core_s2_*` Preference rows, and
+a saved tip is part of the next prompt. See `.cursor/rules/tips-are-the-prompt.mdc`.
+
 ## 7. Two constraints on the handoff
 
 The loop in `neural_net/` updates S1's target on every new token: S1

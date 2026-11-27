@@ -41,7 +41,6 @@ from agent.modes import (
     S2_MOVE_TARGET_USER,
     S2_MOVE_VERDICT_LINES,
     S2_SEALED_NOTE,
-    SYSTEM_PROMPT_S2,
     _S2_LOOK_LINES,
     _S2_MOVE_LINES,
     _build_game_messages,
@@ -74,6 +73,7 @@ from neural_net.s2_pretraining_learn_to_look import (
     _targets_on_board,
     beginning_messages,
     board_context,
+    fake_s2_system,
     draw_question,
     draw_questions,
     gold_region_phrases,
@@ -138,6 +138,7 @@ class Batch:
     settings: dict[str, Any]
     turns: list[Turn]
     inject: str
+    system: str
 
 
 def messages_for(batch: Batch, turn: Turn) -> list[dict]:
@@ -145,9 +146,9 @@ def messages_for(batch: Batch, turn: Turn) -> list[dict]:
     if turn.question in (S2_BEGINNING_USER, S2_BEGINNING_MOVE_USER):
         kind = "look" if turn.question == S2_BEGINNING_USER else "move"
         notepad = batch.notepad if batch.notepad is not None else format_notepad([])
-        return beginning_messages(str(batch.path), notepad, kind)
+        return beginning_messages(str(batch.path), notepad, kind, batch.system)
     return _build_game_messages(
-        SYSTEM_PROMPT_S2,
+        batch.system,
         str(batch.path),
         batch.context,
         turn.question,
@@ -229,6 +230,7 @@ def build_gaze(
             settings={"agent": list(specs_used[0]["agent"]), "placements": placements},
             turns=turns,
             inject="oracle",
+            system=fake_s2_system(rng),
         )
     except Exception:
         path.unlink(missing_ok=True)
@@ -1000,6 +1002,7 @@ def _gaze_game_batch(
         settings=settings,
         turns=turns,
         inject="feedback",
+        system=fake_s2_system(rng),
     )
 
 
@@ -1051,6 +1054,7 @@ def _look_move_batch(
         settings=settings,
         turns=turns,
         inject="feedback",
+        system=fake_s2_system(rng),
     )
 
 
@@ -1231,6 +1235,7 @@ def _shift_batch(
         settings=settings,
         turns=[turn],
         inject="feedback",
+        system=fake_s2_system(rng),
     )
 
 
@@ -1277,6 +1282,7 @@ def _begin_batch(
         settings=settings,
         turns=turns,
         inject="feedback",
+        system=fake_s2_system(rng),
     )
 
 
@@ -1313,6 +1319,7 @@ def _retarget_batch(
         settings=settings,
         turns=turns,
         inject="feedback",
+        system=fake_s2_system(rng),
     )
 
 

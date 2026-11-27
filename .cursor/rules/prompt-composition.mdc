@@ -24,3 +24,6 @@ prose that you apply to functions:
 - **Edits propagate by construction.** Fixing a fact (e.g. the geometry
   conventions) in its block must fix every mode that uses it; if you find
   yourself making the same prompt edit in two places, the blocks are wrong.
+- **A generating prompt is loaded from NAMS.** The blocks above are the seed.
+  Do not hand a generating harness the `SYSTEM_PROMPT_S2` constant. See
+  `tips-are-the-prompt`.
