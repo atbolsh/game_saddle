@@ -2182,6 +2182,17 @@ def t1_pure() -> str:
     from agent import modes
     from agent.memory import ANALYST_TAG, tag_analyst_text, untag_analyst_text
 
+    import asyncio as _asyncio
+
+    async def _off_loop_ping() -> str:
+        return "pong"
+
+    async def _off_loop_from_running() -> str:
+        return modes._run_off_caller_loop(_off_loop_ping)
+
+    assert _asyncio.run(_off_loop_from_running()) == "pong"
+    assert modes._run_off_caller_loop(_off_loop_ping) == "pong"
+
     import re as _re
     cat_re = _re.compile(r"^core_(player|analyst|s2|fa)_(\d{3})_[a-z0-9_]+$")
     seen_cats: set[str] = set()

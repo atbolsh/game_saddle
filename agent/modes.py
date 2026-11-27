@@ -502,26 +502,50 @@ async def load_s2_prompt(client: Any) -> str:
     return assemble_s2_prompt(await mem.get_core_tips(client, "core_s2_"))
 
 
+def _run_off_caller_loop(work):
+    """Run an async function on a fresh loop in another thread.
+
+    A notebook widget callback is already inside the kernel loop. Python
+    3.12 refuses ``run_until_complete`` on that thread. The worker thread
+    has no loop, so ``asyncio.run`` is legal there, and it is also legal
+    when the caller has no loop at all. ``work`` is called on the worker.
+    """
+    import asyncio
+    import threading
+
+    box: dict[str, Any] = {}
+
+    def _runner() -> None:
+        try:
+            box["value"] = asyncio.run(work())
+        except BaseException as exc:
+            box["error"] = exc
+
+    thread = threading.Thread(target=_runner, name="nams-sync", daemon=True)
+    thread.start()
+    thread.join()
+    if "error" in box:
+        raise box["error"]
+    if "value" not in box:
+        raise RuntimeError("NAMS load thread exited without a result")
+    return box["value"]
+
+
 def load_s2_prompt_sync() -> str:
     """:func:`load_s2_prompt` from a notebook cell that already has a loop.
 
-    Opens its own event loop, connects, loads, and closes the client.
-    A NAMS failure raises. There is no fallback to the code constant.
+    Connects, loads, and closes the client on a fresh loop in another
+    thread. A NAMS failure raises. There is no fallback to the code
+    constant.
     """
-    import asyncio
+    async def _go() -> str:
+        client = await mem.connect()
+        try:
+            return await load_s2_prompt(client)
+        finally:
+            await client.close()
 
-    loop = asyncio.new_event_loop()
-    try:
-        async def _go() -> str:
-            client = await mem.connect()
-            try:
-                return await load_s2_prompt(client)
-            finally:
-                await client.close()
-
-        return loop.run_until_complete(_go())
-    finally:
-        loop.close()
+    return _run_off_caller_loop(_go)
 
 _CORE_FA_010_ROLE = "You are the Analyst for an agent that plays a game of gold and exits on the unit square. The agent is the green circle; its red mark is the eye. Gold is yellow. A gap in a wall is an exit. The top edge is y = 1, the right edge x = 1. The agent flags its own failures. Your job is to read those flags and find the common ways it fails. You are not grading one reply. You are looking for patterns across many."
 
@@ -565,23 +589,18 @@ async def load_failure_analyst_prompt(client: Any) -> str:
 def load_failure_analyst_prompt_sync() -> str:
     """:func:`load_failure_analyst_prompt` for a notebook cell.
 
-    Opens its own event loop, connects, loads, and closes the client.
-    A NAMS failure raises. There is no fallback to the code constant.
+    Connects, loads, and closes the client on a fresh loop in another
+    thread. A NAMS failure raises. There is no fallback to the code
+    constant.
     """
-    import asyncio
+    async def _go() -> str:
+        client = await mem.connect()
+        try:
+            return await load_failure_analyst_prompt(client)
+        finally:
+            await client.close()
 
-    loop = asyncio.new_event_loop()
-    try:
-        async def _go() -> str:
-            client = await mem.connect()
-            try:
-                return await load_failure_analyst_prompt(client)
-            finally:
-                await client.close()
-
-        return loop.run_until_complete(_go())
-    finally:
-        loop.close()
+    return _run_off_caller_loop(_go)
 
 
 #: User line for a beginning that looks. Not part of the system prompt.
