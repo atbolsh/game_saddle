@@ -2614,12 +2614,18 @@ def t1_pure() -> str:
         assert "object" in str(exc), exc
     checks += 1
 
-    from training.humaneval_compare import (
+    import base64
+    import pickle
+    import zlib
+
+    from training.lcb_compare import (
         choose_problems,
+        decode_tests,
         extract_program,
         first_ls_name,
+        grade_solution,
         select_full_save,
-        execute_program,
+        stdout_match,
     )
     _he_rows = [{"task_id": f"HumanEval/{i}"} for i in range(10)]
     _he_first, _he_first_sel = choose_problems(
@@ -2657,35 +2663,54 @@ def t1_pure() -> str:
         raise AssertionError("seed without random did not raise")
     except ValueError as exc:
         assert "--seed" in str(exc), exc
-    _he_prompt = "from typing import List\n\ndef add(a, b):\n    \"\"\"sum\"\"\"\n"
-    _he_fenced = "```python\ndef add(a, b):\n    return a + b\n```"
-    assert extract_program(_he_fenced, _he_prompt, "add").startswith(
-        "from typing import List"
-    )
-    assert "return a + b" in extract_program(_he_fenced, _he_prompt, "add")
-    _he_with_imports = (
-        "```python\nfrom typing import List\n\ndef add(a, b):\n"
-        "    return a + b\n```"
-    )
-    _he_full = extract_program(_he_with_imports, _he_prompt, "add")
-    assert _he_full.count("from typing import List") == 1
-    assert extract_program("    return a + b\n", _he_prompt, "add").startswith(
-        _he_prompt
-    )
-    _he_ok, _he_reason = execute_program(
-        "def add(a, b):\n    return a + b\n",
-        "def check(candidate):\n    assert candidate(1, 2) == 3\n",
-        "add",
-        5.0,
+    assert extract_program(
+        "```python\ndef add(a, b):\n    return a + b\n```"
+    ) == "def add(a, b):\n    return a + b"
+    assert stdout_match("3\n", "3")
+    assert stdout_match("1.0 2\n", "1 2")
+    assert not stdout_match("4\n", "3")
+    _he_packed = base64.b64encode(zlib.compress(pickle.dumps(json.dumps([
+        {"input": "1\n", "output": "2", "testtype": "stdin"},
+    ])))).decode()
+    assert decode_tests(_he_packed, "t", "private")[0]["output"] == "2"
+    _he_stdin = [{"input": "2\n", "output": "3", "testtype": "stdin"}]
+    _he_ok, _he_reason = grade_solution(
+        "print(int(input()) + 1)\n", _he_stdin, None, 5.0,
     )
     assert _he_ok, _he_reason
-    _he_bad, _he_bad_reason = execute_program(
-        "def add(a, b):\n    return a - b\n",
-        "def check(candidate):\n    assert candidate(1, 2) == 3\n",
-        "add",
-        5.0,
+    _he_bad, _he_bad_reason = grade_solution(
+        "print(0)\n", _he_stdin, None, 5.0,
     )
-    assert not _he_bad, _he_bad_reason
+    assert not _he_bad and "wrong answer" in _he_bad_reason, _he_bad_reason
+    _he_fn = [{
+        "input": "[1, 2]\n3",
+        "output": "6",
+        "testtype": "functional",
+    }]
+    _he_ok, _he_reason = grade_solution(
+        "class Solution:\n"
+        "    def add(self, nums, extra):\n"
+        "        return sum(nums) + extra\n",
+        _he_fn, "add", 5.0,
+    )
+    assert _he_ok, _he_reason
+    _he_bad, _he_bad_reason = grade_solution(
+        "class Solution:\n"
+        "    def add(self, nums, extra):\n"
+        "        return 0\n",
+        _he_fn, "add", 5.0,
+    )
+    assert not _he_bad and "wrong answer" in _he_bad_reason, _he_bad_reason
+    _he_ok, _he_reason = grade_solution(
+        "def pair(a):\n    return (a, a)\n",
+        [{"input": "1", "output": "[1, 1]", "testtype": "functional"}],
+        "pair", 5.0,
+    )
+    assert _he_ok, _he_reason
+    _he_hung, _he_hung_reason = grade_solution(
+        "import time\ntime.sleep(30)\n", _he_stdin, None, 0.4,
+    )
+    assert not _he_hung and _he_hung_reason == "timeout", _he_hung_reason
     with tempfile.TemporaryDirectory() as _he_tmp:
         _he_root = _Path(_he_tmp)
         (_he_root / "m_later" / "gemma").mkdir(parents=True)
@@ -2702,7 +2727,7 @@ def t1_pure() -> str:
         (_he_root / "0_note.txt").unlink()
         assert select_full_save(_he_root, None) == _he_root / "a_first"
         assert select_full_save(_he_root, "m_later") == _he_root / "m_later"
-    _he_src = (_root / "training" / "humaneval_compare.py").read_text()
+    _he_src = (_root / "training" / "lcb_compare.py").read_text()
     assert "enable_thinking=False" in _he_src
     assert "do_sample=False" in _he_src
     assert "localizer" not in _he_src.split("def _load_finetune")[1].split("def _unload")[0]
@@ -2716,7 +2741,7 @@ def t1_pure() -> str:
         "multi-gold datagen flag, openings, end-game parse, prompt "
         "composition, openings backfill, leak scrubber, core-tip seed, "
         "step estimate, cosine floor, nams retrieval off, "
-        "openings reconcile, humaneval compare)"
+        "openings reconcile, lcb v6 compare)"
     )
 
 
