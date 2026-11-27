@@ -2614,6 +2614,101 @@ def t1_pure() -> str:
         assert "object" in str(exc), exc
     checks += 1
 
+    from training.humaneval_compare import (
+        choose_problems,
+        extract_program,
+        first_ls_name,
+        select_full_save,
+        execute_program,
+    )
+    _he_rows = [{"task_id": f"HumanEval/{i}"} for i in range(10)]
+    _he_first, _he_first_sel = choose_problems(
+        _he_rows, limit=3, random_n=None, seed=None,
+    )
+    assert [row["task_id"] for row in _he_first] == [
+        "HumanEval/0", "HumanEval/1", "HumanEval/2",
+    ]
+    assert _he_first_sel["mode"] == "first" and _he_first_sel["seed"] is None
+    _he_a, _he_a_sel = choose_problems(
+        _he_rows, limit=None, random_n=4, seed=1,
+    )
+    _he_a2, _ = choose_problems(_he_rows, limit=None, random_n=4, seed=1)
+    _he_b, _he_b_sel = choose_problems(
+        _he_rows, limit=None, random_n=4, seed=None,
+    )
+    assert [row["task_id"] for row in _he_a] == [
+        row["task_id"] for row in _he_a2
+    ]
+    assert _he_a_sel["seed"] == 1 and _he_b_sel["seed"] == 0
+    assert len(_he_a) == 4 and len({row["task_id"] for row in _he_a}) == 4
+    assert [row["task_id"] for row in _he_a] != [
+        "HumanEval/0", "HumanEval/1", "HumanEval/2", "HumanEval/3",
+    ]
+    assert [row["task_id"] for row in _he_a] != [
+        row["task_id"] for row in _he_b
+    ]
+    try:
+        choose_problems(_he_rows, limit=2, random_n=2, seed=None)
+        raise AssertionError("limit and random together did not raise")
+    except ValueError as exc:
+        assert "not both" in str(exc), exc
+    try:
+        choose_problems(_he_rows, limit=None, random_n=None, seed=3)
+        raise AssertionError("seed without random did not raise")
+    except ValueError as exc:
+        assert "--seed" in str(exc), exc
+    _he_prompt = "from typing import List\n\ndef add(a, b):\n    \"\"\"sum\"\"\"\n"
+    _he_fenced = "```python\ndef add(a, b):\n    return a + b\n```"
+    assert extract_program(_he_fenced, _he_prompt, "add").startswith(
+        "from typing import List"
+    )
+    assert "return a + b" in extract_program(_he_fenced, _he_prompt, "add")
+    _he_with_imports = (
+        "```python\nfrom typing import List\n\ndef add(a, b):\n"
+        "    return a + b\n```"
+    )
+    _he_full = extract_program(_he_with_imports, _he_prompt, "add")
+    assert _he_full.count("from typing import List") == 1
+    assert extract_program("    return a + b\n", _he_prompt, "add").startswith(
+        _he_prompt
+    )
+    _he_ok, _he_reason = execute_program(
+        "def add(a, b):\n    return a + b\n",
+        "def check(candidate):\n    assert candidate(1, 2) == 3\n",
+        "add",
+        5.0,
+    )
+    assert _he_ok, _he_reason
+    _he_bad, _he_bad_reason = execute_program(
+        "def add(a, b):\n    return a - b\n",
+        "def check(candidate):\n    assert candidate(1, 2) == 3\n",
+        "add",
+        5.0,
+    )
+    assert not _he_bad, _he_bad_reason
+    with tempfile.TemporaryDirectory() as _he_tmp:
+        _he_root = _Path(_he_tmp)
+        (_he_root / "m_later" / "gemma").mkdir(parents=True)
+        (_he_root / "m_later" / "gemma" / "gemma_meta.json").write_text("{}")
+        (_he_root / "a_first" / "gemma").mkdir(parents=True)
+        (_he_root / "a_first" / "gemma" / "gemma_meta.json").write_text("{}")
+        (_he_root / "0_note.txt").write_text("x")
+        assert first_ls_name(_he_root) == "0_note.txt"
+        try:
+            select_full_save(_he_root, None)
+            raise AssertionError("a leading file was accepted as a full save")
+        except RuntimeError as exc:
+            assert "not a directory" in str(exc), exc
+        (_he_root / "0_note.txt").unlink()
+        assert select_full_save(_he_root, None) == _he_root / "a_first"
+        assert select_full_save(_he_root, "m_later") == _he_root / "m_later"
+    _he_src = (_root / "training" / "humaneval_compare.py").read_text()
+    assert "enable_thinking=False" in _he_src
+    assert "do_sample=False" in _he_src
+    assert "localizer" not in _he_src.split("def _load_finetune")[1].split("def _unload")[0]
+    assert "S1S2" not in _he_src
+    checks += 1
+
     return (
         f"{checks} unit groups passed (ratings, rewards, noise, tripwire, "
         "source, batching, scrambler, questions, stack-eq, vram-split, "
@@ -2621,7 +2716,7 @@ def t1_pure() -> str:
         "multi-gold datagen flag, openings, end-game parse, prompt "
         "composition, openings backfill, leak scrubber, core-tip seed, "
         "step estimate, cosine floor, nams retrieval off, "
-        "openings reconcile)"
+        "openings reconcile, humaneval compare)"
     )
 
 
