@@ -2289,6 +2289,8 @@ def t1_pure() -> str:
         "notebooks/testing_learn_to_look.ipynb",
         "agent/analyst.py",
         "notebooks/analyst.ipynb",
+        "notebooks/testing_llm_sense_of_direction.ipynb",
+        "neural_net/direction_probe.py",
     ):
         _text = (_root / _rel).read_text()
         assert "SYSTEM_PROMPT_S2" not in _text, _rel
@@ -2346,6 +2348,42 @@ def t1_pure() -> str:
         assert _found[0][1] == _adapter
         assert _found[1][1] == _full / "gemma"
         assert _found[2][1] == _both / "gemma"
+    _loop_py = (_root / "neural_net" / "loop.py").read_text()
+    _direction = (_root / "neural_net" / "direction_probe.py").read_text()
+    _direction_nb = json.loads(
+        (
+            _root / "notebooks" / "testing_llm_sense_of_direction.ipynb"
+        ).read_text()
+    )
+    _direction_src = "".join(
+        "".join(cell.get("source", [])) for cell in _direction_nb["cells"]
+    )
+    assert "def generate_s2_reply" in _loop_py
+    assert "generate_s2_reply" in _direction
+    assert "S1S2" not in _direction
+    assert "run_s1" not in _direction
+    assert "S1S2" not in _direction_src
+    assert "direction_menu_options" in _direction_src
+    assert 'value="inkling-2-mini"' in _direction_src
+    assert (
+        'DIRECTION_KEYS = ("inkling-2-mini", "gemma-4-31b", "gemma-4-12b")'
+        in _direction
+    )
+    from neural_net.direction_probe import direction_menu_options
+    with tempfile.TemporaryDirectory() as _dir_tmp:
+        _dw = _Path(_dir_tmp)
+        _save = _dw / "full" / "joint"
+        (_save / "gemma").mkdir(parents=True)
+        (_save / "s1.pt").write_text("x")
+        (_save / "localizer.pt").write_text("x")
+        (_save / "coord_embed.pt").write_text("x")
+        (_save / "train_meta.json").write_text("{}")
+        _menu = direction_menu_options(_dw)
+        assert [row[1] for row in _menu[:3]] == [
+            "inkling-2-mini", "gemma-4-31b", "gemma-4-12b",
+        ], _menu
+        assert _menu[3][0] == "full/joint"
+        assert _menu[3][1] == "full:" + str(_save)
     assert _unexpected_core_tip_categories(
         "core_player_",
         {"core_player_010_x"},

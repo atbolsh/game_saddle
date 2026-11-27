@@ -383,6 +383,50 @@ class S1S2:
         return results
 
 
+def generate_s2_reply(
+    s2: GemmaS2,
+    game: discreteGame,
+    prompt: str | list[dict],
+    *,
+    max_new_tokens: int | None = None,
+) -> str:
+    """One reply through the play prefill and decode.
+
+    The Localizer reads ``s`` and ``v`` at each token, and the coordinate
+    code is added to the next token's embedding, the same way
+    :meth:`S1S2.generate` does. S1 is not constructed and does not step
+    the board. Nothing is written to a gaze trace.
+    """
+    from agent.config import CONFIG
+    from agent.modes import ends_with_end_game, ends_with_move
+
+    if s2.vl.model is None or s2.localizer is None or s2.coord_embed is None:
+        raise RuntimeError("GemmaS2 is not loaded")
+    limit = CONFIG.max_new_tokens if max_new_tokens is None else max_new_tokens
+    if limit < 1:
+        raise ValueError(f"max_new_tokens must be >= 1, got {limit}")
+    encoded = s2.vl.encode_messages(_messages(prompt, _frozen_image(game)))
+    sampling = s2.vl._sampling_kwargs()
+    eos = _eos_ids(s2.vl)
+    tokenizer = getattr(s2.vl.processor, "tokenizer", s2.vl.processor)
+    logits, prev_coords, past = s2.prefill(encoded)
+    seq_len = int(encoded["input_ids"].shape[1])
+    generated: list[int] = []
+    for _step in range(limit):
+        token_ids = _sample(logits, sampling)
+        tid = int(token_ids[0])
+        generated.append(tid)
+        logits, coords, past = s2.decode(
+            token_ids, past, seq_len, prev_coords=prev_coords,
+        )
+        seq_len += 1
+        prev_coords = coords
+        text = tokenizer.decode(generated, skip_special_tokens=True)
+        if ends_with_move(text) or ends_with_end_game(text) or tid in eos:
+            break
+    return tokenizer.decode(generated, skip_special_tokens=True).strip()
+
+
 def run_s1_window(
     s1: S1,
     game: discreteGame,
